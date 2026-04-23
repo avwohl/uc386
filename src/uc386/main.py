@@ -14,6 +14,7 @@ from uc_core.parser import Parser, ParseError
 from uc_core import ast as ast_module
 from uc_core.preprocessor import Preprocessor, PreprocessorError, Macro
 from uc_core.ast_optimizer import ASTOptimizer
+from uc_core.type_config import TypeConfig, WATCOM_FLAT32
 
 from .codegen import CodeGenerator
 
@@ -37,7 +38,27 @@ def main() -> int:
     ap.add_argument("-E", "--preprocess-only", action="store_true")
     ap.add_argument("-P", "--no-preprocess", action="store_true")
     ap.add_argument("--no-ast-optimize", action="store_true")
+    ap.add_argument("--int", dest="int_bits", type=int, choices=[16, 32],
+                    help="int width in bits (default: 32 — Watcom flat-32)")
+    ap.add_argument("--long", dest="long_bits", type=int, choices=[32, 64],
+                    help="long width in bits (default: 32)")
+    ap.add_argument("--long-long", dest="long_long_bits", type=int, choices=[64],
+                    help="long long width in bits (default: 64)")
+    ap.add_argument("--ptr", dest="ptr_bits", type=int, choices=[32],
+                    help="pointer width in bits (default: 32 — flat-32 only)")
     args = ap.parse_args()
+
+    type_config = TypeConfig(
+        char_size=WATCOM_FLAT32.char_size,
+        short_size=WATCOM_FLAT32.short_size,
+        int_size=(args.int_bits // 8) if args.int_bits else WATCOM_FLAT32.int_size,
+        long_size=(args.long_bits // 8) if args.long_bits else WATCOM_FLAT32.long_size,
+        long_long_size=(args.long_long_bits // 8) if args.long_long_bits else WATCOM_FLAT32.long_long_size,
+        ptr_size=(args.ptr_bits // 8) if args.ptr_bits else WATCOM_FLAT32.ptr_size,
+        float_size=WATCOM_FLAT32.float_size,
+        double_size=WATCOM_FLAT32.double_size,
+        long_double_size=WATCOM_FLAT32.long_double_size,
+    )
 
     input_paths = [Path(f) for f in args.input]
     for p in input_paths:
@@ -52,7 +73,8 @@ def main() -> int:
         for p in input_paths:
             source = p.read_text()
             if not args.no_preprocess:
-                pp = Preprocessor(args.include, target_predefines=I386_DOS_PREDEFINES)
+                pp_predefines = {**I386_DOS_PREDEFINES, **type_config.predefined_macros()}
+                pp = Preprocessor(args.include, target_predefines=pp_predefines)
                 for define in args.define:
                     if "=" in define:
                         name, value = define.split("=", 1)
@@ -77,7 +99,7 @@ def main() -> int:
                 unit.declarations.extend(u.declarations)
 
         if not args.no_ast_optimize:
-            unit = ASTOptimizer(3).optimize(unit)
+            unit = ASTOptimizer(3, type_config=type_config).optimize(unit)
 
         gen = CodeGenerator(module_name=input_paths[0].stem)
         code = gen.generate(unit)
