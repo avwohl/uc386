@@ -1191,15 +1191,18 @@ _emit_padded_digits_wp:
 _printf_emit_double:
         push    ebp
         mov     ebp, esp
-        sub     esp, 64
+        sub     esp    , 64
         push    esi
         push    edi
         push    ebx
-        ; Save the entire FPU environment so any state we touch
-        ; (FCW, status, tag word, etc.) is restored after we return.
-        ; This protects callers from FCW changes and stale tag bits.
-        fnstenv [ebp - 32]
-        fwait
+        ; Save the value (st0 currently) into a local first, then
+        ; reset the FPU so prior state can't bias our scaling/rounding.
+        ; Caller pushes the value as st0, but if there are stale
+        ; entries below it (e.g. from a leaked previous call) they'd
+        ; throw off the multiply chain.
+        fstp    qword [ebp - 16]      ; save value, drop it from FPU
+        finit                          ; reset FPU to default 80-bit/nearest
+        fld     qword [ebp - 16]      ; reload value as st0
         ; Detect sign.
         ftst
         fnstsw  ax
@@ -1291,9 +1294,7 @@ _printf_emit_double:
         inc     esi
         jmp     .fp
 .end:
-        ; Restore the saved FPU environment so any FCW/tag-word
-        ; changes from our work don't leak to the caller.
-        fldenv  [ebp - 32]
+        ; FPU should already be empty (we popped at fistp); leave it so.
         pop     ebx
         pop     edi
         pop     esi
