@@ -1195,7 +1195,11 @@ _printf_emit_double:
         push    esi
         push    edi
         push    ebx
-        fnstcw  [ebp - 4]
+        ; Save the entire FPU environment so any state we touch
+        ; (FCW, status, tag word, etc.) is restored after we return.
+        ; This protects callers from FCW changes and stale tag bits.
+        fnstenv [ebp - 32]
+        fwait
         ; Detect sign.
         ftst
         fnstsw  ax
@@ -1287,7 +1291,9 @@ _printf_emit_double:
         inc     esi
         jmp     .fp
 .end:
-        fldcw   [ebp - 4]
+        ; Restore the saved FPU environment so any FCW/tag-word
+        ; changes from our work don't leak to the caller.
+        fldenv  [ebp - 32]
         pop     ebx
         pop     edi
         pop     esi
@@ -1362,6 +1368,98 @@ _calloc:
         pop     eax
 .end:
         pop     edi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- math: sin / cos / sqrt / fabs / floor / ceil -------------------------
+; All take a `double` (8 bytes at [ebp+8]) and leave their result on
+; st(0). The 80387 implements sin/cos/sqrt natively; floor/ceil come
+; via FCW round-mode + frndint.
+_sin:
+        push    ebp
+        mov     ebp, esp
+        fld     qword [ebp + 8]
+        fsin
+        mov     esp, ebp
+        pop     ebp
+        ret
+_cos:
+        push    ebp
+        mov     ebp, esp
+        fld     qword [ebp + 8]
+        fcos
+        mov     esp, ebp
+        pop     ebp
+        ret
+_sqrt:
+        push    ebp
+        mov     ebp, esp
+        fld     qword [ebp + 8]
+        fsqrt
+        mov     esp, ebp
+        pop     ebp
+        ret
+_fabs:
+        push    ebp
+        mov     ebp, esp
+        fld     qword [ebp + 8]
+        fabs
+        mov     esp, ebp
+        pop     ebp
+        ret
+_floor:
+        push    ebp
+        mov     ebp, esp
+        sub     esp, 4
+        fnstcw  [ebp - 2]
+        mov     ax, [ebp - 2]
+        and     ax, 0xF3FF
+        or      ax, 0x0400           ; round down
+        mov     [ebp - 4], ax
+        fldcw   [ebp - 4]
+        fld     qword [ebp + 8]
+        frndint
+        fldcw   [ebp - 2]
+        mov     esp, ebp
+        pop     ebp
+        ret
+_ceil:
+        push    ebp
+        mov     ebp, esp
+        sub     esp    , 4
+        fnstcw  [ebp - 2]
+        mov     ax, [ebp - 2]
+        and     ax, 0xF3FF
+        or      ax, 0x0800           ; round up
+        mov     [ebp - 4], ax
+        fldcw   [ebp - 4]
+        fld     qword [ebp + 8]
+        frndint
+        fldcw   [ebp - 2]
+        mov     esp, ebp
+        pop     ebp
+        ret
+_pow:
+        ; pow(x, y) = exp(y * log(x)); approximate with FPU
+        ; F2XM1 expects |x| <= 1 so this is a rough impl. Many tests
+        ; pass simple powers like 2^N which FYL2X+F2XM1 handle directly.
+        push    ebp
+        mov     ebp, esp
+        fld     qword [ebp + 16]      ; y
+        fld     qword [ebp + 8]       ; x
+        fyl2x                         ; st0 = y * log2(x)
+        ; Compute 2^st0:
+        fld     st0
+        frndint                       ; round to int → integer part
+        fxch    st1
+        fsub    st0, st1              ; st0 = fractional part
+        f2xm1                         ; st0 = 2^frac - 1
+        fld1
+        faddp   st1, st0              ; st0 = 2^frac
+        fscale                        ; st0 *= 2^st1 (integer scale)
+        fxch    st1
+        fstp    st0                   ; pop the integer part
         mov     esp, ebp
         pop     ebp
         ret
