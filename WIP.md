@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–31 done. Phase 5 (floats) slices 1–2 done.
-275 tests passing.
+Phase 4 slices 0–31 done. Phase 5 (floats) slices 1–3 done.
+281 tests passing.
 
 ## Bootstrap on the new machine
 
@@ -60,15 +60,12 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in Phase 5 slice 2 (just landed):
-- **Float comparisons.** `f < g`, `f == 0.0` etc. lower to fucompp +
-  fnstsw + sahf + setCC (386-compatible — no fucomi).
+Implemented in Phase 5 slice 3 (just landed):
+- **Float function params and returns.** Cdecl-correct: caller fstp's
+  args into the stack window, callee fld's from `[ebp + offset]`,
+  return value rides st(0).
 
 Deliberately not yet implemented — Phase 5 follow-on slices:
-- **Float function params and returns.** Cdecl pushes 4 / 8 bytes for
-  float / double args (already works with the existing arg-push path
-  if we route Identifier reads through `_eval_float_to_st0` for float
-  params). Returns ride st(0) — small `_return` change.
 - **Float globals init.** `double pi = 3.14;` at top level — the
   existing `.data` emission needs to recognize float types and use
   `dq` / `dd` instead of `_const_eval`.

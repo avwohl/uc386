@@ -1126,6 +1126,90 @@ def test_returning_int_cast_of_float_arithmetic():
     assert "fistp" in asm
 
 
+# ---- float params + returns -----------------------------------------------
+
+def test_float_param_loaded_from_offset():
+    asm = _compile(
+        "float identity(float x) { return x; } "
+        "int main(void) { return (int)identity(2.5); }"
+    )
+    asm_lines = asm.splitlines()
+    fn_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_identity:")
+    fn_section = "\n".join(asm_lines[fn_idx:])
+    # `x` lives at [ebp + 8]; reading it as float is fld dword.
+    assert "fld     dword [ebp + 8]" in fn_section
+
+
+def test_double_param_loaded_qword_and_takes_eight_bytes():
+    asm = _compile(
+        "double scale(double x) { return x + 1.0; } "
+        "int main(void) { return (int)scale(2.0); }"
+    )
+    asm_lines = asm.splitlines()
+    fn_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_scale:")
+    fn_section = "\n".join(asm_lines[fn_idx:])
+    assert "fld     qword [ebp + 8]" in fn_section
+
+
+def test_caller_pushes_float_arg_via_fstp():
+    # Use `2.5f` (float-suffixed) so the literal matches the declared
+    # param type. Without a coercion pass at the call site, an unsuffixed
+    # `2.5` would be treated as `double` and pushed as 8 bytes.
+    asm = _compile(
+        "float identity(float x) { return x; } "
+        "int main(void) { return (int)identity(2.5f); }"
+    )
+    asm_lines = asm.splitlines()
+    main_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_main:")
+    main_section = "\n".join(asm_lines[main_idx:])
+    assert "sub     esp, 4" in main_section
+    assert "fstp    dword [esp]" in main_section
+
+
+def test_float_return_left_on_fpu_stack():
+    asm = _compile(
+        "float two_pi(void) { return 6.28; } "
+        "int main(void) { return (int)two_pi(); }"
+    )
+    asm_lines = asm.splitlines()
+    fn_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_two_pi:")
+    end_idx = next(i for i, l in enumerate(asm_lines[fn_idx:]) if l.strip() == "ret") + fn_idx
+    fn_section = "\n".join(asm_lines[fn_idx:end_idx])
+    # The return loads the literal onto st(0) and jumps to epilogue
+    # without storing to eax.
+    assert "fld     qword [_uc386_float" in fn_section or "fld     dword [_uc386_float" in fn_section
+    assert "jmp     .epilogue" in fn_section
+    # No `mov eax, ...` before the return jump (other than the
+    # default xor eax, eax that follows).
+
+
+def test_caller_consumes_float_return_via_fistp_for_int_assignment():
+    # `int n = f();` where f returns float: caller's auto-convert uses fistp.
+    asm = _compile(
+        "float make(void) { return 3.5; } "
+        "int main(void) { int n = (int)make(); return n; }"
+    )
+    asm_lines = asm.splitlines()
+    main_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_main:")
+    main_section = "\n".join(asm_lines[main_idx:])
+    assert "call    _make" in main_section
+    assert "fistp" in main_section
+
+
+def test_float_return_into_float_local():
+    # `float f = make();` — the result rides st(0) straight into the slot.
+    asm = _compile(
+        "float make(void) { return 3.5; } "
+        "int main(void) { float f = make(); return (int)f; }"
+    )
+    asm_lines = asm.splitlines()
+    main_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_main:")
+    main_section = "\n".join(asm_lines[main_idx:])
+    assert "call    _make" in main_section
+    # No fistp/fild between the call and the float store.
+    assert "fstp    dword [ebp" in main_section
+
+
 # ---- float comparisons ----------------------------------------------------
 
 @pytest.mark.parametrize(

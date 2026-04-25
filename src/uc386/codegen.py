@@ -147,6 +147,9 @@ class _FuncCtx:
         # User-declared `label:` → NASM label mapping for goto. Pre-walked
         # before body emission so forward gotos can resolve.
         self.user_labels: dict[str, str] = {}
+        # The current function's declared return type. Used by `_return`
+        # to dispatch float-returning functions to the FPU stack.
+        self.return_type: ast.TypeNode | None = None
 
     def alloc_local(self, name: str, ty: "ast.TypeNode", size: int = 4) -> int:
         if name in self.slots:
@@ -561,10 +564,12 @@ class CodeGenerator:
 
     def _function(self, fn: ast.FunctionDecl) -> list[str]:
         ctx = _FuncCtx()
+        ctx.return_type = fn.return_type
         # Parameters live above EBP at cdecl offsets; the first sits at
         # [ebp + 8], and each subsequent param is offset by its predecessor's
-        # padded size (4 for scalars / pointers, sizeof(struct) rounded
-        # up to 4 for structs passed by value).
+        # padded size. For scalars/pointers/floats that's `(size + 3) & ~3`
+        # bytes — usually 4, but 8 for `double`. Structs by value take
+        # `sizeof(struct)` rounded up to 4.
         #
         # Struct-returning functions take a hidden first param at [ebp+8]
         # — a pointer to the caller's destination buffer. Real params
@@ -581,11 +586,8 @@ class CodeGenerator:
                 continue
             self._check_supported_type(param.param_type, param.name)
             ctx.alloc_param(param.name, disp, param.param_type)
-            if isinstance(param.param_type, ast.StructType):
-                size = self._size_of(param.param_type)
-                disp += (size + 3) & ~3
-            else:
-                disp += 4
+            size = self._size_of(param.param_type)
+            disp += (size + 3) & ~3
         # First pass: allocate every local up front so the prologue knows
         # the frame size before we emit body code.
         self._collect_locals(fn.body, ctx)
@@ -1766,6 +1768,12 @@ class CodeGenerator:
                 "        xor     eax, eax",
                 "        jmp     .epilogue",
             ]
+        # Float-returning functions leave the result on st(0); the
+        # caller picks it up via fstp. No EAX involvement.
+        if self._is_float_type(ctx.return_type):
+            return self._eval_float_to_st0(stmt.value, ctx) + [
+                "        jmp     .epilogue",
+            ]
         # Struct-returning functions copy the value into the caller-provided
         # buffer (the hidden `__retptr__` first arg) rather than dropping
         # the value into EAX. We forward the retptr in EAX as the return
@@ -2122,6 +2130,11 @@ class CodeGenerator:
             return self._float_member_load(expr, ctx)
         if isinstance(expr, ast.Index):
             return self._float_index_load(expr, ctx)
+        if isinstance(expr, ast.Call):
+            # Float-returning calls leave their result on st(0) per
+            # cdecl, so we just emit the standard call sequence —
+            # `_call`'s post-call cleanup doesn't touch the FPU stack.
+            return self._call(expr, ctx)
         raise CodegenError(
             f"float expression {type(expr).__name__} not implemented yet"
         )
@@ -2350,6 +2363,16 @@ class CodeGenerator:
                     out.append(f"        mov     al, [edx + {offset}]")
                     out.append(f"        mov     [esp + {offset}], al")
                 total_arg_bytes += padded
+            elif self._is_float_type(arg_ty):
+                # Float arg: evaluate to st(0), then `fstp` into a
+                # freshly-reserved arg slot. cdecl pushes 4 bytes for
+                # `float`, 8 for `double`.
+                size = self._size_of(arg_ty)
+                width = "dword" if size == 4 else "qword"
+                out += self._eval_float_to_st0(arg, ctx)
+                out.append(f"        sub     esp, {size}")
+                out.append(f"        fstp    {width} [esp]")
+                total_arg_bytes += size
             else:
                 out += self._eval_expr_to_eax(arg, ctx)
                 out.append("        push    eax")
