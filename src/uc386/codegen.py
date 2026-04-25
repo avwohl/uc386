@@ -24,13 +24,19 @@ Current scope:
 - Ternary `cond ? a : b`.
 - Control flow: `if`/`else`, `while`, `do`/`while`, `for`, `break`, `continue`.
 - Function calls — direct calls only (callee must be an identifier).
-- Pointer locals/params (`int *p`), `&x` (Identifier only), `*expr`,
-  and store-through-pointer assignment `*p = rhs`.
+- Pointer locals/params (`int *p`), `&x` / `&arr[i]`, `*expr`, and
+  store-through-pointer assignment `*p = rhs`.
 - Pointer arithmetic with C scaling rules: `p + n` and `n + p` scale
   the int by `sizeof(*p)`; `p - n` likewise; `p - q` produces a byte
   difference that is then divided by `sizeof(*p)`. `++p` / `p--` on a
   pointer slot step by `sizeof(*p)` rather than 1. Adding two pointers
   and subtracting a pointer from an integer are rejected.
+- Arrays (uninitialized only): `int arr[N]` allocates `N * sizeof(elem)`
+  bytes on the frame, an array name decays to its address in
+  expression context, and `arr[i]` reads/writes through
+  base + i*sizeof(elem). Array assignment, `++arr` / `--arr`, and
+  brace-initialization `int arr[N] = {...}` all raise pending the
+  InitializerList pass.
 - String literals: interned per-translation-unit, emitted as
   null-terminated bytes in `.data` with labels like `_uc386_strN`.
 - `extern` declarations (FunctionDecls without bodies) emit NASM
@@ -270,7 +276,7 @@ class CodeGenerator:
         """
         if isinstance(node, ast.VarDecl):
             self._check_supported_type(node.var_type, node.name)
-            ctx.alloc_local(node.name, node.var_type)
+            ctx.alloc_local(node.name, node.var_type, self._size_of(node.var_type))
             return
         if isinstance(node, ast.CompoundStmt):
             for item in node.items:
@@ -292,18 +298,37 @@ class CodeGenerator:
         # Statements with no nested locals: ExpressionStmt, ReturnStmt,
         # BreakStmt, ContinueStmt, etc.
 
-    @staticmethod
-    def _check_supported_type(t: ast.TypeNode, name: str) -> None:
-        # Both ints and pointers occupy a single 4-byte slot in flat-32.
-        # short/char/long-long codegen comes later.
+    @classmethod
+    def _check_supported_type(cls, t: ast.TypeNode, name: str) -> None:
+        # Ints, pointers, and arrays of supported types are allowed as slot
+        # types. `int` and pointer slots take 4 bytes; arrays take
+        # length*sizeof(elem). short/char/long-long slot codegen comes later.
         if isinstance(t, ast.PointerType):
             return
         if isinstance(t, ast.BasicType) and t.name == "int":
             return
+        if isinstance(t, ast.ArrayType):
+            if t.size is None:
+                raise CodegenError(f"`{name}`: array must have a size")
+            if not isinstance(t.size, ast.IntLiteral):
+                raise CodegenError(
+                    f"`{name}`: array size must be an integer literal"
+                )
+            cls._check_supported_type(t.base_type, name)
+            return
         raise CodegenError(
-            f"`{name}`: only `int` and pointer types are supported "
+            f"`{name}`: only `int`, pointer, and array types are supported "
             f"(got {type(t).__name__})"
         )
+
+    @staticmethod
+    def _is_pointer_like(t: ast.TypeNode) -> bool:
+        """True for types that participate in pointer arithmetic.
+
+        Arrays decay to pointers in expression context, so they're treated
+        the same as pointers anywhere we look at element-step semantics.
+        """
+        return isinstance(t, (ast.PointerType, ast.ArrayType))
 
     # Sizes used for pointer-arithmetic scaling. We can compute these for
     # any pointee type the parser produces, even ones we don't yet support
@@ -326,6 +351,10 @@ class CodeGenerator:
                 return cls._BASIC_SIZES[t.name]
             except KeyError:
                 raise CodegenError(f"sizeof({t.name}) not known")
+        if isinstance(t, ast.ArrayType):
+            if not isinstance(t.size, ast.IntLiteral):
+                raise CodegenError("sizeof(array): size must be an integer literal")
+            return t.size.value * cls._size_of(t.base_type)
         raise CodegenError(f"sizeof not supported for {type(t).__name__}")
 
     # ---- statements -----------------------------------------------------
@@ -453,6 +482,13 @@ class CodeGenerator:
             # Uninitialized — leave the slot as-is. Reading it is UB, but
             # we don't pre-zero unless required.
             return []
+        if isinstance(decl.var_type, ast.ArrayType):
+            # `int arr[3] = {...};` requires walking an InitializerList and
+            # storing each element to its slot. Comes with the InitializerList
+            # codegen pass.
+            raise CodegenError(
+                f"array initialization not yet supported (`{decl.name}`)"
+            )
         return self._eval_expr_to_eax(decl.init, ctx) + [
             f"        mov     {_ebp_addr(disp)}, eax",
         ]
@@ -494,7 +530,7 @@ class CodeGenerator:
                 return ast.PointerType(base_type=self._type_of(expr.operand, ctx))
             if expr.op == "*":
                 inner = self._type_of(expr.operand, ctx)
-                if not isinstance(inner, ast.PointerType):
+                if not self._is_pointer_like(inner):
                     raise CodegenError(
                         f"`*` operand must be a pointer (got {type(inner).__name__})"
                     )
@@ -504,6 +540,14 @@ class CodeGenerator:
                 return self._type_of(expr.operand, ctx)
             # `+ - ~ !` produce int.
             return ast.BasicType(name="int")
+        if isinstance(expr, ast.Index):
+            arr_type = self._type_of(expr.array, ctx)
+            if not self._is_pointer_like(arr_type):
+                raise CodegenError(
+                    f"index target must be array or pointer "
+                    f"(got {type(arr_type).__name__})"
+                )
+            return arr_type.base_type
         if isinstance(expr, ast.BinaryOp):
             if expr.op == "=":
                 return self._type_of(expr.left, ctx)
@@ -512,10 +556,11 @@ class CodeGenerator:
             if expr.op in self._INT_RESULT_BINOPS:
                 return ast.BasicType(name="int")
             # `+` and `-`: pointer ± int → pointer; pointer - pointer → int.
+            # Arrays count as pointer-like via decay.
             lt = self._type_of(expr.left, ctx)
             rt = self._type_of(expr.right, ctx)
-            l_ptr = isinstance(lt, ast.PointerType)
-            r_ptr = isinstance(rt, ast.PointerType)
+            l_ptr = self._is_pointer_like(lt)
+            r_ptr = self._is_pointer_like(rt)
             if l_ptr and r_ptr:
                 return ast.BasicType(name="int")
             if l_ptr:
@@ -542,7 +587,14 @@ class CodeGenerator:
             return [f"        mov     eax, {label}"]
         if isinstance(expr, ast.Identifier):
             disp = ctx.lookup(expr.name)
+            ty = ctx.lookup_type(expr.name)
+            # Array decay: an array name in expression context yields the
+            # address of its first element, not the bytes at that slot.
+            if isinstance(ty, ast.ArrayType):
+                return [f"        lea     eax, {_ebp_addr(disp)}"]
             return [f"        mov     eax, {_ebp_addr(disp)}"]
+        if isinstance(expr, ast.Index):
+            return self._index_load(expr, ctx)
         if isinstance(expr, ast.UnaryOp):
             return self._unary(expr, ctx)
         if isinstance(expr, ast.BinaryOp):
@@ -554,6 +606,36 @@ class CodeGenerator:
         raise CodegenError(
             f"expression {type(expr).__name__} not implemented yet"
         )
+
+    def _index_address(self, expr: ast.Index, ctx: _FuncCtx) -> list[str]:
+        """Compute &(expr.array[expr.index]) into eax.
+
+        The array sub-expression evaluates with normal decay rules, so
+        whether `expr.array` is an array name, a pointer variable, or a
+        more complex expression that produces a pointer — the address
+        flow is the same: base in eax, scale the index by element size,
+        then add.
+        """
+        arr_type = self._type_of(expr.array, ctx)
+        if not self._is_pointer_like(arr_type):
+            raise CodegenError(
+                f"index target must be array or pointer "
+                f"(got {type(arr_type).__name__})"
+            )
+        elem_size = self._size_of(arr_type.base_type)
+        out = self._eval_expr_to_eax(expr.array, ctx)
+        out.append("        push    eax")
+        out += self._eval_expr_to_eax(expr.index, ctx)
+        out += self._scale_reg("eax", elem_size)
+        out.append("        mov     ecx, eax")
+        out.append("        pop     eax")
+        out.append("        add     eax, ecx")
+        return out
+
+    def _index_load(self, expr: ast.Index, ctx: _FuncCtx) -> list[str]:
+        # Read through the computed element address. Sub-word loads come
+        # with `char` / `short` codegen later — every element is 4 bytes for now.
+        return self._index_address(expr, ctx) + ["        mov     eax, [eax]"]
 
     def _ternary(self, expr: ast.TernaryOp, ctx: _FuncCtx) -> list[str]:
         false_label = ctx.label("tern_false")
@@ -617,16 +699,18 @@ class CodeGenerator:
         raise CodegenError(f"unary `{expr.op}` not implemented yet")
 
     def _address_of(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
-        # Only `&identifier` for now — no `&*p` (which is a no-op anyway),
-        # no `&arr[i]` (arrays don't exist yet). Pointer-to-pointer falls
-        # out naturally because the slot is just 4 bytes.
-        if not isinstance(expr.operand, ast.Identifier):
-            raise CodegenError(
-                f"`&` operand must be an identifier "
-                f"(got {type(expr.operand).__name__})"
-            )
-        disp = ctx.lookup(expr.operand.name)
-        return [f"        lea     eax, {_ebp_addr(disp)}"]
+        # `&identifier` and `&arr[i]` are supported. `&*p` (a no-op) and
+        # `&(struct.field)` will land when those constructs do.
+        if isinstance(expr.operand, ast.Identifier):
+            disp = ctx.lookup(expr.operand.name)
+            return [f"        lea     eax, {_ebp_addr(disp)}"]
+        if isinstance(expr.operand, ast.Index):
+            # &arr[i] — same address arithmetic as a load, just no final deref.
+            return self._index_address(expr.operand, ctx)
+        raise CodegenError(
+            f"`&` operand must be an identifier or `arr[i]` "
+            f"(got {type(expr.operand).__name__})"
+        )
 
     def _inc_dec(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
         if not isinstance(expr.operand, ast.Identifier):
@@ -634,12 +718,18 @@ class CodeGenerator:
                 f"`{expr.op}` operand must be an identifier "
                 f"(got {type(expr.operand).__name__})"
             )
+        ty = ctx.lookup_type(expr.operand.name)
+        # Array names aren't lvalues — `++arr` is a C error, not "advance the
+        # array pointer" (that would only make sense for a pointer variable).
+        if isinstance(ty, ast.ArrayType):
+            raise CodegenError(
+                f"cannot {expr.op} array `{expr.operand.name}`"
+            )
         disp = ctx.lookup(expr.operand.name)
         addr = _ebp_addr(disp)
         # On a pointer, ++/-- step by sizeof(*ptr) instead of 1. We still
         # mutate the slot in place — the slot stores the pointer value —
         # so an `add dword [...], N` covers it.
-        ty = ctx.lookup_type(expr.operand.name)
         if isinstance(ty, ast.PointerType):
             step = self._size_of(ty.base_type)
             instr = "add" if expr.op == "++" else "sub"
@@ -782,8 +872,10 @@ class CodeGenerator:
         """
         lt = self._type_of(expr.left, ctx)
         rt = self._type_of(expr.right, ctx)
-        l_ptr = isinstance(lt, ast.PointerType)
-        r_ptr = isinstance(rt, ast.PointerType)
+        # Arrays decay to pointers in arithmetic context, so the four cases
+        # below also cover (array, int), (int, array), and (array, array).
+        l_ptr = self._is_pointer_like(lt)
+        r_ptr = self._is_pointer_like(rt)
 
         out = self._eval_expr_to_eax(expr.left, ctx)
         out.append("        push    eax")
@@ -862,8 +954,13 @@ class CodeGenerator:
         return out
 
     def _assign(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
-        # `x = rhs` — direct slot store.
+        # `x = rhs` — direct slot store. Array names aren't lvalues in C.
         if isinstance(expr.left, ast.Identifier):
+            ty = ctx.lookup_type(expr.left.name)
+            if isinstance(ty, ast.ArrayType):
+                raise CodegenError(
+                    f"cannot assign to array `{expr.left.name}`"
+                )
             disp = ctx.lookup(expr.left.name)
             return self._eval_expr_to_eax(expr.right, ctx) + [
                 f"        mov     {_ebp_addr(disp)}, eax",
@@ -878,8 +975,17 @@ class CodeGenerator:
             out.append("        pop     ecx")
             out.append("        mov     [ecx], eax")
             return out
+        # `arr[i] = rhs` — same shape as `*ptr = rhs`, but the address
+        # comes from element-arithmetic rather than a single load.
+        if isinstance(expr.left, ast.Index):
+            out = self._index_address(expr.left, ctx)
+            out.append("        push    eax")
+            out += self._eval_expr_to_eax(expr.right, ctx)
+            out.append("        pop     ecx")
+            out.append("        mov     [ecx], eax")
+            return out
         raise CodegenError(
-            f"assignment target must be an identifier or `*ptr` "
+            f"assignment target must be an identifier, `*ptr`, or `arr[i]` "
             f"(got {type(expr.left).__name__})"
         )
 

@@ -588,6 +588,100 @@ def test_dereferencing_pointer_arithmetic_works():
     assert "mov     eax, [eax]" in asm
 
 
+# ---- arrays ----------------------------------------------------------------
+
+def test_array_local_allocates_full_size():
+    # 3 ints * 4 bytes = 12 bytes for the arr slot.
+    asm = _compile("int main(void) { int arr[3]; return 0; }")
+    assert "sub     esp, 12" in asm
+
+
+def test_array_followed_by_int_local_layout():
+    # `arr` is allocated first (-12), then `x` (-16). Total frame = 16.
+    asm = _compile("int main(void) { int arr[3]; int x = 5; return x; }")
+    assert "sub     esp, 16" in asm
+    assert "mov     [ebp - 16], eax" in asm
+    assert "mov     eax, [ebp - 16]" in asm
+
+
+def test_array_index_store_and_load():
+    asm = _compile(
+        "int main(void) { int arr[3]; arr[1] = 7; return arr[1]; }"
+    )
+    # Element address: lea (array decay), scale index by sizeof(int), add.
+    assert "lea     eax, [ebp - 12]" in asm
+    assert "shl     eax, 2" in asm
+    # Store goes through ecx.
+    assert "mov     [ecx], eax" in asm
+    # Load reads through eax after the address arithmetic.
+    assert "mov     eax, [eax]" in asm
+
+
+def test_array_decays_to_pointer_in_initializer():
+    asm = _compile("int main(void) { int arr[3]; int *p = arr; return 0; }")
+    # `arr` in a value position decays to its address.
+    assert "lea     eax, [ebp - 12]" in asm
+    # `p` slot lives just below the array (at -16) — store its decayed address.
+    assert "mov     [ebp - 16], eax" in asm
+
+
+def test_array_pointer_arithmetic_decays_array_first():
+    asm = _compile("int main(void) { int arr[5]; int *p = arr + 2; return 0; }")
+    # arr[5] occupies 20 bytes, so it lives at [ebp - 20].
+    assert "lea     eax, [ebp - 20]" in asm
+    # The integer 2 is scaled by sizeof(int)=4 before the add.
+    assert "shl     eax, 2" in asm
+    assert "add     eax, ecx" in asm
+
+
+def test_dereferencing_array_name_reads_first_element():
+    # `*arr` is `*(arr+0)` — same as `arr[0]`.
+    asm = _compile("int main(void) { int arr[3]; arr[0] = 9; return *arr; }")
+    assert "lea     eax, [ebp - 12]" in asm
+    assert "mov     eax, [eax]" in asm
+
+
+def test_address_of_array_element_is_address_arithmetic_only():
+    # `&arr[i]` computes the element address without dereferencing.
+    asm = _compile("int main(void) { int arr[3]; int *p = &arr[1]; return 0; }")
+    asm_lines = asm.splitlines()
+    # The element-address computation happens, but no `mov eax, [eax]` should
+    # follow it (that would be the deref we're suppressing).
+    assert "lea     eax, [ebp - 12]" in asm
+    # `p` slot is at -16; the computed address is stored there directly.
+    assert "mov     [ebp - 16], eax" in asm
+
+
+def test_dynamic_index():
+    asm = _compile(
+        "int main(void) { int arr[5]; int i = 2; arr[i] = 9; return arr[i]; }"
+    )
+    # The index value is loaded from `i`'s slot, then scaled.
+    assert "mov     eax, [ebp - 24]" in asm  # i is the local after arr → -24
+    assert "shl     eax, 2" in asm
+    assert "mov     eax, [eax]" in asm
+
+
+def test_array_assignment_rejected():
+    with pytest.raises(CodegenError, match="array"):
+        _compile("int main(void) { int a[3]; int b[3]; a = b; return 0; }")
+
+
+def test_array_increment_rejected():
+    with pytest.raises(CodegenError, match="array"):
+        _compile("int main(void) { int a[3]; ++a; return 0; }")
+
+
+def test_array_initialization_not_yet_supported():
+    with pytest.raises(CodegenError, match="initializ"):
+        _compile("int main(void) { int a[3] = {1, 2, 3}; return 0; }")
+
+
+def test_unsized_array_local_rejected():
+    with pytest.raises(CodegenError, match="size"):
+        _compile("int main(void) { int a[]; return 0; }")
+
+
 def test_end_to_end_driver(tmp_path):
     src = tmp_path / "hi.c"
     src.write_text("int main(void) { return 0; }\n")
