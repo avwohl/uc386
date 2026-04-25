@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–11 are done. 121 tests passing.
-Slice 12+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–12 are done. 136 tests passing.
+Slice 13+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,19 +60,15 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 11 (just landed):
-- **Array initialization.** `int arr[N] = {a, b, c}` with tail
-  zero-fill, inferred-size unsized arrays (`int arr[] = {...}`,
-  `char s[] = "hi"`), and string init for `char arr[N]` with
-  null-terminator and padding. Driven by `_resolved_var_type` and a
-  new `_array_init`.
+Implemented in slice 12 (just landed):
+- **`sizeof` operator.** Both `sizeof(type)` and `sizeof(expr)` lower
+  to a compile-time `mov eax, N` via the existing `_size_of` helper.
+  Operand of `sizeof(expr)` is unevaluated (no slot reads, no calls).
 
 Deliberately not yet implemented — next slices in roughly this order:
-- **`sizeof` operator.** `_size_of` already exists internally; just
-  need to wire `SizeofExpr` and `SizeofType` into expression eval and
-  type-resolve the operand. Small, high-utility.
 - **Globals.** Same lowering model as locals but in `.data`/`.bss`
-  with named labels instead of `[ebp + disp]`.
+  with named labels instead of `[ebp + disp]`. Architecturally the
+  largest remaining gap — most non-trivial C programs use globals.
 - **Casts.** `(int)x`, `(char *)p`, etc. With sub-word codegen landed,
   many casts are no-ops at the asm level (the load already extends);
   narrowing casts need explicit truncation.

@@ -45,6 +45,9 @@ Current scope:
   integer-promotion rules. Stores narrow via `mov byte [...], al` /
   `mov word [...], ax`, leaving the other bytes of a (4-aligned) slot
   unread.
+- `sizeof(type)` and `sizeof(expr)` lower to a compile-time `mov eax, N`
+  via the same `_size_of` used by pointer arithmetic. `sizeof(expr)`
+  does not evaluate its operand — only the static type matters.
 - String literals: interned per-translation-unit, emitted as
   null-terminated bytes in `.data` with labels like `_uc386_strN`.
 - `extern` declarations (FunctionDecls without bodies) emit NASM
@@ -727,6 +730,9 @@ class CodeGenerator:
         if isinstance(expr, ast.TernaryOp):
             # Both arms should agree in well-formed C; pick the true arm.
             return self._type_of(expr.true_expr, ctx)
+        if isinstance(expr, (ast.SizeofExpr, ast.SizeofType)):
+            # `sizeof` returns size_t; treat it as int for our flat-32 ABI.
+            return ast.BasicType(name="int")
         if isinstance(expr, ast.Call):
             if isinstance(expr.func, ast.Identifier):
                 rt = self._func_return_types.get(expr.func.name)
@@ -759,6 +765,16 @@ class CodeGenerator:
             return self._call(expr, ctx)
         if isinstance(expr, ast.TernaryOp):
             return self._ternary(expr, ctx)
+        if isinstance(expr, ast.SizeofType):
+            return [f"        mov     eax, {self._size_of(expr.target_type)}"]
+        if isinstance(expr, ast.SizeofExpr):
+            # C: the operand of `sizeof` is *not* evaluated — only its
+            # static type matters. So we infer the type and never emit
+            # any of the operand's lowering code (no slot loads, no
+            # function calls).
+            return [
+                f"        mov     eax, {self._size_of(self._type_of(expr.expr, ctx))}"
+            ]
         raise CodegenError(
             f"expression {type(expr).__name__} not implemented yet"
         )

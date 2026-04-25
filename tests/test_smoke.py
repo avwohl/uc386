@@ -678,6 +678,83 @@ def test_unsized_array_without_initializer_rejected():
         _compile("int main(void) { int a[]; return 0; }")
 
 
+# ---- sizeof ---------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "type_str,expected",
+    [
+        ("int",      4),
+        ("char",     1),
+        ("short",    2),
+        ("int *",    4),
+        ("char *",   4),
+        ("int[3]",   12),
+        ("char[5]",  5),
+        ("short[4]", 8),
+    ],
+)
+def test_sizeof_type(type_str, expected):
+    asm = _compile(f"int main(void) {{ return sizeof({type_str}); }}")
+    assert f"mov     eax, {expected}" in asm
+
+
+def test_sizeof_int_local():
+    asm = _compile("int main(void) { int x = 0; return sizeof(x); }")
+    assert "mov     eax, 4" in asm
+
+
+def test_sizeof_char_local():
+    asm = _compile("int main(void) { char c = 0; return sizeof(c); }")
+    # The init still emits `mov eax, 0`, but sizeof emits `mov eax, 1`.
+    assert "mov     eax, 1" in asm
+
+
+def test_sizeof_array_local_does_not_decay():
+    # `sizeof(arr)` returns the full array size, not pointer size.
+    asm = _compile("int main(void) { int arr[5]; return sizeof(arr); }")
+    assert "mov     eax, 20" in asm
+
+
+def test_sizeof_dereferenced_pointer_returns_pointee_size():
+    asm = _compile(
+        "int main(void) { int x = 0; int *p = &x; return sizeof(*p); }"
+    )
+    assert "mov     eax, 4" in asm
+
+
+def test_sizeof_array_index_element_size():
+    asm = _compile("int main(void) { char arr[5]; return sizeof(arr[0]); }")
+    assert "mov     eax, 1" in asm
+
+
+def test_sizeof_does_not_evaluate_operand():
+    # `sizeof(arr[i])` must NOT compute the index — only the operand's
+    # static type matters.
+    asm = _compile(
+        "int main(void) { int arr[3]; int i = 99; return sizeof(arr[i]); }"
+    )
+    asm_lines = asm.splitlines()
+    # The init `int i = 99` writes 99 once; sizeof shouldn't re-load `i`
+    # (no `mov eax, [ebp - 16]` from the sizeof side, and no `lea` from a
+    # phantom array decay). The simplest check: the sizeof produces the
+    # element size and there's no `mov eax, [eax]` index-load.
+    assert "mov     eax, 4" in asm  # sizeof(int) = 4
+    # The slot read for `i` would only appear if sizeof had evaluated the
+    # operand — verify it doesn't.
+    body_lines = [l.strip() for l in asm_lines]
+    # Filter out lines from the init (`mov eax, 99` and its store), keep
+    # everything after to check sizeof's emission.
+    assert "mov     eax, [eax]" not in body_lines
+
+
+def test_sizeof_in_arithmetic():
+    # sizeof participates as a normal int constant in arithmetic.
+    asm = _compile("int main(void) { return sizeof(int) * 2; }")
+    assert "mov     eax, 4" in asm
+    assert "mov     eax, 2" in asm
+    assert "imul    eax, ecx" in asm
+
+
 # ---- array initialization --------------------------------------------------
 
 def test_int_array_init_inline_stores():
