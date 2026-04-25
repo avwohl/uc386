@@ -11,8 +11,10 @@ Watcom-era ecosystem.
 Current scope:
 - `int main(void) { ... }` and other functions returning int.
 - Integer-literal returns and bare `return;`.
-- `int` locals with integer-literal initializers.
-- Reading a local in a return expression.
+- `int` locals with arbitrary initializer expressions.
+- Reading a local in any expression position.
+- Assignment to a local (`x = expr;`) as an expression statement.
+- Unary `+ - ~ !` and binary `+ - * / % & | ^ << >> == != < > <= >=`.
 
 Anything else raises CodegenError.
 """
@@ -148,9 +150,17 @@ class CodeGenerator:
             return self._return(item, ctx)
         if isinstance(item, ast.CompoundStmt):
             return self._compound(item, ctx)
+        if isinstance(item, ast.ExpressionStmt):
+            return self._expr_stmt(item, ctx)
         raise CodegenError(
             f"{type(item).__name__} not implemented yet"
         )
+
+    def _expr_stmt(self, stmt: ast.ExpressionStmt, ctx: _FuncCtx) -> list[str]:
+        if stmt.expr is None:
+            return []
+        # Result is discarded; we still evaluate for side effects (assignment).
+        return self._eval_expr_to_eax(stmt.expr, ctx)
 
     def _var_init(self, decl: ast.VarDecl, ctx: _FuncCtx) -> list[str]:
         offset = ctx.lookup(decl.name)
@@ -180,6 +190,102 @@ class CodeGenerator:
         if isinstance(expr, ast.Identifier):
             offset = ctx.lookup(expr.name)
             return [f"        mov     eax, [ebp - {offset}]"]
+        if isinstance(expr, ast.UnaryOp):
+            return self._unary(expr, ctx)
+        if isinstance(expr, ast.BinaryOp):
+            return self._binary(expr, ctx)
         raise CodegenError(
             f"expression {type(expr).__name__} not implemented yet"
         )
+
+    def _unary(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
+        if not expr.is_prefix:
+            raise CodegenError("postfix ++/-- not implemented yet")
+        out = self._eval_expr_to_eax(expr.operand, ctx)
+        if expr.op == "+":
+            return out
+        if expr.op == "-":
+            return out + ["        neg     eax"]
+        if expr.op == "~":
+            return out + ["        not     eax"]
+        if expr.op == "!":
+            return out + [
+                "        test    eax, eax",
+                "        sete    al",
+                "        movzx   eax, al",
+            ]
+        raise CodegenError(f"unary `{expr.op}` not implemented yet")
+
+    # Map from C operator to a one-line "op eax, ecx" instruction.
+    _SIMPLE_BINOPS = {
+        "+":  "add     eax, ecx",
+        "-":  "sub     eax, ecx",
+        "*":  "imul    eax, ecx",
+        "&":  "and     eax, ecx",
+        "|":  "or      eax, ecx",
+        "^":  "xor     eax, ecx",
+    }
+
+    # setCC mnemonic for each comparison (signed).
+    _CMP_SETCC = {
+        "==": "sete",
+        "!=": "setne",
+        "<":  "setl",
+        ">":  "setg",
+        "<=": "setle",
+        ">=": "setge",
+    }
+
+    def _binary(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
+        if expr.op == "=":
+            return self._assign(expr, ctx)
+
+        # Stack-machine eval: left → EAX → stack, right → EAX → ECX, pop EAX.
+        out = self._eval_expr_to_eax(expr.left, ctx)
+        out.append("        push    eax")
+        out += self._eval_expr_to_eax(expr.right, ctx)
+        out.append("        mov     ecx, eax")
+        out.append("        pop     eax")
+
+        if expr.op in self._SIMPLE_BINOPS:
+            out.append(f"        {self._SIMPLE_BINOPS[expr.op]}")
+            return out
+        if expr.op == "/":
+            return out + [
+                "        cdq",
+                "        idiv    ecx",
+            ]
+        if expr.op == "%":
+            return out + [
+                "        cdq",
+                "        idiv    ecx",
+                "        mov     eax, edx",
+            ]
+        if expr.op == "<<":
+            return out + [
+                "        shl     eax, cl",
+            ]
+        if expr.op == ">>":
+            # Signed int → arithmetic shift. Unsigned will branch here once
+            # type info is plumbed through codegen.
+            return out + [
+                "        sar     eax, cl",
+            ]
+        if expr.op in self._CMP_SETCC:
+            return out + [
+                "        cmp     eax, ecx",
+                f"        {self._CMP_SETCC[expr.op]}    al",
+                "        movzx   eax, al",
+            ]
+        raise CodegenError(f"binary `{expr.op}` not implemented yet")
+
+    def _assign(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
+        if not isinstance(expr.left, ast.Identifier):
+            raise CodegenError(
+                f"assignment target must be an identifier "
+                f"(got {type(expr.left).__name__})"
+            )
+        offset = ctx.lookup(expr.left.name)
+        return self._eval_expr_to_eax(expr.right, ctx) + [
+            f"        mov     [ebp - {offset}], eax",
+        ]

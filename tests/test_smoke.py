@@ -53,10 +53,12 @@ def test_missing_main_rejected():
         _compile("int other(void) { return 0; }")
 
 
-def test_arithmetic_return_rejected():
-    # Binary ops aren't lowered yet.
-    with pytest.raises(CodegenError):
-        _compile("int main(void) { return 1 + 2; }")
+def test_arithmetic_returns_emit_two_loads_and_op():
+    asm = _compile("int main(void) { int x = 1; int y = 2; return x + y; }")
+    # x → eax → push, y → eax → ecx, pop eax, add eax,ecx
+    assert "push    eax" in asm
+    assert "pop     eax" in asm
+    assert "add     eax, ecx" in asm
 
 
 def test_local_int_with_literal_init():
@@ -91,6 +93,90 @@ def test_unknown_identifier_rejected():
 def test_non_int_local_rejected():
     with pytest.raises(CodegenError, match="only `int`"):
         _compile("int main(void) { char c; return 0; }")
+
+
+@pytest.mark.parametrize(
+    "op,instr",
+    [
+        ("+",  "add     eax, ecx"),
+        ("-",  "sub     eax, ecx"),
+        ("*",  "imul    eax, ecx"),
+        ("&",  "and     eax, ecx"),
+        ("|",  "or      eax, ecx"),
+        ("^",  "xor     eax, ecx"),
+    ],
+)
+def test_simple_binops(op, instr):
+    asm = _compile(f"int main(void) {{ int x = 1; int y = 2; return x {op} y; }}")
+    assert instr in asm
+
+
+def test_division_uses_idiv():
+    asm = _compile("int main(void) { int x = 10; int y = 3; return x / y; }")
+    assert "cdq" in asm
+    assert "idiv    ecx" in asm
+
+
+def test_modulo_takes_remainder_from_edx():
+    asm = _compile("int main(void) { int x = 10; int y = 3; return x % y; }")
+    assert "idiv    ecx" in asm
+    assert "mov     eax, edx" in asm
+
+
+def test_left_shift_uses_cl():
+    asm = _compile("int main(void) { int x = 1; int y = 2; return x << y; }")
+    assert "shl     eax, cl" in asm
+
+
+def test_signed_right_shift_is_arithmetic():
+    asm = _compile("int main(void) { int x = 8; int y = 1; return x >> y; }")
+    assert "sar     eax, cl" in asm
+
+
+@pytest.mark.parametrize(
+    "op,setcc",
+    [
+        ("==", "sete"),
+        ("!=", "setne"),
+        ("<",  "setl"),
+        (">",  "setg"),
+        ("<=", "setle"),
+        (">=", "setge"),
+    ],
+)
+def test_comparisons(op, setcc):
+    asm = _compile(f"int main(void) {{ int x = 1; int y = 2; return x {op} y; }}")
+    assert "cmp     eax, ecx" in asm
+    assert f"{setcc}    al" in asm
+    assert "movzx   eax, al" in asm
+
+
+def test_unary_minus_emits_neg():
+    asm = _compile("int main(void) { int x = 5; return -x; }")
+    assert "neg     eax" in asm
+
+
+def test_unary_bitnot_emits_not():
+    asm = _compile("int main(void) { int x = 5; return ~x; }")
+    assert "not     eax" in asm
+
+
+def test_logical_not_emits_test_sete():
+    asm = _compile("int main(void) { int x = 5; return !x; }")
+    assert "test    eax, eax" in asm
+    assert "sete    al" in asm
+
+
+def test_assignment_writes_back_to_slot():
+    asm = _compile("int main(void) { int x = 1; x = 5; return x; }")
+    # The assignment becomes a `mov eax, 5` followed by a write to [ebp-4].
+    # The earlier init also writes [ebp-4]; both must be present.
+    assert asm.count("mov     [ebp - 4], eax") >= 2
+
+
+def test_assignment_to_non_lvalue_rejected():
+    with pytest.raises(CodegenError, match="must be an identifier"):
+        _compile("int main(void) { 1 = 2; return 0; }")
 
 
 def test_end_to_end_driver(tmp_path):
