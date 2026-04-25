@@ -514,7 +514,9 @@ class CodeGenerator:
 
     @staticmethod
     def _is_float_type(t: ast.TypeNode) -> bool:
-        return isinstance(t, ast.BasicType) and t.name in ("float", "double")
+        return isinstance(t, ast.BasicType) and t.name in (
+            "float", "double", "long double",
+        )
 
     def _float_promotion(self, lt: ast.TypeNode, rt: ast.TypeNode) -> ast.TypeNode:
         """C usual-arithmetic-conversions for a float-or-int + float-or-int pair.
@@ -899,14 +901,21 @@ class CodeGenerator:
                 raise CodegenError(
                     f"global `{name}`: string init requires a char array"
                 )
-            chars = list(init.value.encode()) + [0]
-            if len(chars) > length:
+            raw_bytes = list(init.value.encode())
+            # C: a string literal initializing a char array of the exact
+            # length drops the trailing null. If the array is larger,
+            # the null is included and remaining slots zero-fill.
+            if len(raw_bytes) > length:
                 raise CodegenError(
                     f"global `{name}`: string init exceeds array size {length}"
                 )
-            # Render the printable run + explicit nulls + zero-pad in one db.
+            if len(raw_bytes) == length:
+                # No room for the null terminator — emit just the bytes.
+                return [f"        db      {self._render_string(init.value)}"]
+            # Render the printable run + explicit null + zero-pad.
+            chars_with_null = raw_bytes + [0]
             parts = [self._render_string(init.value), "0"]
-            parts.extend(["0"] * (length - len(chars)))
+            parts.extend(["0"] * (length - len(chars_with_null)))
             return [f"        db      {', '.join(parts)}"]
 
         if isinstance(init, ast.InitializerList):
@@ -1538,6 +1547,10 @@ class CodeGenerator:
             except KeyError:
                 raise CodegenError(f"sizeof({t.name}) not known")
         if isinstance(t, ast.ArrayType):
+            if t.size is None:
+                # Flexible array member (`struct S s[];`) — sized 0 in
+                # the struct layout.
+                return 0
             if not isinstance(t.size, ast.IntLiteral):
                 raise CodegenError("sizeof(array): size must be an integer literal")
             return t.size.value * self._size_of(t.base_type)
@@ -1609,7 +1622,14 @@ class CodeGenerator:
             raise CodegenError(
                 f"unknown struct `{t.name}` — define it before use"
             )
-        raise CodegenError("anonymous struct without inline members")
+        # Empty struct (`typedef struct {} empty_s;` → StructType
+        # with name=None, members=[]). GCC permits these; register a
+        # zero-sized layout so it can be a struct member or a local.
+        key = f"__empty_struct_{id(t)}"
+        if key not in self._structs:
+            self._structs[key] = []
+            self._struct_sizes[key] = 0
+        return key
 
     def _anon_member_layout_key(self, t: ast.StructType) -> str:
         """Resolve `t` (a StructType used as an anonymous member) to a
@@ -2518,6 +2538,14 @@ class CodeGenerator:
                     [f"        lea     eax, {_ebp_addr(disp)}"],
                     ctx,
                 )
+            # `struct T s = va_arg(ap, struct T);` — copy the struct
+            # bytes from the variadic stack slot, advancing ap.
+            if isinstance(decl.init, ast.VaArgExpr):
+                return self._va_arg_struct_copy(
+                    decl.init,
+                    [f"        lea     eax, {_ebp_addr(disp)}"],
+                    ctx,
+                )
             return self._struct_init(var_type, decl.init, disp, ctx, decl.name)
         if self._is_float_type(var_type):
             # Float locals get their init value via st0 + fstp.
@@ -2612,6 +2640,11 @@ class CodeGenerator:
             return out
 
         if isinstance(init, ast.InitializerList):
+            # Brace-elide flat positional values into per-element
+            # InitializerLists when the element is a compound type.
+            iter_values = self._elide_braces_for_array(
+                init.values, elem_type, name,
+            )
             # Walk values in source order, allowing `[N] = expr` to jump
             # the cursor. After all source values, any unfilled slots
             # get zero-filled. This handles pure-positional, pure-
@@ -2619,7 +2652,7 @@ class CodeGenerator:
             out = []
             filled: set[int] = set()
             cursor = 0
-            for value_expr in init.values:
+            for value_expr in iter_values:
                 if isinstance(value_expr, ast.DesignatedInit):
                     if (
                         len(value_expr.designators) != 1
@@ -2689,6 +2722,8 @@ class CodeGenerator:
             )
         members = self._structs[self._resolve_struct_name(struct_ty)]
         member_index = {m_name: i for i, (m_name, _, _) in enumerate(members)}
+        # Brace-elide flat values for compound members.
+        elided_values = self._elide_braces_for_struct(init.values, members, name)
         # Walk source values in order, tracking the implicit cursor. A
         # `.field = expr` sets the cursor to that member's index; the
         # next un-designated value continues from cursor + 1. After the
@@ -2696,7 +2731,7 @@ class CodeGenerator:
         out: list[str] = []
         filled: set[int] = set()
         cursor = 0
-        for value in init.values:
+        for value in elided_values:
             if isinstance(value, ast.DesignatedInit):
                 if (
                     len(value.designators) != 1
@@ -2743,6 +2778,13 @@ class CodeGenerator:
                 and isinstance(actual, ast.InitializerList)
             ):
                 out += self._struct_init(
+                    m_ty, actual, m_disp, ctx, f"{name}.{m_name_i}"
+                )
+            elif (
+                isinstance(m_ty, ast.ArrayType)
+                and isinstance(actual, (ast.InitializerList, ast.StringLiteral))
+            ):
+                out += self._array_init(
                     m_ty, actual, m_disp, ctx, f"{name}.{m_name_i}"
                 )
             else:
@@ -2898,6 +2940,38 @@ class CodeGenerator:
             f"        add     dword {ap_addr}, {advance}",
         ]
         out += self._load_to_eax("[ecx]", target_ty)
+        return out
+
+    def _va_arg_struct_copy(
+        self,
+        expr: ast.VaArgExpr,
+        dest_addr_lines: list[str],
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Copy the next variadic struct argument into `*dest`.
+
+        `dest_addr_lines` must leave the destination address in EAX.
+        We compute &source = current ap, advance ap by the struct's
+        padded size, then per-dword copy from source to dest.
+        """
+        ap_addr = self._va_arg_ap_addr(expr, ctx)
+        target_size = self._size_of(expr.target_type)
+        advance = (target_size + 3) & ~3
+        out = list(dest_addr_lines)
+        out.append("        mov     edx, eax")            # edx = dest
+        out.append(f"        mov     ecx, {ap_addr}")     # ecx = &src
+        out.append(f"        add     dword {ap_addr}, {advance}")
+        # Copy in dword-sized chunks, then byte-tail.
+        offset = 0
+        while offset + 4 <= target_size:
+            out.append(f"        mov     eax, [ecx + {offset}]")
+            out.append(f"        mov     [edx + {offset}], eax")
+            offset += 4
+        while offset < target_size:
+            out.append(f"        mov     al, [ecx + {offset}]")
+            out.append(f"        mov     [edx + {offset}], al")
+            offset += 1
+        out.append("        mov     eax, edx")            # leave dest in EAX
         return out
 
     def _va_arg_float(self, expr: ast.VaArgExpr, ctx: _FuncCtx) -> list[str]:
