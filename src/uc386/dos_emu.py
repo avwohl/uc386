@@ -110,6 +110,142 @@ def run(
         text = s.decode("latin1", errors="replace").replace("\r\n", "\n")
         res.stderr += text
 
+    def _read_cstr_local(addr: int, max_len: int = 4096) -> bytes:
+        out = b""
+        for _ in range(max_len):
+            b = bytes(mu.mem_read(addr, 1))
+            if b == b"\x00":
+                break
+            out += b
+            addr += 1
+        return out
+
+    def _printf_format(fmt: bytes, va_ptr: int) -> bytes:
+        """Python-side printf formatter. Reads varargs from emulator
+        memory at va_ptr (advancing as we consume each spec). Supports
+        %d/%i/%u/%x/%X/%o/%c/%s/%p/%f/%g/%e/%%, the common width/precision
+        flags ('0', integer width, '.N' precision), and length modifiers
+        which are ignored (treated as 32-bit / double).
+        """
+        out = bytearray()
+        i = 0
+        ap = va_ptr
+        n = len(fmt)
+        while i < n:
+            c = fmt[i:i+1]
+            if c != b"%":
+                out += c
+                i += 1
+                continue
+            i += 1
+            if i >= n:
+                break
+            # flags
+            zero_pad = False
+            left_align = False
+            while i < n and fmt[i:i+1] in (b"0", b"-", b"+", b" ", b"#"):
+                if fmt[i:i+1] == b"0":
+                    zero_pad = True
+                elif fmt[i:i+1] == b"-":
+                    left_align = True
+                i += 1
+            # width
+            width = 0
+            while i < n and 0x30 <= fmt[i] <= 0x39:
+                width = width * 10 + (fmt[i] - 0x30)
+                i += 1
+            # precision
+            precision = -1
+            if i < n and fmt[i:i+1] == b".":
+                i += 1
+                precision = 0
+                while i < n and 0x30 <= fmt[i] <= 0x39:
+                    precision = precision * 10 + (fmt[i] - 0x30)
+                    i += 1
+            # length modifiers (ignored)
+            while i < n and fmt[i:i+1] in (b"l", b"h", b"L", b"z", b"j", b"t"):
+                i += 1
+            if i >= n:
+                break
+            conv = fmt[i:i+1]
+            i += 1
+
+            def read32_le(addr_ref):
+                bs = bytes(mu.mem_read(addr_ref[0], 4))
+                addr_ref[0] += 4
+                return int.from_bytes(bs, "little")
+
+            ap_box = [ap]
+            if conv == b"%":
+                out += b"%"
+                continue
+            if conv == b"d" or conv == b"i":
+                val = read32_le(ap_box)
+                if val >= 0x80000000:
+                    val -= 0x100000000
+                s = str(val).encode()
+                pad = b"0" if zero_pad else b" "
+                if width > len(s):
+                    if left_align:
+                        s = s + b" " * (width - len(s))
+                    else:
+                        s = pad * (width - len(s)) + s
+                out += s
+            elif conv in (b"u", b"x", b"X", b"o"):
+                val = read32_le(ap_box) & 0xFFFFFFFF
+                if conv == b"u":
+                    s = str(val).encode()
+                elif conv == b"x":
+                    s = f"{val:x}".encode()
+                elif conv == b"X":
+                    s = f"{val:X}".encode()
+                else:
+                    s = f"{val:o}".encode()
+                pad = b"0" if zero_pad else b" "
+                if width > len(s):
+                    if left_align:
+                        s = s + b" " * (width - len(s))
+                    else:
+                        s = pad * (width - len(s)) + s
+                out += s
+            elif conv == b"c":
+                val = read32_le(ap_box)
+                out += bytes([val & 0xFF])
+            elif conv == b"s":
+                addr = read32_le(ap_box)
+                s = _read_cstr_local(addr)
+                if precision >= 0 and len(s) > precision:
+                    s = s[:precision]
+                if width > len(s):
+                    if left_align:
+                        s = s + b" " * (width - len(s))
+                    else:
+                        s = b" " * (width - len(s)) + s
+                out += s
+            elif conv == b"p":
+                val = read32_le(ap_box) & 0xFFFFFFFF
+                out += f"0x{val:x}".encode()
+            elif conv in (b"f", b"g", b"e"):
+                bs = bytes(mu.mem_read(ap_box[0], 8))
+                ap_box[0] += 8
+                import struct as _st
+                val = _st.unpack("<d", bs)[0]
+                if precision < 0:
+                    precision = 6
+                fmt_py = f"%.{precision}{conv.decode()}"
+                s = (fmt_py % val).encode()
+                if width > len(s):
+                    if left_align:
+                        s = s + b" " * (width - len(s))
+                    else:
+                        s = b" " * (width - len(s)) + s
+                out += s
+            else:
+                # Unknown — output as-is.
+                out += b"%" + conv
+            ap = ap_box[0]
+        return bytes(out)
+
     def on_int(uc, intno, user_data):
         if intno != 0x21:
             res.error = f"unexpected interrupt {intno:#x}"
@@ -118,6 +254,31 @@ def run(
         eax = uc.reg_read(UC_X86_REG_EAX)
         ah = (eax >> 8) & 0xFF
         al = eax & 0xFF
+        if ah == 0x5C:
+            # sprintf via harness: EBX=buf, ECX=fmt, EDX=va_ptr
+            ebx = uc.reg_read(UC_X86_REG_EBX)
+            ecx = uc.reg_read(UC_X86_REG_ECX)
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            fmt = _read_cstr_local(ecx)
+            formatted = _printf_format(fmt, edx)
+            uc.mem_write(ebx, formatted + b"\x00")
+            new_eax = (eax & ~0xFFFFFFFF) | len(formatted)
+            uc.reg_write(UC_X86_REG_EAX, new_eax)
+            return
+        if ah == 0x5D:
+            # snprintf: EBX=buf, ESI=size, ECX=fmt, EDX=va_ptr
+            ebx = uc.reg_read(UC_X86_REG_EBX)
+            esi = uc.reg_read(UC_X86_REG_ESI)
+            ecx = uc.reg_read(UC_X86_REG_ECX)
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            fmt = _read_cstr_local(ecx)
+            formatted = _printf_format(fmt, edx)
+            if esi > 0:
+                truncated = formatted[: max(esi - 1, 0)]
+                uc.mem_write(ebx, truncated + b"\x00")
+            new_eax = (eax & ~0xFFFFFFFF) | len(formatted)
+            uc.reg_write(UC_X86_REG_EAX, new_eax)
+            return
         if ah == 0x4C or ah == 0x00:
             res.exit_code = al
             uc.emu_stop()

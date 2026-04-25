@@ -736,6 +736,51 @@ _memset:
 ;
 ; Returns total bytes written.
 
+; sprintf(char *buf, const char *fmt, ...) — formats into buf and
+; returns the byte count (not including the trailing NUL). We punt
+; the formatting to the harness via a custom INT 21h subfunction:
+;
+;   AH = 0x5C
+;   EBX = destination buffer
+;   ECX = format string
+;   EDX = pointer to first vararg
+;   EAX (return) = bytes written (excluding NUL)
+;
+; The harness reads fmt + varargs from emulator memory, formats in
+; Python, writes the result + NUL to ebx, and returns the length.
+_sprintf:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        mov     ebx, [ebp + 8]       ; buf
+        mov     ecx, [ebp + 12]      ; fmt
+        lea     edx, [ebp + 16]      ; first vararg
+        mov     ah, 0x5C
+        int     21h
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; snprintf(buf, size, fmt, ...) — similar but with a size cap.
+;   EBX = buf, ECX = fmt, EDX = first vararg, ESI = size
+_snprintf:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    esi
+        mov     ebx, [ebp + 8]       ; buf
+        mov     esi, [ebp + 12]      ; size
+        mov     ecx, [ebp + 16]      ; fmt
+        lea     edx, [ebp + 20]      ; first vararg
+        mov     ah, 0x5D
+        int     21h
+        pop     esi
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
 ; fprintf(FILE *stream, const char *fmt, ...) — we ignore the stream
 ; (everything goes to stdout) and reuse printf's format engine. The
 ; stream arg sits at [ebp+8], fmt at [ebp+12], varargs at [ebp+16]+.
