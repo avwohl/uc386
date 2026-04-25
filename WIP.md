@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–20 are done. 211 tests passing.
-Slice 21+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–21 are done. 218 tests passing.
+Slice 22+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,17 +60,11 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 20 (just landed):
-- **Struct by-value params.** Caller reserves `sizeof(struct)` rounded
-  to 4 via `sub esp, N` and copies into the slot; callee accesses via
-  the accumulated param offset. Struct return still raises pending its
-  own slice (the ABI for the hidden first arg + caller-side temp slot
-  is the open design question).
+Implemented in slice 21 (just landed):
+- **Unions.** All members at offset 0; total size = max member
+  size. Member access reuses the existing struct paths.
 
 Deliberately not yet implemented — next slices in roughly this order:
-- **Unions.** Same layout as structs but all members at offset 0 and
-  total size = max(member sizes). Member access reuses
-  `_member_address` once the registry distinguishes union from struct.
 - **Struct return by value.** Hidden first arg pointing at a
   caller-allocated buffer. The trickiest piece is the buffer's
   lifetime — likely a per-call temp area added to the caller's frame.

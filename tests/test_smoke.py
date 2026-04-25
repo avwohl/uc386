@@ -674,6 +674,89 @@ def test_unsized_array_without_initializer_rejected():
         _compile("int main(void) { int a[]; return 0; }")
 
 
+# ---- unions ---------------------------------------------------------------
+
+def test_union_local_size_is_max_member():
+    asm = _compile(
+        "union mix { int x; char c; }; "
+        "int main(void) { union mix u; return sizeof(u); }"
+    )
+    # max(int=4, char=1) = 4.
+    assert "mov     eax, 4" in asm
+    assert "sub     esp, 4" in asm
+
+
+def test_union_members_share_offset_zero():
+    asm = _compile(
+        "union mix { int x; char c; }; "
+        "int main(void) { union mix u; u.x = 5; u.c = 65; return u.x; }"
+    )
+    asm_lines = asm.splitlines()
+    # All member accesses lea the same slot address with no `add eax, N`
+    # following — every union member sits at offset 0.
+    lea_count = sum(1 for l in asm_lines if "lea     eax, [ebp - 4]" in l)
+    assert lea_count >= 3
+    # No `add eax, <small>` should follow the lea (members at offset 0).
+    # Searching for the specific bad form:
+    assert not any(
+        "add     eax, 1" in l or "add     eax, 2" in l or "add     eax, 4" in l
+        for l in asm_lines
+    )
+
+
+def test_union_largest_member_wins_size():
+    # Array member dominates — 4 ints = 16 bytes.
+    asm = _compile(
+        "union big { char c; int x; int arr[4]; }; "
+        "int main(void) { return sizeof(union big); }"
+    )
+    assert "mov     eax, 16" in asm
+
+
+def test_union_member_widths_preserved():
+    asm = _compile(
+        "union mix { int x; char c; }; "
+        "int main(void) { union mix u; u.c = 65; return u.c; }"
+    )
+    # Char member access uses byte loads/stores even though the slot is 4 bytes.
+    assert "mov     byte [ecx], al" in asm
+    assert "movsx   eax, byte [eax]" in asm
+
+
+def test_union_global_in_bss():
+    asm = _compile(
+        "union mix { int x; char c; }; "
+        "union mix g; "
+        "int main(void) { return g.x; }"
+    )
+    assert "section .bss" in asm
+    assert "_g:" in asm
+    assert "resb    4" in asm
+
+
+def test_union_inside_struct():
+    # Tagged-union pattern: struct with a union member.
+    asm = _compile(
+        "union v { int i; char c; }; "
+        "struct tagged { int tag; union v val; }; "
+        "int main(void) { struct tagged x; x.tag = 1; x.val.i = 99; return x.val.i; }"
+    )
+    # struct tagged: tag at 0, val at 4. Total = 8.
+    assert "sub     esp, 8" in asm
+
+
+def test_union_pointer_arrow_access():
+    asm = _compile(
+        "union mix { int x; char c; }; "
+        "int main(void) { union mix u; union mix *p = &u; "
+        "p->x = 7; return p->c; }"
+    )
+    # Stored through the pointer.
+    assert "mov     [ecx], eax" in asm
+    # Char-width read for p->c.
+    assert "movsx   eax, byte [eax]" in asm
+
+
 # ---- struct by-value params -----------------------------------------------
 
 def test_struct_param_callee_uses_param_offset():

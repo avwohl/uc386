@@ -73,8 +73,13 @@ Current scope:
   arithmetic all go through `_size_of(StructType)`. Struct-to-struct
   assignment uses an inline per-dword copy. `{...}` init walks the
   InitializerList member-by-member with nested `{...}` for struct
-  members and tail zero-fill. By-value params/returns aren't yet
+  members and tail zero-fill. Struct-by-value params work via
+  caller-side `sub esp + memcpy`; by-value returns aren't yet
   supported.
+- Unions: same registry as structs (`_register_struct` branches on
+  `is_union`) but laid out with every member at offset 0 and total
+  size = `max(sizeof(member))` rounded to the union's alignment.
+  Access, sizeof, and pointer arithmetic all share the struct paths.
 - String literals: interned per-translation-unit, emitted as
   null-terminated bytes in `.data` with labels like `_uc386_strN`.
 - `extern` declarations (FunctionDecls without bodies) emit NASM
@@ -675,29 +680,44 @@ class CodeGenerator:
             # if they happen to repeat. Conflicting definitions aren't
             # detected here.
             return
-        if decl.is_union:
-            raise CodegenError(
-                f"unions are not supported yet (struct `{decl.name}`)"
-            )
+        # Validate every member up front. Unions and structs share the
+        # same per-member checks; only the layout step differs.
         members: list[tuple[str, ast.TypeNode, int]] = []
-        offset = 0
         max_align = 1
         for m in decl.members:
             if m.name is None:
                 raise CodegenError(
-                    f"struct `{decl.name}`: anonymous members not supported"
+                    f"`{decl.name}`: anonymous members not supported"
                 )
             if m.bit_width is not None:
                 raise CodegenError(
-                    f"struct `{decl.name}`: bit-fields not supported"
+                    f"`{decl.name}`: bit-fields not supported"
                 )
             self._check_supported_type(m.member_type, f"{decl.name}.{m.name}")
+            align = self._alignment_of(m.member_type)
+            if align > max_align:
+                max_align = align
+
+        if decl.is_union:
+            # All members share offset 0; total size = max member size,
+            # rounded up to the union's alignment.
+            total = 0
+            for m in decl.members:
+                members.append((m.name, m.member_type, 0))
+                size = self._size_of(m.member_type)
+                if size > total:
+                    total = size
+            total = (total + max_align - 1) & ~(max_align - 1)
+            self._structs[decl.name] = members
+            self._struct_sizes[decl.name] = total
+            return
+
+        offset = 0
+        for m in decl.members:
             align = self._alignment_of(m.member_type)
             offset = (offset + align - 1) & ~(align - 1)
             members.append((m.name, m.member_type, offset))
             offset += self._size_of(m.member_type)
-            if align > max_align:
-                max_align = align
         # Round total size up to struct's own alignment.
         offset = (offset + max_align - 1) & ~(max_align - 1)
         self._structs[decl.name] = members
