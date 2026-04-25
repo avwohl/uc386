@@ -317,10 +317,12 @@ def test_duplicate_parameter_rejected():
         _compile("int f(int x, int x) { return x; } int main(void) { return 0; }")
 
 
-def test_param_and_local_share_namespace():
-    # A local can't shadow a parameter (flat scope).
-    with pytest.raises(CodegenError, match="redeclaration"):
-        _compile("int f(int x) { int x = 7; return x; } int main(void) { return 0; }")
+def test_param_and_local_can_shadow():
+    # A local in the body's compound shadows the param (block scope).
+    asm = _compile("int f(int x) { int x = 7; return x; } int main(void) { return 0; }")
+    # The local `x` gets a fresh slot at [ebp - 4] regardless of the param at
+    # [ebp + 8]; reading back x sees the local value (7).
+    assert "[ebp - 4]" in asm
 
 
 # ---- compound assign / ++ / -- / ternary -----------------------------------
