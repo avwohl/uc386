@@ -63,6 +63,12 @@ Current scope:
   no-ops; narrowing to `char`/`short` emits `movsx eax, al/ax` (or
   `movzx` for unsigned). `_type_of(Cast)` returns the target type so
   e.g. `(char *)p + 1` scales by 1, not by the source's pointee size.
+- Structs: top-level `struct foo { ... }` definitions register a
+  layout (member name, type, byte offset) plus total size. `s.m` and
+  `p->m` lower as base-address + offset, then load/store at the
+  member's natural width. Slot allocation, sizeof, and pointer
+  arithmetic all go through `_size_of(StructType)`. Struct copy,
+  by-value passing, and `{...}` init are not yet supported.
 - String literals: interned per-translation-unit, emitted as
   null-terminated bytes in `.data` with labels like `_uc386_strN`.
 - `extern` declarations (FunctionDecls without bodies) emit NASM
@@ -153,6 +159,11 @@ class CodeGenerator:
         # supplied, so the `.data` emission can produce constants.
         self._globals: dict[str, ast.TypeNode] = {}
         self._global_inits: dict[str, ast.Expression] = {}
+        # Struct definitions: name → list of (member_name, member_type,
+        # offset). `_struct_sizes` is the corresponding total size in bytes
+        # (rounded up to struct alignment).
+        self._structs: dict[str, list[tuple[str, ast.TypeNode, int]]] = {}
+        self._struct_sizes: dict[str, int] = {}
 
     # ---- top level ------------------------------------------------------
 
@@ -190,6 +201,19 @@ class CodeGenerator:
                 self._func_return_types[d.name] = d.return_type
             elif isinstance(d, ast.VarDecl) and isinstance(d.var_type, ast.FunctionType):
                 self._func_return_types[d.name] = d.var_type.return_type
+
+        # Reset struct + globals state. Structs need to be registered
+        # before globals because a global of struct type will look up the
+        # struct's size during validation.
+        self._structs = {}
+        self._struct_sizes = {}
+        for d in unit.declarations:
+            if isinstance(d, ast.StructDecl) and d.is_definition:
+                self._register_struct(d)
+        # `StructType` references inside a containing decl (e.g.,
+        # `struct point origin;` at top level) carry an empty members
+        # list; the layout is owned by `_structs[name]`. Inline struct
+        # definitions inside another decl aren't yet supported.
 
         # Register top-level VarDecls (non-function-type) as globals. The
         # resolved type fills in inferred array sizes the same way local
@@ -506,26 +530,35 @@ class CodeGenerator:
     # 64-bit value-tracking pass.
     _SLOT_BASIC_NAMES = frozenset({"char", "short", "int"})
 
-    @classmethod
-    def _check_supported_type(cls, t: ast.TypeNode, name: str) -> None:
-        # Pointers, and arrays / scalars of supported base types. Slot sizes
-        # are rounded up to 4 in `_collect_locals` so adjacent ints stay
-        # 4-aligned. Unsized arrays (`int a[]` without an init) are caught
+    def _check_supported_type(self, t: ast.TypeNode, name: str) -> None:
+        # Pointers, and arrays / scalars / structs of supported base types.
+        # Slot sizes are rounded up to 4 in `_collect_locals` so adjacent ints
+        # stay 4-aligned. Unsized arrays (`int a[]` without an init) are caught
         # by `_resolved_var_type` before they reach this check.
         if isinstance(t, ast.PointerType):
             return
-        if isinstance(t, ast.BasicType) and t.name in cls._SLOT_BASIC_NAMES:
+        if isinstance(t, ast.BasicType) and t.name in self._SLOT_BASIC_NAMES:
             return
         if isinstance(t, ast.ArrayType):
             if t.size is not None and not isinstance(t.size, ast.IntLiteral):
                 raise CodegenError(
                     f"`{name}`: array size must be an integer literal"
                 )
-            cls._check_supported_type(t.base_type, name)
+            self._check_supported_type(t.base_type, name)
+            return
+        if isinstance(t, ast.StructType):
+            if t.name is None:
+                raise CodegenError(
+                    f"`{name}`: anonymous structs are not supported yet"
+                )
+            if t.name not in self._structs:
+                raise CodegenError(
+                    f"`{name}`: unknown struct `{t.name}` — define it before use"
+                )
             return
         raise CodegenError(
-            f"`{name}`: only `int`/`short`/`char`, pointer, and array "
-            f"types are supported (got {type(t).__name__})"
+            f"`{name}`: only `int`/`short`/`char`, pointer, array, and "
+            f"struct types are supported (got {type(t).__name__})"
         )
 
     @staticmethod
@@ -575,25 +608,172 @@ class CodeGenerator:
         "void": 1,          # GCC convention; standard C disallows arithmetic on void*
     }
 
-    @classmethod
-    def _size_of(cls, t: ast.TypeNode) -> int:
+    def _size_of(self, t: ast.TypeNode) -> int:
         if isinstance(t, ast.PointerType):
             return 4
         if isinstance(t, ast.BasicType):
             try:
-                return cls._BASIC_SIZES[t.name]
+                return self._BASIC_SIZES[t.name]
             except KeyError:
                 raise CodegenError(f"sizeof({t.name}) not known")
         if isinstance(t, ast.ArrayType):
             if not isinstance(t.size, ast.IntLiteral):
                 raise CodegenError("sizeof(array): size must be an integer literal")
-            return t.size.value * cls._size_of(t.base_type)
+            return t.size.value * self._size_of(t.base_type)
+        if isinstance(t, ast.StructType):
+            if t.name not in self._struct_sizes:
+                raise CodegenError(
+                    f"sizeof(struct {t.name}): struct not defined"
+                )
+            return self._struct_sizes[t.name]
         raise CodegenError(f"sizeof not supported for {type(t).__name__}")
+
+    def _register_struct(self, decl: ast.StructDecl) -> None:
+        """Compute member offsets and total size for a struct definition.
+
+        Member offsets are aligned to the member's natural alignment
+        (power-of-two sizes for char/short/int/pointer). The total struct
+        size is rounded up to the largest member alignment so arrays of
+        the struct stay properly aligned.
+        """
+        if decl.name in self._structs:
+            # Idempotent: tolerate multiple `struct foo { ... }` definitions
+            # if they happen to repeat. Conflicting definitions aren't
+            # detected here.
+            return
+        if decl.is_union:
+            raise CodegenError(
+                f"unions are not supported yet (struct `{decl.name}`)"
+            )
+        members: list[tuple[str, ast.TypeNode, int]] = []
+        offset = 0
+        max_align = 1
+        for m in decl.members:
+            if m.name is None:
+                raise CodegenError(
+                    f"struct `{decl.name}`: anonymous members not supported"
+                )
+            if m.bit_width is not None:
+                raise CodegenError(
+                    f"struct `{decl.name}`: bit-fields not supported"
+                )
+            self._check_supported_type(m.member_type, f"{decl.name}.{m.name}")
+            align = self._alignment_of(m.member_type)
+            offset = (offset + align - 1) & ~(align - 1)
+            members.append((m.name, m.member_type, offset))
+            offset += self._size_of(m.member_type)
+            if align > max_align:
+                max_align = align
+        # Round total size up to struct's own alignment.
+        offset = (offset + max_align - 1) & ~(max_align - 1)
+        self._structs[decl.name] = members
+        self._struct_sizes[decl.name] = offset
+
+    def _member_layout(
+        self, struct_name: str, member: str
+    ) -> tuple[ast.TypeNode, int]:
+        members = self._structs.get(struct_name)
+        if members is None:
+            raise CodegenError(f"struct `{struct_name}` not defined")
+        for name, ty, off in members:
+            if name == member:
+                return ty, off
+        raise CodegenError(
+            f"struct `{struct_name}` has no member `{member}`"
+        )
+
+    def _alignment_of(self, t: ast.TypeNode) -> int:
+        """Required alignment in bytes for a value of type `t`.
+
+        Used by struct layout — each member's offset is rounded up to its
+        alignment, and the struct's overall size is rounded up to the
+        largest member alignment so an array of structs stays packed
+        without internal misalignment.
+        """
+        if isinstance(t, ast.PointerType):
+            return 4
+        if isinstance(t, ast.BasicType):
+            return self._BASIC_SIZES.get(t.name, 1)
+        if isinstance(t, ast.ArrayType):
+            return self._alignment_of(t.base_type)
+        if isinstance(t, ast.StructType):
+            members = self._structs.get(t.name) if t.name else None
+            if not members:
+                return 1
+            return max(self._alignment_of(mt) for _, mt, _ in members)
+        return 1
 
     @staticmethod
     def _is_unsigned(t: ast.TypeNode) -> bool:
         # `is_signed=None` is the language default — signed for char/short/int.
         return isinstance(t, ast.BasicType) and t.is_signed is False
+
+    # ---- struct member lowering ---------------------------------------
+
+    def _member_address(self, expr: ast.Member, ctx: _FuncCtx) -> list[str]:
+        """Compute the address of `expr` (`.` or `->` member) into eax."""
+        if expr.is_arrow:
+            obj_ty = self._type_of(expr.obj, ctx)
+            if not (
+                isinstance(obj_ty, ast.PointerType)
+                and isinstance(obj_ty.base_type, ast.StructType)
+            ):
+                raise CodegenError(
+                    f"`->` requires a pointer to struct "
+                    f"(got {type(obj_ty).__name__})"
+                )
+            struct_name = obj_ty.base_type.name
+            # eax = the pointer's value, i.e. the struct's address.
+            out = self._eval_expr_to_eax(expr.obj, ctx)
+        else:
+            obj_ty = self._type_of(expr.obj, ctx)
+            if not isinstance(obj_ty, ast.StructType):
+                raise CodegenError(
+                    f"`.` requires a struct value "
+                    f"(got {type(obj_ty).__name__})"
+                )
+            struct_name = obj_ty.name
+            out = self._struct_address(expr.obj, ctx)
+        _, offset = self._member_layout(struct_name, expr.member)
+        if offset != 0:
+            out.append(f"        add     eax, {offset}")
+        return out
+
+    def _struct_address(self, expr: ast.Expression, ctx: _FuncCtx) -> list[str]:
+        """Compute the address of a struct l-value into eax.
+
+        Used as the base for `obj.member`: we don't want to "load" the
+        struct's bytes into EAX (it doesn't fit), we want its address so
+        we can offset into it.
+        """
+        if isinstance(expr, ast.Identifier):
+            return self._identifier_address(expr.name, ctx)
+        if isinstance(expr, ast.Member):
+            return self._member_address(expr, ctx)
+        if isinstance(expr, ast.Index):
+            return self._index_address(expr, ctx)
+        if isinstance(expr, ast.UnaryOp) and expr.op == "*":
+            return self._eval_expr_to_eax(expr.operand, ctx)
+        raise CodegenError(
+            f"can't take address of {type(expr).__name__} for `.member`"
+        )
+
+    def _member_load(self, expr: ast.Member, ctx: _FuncCtx) -> list[str]:
+        """Lower `obj.member` (or `obj->member`) as a value in EAX."""
+        member_ty = self._type_of(expr, ctx)
+        addr = self._member_address(expr, ctx)
+        if isinstance(member_ty, ast.ArrayType):
+            # Array decay — leave the address in eax.
+            return addr
+        if isinstance(member_ty, ast.StructType):
+            # Reading a nested struct as a value requires struct-copy
+            # codegen; defer until that slice lands. Until then, only
+            # uses that immediately take an address (`.inner.field`) work,
+            # and those go through `_struct_address` not `_member_load`.
+            raise CodegenError(
+                "reading a nested struct as a value is not supported yet"
+            )
+        return addr + self._load_to_eax("[eax]", member_ty)
 
     # ---- identifier resolution (local vs global) ----------------------
 
@@ -856,6 +1036,13 @@ class CodeGenerator:
         var_type = ctx.lookup_type(decl.name)
         if isinstance(var_type, ast.ArrayType):
             return self._array_init(var_type, decl.init, disp, ctx, decl.name)
+        if isinstance(var_type, ast.StructType):
+            # Per-member struct init waits on a follow-up slice — needs to
+            # walk the InitializerList and emit member-by-member stores
+            # with the right widths and offsets.
+            raise CodegenError(
+                f"struct initialization not yet supported (`{decl.name}`)"
+            )
         return self._eval_expr_to_eax(decl.init, ctx) + self._store_from_eax(
             _ebp_addr(disp), var_type
         )
@@ -991,6 +1178,26 @@ class CodeGenerator:
                     f"(got {type(arr_type).__name__})"
                 )
             return arr_type.base_type
+        if isinstance(expr, ast.Member):
+            obj_ty = self._type_of(expr.obj, ctx)
+            if expr.is_arrow:
+                if not (
+                    isinstance(obj_ty, ast.PointerType)
+                    and isinstance(obj_ty.base_type, ast.StructType)
+                ):
+                    raise CodegenError(
+                        f"`->` requires a pointer to struct "
+                        f"(got {type(obj_ty).__name__})"
+                    )
+                struct_name = obj_ty.base_type.name
+            else:
+                if not isinstance(obj_ty, ast.StructType):
+                    raise CodegenError(
+                        f"`.` requires a struct (got {type(obj_ty).__name__})"
+                    )
+                struct_name = obj_ty.name
+            ty, _ = self._member_layout(struct_name, expr.member)
+            return ty
         if isinstance(expr, ast.BinaryOp):
             if expr.op == "=":
                 return self._type_of(expr.left, ctx)
@@ -1041,6 +1248,8 @@ class CodeGenerator:
             return self._identifier_load(expr.name, ctx)
         if isinstance(expr, ast.Index):
             return self._index_load(expr, ctx)
+        if isinstance(expr, ast.Member):
+            return self._member_load(expr, ctx)
         if isinstance(expr, ast.UnaryOp):
             return self._unary(expr, ctx)
         if isinstance(expr, ast.BinaryOp):
@@ -1187,15 +1396,18 @@ class CodeGenerator:
         raise CodegenError(f"unary `{expr.op}` not implemented yet")
 
     def _address_of(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
-        # `&identifier` and `&arr[i]` are supported. `&*p` (a no-op) and
-        # `&(struct.field)` will land when those constructs do.
+        # `&identifier`, `&arr[i]`, and `&s.m` are supported. `&*p` (a
+        # no-op) will land if needed.
         if isinstance(expr.operand, ast.Identifier):
             return self._identifier_address(expr.operand.name, ctx)
         if isinstance(expr.operand, ast.Index):
             # &arr[i] — same address arithmetic as a load, just no final deref.
             return self._index_address(expr.operand, ctx)
+        if isinstance(expr.operand, ast.Member):
+            # &s.m or &p->m — member-address lowering, no deref.
+            return self._member_address(expr.operand, ctx)
         raise CodegenError(
-            f"`&` operand must be an identifier or `arr[i]` "
+            f"`&` operand must be an identifier, `arr[i]`, or `s.m` "
             f"(got {type(expr.operand).__name__})"
         )
 
@@ -1479,9 +1691,22 @@ class CodeGenerator:
             out.append("        pop     ecx")
             out += self._store_from_eax("[ecx]", elem_ty)
             return out
+        # `s.m = rhs` / `pp->m = rhs` — same address-once pattern.
+        if isinstance(expr.left, ast.Member):
+            member_ty = self._type_of(expr.left, ctx)
+            if isinstance(member_ty, ast.StructType):
+                raise CodegenError(
+                    "struct-to-struct assignment is not supported yet"
+                )
+            out = self._member_address(expr.left, ctx)
+            out.append("        push    eax")
+            out += self._eval_expr_to_eax(expr.right, ctx)
+            out.append("        pop     ecx")
+            out += self._store_from_eax("[ecx]", member_ty)
+            return out
         raise CodegenError(
-            f"assignment target must be an identifier, `*ptr`, or `arr[i]` "
-            f"(got {type(expr.left).__name__})"
+            f"assignment target must be an identifier, `*ptr`, `arr[i]`, "
+            f"or `s.m` (got {type(expr.left).__name__})"
         )
 
     def _compound_assign(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
@@ -1510,10 +1735,12 @@ class CodeGenerator:
             # The pointer operand evaluates once into eax — that's the
             # address we'll read from and write back to.
             addr_lines = self._eval_expr_to_eax(expr.left.operand, ctx)
+        elif isinstance(expr.left, ast.Member):
+            addr_lines = self._member_address(expr.left, ctx)
         else:
             raise CodegenError(
-                f"compound assignment target must be an identifier, `*ptr`, or `arr[i]` "
-                f"(got {type(expr.left).__name__})"
+                f"compound assignment target must be an identifier, "
+                f"`*ptr`, `arr[i]`, or `s.m` (got {type(expr.left).__name__})"
             )
 
         target_ty = self._type_of(expr.left, ctx)

@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–16 are done. 176 tests passing.
-Slice 17+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–17 are done. 192 tests passing.
+Slice 18+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,22 +60,26 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 16 (just landed):
-- **Compound assignment to non-Identifier lvalues.** `arr[i] += rhs`
-  and `*p += rhs` evaluate the address once, then load/op/store
-  through it. Sub-word widths and pointer scaling both flow through
-  the same path.
+Implemented in slice 17 (just landed):
+- **Structs.** `struct foo { ... }` definitions, member layout with
+  alignment, `s.m` / `p->m` access, struct locals + globals, sizeof,
+  pointer arithmetic on struct pointers, compound assign to members.
 
 Deliberately not yet implemented — next slices in roughly this order:
+- **Struct copy + struct init.** `s1 = s2` (memcpy of N bytes),
+  `struct foo s = {1, 2}` (per-member init walking InitializerList),
+  global struct init in `.data` with mixed widths + padding.
+- **Switch / case.** `switch (x) { case 1: ...; default: ... }` —
+  dispatch via `cmp eax, V; je .case_V`, fall-through, `break`
+  resolves to the switch end (extend the `loops` stack to also carry
+  switch ends).
 - **Designated/nested initializers.** `int arr[3] = {[1] = 5}` and
   `int m[2][3] = {{...}, {...}}` both raise. Multidim arrays would
   also need ArrayType-of-ArrayType slot support.
 - **Floating point.** `float` / `double` slot codegen via x87 or SSE.
   Big topic — likely a phase of its own.
 
-Suggested first move next session: read `CLAUDE.md`. **Structs and
-unions** is the biggest remaining piece of Phase 4 — member layout,
-`.field` / `->field` access, taking `&struct.field`, eventually
-struct return-by-value (probably its own slice). After structs, the
-remaining gaps (designated init, floats, switch/case) are mostly
-optional polish or new phases.
+Suggested first move next session: read `CLAUDE.md`. **Struct copy +
+struct init** is the natural follow-on to slice 17, and **switch/case**
+is the largest remaining language feature. Both are bite-sized slices
+with the infrastructure already in place.

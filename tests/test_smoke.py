@@ -674,6 +674,172 @@ def test_unsized_array_without_initializer_rejected():
         _compile("int main(void) { int a[]; return 0; }")
 
 
+# ---- structs --------------------------------------------------------------
+
+def test_struct_local_allocates_full_size():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int main(void) { struct point p; return 0; }"
+    )
+    # Two ints, no padding, total 8 bytes.
+    assert "sub     esp, 8" in asm
+
+
+def test_struct_member_assign_and_read():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int main(void) { struct point p; p.x = 5; p.y = 7; return p.x + p.y; }"
+    )
+    # &p is at [ebp - 8]; member access uses lea + add offset.
+    assert "lea     eax, [ebp - 8]" in asm
+    assert "mov     [ecx], eax" in asm
+    assert "add     eax, ecx" in asm   # the + in the return
+
+
+def test_struct_member_offset_for_second_field():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int main(void) { struct point p; p.y = 99; return 0; }"
+    )
+    # &p.y = &p + 4. Both pieces appear.
+    assert "lea     eax, [ebp - 8]" in asm
+    assert "add     eax, 4" in asm
+
+
+def test_struct_pointer_arrow_member_access():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int main(void) { struct point p; struct point *pp = &p; pp->x = 10; return pp->y; }"
+    )
+    # Arrow loads the pointer value, adds offset, then reads/writes.
+    asm_lines = asm.splitlines()
+    # The pointer slot should be loaded — `mov eax, [ebp - 12]` for pp at -12.
+    assert "mov     eax, [ebp - 12]" in asm
+    assert "add     eax, 4" in asm   # for pp->y, offset 4
+
+
+def test_struct_with_mixed_widths_pads_for_alignment():
+    # `char` then `int` lays out as: c at 0, 3 bytes pad, int at 4. Total 8.
+    asm = _compile(
+        "struct mix { char c; int x; }; "
+        "int main(void) { struct mix m; m.c = 65; m.x = 100; return m.x + m.c; }"
+    )
+    assert "sub     esp, 8" in asm
+    # char store goes through `mov byte [ecx], al`.
+    assert "mov     byte [ecx], al" in asm
+    # int member at offset 4.
+    assert "add     eax, 4" in asm
+
+
+def test_sizeof_struct_type():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int main(void) { return sizeof(struct point); }"
+    )
+    assert "mov     eax, 8" in asm
+
+
+def test_sizeof_struct_value():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int main(void) { struct point p; return sizeof(p); }"
+    )
+    assert "mov     eax, 8" in asm
+
+
+def test_address_of_struct_member():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int main(void) { struct point p; int *q = &p.y; return 0; }"
+    )
+    # &p.y computes the address — no final `mov eax, [eax]`.
+    assert "lea     eax, [ebp - 8]" in asm
+    assert "add     eax, 4" in asm
+
+
+def test_struct_pointer_arithmetic_scales_by_struct_size():
+    # `pp + 1` scales by sizeof(struct point) = 8, which is `shl eax, 3`.
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int main(void) { struct point arr[2]; struct point *pp = arr; "
+        "pp = pp + 1; return 0; }"
+    )
+    assert "shl     eax, 3" in asm
+
+
+def test_struct_global_uninitialized_in_bss():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "struct point origin; "
+        "int main(void) { return origin.x; }"
+    )
+    assert "section .bss" in asm
+    assert "_origin:" in asm
+    assert "resb    8" in asm
+    # Global member access uses the label as base.
+    assert "mov     eax, _origin" in asm
+
+
+def test_compound_assign_struct_member_address_computed_once():
+    asm = _compile(
+        "struct counter { int n; }; "
+        "int main(void) { struct counter c; c.n = 0; c.n += 5; return c.n; }"
+    )
+    asm_lines = asm.splitlines()
+    # The compound assign should not double-emit the `lea` for c.
+    # &c is at [ebp - 4] (just one int member). The `lea` for the compound
+    # assign appears once; the read in `return c.n` is a separate occurrence.
+    lea_count = sum(1 for l in asm_lines if "lea     eax, [ebp - 4]" in l)
+    # One for `c.n = 0`, one for `c.n += 5`, one for `return c.n` = 3.
+    assert lea_count == 3
+
+
+def test_array_of_structs_index_then_member():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int main(void) { struct point arr[2]; arr[0].x = 1; arr[1].y = 2; "
+        "return arr[1].x + arr[0].y; }"
+    )
+    # 2 structs * 8 = 16 bytes.
+    assert "sub     esp, 16" in asm
+
+
+def test_struct_pointer_param():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int get_y(struct point *p) { return p->y; } "
+        "int main(void) { struct point pt; pt.y = 99; return get_y(&pt); }"
+    )
+    # In get_y, p loads from [ebp+8]; offset 4 added for `->y`.
+    asm_lines = asm.splitlines()
+    fn_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_get_y:")
+    fn_section = "\n".join(asm_lines[fn_idx:])
+    assert "mov     eax, [ebp + 8]" in fn_section
+    assert "add     eax, 4" in fn_section
+
+
+def test_undefined_struct_rejected():
+    with pytest.raises(CodegenError, match="struct"):
+        _compile("int main(void) { struct undefined u; return 0; }")
+
+
+def test_unknown_struct_member_rejected():
+    with pytest.raises(CodegenError, match="member"):
+        _compile(
+            "struct point { int x; int y; }; "
+            "int main(void) { struct point p; return p.z; }"
+        )
+
+
+def test_struct_init_braces_not_yet_supported():
+    # Struct initialization waits on a follow-up slice.
+    with pytest.raises(CodegenError, match="initializ|struct"):
+        _compile(
+            "struct point { int x; int y; }; "
+            "int main(void) { struct point p = {1, 2}; return p.x; }"
+        )
+
+
 # ---- compound assignment to non-Identifier lvalues ------------------------
 
 def test_index_compound_add_assign():
