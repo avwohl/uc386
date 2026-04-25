@@ -53,10 +53,44 @@ def test_missing_main_rejected():
         _compile("int other(void) { return 0; }")
 
 
-def test_non_literal_return_rejected():
-    # Phase 0 only handles integer-literal returns.
+def test_arithmetic_return_rejected():
+    # Binary ops aren't lowered yet.
     with pytest.raises(CodegenError):
         _compile("int main(void) { return 1 + 2; }")
+
+
+def test_local_int_with_literal_init():
+    asm = _compile("int main(void) { int x = 7; return x; }")
+    assert "sub     esp, 4" in asm
+    assert "mov     eax, 7" in asm
+    assert "mov     [ebp - 4], eax" in asm
+    assert "mov     eax, [ebp - 4]" in asm
+
+
+def test_multiple_locals_get_distinct_slots():
+    asm = _compile("int main(void) { int x = 1; int y = 2; return y; }")
+    assert "sub     esp, 8" in asm
+    assert "mov     [ebp - 4], eax" in asm
+    assert "mov     [ebp - 8], eax" in asm
+    # Return reads y, which is at -8.
+    assert "mov     eax, [ebp - 8]\n        jmp     .epilogue" in asm
+
+
+def test_uninitialized_local_allocated_no_store():
+    asm = _compile("int main(void) { int x; return 0; }")
+    # Frame is reserved but no init store is emitted.
+    assert "sub     esp, 4" in asm
+    assert "mov     [ebp - 4], eax" not in asm
+
+
+def test_unknown_identifier_rejected():
+    with pytest.raises(CodegenError, match="unknown identifier"):
+        _compile("int main(void) { return x; }")
+
+
+def test_non_int_local_rejected():
+    with pytest.raises(CodegenError, match="only `int`"):
+        _compile("int main(void) { char c; return 0; }")
 
 
 def test_end_to_end_driver(tmp_path):
