@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–25 are done. 234 tests passing.
-Slice 26+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–26 are done. 239 tests passing.
+Slice 27+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,9 +60,10 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 25 (just landed):
-- **Multidim arrays.** `int m[2][3]`, `m[i][j]` indexing, decay of
-  inner array to pointer (`int *row = m[1]`), sizeof through any depth.
+Implemented in slice 26 (just landed):
+- **`goto` + labels.** Pre-walked user labels → NASM local labels.
+  Forward and backward gotos work; duplicate label and unknown
+  label both raise.
 
 Deliberately not yet implemented — what's left of Phase 4:
 - **Bitfields.** Niche; `_register_struct` rejects `bit_width != None`.

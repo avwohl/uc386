@@ -1037,6 +1037,60 @@ def test_break_outside_switch_or_loop_still_rejected():
         _compile("int main(void) { break; return 0; }")
 
 
+# ---- goto + labels --------------------------------------------------------
+
+def test_goto_forward_jump():
+    asm = _compile(
+        "int main(void) { int x = 0; goto skip; x = 1; skip: return x; }"
+    )
+    asm_lines = asm.splitlines()
+    # The goto emits a jmp; the label appears later.
+    label_line = next(l for l in asm_lines if l.endswith("_skip:"))
+    label_name = label_line.rstrip(":").lstrip()
+    assert any(f"jmp     {label_name}" in l for l in asm_lines)
+    # The skipped assignment to x = 1 still appears in the output (we just
+    # never execute it).
+    assert "mov     eax, 1" in asm
+
+
+def test_goto_backward_loop():
+    asm = _compile(
+        "int main(void) { int i = 0; "
+        "again: i = i + 1; if (i < 3) goto again; return i; }"
+    )
+    asm_lines = asm.splitlines()
+    label_line = next(l for l in asm_lines if l.endswith("_again:"))
+    label_name = label_line.rstrip(":").lstrip()
+    # The jmp to `again` appears after the conditional check.
+    assert any(f"jmp     {label_name}" in l for l in asm_lines)
+
+
+def test_goto_unknown_label_rejected():
+    with pytest.raises(CodegenError, match="label"):
+        _compile("int main(void) { goto nowhere; return 0; }")
+
+
+def test_duplicate_label_rejected():
+    with pytest.raises(CodegenError, match="label"):
+        _compile("int main(void) { dup: dup: return 0; }")
+
+
+def test_label_in_separate_function_does_not_collide():
+    # NASM `.L*` labels are local to the previous global (= function) label,
+    # so two functions can each have `loop:` without an actual link-time
+    # collision. Just verify both functions emit a `*_loop:` label in their
+    # own scope.
+    asm = _compile(
+        "int f(void) { int i = 0; loop: i = i + 1; if (i < 2) goto loop; return i; } "
+        "int g(void) { int j = 0; loop: j = j + 1; if (j < 3) goto loop; return j; } "
+        "int main(void) { return f() + g(); }"
+    )
+    asm_lines = asm.splitlines()
+    label_lines = [l for l in asm_lines if l.endswith("_loop:")]
+    # One occurrence per function.
+    assert len(label_lines) == 2
+
+
 # ---- multidim arrays ------------------------------------------------------
 
 def test_2d_array_local_full_size():

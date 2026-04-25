@@ -23,9 +23,10 @@ Current scope:
 - Logical `&&` and `||` with proper short-circuit evaluation.
 - Ternary `cond ? a : b`.
 - Control flow: `if`/`else`, `while`, `do`/`while`, `for`,
-  `switch`/`case`/`default`, `break`, `continue`. `continue` inside
-  a switch escapes to the enclosing loop (separate break/continue
-  target stacks).
+  `switch`/`case`/`default`, `break`, `continue`, `goto`/labels.
+  `continue` inside a switch escapes to the enclosing loop
+  (separate break/continue target stacks). User-declared labels
+  are pre-walked so forward `goto`s resolve.
 - Function calls — direct (`call _name` for known function-name
   callees) and indirect (`call eax` after evaluating an arbitrary
   function-pointer expression). Leading `*`s on the callee are
@@ -133,6 +134,9 @@ class _FuncCtx:
         # `id(call_node)` so each Call expression in the function gets
         # its own buffer (so `make(1).x + make(2).x` works).
         self.call_temps: dict[int, int] = {}
+        # User-declared `label:` → NASM label mapping for goto. Pre-walked
+        # before body emission so forward gotos can resolve.
+        self.user_labels: dict[str, str] = {}
 
     def alloc_local(self, name: str, ty: "ast.TypeNode", size: int = 4) -> int:
         if name in self.slots:
@@ -526,6 +530,9 @@ class CodeGenerator:
         # temp — wasting a few bytes of frame is simpler than tracking
         # parent context here.
         self._collect_call_temps(fn.body, ctx)
+        # Third pass: assign a NASM label to every user `label:`. Done
+        # ahead of body emission so a forward `goto` can resolve.
+        self._collect_labels(fn.body, ctx)
 
         body = self._compound(fn.body, ctx)
 
@@ -544,6 +551,20 @@ class CodeGenerator:
         out.append("        pop     ebp")
         out.append("        ret")
         return out
+
+    def _collect_labels(self, node, ctx: _FuncCtx) -> None:
+        """Record a NASM label for every user `label:` in the function body.
+
+        Done before body emission so a `goto` that targets a label
+        appearing later in the source still resolves cleanly.
+        """
+        for sub in self._walk_ast(node):
+            if isinstance(sub, ast.LabelStmt):
+                if sub.label in ctx.user_labels:
+                    raise CodegenError(
+                        f"duplicate label `{sub.label}` in function"
+                    )
+                ctx.user_labels[sub.label] = ctx.label(f"user_{sub.label}")
 
     def _collect_call_temps(self, node, ctx: _FuncCtx) -> None:
         """Pre-allocate a frame slot for every struct-returning Call in `node`.
@@ -627,6 +648,11 @@ class CodeGenerator:
             # `stmt` may eventually be a real declaration or a compound.
             # Recursing is enough — the next layer will be another
             # CaseStmt (and recurse further) or a real statement.
+            self._collect_locals(node.stmt, ctx)
+            return
+        if isinstance(node, ast.LabelStmt):
+            # `mylabel: VarDecl;` — the labeled statement may declare a
+            # local. Recurse into the nested statement.
             self._collect_locals(node.stmt, ctx)
             return
         # Statements with no nested locals: ExpressionStmt, ReturnStmt,
@@ -1061,6 +1087,16 @@ class CodeGenerator:
             return self._for(item, ctx)
         if isinstance(item, ast.SwitchStmt):
             return self._switch(item, ctx)
+        if isinstance(item, ast.LabelStmt):
+            label = ctx.user_labels[item.label]
+            return [f"{label}:"] + self._item(item.stmt, ctx)
+        if isinstance(item, ast.GotoStmt):
+            target = ctx.user_labels.get(item.label)
+            if target is None:
+                raise CodegenError(
+                    f"goto: unknown label `{item.label}`"
+                )
+            return [f"        jmp     {target}"]
         if isinstance(item, ast.BreakStmt):
             if not ctx.break_targets:
                 raise CodegenError("`break` outside of a loop or switch")
