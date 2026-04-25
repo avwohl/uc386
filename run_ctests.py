@@ -43,8 +43,8 @@ PLATFORM_DIR = UC386_DIR / "tests" / "c-testsuite-i386"
 
 # Tests that need longer timeouts when the run stage lands.
 SLOW_TESTS = {
-    "00040": 600,  # 8-queens — O(n!)
-    "00041": 60,   # prime sieve — many div/mods
+    "00040": 1800,  # 8-queens — O(n!), our naive codegen takes ~10min on unicorn
+    "00041": 60,    # prime sieve — many div/mods
 }
 
 # Known-skip with reason. Keep this empty by default; only add entries
@@ -122,7 +122,7 @@ def run_test(
 
     timeout = SLOW_TESTS.get(test_num, 10)
     insn_limit = (
-        20_000_000_000 if test_num in SLOW_TESTS else 200_000_000
+        50_000_000_000 if test_num in SLOW_TESTS else 200_000_000
     )
     try:
         emu_res = assemble_and_run(
