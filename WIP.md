@@ -1,8 +1,8 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–30 are done. 254 tests passing.
-Phase 4 is feature-complete for typical C; remaining slices are
-niche or rise to the level of new phases — see below.
+Phase 4 slices 0–31 are done. 257 tests passing.
+Phase 4 is feature-complete for typical C; the remaining gaps
+are floats (Phase 5 territory) and callee-side va_list / va_arg.
 
 ## Bootstrap on the new machine
 
@@ -61,12 +61,12 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 30 (just landed):
-- **`_Bool` + `nullptr`.** `_Bool` slots as a byte; `nullptr` lowers
-  to `mov eax, 0` and types as `void *`.
+Implemented in slice 31 (just landed):
+- **Bit-fields.** Adjacent same-type bit-fields pack into a 32-bit
+  storage unit; reads use shr+and (+sign-extend), writes RMW the
+  storage. Cross-unit splitting starts a new unit cleanly.
 
 Deliberately not yet implemented — what's left of Phase 4:
-- **Bitfields.** Niche; `_register_struct` rejects `bit_width != None`.
 - **Floating point.** `float` / `double` slot codegen via x87 or SSE.
   Big topic — likely a phase of its own.
 - **Variadic function definitions** (callee-side va_list / va_arg /

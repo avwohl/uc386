@@ -1037,6 +1037,42 @@ def test_break_outside_switch_or_loop_still_rejected():
         _compile("int main(void) { break; return 0; }")
 
 
+# ---- bitfields ------------------------------------------------------------
+
+def test_bitfield_struct_size_one_word():
+    asm = _compile(
+        "struct flags { int a:1; int b:1; int c:6; }; "
+        "int main(void) { return sizeof(struct flags); }"
+    )
+    # All three bitfields pack into a single 4-byte storage unit.
+    assert "mov     eax, 4" in asm
+
+
+def test_bitfield_write_then_read():
+    asm = _compile(
+        "struct flags { int a:1; int b:1; int c:6; }; "
+        "int main(void) { struct flags f; f.a = 0; f.b = 0; f.c = 0; "
+        "f.a = 1; f.c = 5; return f.a + f.c; }"
+    )
+    # Bitfield writes use AND (mask out) + OR (insert) + shift.
+    asm_lines = asm.splitlines()
+    # We just verify the codegen produced shift / and / or instructions —
+    # the exact sequence depends on the layout but bitfield RMW always
+    # involves these.
+    assert any("shl     eax," in l or "shl     ecx," in l for l in asm_lines)
+    assert any("and     eax," in l for l in asm_lines)
+
+
+def test_bitfield_cross_int_starts_new_unit():
+    # `int a:24; int b:16` — b doesn't fit in the first int's leftover
+    # 8 bits, so it starts a new 4-byte unit. Total = 8 bytes.
+    asm = _compile(
+        "struct s { int a:24; int b:16; }; "
+        "int main(void) { return sizeof(struct s); }"
+    )
+    assert "mov     eax, 8" in asm
+
+
 # ---- _Bool + nullptr ------------------------------------------------------
 
 def test_bool_local_size_one_byte():

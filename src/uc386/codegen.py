@@ -81,7 +81,9 @@ Current scope:
   (`make().field`, `f(make())`, `make(1).x + make(2).x`), a
   per-call-site temp slot is pre-allocated in the caller's frame;
   each Call gets its own slot so multiple struct-returning calls
-  in one expression don't collide.
+  in one expression don't collide. Bit-field members pack into
+  shared 32-bit storage units; reads use shift+mask+sign-extend,
+  writes RMW the unit.
 - Unions: same registry as structs (`_register_struct` branches on
   `is_union`) but laid out with every member at offset 0 and total
   size = `max(sizeof(member))` rounded to the union's alignment.
@@ -207,6 +209,10 @@ class CodeGenerator:
         # Enum constant table — `enum c { A, B }` registers A=0, B=1.
         # Identifiers that aren't slots/globals/functions fall back here.
         self._enum_constants: dict[str, int] = {}
+        # Bit-field info per struct: `_struct_bitfields[struct][member]` =
+        # `(bit_offset, bit_width)` for members declared as `int x:N`.
+        # Members not in the dict are byte-aligned (regular) members.
+        self._struct_bitfields: dict[str, dict[str, tuple[int, int]]] = {}
 
     # ---- top level ------------------------------------------------------
 
@@ -250,6 +256,7 @@ class CodeGenerator:
         # struct's size during validation.
         self._structs = {}
         self._struct_sizes = {}
+        self._struct_bitfields = {}
         self._enum_constants = {}
         for d in unit.declarations:
             if isinstance(d, ast.StructDecl) and d.is_definition:
@@ -833,15 +840,12 @@ class CodeGenerator:
         # Validate every member up front. Unions and structs share the
         # same per-member checks; only the layout step differs.
         members: list[tuple[str, ast.TypeNode, int]] = []
+        bitfields: dict[str, tuple[int, int]] = {}
         max_align = 1
         for m in decl.members:
             if m.name is None:
                 raise CodegenError(
                     f"`{decl.name}`: anonymous members not supported"
-                )
-            if m.bit_width is not None:
-                raise CodegenError(
-                    f"`{decl.name}`: bit-fields not supported"
                 )
             self._check_supported_type(m.member_type, f"{decl.name}.{m.name}")
             align = self._alignment_of(m.member_type)
@@ -850,9 +854,14 @@ class CodeGenerator:
 
         if decl.is_union:
             # All members share offset 0; total size = max member size,
-            # rounded up to the union's alignment.
+            # rounded up to the union's alignment. (Bitfields in unions
+            # are unusual; we don't try to support them here.)
             total = 0
             for m in decl.members:
+                if m.bit_width is not None:
+                    raise CodegenError(
+                        f"`{decl.name}`: bit-fields in unions not supported"
+                    )
                 members.append((m.name, m.member_type, 0))
                 size = self._size_of(m.member_type)
                 if size > total:
@@ -862,16 +871,54 @@ class CodeGenerator:
             self._struct_sizes[decl.name] = total
             return
 
-        offset = 0
+        # Struct layout. Two cursors run in parallel: a byte cursor for
+        # regular members, and a bit cursor within the current 32-bit
+        # storage unit for bit-fields. Adjacent bit-fields pack into the
+        # same unit; a regular member or a bit-field that would overflow
+        # the current unit forces a new unit.
+        unit_offset = 0     # byte offset of the current bit-field unit
+        unit_used = 0       # bits used in the current unit (0..32)
         for m in decl.members:
-            align = self._alignment_of(m.member_type)
-            offset = (offset + align - 1) & ~(align - 1)
-            members.append((m.name, m.member_type, offset))
-            offset += self._size_of(m.member_type)
-        # Round total size up to struct's own alignment.
-        offset = (offset + max_align - 1) & ~(max_align - 1)
+            if m.bit_width is not None:
+                if not isinstance(m.bit_width, ast.IntLiteral):
+                    raise CodegenError(
+                        f"`{decl.name}.{m.name}`: bit-field width must "
+                        f"be an integer literal"
+                    )
+                width = m.bit_width.value
+                if width < 0 or width > 32:
+                    raise CodegenError(
+                        f"`{decl.name}.{m.name}`: bit-field width "
+                        f"{width} out of range (0..32)"
+                    )
+                if width == 0:
+                    # C: zero-width forces alignment to the next unit.
+                    if unit_used > 0:
+                        unit_offset += 4
+                        unit_used = 0
+                    continue
+                if unit_used + width > 32:
+                    unit_offset += 4
+                    unit_used = 0
+                members.append((m.name, m.member_type, unit_offset))
+                bitfields[m.name] = (unit_used, width)
+                unit_used += width
+            else:
+                # Regular member — finish any in-progress bit-field unit
+                # before laying it out.
+                if unit_used > 0:
+                    unit_offset += 4
+                    unit_used = 0
+                align = self._alignment_of(m.member_type)
+                offset = (unit_offset + align - 1) & ~(align - 1)
+                members.append((m.name, m.member_type, offset))
+                unit_offset = offset + self._size_of(m.member_type)
+        total = unit_offset + (4 if unit_used > 0 else 0)
+        total = (total + max_align - 1) & ~(max_align - 1)
         self._structs[decl.name] = members
-        self._struct_sizes[decl.name] = offset
+        self._struct_sizes[decl.name] = total
+        if bitfields:
+            self._struct_bitfields[decl.name] = bitfields
 
     def _member_layout(
         self, struct_name: str, member: str
@@ -969,8 +1016,35 @@ class CodeGenerator:
             f"can't take address of {type(expr).__name__} for `.member`"
         )
 
+    def _bitfield_info(
+        self, expr: ast.Member, ctx: _FuncCtx
+    ) -> tuple[int, int, ast.TypeNode] | None:
+        """If `expr` is a bit-field, return `(bit_offset, bit_width, type)`.
+
+        The address that `_member_address` returns for a bit-field is the
+        address of the underlying 32-bit storage unit, not the field's
+        bit-position; `bit_offset` and `bit_width` then describe how to
+        read/write the field within that unit.
+        """
+        obj_ty = self._type_of(expr.obj, ctx)
+        if isinstance(obj_ty, ast.PointerType):
+            obj_ty = obj_ty.base_type
+        if not isinstance(obj_ty, ast.StructType):
+            return None
+        struct_name = self._resolve_struct_name(obj_ty)
+        bf = self._struct_bitfields.get(struct_name, {})
+        info = bf.get(expr.member)
+        if info is None:
+            return None
+        bit_offset, bit_width = info
+        member_ty, _ = self._member_layout(struct_name, expr.member)
+        return bit_offset, bit_width, member_ty
+
     def _member_load(self, expr: ast.Member, ctx: _FuncCtx) -> list[str]:
         """Lower `obj.member` (or `obj->member`) as a value in EAX."""
+        bf = self._bitfield_info(expr, ctx)
+        if bf is not None:
+            return self._bitfield_load(expr, bf, ctx)
         member_ty = self._type_of(expr, ctx)
         addr = self._member_address(expr, ctx)
         if isinstance(member_ty, ast.ArrayType):
@@ -985,6 +1059,61 @@ class CodeGenerator:
                 "reading a nested struct as a value is not supported yet"
             )
         return addr + self._load_to_eax("[eax]", member_ty)
+
+    def _bitfield_load(
+        self,
+        expr: ast.Member,
+        bf: tuple[int, int, ast.TypeNode],
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Read a bit-field: load the storage unit, shift, mask, sign-extend."""
+        bit_offset, bit_width, member_ty = bf
+        out = self._member_address(expr, ctx)        # eax = &storage_unit
+        out.append("        mov     eax, [eax]")     # eax = full 32-bit unit
+        if bit_offset > 0:
+            out.append(f"        shr     eax, {bit_offset}")
+        if bit_width < 32:
+            mask = (1 << bit_width) - 1
+            out.append(f"        and     eax, {mask}")
+        # Sign-extend if the field is signed (default for plain `int`).
+        if not self._is_unsigned(member_ty) and bit_width < 32:
+            shift = 32 - bit_width
+            out.append(f"        shl     eax, {shift}")
+            out.append(f"        sar     eax, {shift}")
+        return out
+
+    def _bitfield_store(
+        self,
+        expr: ast.Member,
+        bf: tuple[int, int, ast.TypeNode],
+        rhs: ast.Expression,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Write a bit-field: position the rhs, mask the storage, OR them in."""
+        bit_offset, bit_width, _ = bf
+        mask = (1 << bit_width) - 1
+        clear_mask = (~(mask << bit_offset)) & 0xFFFFFFFF
+        out = self._eval_expr_to_eax(rhs, ctx)        # eax = rhs
+        out.append(f"        and     eax, {mask}")    # mask rhs to width
+        if bit_offset > 0:
+            out.append(f"        shl     eax, {bit_offset}")  # position
+        out.append("        push    eax")             # save positioned rhs
+        out += self._member_address(expr, ctx)        # eax = &storage_unit
+        out.append("        mov     ecx, [eax]")     # ecx = full unit
+        out.append(f"        and     ecx, {clear_mask}")  # clear field bits
+        out.append("        pop     edx")             # edx = positioned rhs
+        out.append("        or      ecx, edx")        # combine
+        out.append("        mov     [eax], ecx")     # store back
+        # Result of the assignment expression is the new value (rhs as
+        # narrowed to the field's width). Recompute it cheaply: edx
+        # already has the positioned form, but we want the unpositioned
+        # value — for simplicity, leave EAX = the rhs as-positioned in
+        # EDX. This is a fudge; chained `(f.x = v).y` isn't really
+        # meaningful for bit-fields.
+        out.append("        mov     eax, edx")
+        if bit_offset > 0:
+            out.append(f"        shr     eax, {bit_offset}")
+        return out
 
     # ---- identifier resolution (local vs global) ----------------------
 
@@ -2336,6 +2465,9 @@ class CodeGenerator:
         # `s.m = rhs` / `pp->m = rhs` — same address-once pattern.
         # (Struct-typed members already short-circuited above.)
         if isinstance(expr.left, ast.Member):
+            bf = self._bitfield_info(expr.left, ctx)
+            if bf is not None:
+                return self._bitfield_store(expr.left, bf, expr.right, ctx)
             member_ty = self._type_of(expr.left, ctx)
             out = self._member_address(expr.left, ctx)
             out.append("        push    eax")
