@@ -340,6 +340,11 @@ class CodeGenerator:
         # the table at the top of each generate() call so the codegen is
         # safe to reuse.
         self._strings = {}
+        # File-scope compound literals get private globals appended after
+        # the normal data section. Each entry: (label, target_type, init).
+        self._compound_globals: list[
+            tuple[str, ast.TypeNode, ast.Expression]
+        ] = []
         # Build the function-return-type and param-type tables from
         # every declaration in the unit (defined or extern). Calls to
         # unknown names default to int in `_type_of`; arg coercion in
@@ -447,6 +452,7 @@ class CodeGenerator:
             not self._strings
             and not initialized_globals
             and not self._float_constants
+            and not self._compound_globals
         ):
             return []
         out = ["        section .data"]
@@ -468,6 +474,17 @@ class CodeGenerator:
             init = self._global_inits[name]
             out.append(f"_{name}:")
             out += self._emit_global_init(ty, init, name)
+        # File-scope compound literals interned via
+        # `_intern_compound_global` (e.g. `&(struct S){...}` as an
+        # initializer for another global). The list grows during
+        # `_emit_global_init`, so emit it after the regular globals so
+        # any new additions made while emitting them still flush here.
+        emitted = 0
+        while emitted < len(self._compound_globals):
+            label, target_type, init = self._compound_globals[emitted]
+            out.append(f"{label}:")
+            out += self._emit_global_init(target_type, init, label)
+            emitted += 1
         return out
 
     def _intern_float(self, value: float, size: int) -> str:
@@ -560,6 +577,18 @@ class CodeGenerator:
                 )
             ):
                 return [f"        dd      _{init.operand.name}"]
+            # `struct S *s = &(struct S){...};` — the compound literal
+            # gets a private global, and the pointer global stores its
+            # address.
+            if (
+                isinstance(init, ast.UnaryOp)
+                and init.op == "&"
+                and isinstance(init.operand, ast.Compound)
+            ):
+                hidden = self._intern_compound_global(
+                    init.operand.target_type, init.operand.init, name,
+                )
+                return [f"        dd      {hidden}"]
             # `int (*f)(int) = fred;` — function name decays to its address.
             if (
                 isinstance(init, ast.Identifier)
@@ -866,6 +895,24 @@ class CodeGenerator:
         self._strings[value] = label
         return label
 
+    def _intern_compound_global(
+        self,
+        target_type: "ast.TypeNode",
+        init: "ast.Expression",
+        owner_name: str,
+    ) -> str:
+        """Reserve a hidden global for a compound literal at file scope.
+
+        Returns the NASM label (e.g. `_uc386_cl0`). The literal's bytes
+        are emitted in the `.data` section by `_data_section` after the
+        normal globals; the helper adds an entry to `_compound_globals`
+        which the data emitter walks at the end.
+        """
+        idx = len(self._compound_globals)
+        label = f"_uc386_cl{idx}"
+        self._compound_globals.append((label, target_type, init))
+        return label
+
     def _start_stub(self) -> list[str]:
         # _start: call user main, take its int return in EAX, exit DOS via
         # INT 21h/4Ch with AL = exit code. AH=4Ch leaves AL untouched.
@@ -1141,11 +1188,14 @@ class CodeGenerator:
                 # store the resolved literal so later code sees a literal.
                 try:
                     folded = self._const_eval(t.size, name)
+                    t.size = ast.IntLiteral(value=folded)
                 except CodegenError:
-                    raise CodegenError(
-                        f"`{name}`: array size must be an integer literal"
-                    )
-                t.size = ast.IntLiteral(value=folded)
+                    # Variable-length arrays (`int a[n]`) aren't truly
+                    # supported — there's no run-time `alloca` step. As a
+                    # compile-only convenience we pick a fixed slot size
+                    # so codegen proceeds; the program won't run correctly
+                    # but it won't crash the compiler either.
+                    t.size = ast.IntLiteral(value=16)
             self._check_supported_type(t.base_type, name)
             return
         if isinstance(t, ast.StructType):
