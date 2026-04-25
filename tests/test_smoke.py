@@ -472,6 +472,122 @@ def test_string_literal_with_special_chars():
     assert "'a', 10, 'b', 0" in asm
 
 
+# ---- pointer arithmetic with size scaling ---------------------------------
+
+def test_pointer_plus_int_scales_by_pointee_size():
+    asm = _compile("int main(void) { int x = 0; int *p = &x; p = p + 1; return 0; }")
+    # The integer 1 is loaded into eax, then scaled by sizeof(int)=4 before
+    # the add — using `shl` for the power-of-two case.
+    assert "shl     eax, 2" in asm
+    assert "add     eax, ecx" in asm
+
+
+def test_pointer_minus_int_scales():
+    asm = _compile("int main(void) { int x = 0; int *p = &x; p = p - 2; return 0; }")
+    assert "shl     eax, 2" in asm
+    assert "sub     eax, ecx" in asm
+
+
+def test_int_plus_pointer_scales_int_side():
+    # C allows `n + p`; the int is what gets scaled, not the pointer.
+    asm = _compile("int main(void) { int x = 0; int *p = &x; p = 1 + p; return 0; }")
+    # After both sides eval, eax = ptr, stack = int. We pop the int into ecx,
+    # scale ecx, then add.
+    assert "shl     ecx, 2" in asm
+    assert "add     eax, ecx" in asm
+
+
+def test_pointer_difference_divides_by_pointee_size():
+    asm = _compile(
+        "int main(void) { int a = 0; int b = 0; int *p = &a; int *q = &b; "
+        "int d = p - q; return 0; }"
+    )
+    # ptr - ptr → byte difference, then arithmetic shift right to divide by 4.
+    assert "sub     eax, ecx" in asm
+    assert "sar     eax, 2" in asm
+
+
+def test_pointer_compound_add_scales():
+    asm = _compile("int main(void) { int x = 0; int *p = &x; p += 3; return 0; }")
+    # `p += 3` desugars to `p = p + 3`, which routes through pointer +.
+    assert "shl     eax, 2" in asm
+    assert "add     eax, ecx" in asm
+
+
+def test_pointer_prefix_increment_advances_by_pointee_size():
+    asm = _compile("int main(void) { int x = 0; int *p = &x; ++p; return 0; }")
+    # Pointer ++ becomes `add dword [slot], 4`, not `inc`.
+    assert "add     dword [ebp - 8], 4" in asm
+    assert "inc     dword [ebp - 8]" not in asm
+
+
+def test_pointer_postfix_increment_advances_by_pointee_size():
+    asm = _compile("int main(void) { int x = 0; int *p = &x; p++; return 0; }")
+    # Postfix loads first, then bumps — the bump is still `add ..., 4`.
+    asm_lines = asm.splitlines()
+    load_idx = next(
+        i for i, l in enumerate(asm_lines)
+        if l.strip() == "mov     eax, [ebp - 8]"
+        and i + 1 < len(asm_lines)
+        and "add     dword [ebp - 8], 4" in asm_lines[i + 1]
+    )
+    assert load_idx >= 0
+
+
+def test_pointer_decrement_steps_back_by_pointee_size():
+    asm = _compile("int main(void) { int x = 0; int *p = &x; --p; return 0; }")
+    assert "sub     dword [ebp - 8], 4" in asm
+    assert "dec     dword [ebp - 8]" not in asm
+
+
+def test_int_increment_still_uses_inc():
+    # Regression: int slots keep using `inc` / `dec`, not `add ..., 1`.
+    asm = _compile("int main(void) { int x = 0; ++x; return x; }")
+    assert "inc     dword [ebp - 4]" in asm
+
+
+def test_char_pointer_arithmetic_no_scaling():
+    # sizeof(char)=1, so `p + 1` on char* needs no multiplicative scaling.
+    asm = _compile(
+        'int puts(const char *s); '
+        'int main(void) { const char *p = "abc"; p = p + 1; return 0; }'
+    )
+    assert "shl     eax, 2" not in asm
+    assert "imul" not in asm
+    # The bare add still happens.
+    assert "add     eax, ecx" in asm
+
+
+def test_char_pointer_increment_advances_by_one():
+    asm = _compile(
+        'int puts(const char *s); '
+        'int main(void) { const char *p = "abc"; ++p; return 0; }'
+    )
+    # sizeof(char) = 1: pointer ++ on char* is functionally `inc`, but we
+    # emit `add ..., 1` for consistency with all pointer increments.
+    assert "add     dword [ebp - 4], 1" in asm
+
+
+def test_adding_two_pointers_rejected():
+    # C: pointer + pointer is illegal. Only pointer - pointer is meaningful.
+    with pytest.raises(CodegenError, match="add"):
+        _compile(
+            "int main(void) { int x = 0; int *p = &x; int *q = &x; "
+            "int r = p + q; return 0; }"
+        )
+
+
+def test_dereferencing_pointer_arithmetic_works():
+    # `*(p + 1)` evaluates the arithmetic, then loads through the result.
+    asm = _compile(
+        "int main(void) { int x = 0; int *p = &x; int y = *(p + 1); return 0; }"
+    )
+    assert "shl     eax, 2" in asm
+    assert "add     eax, ecx" in asm
+    # The dereference reads through eax after the arithmetic.
+    assert "mov     eax, [eax]" in asm
+
+
 def test_end_to_end_driver(tmp_path):
     src = tmp_path / "hi.c"
     src.write_text("int main(void) { return 0; }\n")

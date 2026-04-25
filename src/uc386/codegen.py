@@ -25,8 +25,12 @@ Current scope:
 - Control flow: `if`/`else`, `while`, `do`/`while`, `for`, `break`, `continue`.
 - Function calls — direct calls only (callee must be an identifier).
 - Pointer locals/params (`int *p`), `&x` (Identifier only), `*expr`,
-  and store-through-pointer assignment `*p = rhs`. Pointer arithmetic
-  not implemented yet — needs type-info plumbing for size scaling.
+  and store-through-pointer assignment `*p = rhs`.
+- Pointer arithmetic with C scaling rules: `p + n` and `n + p` scale
+  the int by `sizeof(*p)`; `p - n` likewise; `p - q` produces a byte
+  difference that is then divided by `sizeof(*p)`. `++p` / `p--` on a
+  pointer slot step by `sizeof(*p)` rather than 1. Adding two pointers
+  and subtracting a pointer from an integer are rejected.
 - String literals: interned per-translation-unit, emitted as
   null-terminated bytes in `.data` with labels like `_uc386_strN`.
 - `extern` declarations (FunctionDecls without bodies) emit NASM
@@ -57,32 +61,42 @@ class _FuncCtx:
         # negative (below EBP), params are positive (above the saved EBP
         # and return address — first param is at +8 in cdecl).
         self.slots: dict[str, int] = {}
+        # Parallel map from name to its declared TypeNode. Used by
+        # `_type_of` to drive pointer-arithmetic scaling.
+        self.types: dict[str, "ast.TypeNode"] = {}
         self.frame_size: int = 0          # bytes reserved by `sub esp, frame_size`
         self._next_label: int = 0
         # Stack of (continue_target, break_target) for the enclosing loops.
         self.loops: list[tuple[str, str]] = []
 
-    def alloc_local(self, name: str, size: int = 4) -> int:
+    def alloc_local(self, name: str, ty: "ast.TypeNode", size: int = 4) -> int:
         if name in self.slots:
             raise CodegenError(f"redeclaration of `{name}`")
         # Each local sits at the next 4-byte slot below EBP.
         self.frame_size += size
         self.slots[name] = -self.frame_size
+        self.types[name] = ty
         return self.slots[name]
 
-    def alloc_param(self, name: str, index: int, size: int = 4) -> int:
+    def alloc_param(self, name: str, index: int, ty: "ast.TypeNode", size: int = 4) -> int:
         # cdecl: caller pushed args right-to-left, then `call` pushed the
         # return address, then we pushed EBP. So the first arg lives at
         # [ebp + 8], the second at [ebp + 12], etc.
         if name in self.slots:
             raise CodegenError(f"duplicate parameter `{name}`")
         self.slots[name] = 8 + index * size
+        self.types[name] = ty
         return self.slots[name]
 
     def lookup(self, name: str) -> int:
         if name not in self.slots:
             raise CodegenError(f"unknown identifier `{name}`")
         return self.slots[name]
+
+    def lookup_type(self, name: str) -> "ast.TypeNode":
+        if name not in self.types:
+            raise CodegenError(f"unknown identifier `{name}`")
+        return self.types[name]
 
     def label(self, hint: str) -> str:
         self._next_label += 1
@@ -97,6 +111,10 @@ class CodeGenerator:
         # Module-level state populated during generate(). Strings are
         # interned by content so identical literals share a label.
         self._strings: dict[str, str] = {}
+        # Map from function name to its declared return type. Lets
+        # `_type_of` give a Call expression the right type for downstream
+        # pointer-arithmetic decisions.
+        self._func_return_types: dict[str, ast.TypeNode] = {}
 
     # ---- top level ------------------------------------------------------
 
@@ -125,6 +143,15 @@ class CodeGenerator:
         # the table at the top of each generate() call so the codegen is
         # safe to reuse.
         self._strings = {}
+        # Build the function-return-type table from every declaration in
+        # the unit (defined or extern). Calls to unknown names default to
+        # int in `_type_of`.
+        self._func_return_types = {}
+        for d in unit.declarations:
+            if isinstance(d, ast.FunctionDecl):
+                self._func_return_types[d.name] = d.return_type
+            elif isinstance(d, ast.VarDecl) and isinstance(d.var_type, ast.FunctionType):
+                self._func_return_types[d.name] = d.var_type.return_type
 
         lines: list[str] = []
         lines += self._header(extern_list)
@@ -211,7 +238,7 @@ class CodeGenerator:
             if param.name is None:
                 continue
             self._check_supported_type(param.param_type, param.name)
-            ctx.alloc_param(param.name, i)
+            ctx.alloc_param(param.name, i, param.param_type)
         # First pass: allocate every local up front so the prologue knows
         # the frame size before we emit body code.
         self._collect_locals(fn.body, ctx)
@@ -243,7 +270,7 @@ class CodeGenerator:
         """
         if isinstance(node, ast.VarDecl):
             self._check_supported_type(node.var_type, node.name)
-            ctx.alloc_local(node.name)
+            ctx.alloc_local(node.name, node.var_type)
             return
         if isinstance(node, ast.CompoundStmt):
             for item in node.items:
@@ -277,6 +304,29 @@ class CodeGenerator:
             f"`{name}`: only `int` and pointer types are supported "
             f"(got {type(t).__name__})"
         )
+
+    # Sizes used for pointer-arithmetic scaling. We can compute these for
+    # any pointee type the parser produces, even ones we don't yet support
+    # as full slot types — `char *p; p + 1;` works without `*p` working.
+    _BASIC_SIZES = {
+        "char": 1,
+        "short": 2,
+        "int": 4,
+        "long": 4,          # i386: long is 32-bit
+        "long long": 8,
+        "void": 1,          # GCC convention; standard C disallows arithmetic on void*
+    }
+
+    @classmethod
+    def _size_of(cls, t: ast.TypeNode) -> int:
+        if isinstance(t, ast.PointerType):
+            return 4
+        if isinstance(t, ast.BasicType):
+            try:
+                return cls._BASIC_SIZES[t.name]
+            except KeyError:
+                raise CodegenError(f"sizeof({t.name}) not known")
+        raise CodegenError(f"sizeof not supported for {type(t).__name__}")
 
     # ---- statements -----------------------------------------------------
 
@@ -419,6 +469,71 @@ class CodeGenerator:
 
     # ---- expressions ----------------------------------------------------
 
+    # Operators whose result is always plain int regardless of operand types
+    # (relational, equality, logical, shifts, bitwise, multiplicative).
+    _INT_RESULT_BINOPS = frozenset({
+        "*", "/", "%", "&", "|", "^", "<<", ">>",
+        "==", "!=", "<", ">", "<=", ">=", "&&", "||",
+    })
+
+    def _type_of(self, expr: ast.Expression, ctx: _FuncCtx) -> ast.TypeNode:
+        """Best-effort static type of `expr`.
+
+        Used to drive pointer-arithmetic scaling. Falls back to `int` for
+        anything we can't classify (call return when no prototype, etc.) —
+        the conservative default keeps non-pointer code on the integer path.
+        """
+        if isinstance(expr, ast.Identifier):
+            return ctx.lookup_type(expr.name)
+        if isinstance(expr, ast.IntLiteral):
+            return ast.BasicType(name="int")
+        if isinstance(expr, ast.StringLiteral):
+            return ast.PointerType(base_type=ast.BasicType(name="char", is_const=True))
+        if isinstance(expr, ast.UnaryOp):
+            if expr.op == "&":
+                return ast.PointerType(base_type=self._type_of(expr.operand, ctx))
+            if expr.op == "*":
+                inner = self._type_of(expr.operand, ctx)
+                if not isinstance(inner, ast.PointerType):
+                    raise CodegenError(
+                        f"`*` operand must be a pointer (got {type(inner).__name__})"
+                    )
+                return inner.base_type
+            if expr.op in ("++", "--"):
+                # Mutation in place; the expression's type matches the operand.
+                return self._type_of(expr.operand, ctx)
+            # `+ - ~ !` produce int.
+            return ast.BasicType(name="int")
+        if isinstance(expr, ast.BinaryOp):
+            if expr.op == "=":
+                return self._type_of(expr.left, ctx)
+            if expr.op in self._COMPOUND_OPS:
+                return self._type_of(expr.left, ctx)
+            if expr.op in self._INT_RESULT_BINOPS:
+                return ast.BasicType(name="int")
+            # `+` and `-`: pointer ± int → pointer; pointer - pointer → int.
+            lt = self._type_of(expr.left, ctx)
+            rt = self._type_of(expr.right, ctx)
+            l_ptr = isinstance(lt, ast.PointerType)
+            r_ptr = isinstance(rt, ast.PointerType)
+            if l_ptr and r_ptr:
+                return ast.BasicType(name="int")
+            if l_ptr:
+                return lt
+            if r_ptr:
+                return rt
+            return ast.BasicType(name="int")
+        if isinstance(expr, ast.TernaryOp):
+            # Both arms should agree in well-formed C; pick the true arm.
+            return self._type_of(expr.true_expr, ctx)
+        if isinstance(expr, ast.Call):
+            if isinstance(expr.func, ast.Identifier):
+                rt = self._func_return_types.get(expr.func.name)
+                if rt is not None:
+                    return rt
+            return ast.BasicType(name="int")
+        return ast.BasicType(name="int")
+
     def _eval_expr_to_eax(self, expr: ast.Expression, ctx: _FuncCtx) -> list[str]:
         if isinstance(expr, ast.IntLiteral):
             return [f"        mov     eax, {expr.value}"]
@@ -521,23 +636,57 @@ class CodeGenerator:
             )
         disp = ctx.lookup(expr.operand.name)
         addr = _ebp_addr(disp)
-        instr = "inc" if expr.op == "++" else "dec"
+        # On a pointer, ++/-- step by sizeof(*ptr) instead of 1. We still
+        # mutate the slot in place — the slot stores the pointer value —
+        # so an `add dword [...], N` covers it.
+        ty = ctx.lookup_type(expr.operand.name)
+        if isinstance(ty, ast.PointerType):
+            step = self._size_of(ty.base_type)
+            instr = "add" if expr.op == "++" else "sub"
+            bump = f"        {instr}     dword {addr}, {step}"
+        else:
+            instr = "inc" if expr.op == "++" else "dec"
+            bump = f"        {instr}     dword {addr}"
         if expr.is_prefix:
             # ++x: bump in place, then load the new value into EAX.
-            return [
-                f"        {instr}     dword {addr}",
-                f"        mov     eax, {addr}",
-            ]
+            return [bump, f"        mov     eax, {addr}"]
         # x++: load old value into EAX, then bump in place. EAX is the result.
+        return [f"        mov     eax, {addr}", bump]
+
+    @staticmethod
+    def _scale_reg(reg: str, size: int) -> list[str]:
+        """Multiply `reg` by `size` (unsigned). Used for pointer-arithmetic scaling."""
+        if size == 1:
+            return []
+        if size == 2:
+            return [f"        shl     {reg}, 1"]
+        if size == 4:
+            return [f"        shl     {reg}, 2"]
+        if size == 8:
+            return [f"        shl     {reg}, 3"]
+        return [f"        imul    {reg}, {reg}, {size}"]
+
+    @staticmethod
+    def _unscale_eax(size: int) -> list[str]:
+        """Divide EAX (signed) by `size`. Used for pointer differences."""
+        if size == 1:
+            return []
+        if size == 2:
+            return ["        sar     eax, 1"]
+        if size == 4:
+            return ["        sar     eax, 2"]
+        if size == 8:
+            return ["        sar     eax, 3"]
         return [
-            f"        mov     eax, {addr}",
-            f"        {instr}     dword {addr}",
+            "        cdq",
+            f"        mov     ecx, {size}",
+            "        idiv    ecx",
         ]
 
-    # Map from C operator to a one-line "op eax, ecx" instruction.
+    # Map from C operator to a one-line "op eax, ecx" instruction. `+` and
+    # `-` are routed through `_add_sub` instead because of pointer
+    # arithmetic; everything else here is type-uniform on int.
     _SIMPLE_BINOPS = {
-        "+":  "add     eax, ecx",
-        "-":  "sub     eax, ecx",
         "*":  "imul    eax, ecx",
         "&":  "and     eax, ecx",
         "|":  "or      eax, ecx",
@@ -577,6 +726,8 @@ class CodeGenerator:
             return self._logical_and(expr, ctx)
         if expr.op == "||":
             return self._logical_or(expr, ctx)
+        if expr.op in ("+", "-"):
+            return self._add_sub(expr, ctx)
 
         # Stack-machine eval: left → EAX → stack, right → EAX → ECX, pop EAX.
         out = self._eval_expr_to_eax(expr.left, ctx)
@@ -616,6 +767,67 @@ class CodeGenerator:
                 "        movzx   eax, al",
             ]
         raise CodegenError(f"binary `{expr.op}` not implemented yet")
+
+    def _add_sub(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
+        """`+` / `-` with C pointer-arithmetic semantics.
+
+        Four cases by operand types:
+          int   ± int    — straight integer add/sub.
+          ptr   + int    — scale the int by sizeof(*ptr), then add.
+          int   + ptr    — symmetric (the int is what gets scaled).
+          ptr   - ptr    — byte difference, then divide by sizeof(*left).
+
+        Both operands pointer for `+`, or `int - ptr`, are illegal C and
+        get rejected here rather than silently producing nonsense.
+        """
+        lt = self._type_of(expr.left, ctx)
+        rt = self._type_of(expr.right, ctx)
+        l_ptr = isinstance(lt, ast.PointerType)
+        r_ptr = isinstance(rt, ast.PointerType)
+
+        out = self._eval_expr_to_eax(expr.left, ctx)
+        out.append("        push    eax")
+        out += self._eval_expr_to_eax(expr.right, ctx)
+        # Post-eval: stack top = left value, eax = right value.
+
+        if l_ptr and r_ptr:
+            if expr.op == "+":
+                raise CodegenError("cannot add two pointers")
+            # ptr - ptr: byte-difference / sizeof(*left).
+            size = self._size_of(lt.base_type)
+            out.append("        mov     ecx, eax")
+            out.append("        pop     eax")
+            out.append("        sub     eax, ecx")
+            out += self._unscale_eax(size)
+            return out
+
+        if l_ptr:
+            # ptr ± int: scale the int (in eax), then op against the pointer.
+            size = self._size_of(lt.base_type)
+            out += self._scale_reg("eax", size)
+            out.append("        mov     ecx, eax")
+            out.append("        pop     eax")
+            mnem = "add" if expr.op == "+" else "sub"
+            out.append(f"        {mnem}     eax, ecx")
+            return out
+
+        if r_ptr:
+            if expr.op == "-":
+                raise CodegenError("cannot subtract a pointer from an integer")
+            # int + ptr: the int is on the stack, the pointer is in eax. Pop
+            # the int into ecx, scale ecx, then add to eax (which holds ptr).
+            size = self._size_of(rt.base_type)
+            out.append("        pop     ecx")
+            out += self._scale_reg("ecx", size)
+            out.append("        add     eax, ecx")
+            return out
+
+        # int ± int — the original integer path.
+        out.append("        mov     ecx, eax")
+        out.append("        pop     eax")
+        mnem = "add" if expr.op == "+" else "sub"
+        out.append(f"        {mnem}     eax, ecx")
+        return out
 
     def _logical_and(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
         false_label = ctx.label("and_false")

@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Snapshot at HEAD `75dbdfd`. No uncommitted changes. 74 tests passing.
-Phase 4 slices 0–7 are done; slice 8+ is the next logical work.
+Phase 4 slices 0–8 are done. 87 tests passing on the new machine.
+Slice 9+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,23 +60,27 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Deliberately not yet implemented — these are the next slices:
-- **Pointer arithmetic with size scaling.** `p + 1` should advance by
-  `sizeof(*p)`, but expression-node type info isn't plumbed through
-  codegen yet. This is the next blocker; everything below depends on
-  the same plumbing.
+Implemented in slice 8 (just landed):
+- **Pointer arithmetic with size scaling.** `p + n`, `n + p`, `p - n`,
+  `p - q`, `++p`, `--p`, `p += n` etc. all use `sizeof(*p)`. Backed
+  by `_type_of` / `_size_of` and the per-slot type map on `_FuncCtx`.
+
+Deliberately not yet implemented — next slices in roughly this order:
 - **Arrays.** `int arr[N]` (frame allocation `N*sizeof(int)`),
-  `arr[i]` indexing, decay to pointer at use sites.
+  `arr[i]` indexing, decay to pointer at use sites. Indexing should
+  fall out cheaply now that pointer arithmetic works (`arr[i]` is
+  `*(arr+i)`).
 - **`char` / `short` codegen.** Size-aware load (`movsx` / `movzx`
   for sub-word) and store (`mov byte`/`mov word`). Today every slot
-  is 4 bytes regardless of declared type.
+  is 4 bytes regardless of declared type. `char *p` arithmetic works,
+  but `*p` still emits a 4-byte load — that's a latent bug this slice
+  fixes.
 - **Globals.** Same lowering model as locals but in `.data`/`.bss`
   with named labels instead of `[ebp + disp]`.
 - **Casts.** `(int)x`, `(char *)p`, etc.
 - **Function pointers / indirect calls.** Currently `_call` rejects
   any non-Identifier callee.
 
-Suggested first move on the new machine: read `CLAUDE.md`, glance at
-`tests/test_smoke.py` to see what the contract feels like, then ask
-Claude to plumb expression-node type info through codegen as the
-prerequisite for pointer arithmetic + arrays + sub-word types.
+Suggested first move next session: read `CLAUDE.md`, then either start
+on arrays (relatively cheap with pointer arithmetic landed) or sub-word
+codegen (closes the `*char_ptr` correctness gap).
