@@ -1210,6 +1210,52 @@ def test_float_return_into_float_local():
     assert "fstp    dword [ebp" in main_section
 
 
+# ---- float in boolean context ---------------------------------------------
+
+def test_if_with_float_condition_uses_fp_compare():
+    asm = _compile(
+        "int main(void) { float x = 0.5f; if (x) return 1; return 0; }"
+    )
+    # The condition test goes through an FPU compare against 0.0,
+    # not an int truncation — so 0.5 takes the if branch.
+    assert "fldz" in asm
+    assert "fucompp" in asm
+
+
+def test_while_with_float_condition_uses_fp_compare():
+    asm = _compile(
+        "int main(void) { float x = 0.0f; while (x) {} return 0; }"
+    )
+    assert "fldz" in asm
+    assert "fucompp" in asm
+
+
+def test_logical_not_on_float_uses_fp_compare():
+    # `!f` should be 1 only when f is exactly 0.0 — not when (int)f is 0.
+    asm = _compile(
+        "int main(void) { float x = 0.5f; return !x; }"
+    )
+    assert "fldz" in asm
+    assert "fucompp" in asm
+
+
+def test_ternary_with_float_condition():
+    asm = _compile(
+        "int main(void) { float x = 0.5f; return x ? 1 : 0; }"
+    )
+    assert "fldz" in asm
+    assert "fucompp" in asm
+
+
+def test_logical_and_with_float_operand():
+    asm = _compile(
+        "int main(void) { float a = 0.5f; int b = 1; return a && b; }"
+    )
+    # First operand (float) compares to 0.0; second (int) tests directly.
+    assert "fldz" in asm
+    assert "fucompp" in asm
+
+
 # ---- float lvalue stores --------------------------------------------------
 
 def test_float_array_element_assignment():

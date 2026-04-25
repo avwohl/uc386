@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–31 done. Phase 5 (floats) slices 1–5 done.
-290 tests passing.
+Phase 4 slices 0–31 done. Phase 5 (floats) slices 1–6 done.
+295 tests passing.
 
 ## Bootstrap on the new machine
 
@@ -60,10 +60,12 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in Phase 5 slice 5 (just landed):
-- **Float lvalue stores + Identifier compound assign.** `*p = f`,
-  `arr[i] = f`, `s.m = f` all work via the address-once dance.
-  `f += rhs` desugars through the Identifier path.
+Implemented in Phase 5 slice 6 (just landed):
+- **Float-as-bool correctness fix.** `if (0.5f)` now takes the true
+  branch (previously truncated to int 0 and went false). Applied to
+  if/while/for/do-while conditions, ternary condition, `!`, `&&`,
+  `||`. New `_eval_to_bool_eax` does the FPU compare against 0.0
+  for floats and defers to `_eval_expr_to_eax` for ints.
 
 Deliberately not yet implemented — Phase 5 follow-on slices:
 

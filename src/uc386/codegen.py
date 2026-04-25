@@ -1374,7 +1374,7 @@ class CodeGenerator:
     def _if(self, stmt: ast.IfStmt, ctx: _FuncCtx) -> list[str]:
         else_label = ctx.label("else")
         end_label = ctx.label("endif")
-        out = self._eval_expr_to_eax(stmt.condition, ctx)
+        out = self._eval_to_bool_eax(stmt.condition, ctx)
         out.append("        test    eax, eax")
         out.append(f"        jz      {else_label if stmt.else_branch else end_label}")
         out += self._item(stmt.then_branch, ctx)
@@ -1392,7 +1392,7 @@ class CodeGenerator:
         ctx.continue_targets.append(top)
         try:
             out = [f"{top}:"]
-            out += self._eval_expr_to_eax(stmt.condition, ctx)
+            out += self._eval_to_bool_eax(stmt.condition, ctx)
             out.append("        test    eax, eax")
             out.append(f"        jz      {end}")
             out += self._item(stmt.body, ctx)
@@ -1414,7 +1414,7 @@ class CodeGenerator:
             out = [f"{top}:"]
             out += self._item(stmt.body, ctx)
             out.append(f"{cont}:")
-            out += self._eval_expr_to_eax(stmt.condition, ctx)
+            out += self._eval_to_bool_eax(stmt.condition, ctx)
             out.append("        test    eax, eax")
             out.append(f"        jnz     {top}")
             out.append(f"{end}:")
@@ -1435,7 +1435,7 @@ class CodeGenerator:
                 out += self._item(stmt.init, ctx)
         out.append(f"{top}:")
         if stmt.condition is not None:
-            out += self._eval_expr_to_eax(stmt.condition, ctx)
+            out += self._eval_to_bool_eax(stmt.condition, ctx)
             out.append("        test    eax, eax")
             out.append(f"        jz      {end}")
         # `continue` jumps to the step, not the top.
@@ -2220,7 +2220,7 @@ class CodeGenerator:
     def _float_ternary(self, expr: ast.TernaryOp, ctx: _FuncCtx) -> list[str]:
         false_label = ctx.label("ftern_false")
         end_label = ctx.label("ftern_end")
-        out = self._eval_expr_to_eax(expr.condition, ctx)
+        out = self._eval_to_bool_eax(expr.condition, ctx)
         out.append("        test    eax, eax")
         out.append(f"        jz      {false_label}")
         out += self._eval_float_to_st0(expr.true_expr, ctx)
@@ -2294,6 +2294,27 @@ class CodeGenerator:
             f"not yet supported"
         )
 
+    def _eval_to_bool_eax(self, expr: ast.Expression, ctx: _FuncCtx) -> list[str]:
+        """Evaluate `expr` and leave EAX = 0 (false) or 1 (true).
+
+        For float-typed expressions, tests against 0.0 on the FPU rather
+        than truncating to int — `if (0.5)` should branch true, not
+        false (which would happen with `_eval_expr_to_eax`'s fistp path).
+        For int-typed expressions, just defers to `_eval_expr_to_eax`;
+        callers that follow with `test eax, eax` get the right behavior
+        because any non-zero int is truthy.
+        """
+        if self._is_float_type(self._type_of(expr, ctx)):
+            out = self._eval_float_to_st0(expr, ctx)
+            out.append("        fldz")
+            out.append("        fucompp")
+            out.append("        fnstsw  ax")
+            out.append("        sahf")
+            out.append("        setne   al")
+            out.append("        movzx   eax, al")
+            return out
+        return self._eval_expr_to_eax(expr, ctx)
+
     def _float_compare(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
         """Lower a float comparison to a 386-compatible setCC sequence.
 
@@ -2361,7 +2382,7 @@ class CodeGenerator:
     def _ternary(self, expr: ast.TernaryOp, ctx: _FuncCtx) -> list[str]:
         false_label = ctx.label("tern_false")
         end_label = ctx.label("tern_end")
-        out = self._eval_expr_to_eax(expr.condition, ctx)
+        out = self._eval_to_bool_eax(expr.condition, ctx)
         out.append("        test    eax, eax")
         out.append(f"        jz      {false_label}")
         out += self._eval_expr_to_eax(expr.true_expr, ctx)
@@ -2490,6 +2511,11 @@ class CodeGenerator:
         if expr.op == "~":
             return out + ["        not     eax"]
         if expr.op == "!":
+            # `!f` for a float must compare against 0.0, not against the
+            # truncated int. Re-do the eval through `_eval_to_bool_eax`,
+            # which gives EAX = 1 for nonzero / 0 for zero, and then
+            # invert it.
+            out = self._eval_to_bool_eax(expr.operand, ctx)
             return out + [
                 "        test    eax, eax",
                 "        sete    al",
@@ -2754,10 +2780,10 @@ class CodeGenerator:
     def _logical_and(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
         false_label = ctx.label("and_false")
         end_label = ctx.label("and_end")
-        out = self._eval_expr_to_eax(expr.left, ctx)
+        out = self._eval_to_bool_eax(expr.left, ctx)
         out.append("        test    eax, eax")
         out.append(f"        jz      {false_label}")
-        out += self._eval_expr_to_eax(expr.right, ctx)
+        out += self._eval_to_bool_eax(expr.right, ctx)
         out.append("        test    eax, eax")
         out.append(f"        jz      {false_label}")
         out.append("        mov     eax, 1")
@@ -2770,10 +2796,10 @@ class CodeGenerator:
     def _logical_or(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
         true_label = ctx.label("or_true")
         end_label = ctx.label("or_end")
-        out = self._eval_expr_to_eax(expr.left, ctx)
+        out = self._eval_to_bool_eax(expr.left, ctx)
         out.append("        test    eax, eax")
         out.append(f"        jnz     {true_label}")
-        out += self._eval_expr_to_eax(expr.right, ctx)
+        out += self._eval_to_bool_eax(expr.right, ctx)
         out.append("        test    eax, eax")
         out.append(f"        jnz     {true_label}")
         out.append("        xor     eax, eax")
