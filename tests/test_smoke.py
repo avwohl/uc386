@@ -831,12 +831,79 @@ def test_unknown_struct_member_rejected():
         )
 
 
-def test_struct_init_braces_not_yet_supported():
-    # Struct initialization waits on a follow-up slice.
-    with pytest.raises(CodegenError, match="initializ|struct"):
+def test_struct_local_init_with_initializer_list():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int main(void) { struct point p = {1, 2}; return p.x + p.y; }"
+    )
+    # Each member stored via the standard `_store_from_eax` path; for an
+    # int member that's `mov [..], eax` after `mov eax, value`.
+    asm_lines = asm.splitlines()
+    # Find the `mov eax, 1` and `mov eax, 2` followed by stores at the
+    # right offsets (p at -8: x at -8, y at -4).
+    assert "mov     eax, 1" in asm
+    assert "mov     [ebp - 8], eax" in asm
+    assert "mov     eax, 2" in asm
+    assert "mov     [ebp - 4], eax" in asm
+
+
+def test_struct_local_underspecified_init_zero_fills():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int main(void) { struct point p = {7}; return p.x + p.y; }"
+    )
+    assert "mov     eax, 7" in asm
+    assert "mov     [ebp - 8], eax" in asm
+    # Tail member zero-filled directly.
+    assert "mov     dword [ebp - 4], 0" in asm
+
+
+def test_struct_local_init_mixed_widths():
+    asm = _compile(
+        "struct mix { char c; int n; }; "
+        "int main(void) { struct mix m = {65, 100}; return m.c + m.n; }"
+    )
+    # m at [ebp - 8]; c at offset 0 (= -8), n at offset 4 (= -4).
+    assert "mov     byte [ebp - 8], al" in asm
+    assert "mov     [ebp - 4], eax" in asm
+
+
+def test_struct_array_init_nested_braces():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int main(void) { struct point arr[2] = {{1, 2}, {3, 4}}; return arr[1].y; }"
+    )
+    # Two structs * 8 bytes = 16. Each pair of members landed at the right offsets.
+    assert "sub     esp, 16" in asm
+    asm_lines = asm.splitlines()
+    # arr[0] starts at -16; arr[1] at -8. Members within: x at +0, y at +4.
+    assert "mov     eax, 1" in asm
+    assert "mov     [ebp - 16], eax" in asm  # arr[0].x
+    assert "mov     eax, 2" in asm
+    assert "mov     [ebp - 12], eax" in asm  # arr[0].y
+    assert "mov     eax, 3" in asm
+    assert "mov     [ebp - 8], eax" in asm   # arr[1].x
+    assert "mov     eax, 4" in asm
+    assert "mov     [ebp - 4], eax" in asm   # arr[1].y
+
+
+def test_struct_assignment_inline_per_dword_copy():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int main(void) { struct point a; struct point b; a.x = 7; b = a; return b.x; }"
+    )
+    # 8-byte struct copies as two dword loads + stores via edx/ecx.
+    assert "mov     eax, [edx + 0]" in asm
+    assert "mov     [ecx + 0], eax" in asm
+    assert "mov     eax, [edx + 4]" in asm
+    assert "mov     [ecx + 4], eax" in asm
+
+
+def test_too_many_struct_initializers_rejected():
+    with pytest.raises(CodegenError, match="too many"):
         _compile(
             "struct point { int x; int y; }; "
-            "int main(void) { struct point p = {1, 2}; return p.x; }"
+            "int main(void) { struct point p = {1, 2, 3}; return 0; }"
         )
 
 

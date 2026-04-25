@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–17 are done. 192 tests passing.
-Slice 18+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–18 are done. 197 tests passing.
+Slice 19+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,15 +60,13 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 17 (just landed):
-- **Structs.** `struct foo { ... }` definitions, member layout with
-  alignment, `s.m` / `p->m` access, struct locals + globals, sizeof,
-  pointer arithmetic on struct pointers, compound assign to members.
+Implemented in slice 18 (just landed):
+- **Struct init + struct copy.** `struct foo s = {a, b}` walks members
+  with tail zero-fill; nested `{{...}, {...}}` for struct arrays
+  recurses. `s1 = s2` copies sizeof bytes inline (per-dword + tail).
+  Global struct init and by-value params/returns still deferred.
 
 Deliberately not yet implemented — next slices in roughly this order:
-- **Struct copy + struct init.** `s1 = s2` (memcpy of N bytes),
-  `struct foo s = {1, 2}` (per-member init walking InitializerList),
-  global struct init in `.data` with mixed widths + padding.
 - **Switch / case.** `switch (x) { case 1: ...; default: ... }` —
   dispatch via `cmp eax, V; je .case_V`, fall-through, `break`
   resolves to the switch end (extend the `loops` stack to also carry

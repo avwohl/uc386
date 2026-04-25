@@ -67,8 +67,11 @@ Current scope:
   layout (member name, type, byte offset) plus total size. `s.m` and
   `p->m` lower as base-address + offset, then load/store at the
   member's natural width. Slot allocation, sizeof, and pointer
-  arithmetic all go through `_size_of(StructType)`. Struct copy,
-  by-value passing, and `{...}` init are not yet supported.
+  arithmetic all go through `_size_of(StructType)`. Struct-to-struct
+  assignment uses an inline per-dword copy. `{...}` init walks the
+  InitializerList member-by-member with nested `{...}` for struct
+  members and tail zero-fill. By-value params/returns aren't yet
+  supported.
 - String literals: interned per-translation-unit, emitted as
   null-terminated bytes in `.data` with labels like `_uc386_strN`.
 - `extern` declarations (FunctionDecls without bodies) emit NASM
@@ -1037,12 +1040,7 @@ class CodeGenerator:
         if isinstance(var_type, ast.ArrayType):
             return self._array_init(var_type, decl.init, disp, ctx, decl.name)
         if isinstance(var_type, ast.StructType):
-            # Per-member struct init waits on a follow-up slice — needs to
-            # walk the InitializerList and emit member-by-member stores
-            # with the right widths and offsets.
-            raise CodegenError(
-                f"struct initialization not yet supported (`{decl.name}`)"
-            )
+            return self._struct_init(var_type, decl.init, disp, ctx, decl.name)
         return self._eval_expr_to_eax(decl.init, ctx) + self._store_from_eax(
             _ebp_addr(disp), var_type
         )
@@ -1106,19 +1104,98 @@ class CodeGenerator:
                 )
             out = []
             for i, value_expr in enumerate(init.values):
-                addr = _ebp_addr(base_disp + i * elem_size)
-                out += self._eval_expr_to_eax(value_expr, ctx)
-                out += self._store_from_eax(addr, elem_type)
-            zero_width = self._ZERO_WIDTHS[elem_size]
-            for i in range(len(init.values), length):
-                addr = _ebp_addr(base_disp + i * elem_size)
-                out.append(f"        mov     {zero_width} {addr}, 0")
+                elem_disp = base_disp + i * elem_size
+                # Nested `{...}` for an array of structs descends into a
+                # struct-init at this element's offset.
+                if (
+                    isinstance(elem_type, ast.StructType)
+                    and isinstance(value_expr, ast.InitializerList)
+                ):
+                    out += self._struct_init(
+                        elem_type, value_expr, elem_disp, ctx,
+                        f"{name}[{i}]",
+                    )
+                else:
+                    out += self._eval_expr_to_eax(value_expr, ctx)
+                    out += self._store_from_eax(_ebp_addr(elem_disp), elem_type)
+            # Tail zero-fill — one element per declared slot beyond what
+            # the initializer specified. Use the byte-level helper so it
+            # works for any element size (including structs).
+            tail_count = length - len(init.values)
+            if tail_count > 0:
+                tail_start = base_disp + len(init.values) * elem_size
+                out += self._zero_fill_at(tail_start, tail_count * elem_size)
             return out
 
         raise CodegenError(
             f"`{name}`: unsupported array initializer "
             f"({type(init).__name__})"
         )
+
+    def _struct_init(
+        self,
+        struct_ty: ast.StructType,
+        init: ast.Expression,
+        base_disp: int,
+        ctx: _FuncCtx,
+        name: str,
+    ) -> list[str]:
+        """Lower `struct foo s = {a, b, ...}` to per-member stores at offsets.
+
+        Members not covered by the initializer get zero-fill at their
+        natural width (recursively, for nested struct members). Nested
+        `{...}` recurses into `_struct_init` for struct-typed members.
+        """
+        if not isinstance(init, ast.InitializerList):
+            raise CodegenError(
+                f"`{name}`: struct must be initialized with `{{...}}` "
+                f"(got {type(init).__name__})"
+            )
+        members = self._structs[struct_ty.name]
+        if len(init.values) > len(members):
+            raise CodegenError(
+                f"`{name}`: too many initializers (got "
+                f"{len(init.values)}, struct has {len(members)} members)"
+            )
+        out: list[str] = []
+        for i, (m_name, m_ty, m_off) in enumerate(members):
+            m_disp = base_disp + m_off
+            if i < len(init.values):
+                value = init.values[i]
+                if (
+                    isinstance(m_ty, ast.StructType)
+                    and isinstance(value, ast.InitializerList)
+                ):
+                    out += self._struct_init(
+                        m_ty, value, m_disp, ctx, f"{name}.{m_name}"
+                    )
+                else:
+                    out += self._eval_expr_to_eax(value, ctx)
+                    out += self._store_from_eax(_ebp_addr(m_disp), m_ty)
+            else:
+                out += self._zero_fill_at(m_disp, self._size_of(m_ty))
+        return out
+
+    def _zero_fill_at(self, disp: int, size: int) -> list[str]:
+        """Emit asm zeroing `size` bytes starting at `[ebp + disp]`.
+
+        Uses the widest store that fits — `mov dword [...], 0` for each
+        4-byte chunk, then `mov word`, then `mov byte`. Works regardless
+        of the original type at that location, which is what we need for
+        zero-filling struct array tails or unspecified struct members.
+        """
+        out: list[str] = []
+        while size >= 4:
+            out.append(f"        mov     dword {_ebp_addr(disp)}, 0")
+            disp += 4
+            size -= 4
+        if size >= 2:
+            out.append(f"        mov     word {_ebp_addr(disp)}, 0")
+            disp += 2
+            size -= 2
+        if size >= 1:
+            out.append(f"        mov     byte {_ebp_addr(disp)}, 0")
+        return out
 
     def _return(self, stmt: ast.ReturnStmt, ctx: _FuncCtx) -> list[str]:
         if stmt.value is None:
@@ -1658,6 +1735,14 @@ class CodeGenerator:
         return out
 
     def _assign(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
+        # Struct-to-struct assignment `dst = src` short-circuits to a
+        # struct-copy regardless of the lvalue shape. Without this, the
+        # rhs's `_eval_expr_to_eax` would try to load the whole struct
+        # into EAX (which `_load_to_eax` rejects).
+        target_ty = self._type_of(expr.left, ctx)
+        if isinstance(target_ty, ast.StructType):
+            return self._struct_copy_assign(expr, target_ty, ctx)
+
         # `x = rhs` — direct slot store. Array names aren't lvalues in C.
         if isinstance(expr.left, ast.Identifier):
             ty = self._identifier_type(expr.left.name, ctx)
@@ -1692,12 +1777,9 @@ class CodeGenerator:
             out += self._store_from_eax("[ecx]", elem_ty)
             return out
         # `s.m = rhs` / `pp->m = rhs` — same address-once pattern.
+        # (Struct-typed members already short-circuited above.)
         if isinstance(expr.left, ast.Member):
             member_ty = self._type_of(expr.left, ctx)
-            if isinstance(member_ty, ast.StructType):
-                raise CodegenError(
-                    "struct-to-struct assignment is not supported yet"
-                )
             out = self._member_address(expr.left, ctx)
             out.append("        push    eax")
             out += self._eval_expr_to_eax(expr.right, ctx)
@@ -1708,6 +1790,58 @@ class CodeGenerator:
             f"assignment target must be an identifier, `*ptr`, `arr[i]`, "
             f"or `s.m` (got {type(expr.left).__name__})"
         )
+
+    def _struct_copy_assign(
+        self,
+        expr: ast.BinaryOp,
+        target_ty: ast.StructType,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Lower `dst = src` where dst is a struct l-value.
+
+        Both sides resolve to struct addresses; we copy `sizeof(struct)`
+        bytes via per-dword `mov` (with byte/word tail for non-multiples
+        of 4). EAX is left holding the destination address — a sentinel
+        that lets chained assignments compile, even though struct values
+        aren't first-class in our codegen yet.
+        """
+        rhs_ty = self._type_of(expr.right, ctx)
+        if not (
+            isinstance(rhs_ty, ast.StructType) and rhs_ty.name == target_ty.name
+        ):
+            raise CodegenError(
+                f"struct assignment requires both sides be the same struct type "
+                f"(got {target_ty.name} and "
+                f"{rhs_ty.name if isinstance(rhs_ty, ast.StructType) else type(rhs_ty).__name__})"
+            )
+        size = self._size_of(target_ty)
+        # Compute &src first, push it, then &dst — that way EDX (src) and
+        # ECX (dst) wind up holding the right values without further
+        # juggling.
+        out = self._struct_address(expr.right, ctx)        # eax = &src
+        out.append("        push    eax")
+        out += self._struct_address(expr.left, ctx)        # eax = &dst
+        out.append("        mov     ecx, eax")             # ecx = &dst
+        out.append("        pop     edx")                  # edx = &src
+        offset = 0
+        # Per-dword body. ECX/EDX are caller-save in cdecl, so clobbering
+        # is fine within a function.
+        while size - offset >= 4:
+            out.append(f"        mov     eax, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], eax")
+            offset += 4
+        if size - offset >= 2:
+            out.append(f"        mov     ax, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], ax")
+            offset += 2
+        if size - offset >= 1:
+            out.append(f"        mov     al, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], al")
+        # Leave EAX = &dst as the assignment-expression result. Real
+        # struct-value semantics would copy the struct again, but our
+        # codegen never reads a struct as a value.
+        out.append("        mov     eax, ecx")
+        return out
 
     def _compound_assign(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
         # `x op= rhs` is `x = x op rhs`. For Identifier lvalues, evaluating
