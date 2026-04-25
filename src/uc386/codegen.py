@@ -55,6 +55,11 @@ Current scope:
   variables shadow same-named globals via the `_identifier_*` lookup
   order. Global initializers must be compile-time constants —
   references to other globals are not yet emitted as `dd _other`.
+- Casts: `(T)expr` evaluates the operand and then narrows/extends
+  EAX as needed. Pointer↔pointer and within-int-family casts are
+  no-ops; narrowing to `char`/`short` emits `movsx eax, al/ax` (or
+  `movzx` for unsigned). `_type_of(Cast)` returns the target type so
+  e.g. `(char *)p + 1` scales by 1, not by the source's pointee size.
 - String literals: interned per-translation-unit, emitted as
   null-terminated bytes in `.data` with labels like `_uc386_strN`.
 - `extern` declarations (FunctionDecls without bodies) emit NASM
@@ -658,6 +663,35 @@ class CodeGenerator:
             return [f"        {mnem}   eax, byte {addr}"]
         raise CodegenError(f"can't load size-{size} value into eax")
 
+    def _cast(self, expr: ast.Cast, ctx: _FuncCtx) -> list[str]:
+        """Evaluate `expr.expr` then narrow/extend EAX to match `target_type`.
+
+        i386 makes most casts cheap: pointer ↔ pointer, int ↔ pointer, and
+        int ↔ long are all no-ops (every 32-bit value already lives in EAX).
+        Narrowing to char/short truncates through the low half of EAX
+        (`al`/`ax`) and re-extends per the target's signedness, so a
+        subsequent use of the value sees the right C semantics.
+        """
+        out = self._eval_expr_to_eax(expr.expr, ctx)
+        target = expr.target_type
+        if isinstance(target, ast.PointerType):
+            return out
+        if isinstance(target, ast.BasicType):
+            size = self._size_of(target)
+            if size == 4:
+                return out
+            mnem = "movzx" if target.is_signed is False else "movsx"
+            half = "al" if size == 1 else "ax" if size == 2 else None
+            if half is None:
+                raise CodegenError(
+                    f"cast to size-{size} basic type not supported"
+                )
+            out.append(f"        {mnem}   eax, {half}")
+            return out
+        raise CodegenError(
+            f"cast to {type(target).__name__} not supported"
+        )
+
     def _store_from_eax(self, addr: str, ty: ast.TypeNode) -> list[str]:
         """Lines that store EAX (treated as `ty`) to `addr`.
 
@@ -962,6 +996,8 @@ class CodeGenerator:
         if isinstance(expr, (ast.SizeofExpr, ast.SizeofType)):
             # `sizeof` returns size_t; treat it as int for our flat-32 ABI.
             return ast.BasicType(name="int")
+        if isinstance(expr, ast.Cast):
+            return expr.target_type
         if isinstance(expr, ast.Call):
             if isinstance(expr.func, ast.Identifier):
                 rt = self._func_return_types.get(expr.func.name)
@@ -988,6 +1024,8 @@ class CodeGenerator:
             return self._call(expr, ctx)
         if isinstance(expr, ast.TernaryOp):
             return self._ternary(expr, ctx)
+        if isinstance(expr, ast.Cast):
+            return self._cast(expr, ctx)
         if isinstance(expr, ast.SizeofType):
             return [f"        mov     eax, {self._size_of(expr.target_type)}"]
         if isinstance(expr, ast.SizeofExpr):

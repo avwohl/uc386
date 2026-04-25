@@ -678,6 +678,68 @@ def test_unsized_array_without_initializer_rejected():
         _compile("int main(void) { int a[]; return 0; }")
 
 
+# ---- casts ----------------------------------------------------------------
+
+def test_cast_int_to_signed_char_narrows():
+    asm = _compile("int main(void) { int x = 300; return (char)x; }")
+    # Truncate to byte then sign-extend back through al.
+    assert "movsx   eax, al" in asm
+
+
+def test_cast_int_to_unsigned_char_zero_extends():
+    asm = _compile("int main(void) { int x = 300; return (unsigned char)x; }")
+    assert "movzx   eax, al" in asm
+
+
+def test_cast_int_to_signed_short_narrows():
+    asm = _compile("int main(void) { int x = 70000; return (short)x; }")
+    assert "movsx   eax, ax" in asm
+
+
+def test_cast_int_to_unsigned_short_zero_extends():
+    asm = _compile("int main(void) { int x = 70000; return (unsigned short)x; }")
+    assert "movzx   eax, ax" in asm
+
+
+def test_cast_to_int_is_noop():
+    asm = _compile("int main(void) { int x = 5; return (int)x; }")
+    # No truncation instructions emitted.
+    assert "movsx" not in asm
+    assert "movzx" not in asm
+
+
+def test_cast_pointer_to_pointer_is_noop():
+    asm = _compile("int main(void) { int x = 0; char *p = (char *)&x; return 0; }")
+    # The address still loads via lea; the cast itself emits nothing.
+    assert "lea     eax, [ebp - 4]" in asm
+
+
+def test_cast_int_to_pointer():
+    # `(int *)0` is the canonical null-pointer form.
+    asm = _compile("int main(void) { int *p = (int *)0; return 0; }")
+    assert "mov     eax, 0" in asm
+
+
+def test_cast_then_arithmetic_uses_target_type():
+    # `(char *)p + 1` should scale by sizeof(char)=1, not sizeof(int)=4.
+    asm = _compile(
+        "int main(void) { int x = 0; char *p = (char *)&x + 1; return 0; }"
+    )
+    # No `shl eax, 2` from a missed scaling decision.
+    asm_lines = asm.splitlines()
+    # Allow scaling by 2 (short) or 1 (no-op) but specifically NOT by 4.
+    assert "shl     eax, 2" not in asm
+    # And we should still see the address arithmetic.
+    assert "add     eax, ecx" in asm
+
+
+def test_cast_widens_via_load():
+    # Loading a char already sign-extends; an explicit cast back to int is a no-op.
+    asm = _compile("int main(void) { char c = -1; return (int)c; }")
+    # The `c` read is already movsx, no additional widening needed.
+    assert "movsx   eax, byte [ebp - 4]" in asm
+
+
 # ---- globals --------------------------------------------------------------
 
 def test_global_int_uninitialized_in_bss():

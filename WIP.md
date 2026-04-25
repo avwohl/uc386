@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–13 are done. 152 tests passing.
-Slice 14+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–14 are done. 161 tests passing.
+Slice 15+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,17 +60,13 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 13 (just landed):
-- **Globals.** Top-level VarDecls — initialized to `.data`,
-  uninitialized to `.bss`. Read/written via `[_name]`; address-taken
-  via `_name` immediate. Locals shadow same-named globals. Init
-  expressions must be compile-time constants (`_const_eval` handles
-  literals + unary/binary integer ops).
+Implemented in slice 14 (just landed):
+- **Casts.** `(T)expr` — pointer casts and within-int-family casts are
+  no-ops; narrowing to char/short emits `movsx`/`movzx` of `al`/`ax`.
+  `_type_of(Cast)` returns the target so subsequent pointer arithmetic
+  scales by the right pointee size.
 
 Deliberately not yet implemented — next slices in roughly this order:
-- **Casts.** `(int)x`, `(char *)p`, etc. With sub-word codegen landed,
-  many casts are no-ops at the asm level (the load already extends);
-  narrowing casts need explicit truncation.
 - **Compound assignment to non-Identifier lvalues.** `arr[i] += 5` and
   `*p += 5` currently raise. Needs lowering that computes the address
   once into a temp slot rather than re-evaluating the lvalue twice.
@@ -85,9 +81,9 @@ Deliberately not yet implemented — next slices in roughly this order:
 - **Floating point.** `float` / `double` slot codegen via x87 or SSE.
   Big topic — likely a phase of its own.
 
-Suggested first move next session: read `CLAUDE.md`. **Casts** is
-the natural next slice — small, frequently needed (`(int *)malloc(...)`,
-`(char)x`). With sub-word codegen landed, narrowing casts emit a
-truncating store; widening casts mostly piggyback on the existing
-sign/zero-extend rules. **Function pointers / indirect calls** is also
-small (one branch in `_call`).
+Suggested first move next session: read `CLAUDE.md`. **Function
+pointers / indirect calls** is the smallest remaining slice — one
+branch in `_call` to evaluate a non-Identifier callee into a register
+and emit `call eax`. Then **CharLiteral** support (one expression
+handler, makes `'a'` work) and **compound-assign to lvalues** would
+round out Phase 4.
