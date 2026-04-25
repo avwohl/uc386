@@ -48,6 +48,13 @@ Current scope:
 - `sizeof(type)` and `sizeof(expr)` lower to a compile-time `mov eax, N`
   via the same `_size_of` used by pointer arithmetic. `sizeof(expr)`
   does not evaluate its operand — only the static type matters.
+- Top-level globals: read/written through `[_name]`, address taken via
+  `_name` immediate. Initialized globals land in `.data` (`db`/`dw`/`dd`
+  per element width, with assembler-time zero-padding for short
+  initializer lists), uninitialized in `.bss` as `resb N`. Local
+  variables shadow same-named globals via the `_identifier_*` lookup
+  order. Global initializers must be compile-time constants —
+  references to other globals are not yet emitted as `dd _other`.
 - String literals: interned per-translation-unit, emitted as
   null-terminated bytes in `.data` with labels like `_uc386_strN`.
 - `extern` declarations (FunctionDecls without bodies) emit NASM
@@ -132,6 +139,12 @@ class CodeGenerator:
         # `_type_of` give a Call expression the right type for downstream
         # pointer-arithmetic decisions.
         self._func_return_types: dict[str, ast.TypeNode] = {}
+        # Module-level variables declared at top scope. `_globals` carries
+        # the resolved type (size filled in for unsized arrays);
+        # `_global_inits` holds the initializer expression when one was
+        # supplied, so the `.data` emission can produce constants.
+        self._globals: dict[str, ast.TypeNode] = {}
+        self._global_inits: dict[str, ast.Expression] = {}
 
     # ---- top level ------------------------------------------------------
 
@@ -170,6 +183,19 @@ class CodeGenerator:
             elif isinstance(d, ast.VarDecl) and isinstance(d.var_type, ast.FunctionType):
                 self._func_return_types[d.name] = d.var_type.return_type
 
+        # Register top-level VarDecls (non-function-type) as globals. The
+        # resolved type fills in inferred array sizes the same way local
+        # var-decls do.
+        self._globals = {}
+        self._global_inits = {}
+        for d in unit.declarations:
+            if isinstance(d, ast.VarDecl) and not isinstance(d.var_type, ast.FunctionType):
+                resolved = self._resolved_var_type(d)
+                self._check_supported_type(resolved, d.name)
+                self._globals[d.name] = resolved
+                if d.init is not None:
+                    self._global_inits[d.name] = d.init
+
         lines: list[str] = []
         lines += self._header(extern_list)
         lines += self._start_stub()
@@ -179,9 +205,16 @@ class CodeGenerator:
         for block in function_blocks:
             lines.append("")
             lines += block
-        if self._strings:
+        # `.data` holds initialized globals plus interned string literals;
+        # `.bss` holds uninitialized globals (loader zeros them).
+        data_lines = self._data_section()
+        if data_lines:
             lines.append("")
-            lines += self._data_section()
+            lines += data_lines
+        bss_lines = self._bss_section()
+        if bss_lines:
+            lines.append("")
+            lines += bss_lines
         return "\n".join(lines) + "\n"
 
     def _header(self, externs: list[str]) -> list[str]:
@@ -200,12 +233,155 @@ class CodeGenerator:
         return out
 
     def _data_section(self) -> list[str]:
+        # Initialized globals + interned string literals share `.data`.
+        # Skip the section header entirely when neither is present so we
+        # don't emit an empty section.
+        initialized_globals = sorted(
+            name for name in self._globals if name in self._global_inits
+        )
+        if not self._strings and not initialized_globals:
+            return []
         out = ["        section .data"]
         # Stable order for reproducible output.
         for value, label in sorted(self._strings.items(), key=lambda kv: kv[1]):
             out.append(f"{label}:")
             out.append(f"        db      {self._render_string(value)}, 0")
+        for name in initialized_globals:
+            ty = self._globals[name]
+            init = self._global_inits[name]
+            out.append(f"_{name}:")
+            out += self._emit_global_init(ty, init, name)
         return out
+
+    def _bss_section(self) -> list[str]:
+        uninit = sorted(
+            name for name in self._globals if name not in self._global_inits
+        )
+        if not uninit:
+            return []
+        out = ["        section .bss"]
+        for name in uninit:
+            ty = self._globals[name]
+            size = self._size_of(ty)
+            out.append(f"_{name}:")
+            out.append(f"        resb    {size}")
+        return out
+
+    def _emit_global_init(
+        self,
+        ty: ast.TypeNode,
+        init: ast.Expression,
+        name: str,
+    ) -> list[str]:
+        """Emit NASM `db`/`dw`/`dd` directives for an initialized global.
+
+        Globals must initialize from compile-time constants — `_const_eval`
+        accepts integer literals and signed integer constants like `-1`.
+        Pointer-typed globals with `&other_global` initializers will land
+        when there's a clear use case; for now they raise.
+        """
+        # Scalar globals with a literal init.
+        if isinstance(ty, ast.BasicType):
+            value = self._const_eval(init, name)
+            directive = self._DATA_DIRECTIVE[self._size_of(ty)]
+            return [f"        {directive}      {value}"]
+        if isinstance(ty, ast.PointerType):
+            # Allow `int *p = 0` (null pointer). Pointer-to-other-global
+            # init is rejected pending a clearer use case.
+            value = self._const_eval(init, name)
+            return [f"        dd      {value}"]
+        if isinstance(ty, ast.ArrayType):
+            return self._emit_global_array_init(ty, init, name)
+        raise CodegenError(
+            f"global `{name}`: unsupported type {type(ty).__name__}"
+        )
+
+    def _emit_global_array_init(
+        self,
+        arr_ty: ast.ArrayType,
+        init: ast.Expression,
+        name: str,
+    ) -> list[str]:
+        elem_type = arr_ty.base_type
+        elem_size = self._size_of(elem_type)
+        directive = self._DATA_DIRECTIVE[elem_size]
+        length = arr_ty.size.value
+
+        if isinstance(init, ast.StringLiteral):
+            if not (
+                isinstance(elem_type, ast.BasicType) and elem_type.name == "char"
+            ):
+                raise CodegenError(
+                    f"global `{name}`: string init requires a char array"
+                )
+            chars = list(init.value.encode()) + [0]
+            if len(chars) > length:
+                raise CodegenError(
+                    f"global `{name}`: string init exceeds array size {length}"
+                )
+            # Render the printable run + explicit nulls + zero-pad in one db.
+            parts = [self._render_string(init.value), "0"]
+            parts.extend(["0"] * (length - len(chars)))
+            return [f"        db      {', '.join(parts)}"]
+
+        if isinstance(init, ast.InitializerList):
+            if len(init.values) > length:
+                raise CodegenError(
+                    f"global `{name}`: too many initializers "
+                    f"(got {len(init.values)}, array size {length})"
+                )
+            values = [str(self._const_eval(v, name)) for v in init.values]
+            values.extend(["0"] * (length - len(values)))
+            return [f"        {directive}      {', '.join(values)}"]
+
+        raise CodegenError(
+            f"global `{name}`: unsupported array initializer "
+            f"({type(init).__name__})"
+        )
+
+    # NASM directives keyed by element size in bytes.
+    _DATA_DIRECTIVE = {1: "db", 2: "dw", 4: "dd"}
+
+    def _const_eval(self, expr: ast.Expression, name: str) -> int:
+        """Evaluate a compile-time integer constant for a global initializer.
+
+        Accepts integer literals, signed/unsigned/bitwise unaries on them,
+        and simple arithmetic between literals. Anything that would require
+        actually generating code (identifier reads, function calls, etc.)
+        raises — globals can only be initialized from constants.
+        """
+        if isinstance(expr, ast.IntLiteral):
+            return expr.value
+        if isinstance(expr, ast.CharLiteral):
+            return expr.value
+        if isinstance(expr, ast.UnaryOp) and expr.is_prefix:
+            inner = self._const_eval(expr.operand, name)
+            if expr.op == "-":
+                return -inner
+            if expr.op == "+":
+                return inner
+            if expr.op == "~":
+                return ~inner
+            if expr.op == "!":
+                return 0 if inner else 1
+        if isinstance(expr, ast.BinaryOp):
+            l = self._const_eval(expr.left, name)
+            r = self._const_eval(expr.right, name)
+            if expr.op == "+":   return l + r
+            if expr.op == "-":   return l - r
+            if expr.op == "*":   return l * r
+            # `/` and `%` for ints in C are truncated toward zero.
+            if expr.op == "/":   return int(l / r) if r != 0 else 0
+            if expr.op == "%":   return l - int(l / r) * r if r != 0 else 0
+            if expr.op == "&":   return l & r
+            if expr.op == "|":   return l | r
+            if expr.op == "^":   return l ^ r
+            if expr.op == "<<":  return l << r
+            if expr.op == ">>":  return l >> r
+        raise CodegenError(
+            f"global `{name}`: initializer must be a constant expression "
+            f"(got {type(expr).__name__})"
+        )
 
     @staticmethod
     def _render_string(s: str) -> str:
@@ -410,6 +586,59 @@ class CodeGenerator:
     def _is_unsigned(t: ast.TypeNode) -> bool:
         # `is_signed=None` is the language default — signed for char/short/int.
         return isinstance(t, ast.BasicType) and t.is_signed is False
+
+    # ---- identifier resolution (local vs global) ----------------------
+
+    def _identifier_type(self, name: str, ctx: _FuncCtx) -> ast.TypeNode:
+        if name in ctx.slots:
+            return ctx.lookup_type(name)
+        if name in self._globals:
+            return self._globals[name]
+        raise CodegenError(f"unknown identifier `{name}`")
+
+    def _identifier_addr_text(self, name: str, ctx: _FuncCtx) -> str:
+        """Return the `[...]` operand text used for in-place memory ops.
+
+        Locals render as `[ebp - N]`; globals render as `[_name]`. Used by
+        `_inc_dec` (for `inc/dec dword [...]`-style instructions) where
+        `_load_to_eax` / `_store_from_eax` would be overkill.
+        """
+        if name in ctx.slots:
+            return _ebp_addr(ctx.lookup(name))
+        if name in self._globals:
+            return f"[_{name}]"
+        raise CodegenError(f"unknown identifier `{name}`")
+
+    def _identifier_load(self, name: str, ctx: _FuncCtx) -> list[str]:
+        """Lines that produce the value (or, for arrays, the address) of `name` in eax."""
+        ty = self._identifier_type(name, ctx)
+        if name in ctx.slots:
+            disp = ctx.lookup(name)
+            if isinstance(ty, ast.ArrayType):
+                # Array decay: yield the slot's address, not its bytes.
+                return [f"        lea     eax, {_ebp_addr(disp)}"]
+            return self._load_to_eax(_ebp_addr(disp), ty)
+        # Global path.
+        label = f"_{name}"
+        if isinstance(ty, ast.ArrayType):
+            # The label IS the address in flat-32; load it as an immediate.
+            return [f"        mov     eax, {label}"]
+        return self._load_to_eax(f"[{label}]", ty)
+
+    def _identifier_address(self, name: str, ctx: _FuncCtx) -> list[str]:
+        """Lines that compute &name into eax — for `&id` and as the base for indexing."""
+        if name in ctx.slots:
+            return [f"        lea     eax, {_ebp_addr(ctx.lookup(name))}"]
+        if name in self._globals:
+            return [f"        mov     eax, _{name}"]
+        raise CodegenError(f"unknown identifier `{name}`")
+
+    def _identifier_store(self, name: str, ctx: _FuncCtx) -> list[str]:
+        """Lines that store eax to the slot for `name`, with width per type."""
+        ty = self._identifier_type(name, ctx)
+        if name in ctx.slots:
+            return self._store_from_eax(_ebp_addr(ctx.lookup(name)), ty)
+        return self._store_from_eax(f"[_{name}]", ty)
 
     def _load_to_eax(self, addr: str, ty: ast.TypeNode) -> list[str]:
         """Lines that load a value of type `ty` from `addr` into EAX.
@@ -679,7 +908,7 @@ class CodeGenerator:
         the conservative default keeps non-pointer code on the integer path.
         """
         if isinstance(expr, ast.Identifier):
-            return ctx.lookup_type(expr.name)
+            return self._identifier_type(expr.name, ctx)
         if isinstance(expr, ast.IntLiteral):
             return ast.BasicType(name="int")
         if isinstance(expr, ast.StringLiteral):
@@ -748,13 +977,7 @@ class CodeGenerator:
             label = self._intern_string(expr.value)
             return [f"        mov     eax, {label}"]
         if isinstance(expr, ast.Identifier):
-            disp = ctx.lookup(expr.name)
-            ty = ctx.lookup_type(expr.name)
-            # Array decay: an array name in expression context yields the
-            # address of its first element, not the bytes at that slot.
-            if isinstance(ty, ast.ArrayType):
-                return [f"        lea     eax, {_ebp_addr(disp)}"]
-            return self._load_to_eax(_ebp_addr(disp), ty)
+            return self._identifier_load(expr.name, ctx)
         if isinstance(expr, ast.Index):
             return self._index_load(expr, ctx)
         if isinstance(expr, ast.UnaryOp):
@@ -876,8 +1099,7 @@ class CodeGenerator:
         # `&identifier` and `&arr[i]` are supported. `&*p` (a no-op) and
         # `&(struct.field)` will land when those constructs do.
         if isinstance(expr.operand, ast.Identifier):
-            disp = ctx.lookup(expr.operand.name)
-            return [f"        lea     eax, {_ebp_addr(disp)}"]
+            return self._identifier_address(expr.operand.name, ctx)
         if isinstance(expr.operand, ast.Index):
             # &arr[i] — same address arithmetic as a load, just no final deref.
             return self._index_address(expr.operand, ctx)
@@ -892,15 +1114,14 @@ class CodeGenerator:
                 f"`{expr.op}` operand must be an identifier "
                 f"(got {type(expr.operand).__name__})"
             )
-        ty = ctx.lookup_type(expr.operand.name)
+        ty = self._identifier_type(expr.operand.name, ctx)
         # Array names aren't lvalues — `++arr` is a C error, not "advance the
         # array pointer" (that would only make sense for a pointer variable).
         if isinstance(ty, ast.ArrayType):
             raise CodegenError(
                 f"cannot {expr.op} array `{expr.operand.name}`"
             )
-        disp = ctx.lookup(expr.operand.name)
-        addr = _ebp_addr(disp)
+        addr = self._identifier_addr_text(expr.operand.name, ctx)
         # On a pointer, ++/-- step by sizeof(*ptr) instead of 1. We still
         # mutate the slot in place — the slot stores the pointer value —
         # so an `add dword [...], N` covers it.
@@ -1136,14 +1357,13 @@ class CodeGenerator:
     def _assign(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
         # `x = rhs` — direct slot store. Array names aren't lvalues in C.
         if isinstance(expr.left, ast.Identifier):
-            ty = ctx.lookup_type(expr.left.name)
+            ty = self._identifier_type(expr.left.name, ctx)
             if isinstance(ty, ast.ArrayType):
                 raise CodegenError(
                     f"cannot assign to array `{expr.left.name}`"
                 )
-            disp = ctx.lookup(expr.left.name)
-            return self._eval_expr_to_eax(expr.right, ctx) + self._store_from_eax(
-                _ebp_addr(disp), ty
+            return self._eval_expr_to_eax(expr.right, ctx) + self._identifier_store(
+                expr.left.name, ctx
             )
         # `*p = rhs` — store-through-pointer. Evaluate the pointer expr
         # first, save its value, then evaluate rhs into EAX (so the result

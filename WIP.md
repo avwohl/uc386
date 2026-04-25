@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–12 are done. 136 tests passing.
-Slice 13+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–13 are done. 152 tests passing.
+Slice 14+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,15 +60,14 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 12 (just landed):
-- **`sizeof` operator.** Both `sizeof(type)` and `sizeof(expr)` lower
-  to a compile-time `mov eax, N` via the existing `_size_of` helper.
-  Operand of `sizeof(expr)` is unevaluated (no slot reads, no calls).
+Implemented in slice 13 (just landed):
+- **Globals.** Top-level VarDecls — initialized to `.data`,
+  uninitialized to `.bss`. Read/written via `[_name]`; address-taken
+  via `_name` immediate. Locals shadow same-named globals. Init
+  expressions must be compile-time constants (`_const_eval` handles
+  literals + unary/binary integer ops).
 
 Deliberately not yet implemented — next slices in roughly this order:
-- **Globals.** Same lowering model as locals but in `.data`/`.bss`
-  with named labels instead of `[ebp + disp]`. Architecturally the
-  largest remaining gap — most non-trivial C programs use globals.
 - **Casts.** `(int)x`, `(char *)p`, etc. With sub-word codegen landed,
   many casts are no-ops at the asm level (the load already extends);
   narrowing casts need explicit truncation.
@@ -86,8 +85,9 @@ Deliberately not yet implemented — next slices in roughly this order:
 - **Floating point.** `float` / `double` slot codegen via x87 or SSE.
   Big topic — likely a phase of its own.
 
-Suggested first move next session: read `CLAUDE.md`. **`sizeof`** is
-the natural next slice — small, lets the test suite write real
-`sizeof(arr)` / `sizeof(int)` instead of hardcoded magic numbers.
-**Globals** would be the next architectural step (a new lowering
-pathway, similar shape to slice 4).
+Suggested first move next session: read `CLAUDE.md`. **Casts** is
+the natural next slice — small, frequently needed (`(int *)malloc(...)`,
+`(char)x`). With sub-word codegen landed, narrowing casts emit a
+truncating store; widening casts mostly piggyback on the existing
+sign/zero-extend rules. **Function pointers / indirect calls** is also
+small (one branch in `_call`).

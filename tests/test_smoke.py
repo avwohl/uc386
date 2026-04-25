@@ -678,6 +678,124 @@ def test_unsized_array_without_initializer_rejected():
         _compile("int main(void) { int a[]; return 0; }")
 
 
+# ---- globals --------------------------------------------------------------
+
+def test_global_int_uninitialized_in_bss():
+    asm = _compile("int g; int main(void) { return 0; }")
+    assert "section .bss" in asm
+    assert "_g:" in asm
+    # NASM `resb` reserves N bytes of uninitialized space.
+    assert "resb    4" in asm
+
+
+def test_global_int_initialized_in_data():
+    asm = _compile("int g = 42; int main(void) { return 0; }")
+    assert "section .data" in asm
+    assert "_g:" in asm
+    assert "dd      42" in asm
+
+
+def test_global_int_read_uses_label():
+    asm = _compile("int g = 7; int main(void) { return g; }")
+    # No frame load — direct memory access via the label.
+    assert "mov     eax, [_g]" in asm
+
+
+def test_global_int_write_uses_label():
+    asm = _compile("int g; int main(void) { g = 5; return g; }")
+    assert "mov     [_g], eax" in asm
+
+
+def test_global_address_of_emits_label_immediate():
+    asm = _compile("int g; int main(void) { int *p = &g; return 0; }")
+    # `&g` loads the label as an absolute address (immediate operand).
+    assert "mov     eax, _g" in asm
+
+
+def test_global_array_uninitialized_in_bss():
+    asm = _compile("int arr[3]; int main(void) { return arr[0]; }")
+    assert "section .bss" in asm
+    assert "_arr:" in asm
+    assert "resb    12" in asm
+    # Array decay loads the label into eax as the base address.
+    assert "mov     eax, _arr" in asm
+
+
+def test_global_array_initialized_in_data():
+    asm = _compile("int arr[3] = {1, 2, 3}; int main(void) { return arr[1]; }")
+    assert "section .data" in asm
+    assert "_arr:" in asm
+    assert "dd      1, 2, 3" in asm
+
+
+def test_global_array_underspecified_zero_filled():
+    asm = _compile("int arr[5] = {1, 2}; int main(void) { return 0; }")
+    # Assembler-time zero-fill via the directive.
+    assert "dd      1, 2, 0, 0, 0" in asm
+
+
+def test_global_string_array_inferred_size():
+    asm = _compile('char s[] = "hi"; int main(void) { return 0; }')
+    assert "_s:" in asm
+    # String stored inline: 'h', 'i', 0.
+    assert "db      'hi', 0" in asm
+
+
+def test_global_string_array_with_padding():
+    asm = _compile('char s[5] = "hi"; int main(void) { return 0; }')
+    # 'h', 'i', null, then 2 zero-pad bytes to fill out to 5.
+    assert "db      'hi', 0, 0, 0" in asm
+
+
+def test_global_char_uses_db():
+    asm = _compile("char c = 65; int main(void) { return c; }")
+    assert "db      65" in asm
+    # Read still goes through movsx (signed-char default).
+    assert "movsx   eax, byte [_c]" in asm
+
+
+def test_global_short_uses_dw_with_negative_value():
+    asm = _compile("short s = -1; int main(void) { return s; }")
+    # NASM accepts negative values directly in `dw`; the assembler chooses
+    # the right two's-complement encoding.
+    assert "dw      -1" in asm
+    assert "movsx   eax, word [_s]" in asm
+
+
+def test_global_increment_uses_label():
+    asm = _compile("int g; int main(void) { ++g; return g; }")
+    assert "inc     dword [_g]" in asm
+
+
+def test_local_shadows_global():
+    asm = _compile("int g = 99; int main(void) { int g = 5; return g; }")
+    asm_lines = asm.splitlines()
+    # The local is at [ebp - 4]; the return must read from there, not [_g].
+    ret_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "jmp     .epilogue")
+    prev_load = next(
+        l for l in reversed(asm_lines[:ret_idx])
+        if l.strip().startswith("mov     eax,")
+    )
+    assert "[ebp - 4]" in prev_load
+    # The global is still emitted — its label is still in .data.
+    assert "_g:" in asm
+    assert "dd      99" in asm
+
+
+def test_non_constant_global_init_rejected():
+    # Globals must be initialized with literals, not expressions referencing
+    # other names.
+    with pytest.raises(CodegenError, match="constant|literal"):
+        _compile(
+            "int x = 5; int g = x + 1; int main(void) { return 0; }"
+        )
+
+
+def test_negative_int_global_init():
+    asm = _compile("int g = -7; int main(void) { return g; }")
+    assert "dd      -7" in asm
+
+
 # ---- sizeof ---------------------------------------------------------------
 
 @pytest.mark.parametrize(
