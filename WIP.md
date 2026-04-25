@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–31 done. Phase 5 (floats) slices 1–7 done.
-298 tests passing.
+Phase 4 slices 0–31 done. Phase 5 (floats) slices 1–8 done.
+301 tests passing.
 
 ## Bootstrap on the new machine
 
@@ -60,9 +60,9 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in Phase 5 slice 7 (just landed):
-- **Float compound assign to lvalues.** `arr[i] += f`, `*p -= f`,
-  `s.m *= f` via address-once + fld + faddp/fsubp/fmulp/fdivp + fst.
+Implemented in Phase 5 slice 8 (just landed):
+- **Float `++` / `--`.** Pre and post forms via fld + fld1 + faddp
+  (or fsubp). Identifier lvalues only.
 
 Deliberately not yet implemented:
 - **Variadic function definitions** (callee-side va_list / va_arg /
@@ -73,8 +73,6 @@ Deliberately not yet implemented:
   Right now the caller emits a qword push for an unsuffixed literal
   passed to a `float` param. A coercion pass at the call site (look
   up param types) would fix this — currently we just require `2.5f`.
-- **Float `++` / `--`.** `++f` for float `f` is uncommon and currently
-  raises in `_eval_float_to_st0`'s UnaryOp branch.
 
 ## Phase 5 design questions (floats — settled, kept here for reference)
 

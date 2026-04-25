@@ -2129,6 +2129,8 @@ class CodeGenerator:
                 return self._eval_float_to_st0(expr.operand, ctx) + [
                     "        fchs",
                 ]
+            if expr.op in ("++", "--"):
+                return self._float_inc_dec(expr, ctx)
             raise CodegenError(
                 f"unary `{expr.op}` not supported on float operand"
             )
@@ -2273,6 +2275,39 @@ class CodeGenerator:
         out.append("        pop     ecx")
         out.append(f"        fst     {width} [ecx]")
         return out
+
+    def _float_inc_dec(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
+        """`++f` / `--f` / `f++` / `f--` for a float Identifier.
+
+        Pre-form: bump the slot, leaving the new value on st(0).
+        Post-form: load the slot twice, bump one copy, store it, leaving
+        the original value on st(0) so the expression yields the old.
+        """
+        if not isinstance(expr.operand, ast.Identifier):
+            raise CodegenError(
+                f"`{expr.op}` on a float requires an identifier"
+            )
+        name = expr.operand.name
+        ty = self._identifier_type(name, ctx)
+        addr = self._float_lvalue_addr(name, ctx)
+        size = self._size_of(ty)
+        width = "dword" if size == 4 else "qword"
+        op_mnem = "faddp" if expr.op == "++" else "fsubp"
+        if expr.is_prefix:
+            return [
+                f"        fld     {width} {addr}",
+                "        fld1",
+                f"        {op_mnem}   st1, st0",
+                f"        fst     {width} {addr}",
+            ]
+        # Post-form: keep the old value on st(0) after storing the new.
+        return [
+            f"        fld     {width} {addr}",   # st0 = old (the value we yield)
+            f"        fld     {width} {addr}",   # st0 = old, st1 = old
+            "        fld1",                       # st0 = 1, st1 = old, st2 = old
+            f"        {op_mnem}   st1, st0",      # pops, st1 = old±1. Now st0 = old±1, st1 = old.
+            f"        fstp    {width} {addr}",   # store new, pop. st0 = old.
+        ]
 
     def _float_compound_assign(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
         """Lower `lvalue op= rhs` where the value is float-typed.

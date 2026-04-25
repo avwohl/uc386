@@ -1256,6 +1256,39 @@ def test_logical_and_with_float_operand():
     assert "fucompp" in asm
 
 
+# ---- float ++ / -- --------------------------------------------------------
+
+def test_float_prefix_increment():
+    asm = _compile(
+        "int main(void) { float f = 1.5f; ++f; return (int)f; }"
+    )
+    # `++f` on a float: load, fld1, faddp, fst.
+    assert "fld1" in asm
+    assert "faddp" in asm
+
+
+def test_float_prefix_decrement():
+    asm = _compile(
+        "int main(void) { float f = 2.5f; --f; return (int)f; }"
+    )
+    assert "fld1" in asm
+    assert "fsubp" in asm
+
+
+def test_float_postfix_increment_returns_old_value():
+    # `f++` should yield the old value but leave f as old + 1.
+    asm = _compile(
+        "int main(void) { float f = 1.5f; float g = f++; return (int)g; }"
+    )
+    asm_lines = asm.splitlines()
+    # Expect two `fld dword [ebp - 4]` (one for the kept old value, one
+    # for the bumped copy).
+    fld_count = sum(1 for l in asm_lines if "fld     dword [ebp - 4]" in l)
+    assert fld_count >= 2
+    assert "fld1" in asm
+    assert "faddp" in asm
+
+
 # ---- float lvalue stores --------------------------------------------------
 
 def test_float_array_element_assignment():
