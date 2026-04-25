@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–24 are done. 229 tests passing.
-Slice 25+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–25 are done. 234 tests passing.
+Slice 26+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,14 +60,11 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 24 (just landed):
-- **Designated initializers.** `[N] = value` (arrays) and
-  `.field = value` (structs), mixed with positional, with cursor
-  tracking and zero-fill of unfilled positions.
+Implemented in slice 25 (just landed):
+- **Multidim arrays.** `int m[2][3]`, `m[i][j]` indexing, decay of
+  inner array to pointer (`int *row = m[1]`), sizeof through any depth.
 
 Deliberately not yet implemented — what's left of Phase 4:
-- **Multidim arrays.** `int m[2][3]` would need ArrayType-of-ArrayType
-  slot support and per-row indexing in `_index_address`.
 - **Bitfields.** Niche; `_register_struct` rejects `bit_width != None`.
 - **Floating point.** `float` / `double` slot codegen via x87 or SSE.
   Big topic — likely a phase of its own.

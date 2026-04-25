@@ -1773,8 +1773,15 @@ class CodeGenerator:
     def _index_load(self, expr: ast.Index, ctx: _FuncCtx) -> list[str]:
         # Read through the computed element address using a width matching
         # the element type — `arr[i]` for `char arr[]` reads one byte.
+        # For aggregate elements (an inner array of a multidim or a
+        # struct row), evaluating the expression yields the element's
+        # address (array-to-pointer decay / struct l-value), since we
+        # don't load aggregates into EAX.
         elem_ty = self._type_of(expr, ctx)
-        return self._index_address(expr, ctx) + self._load_to_eax("[eax]", elem_ty)
+        addr = self._index_address(expr, ctx)
+        if isinstance(elem_ty, (ast.ArrayType, ast.StructType)):
+            return addr
+        return addr + self._load_to_eax("[eax]", elem_ty)
 
     def _ternary(self, expr: ast.TernaryOp, ctx: _FuncCtx) -> list[str]:
         false_label = ctx.label("tern_false")
