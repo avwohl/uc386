@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–28 are done. 247 tests passing.
-Slice 29+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–29 are done. 251 tests passing.
+Slice 30+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,12 +60,10 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slices 27–28 (just landed):
-- **Variadic external calls.** `printf(fmt, ...)` works via the
-  existing cdecl arg push (no callee-side va_list yet).
-- **Enums.** `enum c { A, B = 5, C }` registers A=0, B=5, C=6.
-  Identifier lookup falls back to the enum table; `enum c x = B`
-  works as a 4-byte slot.
+Implemented in slice 29 (just landed):
+- **Typedef'd structs.** `typedef struct { ... } P;` and named-tag
+  versions register the layout lazily via `_resolve_struct_name`.
+  Anonymous typedef'd structs get a synthetic registry key.
 
 Deliberately not yet implemented — what's left of Phase 4:
 - **Bitfields.** Niche; `_register_struct` rejects `bit_width != None`.

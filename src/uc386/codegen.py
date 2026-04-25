@@ -693,14 +693,10 @@ class CodeGenerator:
             self._check_supported_type(t.base_type, name)
             return
         if isinstance(t, ast.StructType):
-            if t.name is None:
-                raise CodegenError(
-                    f"`{name}`: anonymous structs are not supported yet"
-                )
-            if t.name not in self._structs:
-                raise CodegenError(
-                    f"`{name}`: unknown struct `{t.name}` — define it before use"
-                )
+            # `_resolve_struct_name` lazily registers typedef'd or
+            # otherwise-inline-defined structs and raises if neither a
+            # registered name nor inline members are available.
+            self._resolve_struct_name(t)
             return
         raise CodegenError(
             f"`{name}`: only `int`/`short`/`char`, pointer, array, and "
@@ -767,14 +763,39 @@ class CodeGenerator:
                 raise CodegenError("sizeof(array): size must be an integer literal")
             return t.size.value * self._size_of(t.base_type)
         if isinstance(t, ast.StructType):
-            if t.name not in self._struct_sizes:
-                raise CodegenError(
-                    f"sizeof(struct {t.name}): struct not defined"
-                )
-            return self._struct_sizes[t.name]
+            return self._struct_sizes[self._resolve_struct_name(t)]
         if isinstance(t, ast.EnumType):
             return 4
         raise CodegenError(f"sizeof not supported for {type(t).__name__}")
+
+    def _resolve_struct_name(self, t: ast.StructType) -> str:
+        """Return a registry key for `t`, registering its layout if needed.
+
+        Top-level `struct point { ... };` definitions are registered
+        eagerly during `generate()`. But `typedef struct { ... } P;`
+        produces a StructType node with inline members and (sometimes)
+        no name — the parser doesn't synthesize a separate StructDecl
+        for it. We register on first sight here using either the
+        struct's name or a synthetic id-based key.
+        """
+        if t.name and t.name in self._structs:
+            return t.name
+        if t.members:
+            key = t.name or f"__anon_struct_{id(t)}"
+            if key not in self._structs:
+                # Synthesize a minimal StructDecl-shaped object so we can
+                # reuse `_register_struct`. SimpleNamespace is enough; the
+                # method only reads name / members / is_union.
+                from types import SimpleNamespace
+                self._register_struct(SimpleNamespace(
+                    name=key, members=t.members, is_union=t.is_union,
+                ))
+            return key
+        if t.name:
+            raise CodegenError(
+                f"unknown struct `{t.name}` — define it before use"
+            )
+        raise CodegenError("anonymous struct without inline members")
 
     def _register_enum(self, decl: ast.EnumDecl) -> None:
         """Compute and record each `EnumValue`'s integer constant.
@@ -879,7 +900,7 @@ class CodeGenerator:
         if isinstance(t, ast.ArrayType):
             return self._alignment_of(t.base_type)
         if isinstance(t, ast.StructType):
-            members = self._structs.get(t.name) if t.name else None
+            members = self._structs.get(self._resolve_struct_name(t))
             if not members:
                 return 1
             return max(self._alignment_of(mt) for _, mt, _ in members)
@@ -906,7 +927,7 @@ class CodeGenerator:
                     f"`->` requires a pointer to struct "
                     f"(got {type(obj_ty).__name__})"
                 )
-            struct_name = obj_ty.base_type.name
+            struct_name = self._resolve_struct_name(obj_ty.base_type)
             # eax = the pointer's value, i.e. the struct's address.
             out = self._eval_expr_to_eax(expr.obj, ctx)
         else:
@@ -916,7 +937,7 @@ class CodeGenerator:
                     f"`.` requires a struct value "
                     f"(got {type(obj_ty).__name__})"
                 )
-            struct_name = obj_ty.name
+            struct_name = self._resolve_struct_name(obj_ty)
             out = self._struct_address(expr.obj, ctx)
         _, offset = self._member_layout(struct_name, expr.member)
         if offset != 0:
@@ -1469,7 +1490,7 @@ class CodeGenerator:
                 f"`{name}`: struct must be initialized with `{{...}}` "
                 f"(got {type(init).__name__})"
             )
-        members = self._structs[struct_ty.name]
+        members = self._structs[self._resolve_struct_name(struct_ty)]
         member_index = {m_name: i for i, (m_name, _, _) in enumerate(members)}
         # Walk source values in order, tracking the implicit cursor. A
         # `.field = expr` sets the cursor to that member's index; the
@@ -1727,13 +1748,13 @@ class CodeGenerator:
                         f"`->` requires a pointer to struct "
                         f"(got {type(obj_ty).__name__})"
                     )
-                struct_name = obj_ty.base_type.name
+                struct_name = self._resolve_struct_name(obj_ty.base_type)
             else:
                 if not isinstance(obj_ty, ast.StructType):
                     raise CodegenError(
                         f"`.` requires a struct (got {type(obj_ty).__name__})"
                     )
-                struct_name = obj_ty.name
+                struct_name = self._resolve_struct_name(obj_ty)
             ty, _ = self._member_layout(struct_name, expr.member)
             return ty
         if isinstance(expr, ast.BinaryOp):
@@ -2334,13 +2355,17 @@ class CodeGenerator:
         aren't first-class in our codegen yet.
         """
         rhs_ty = self._type_of(expr.right, ctx)
-        if not (
-            isinstance(rhs_ty, ast.StructType) and rhs_ty.name == target_ty.name
-        ):
+        if not isinstance(rhs_ty, ast.StructType):
             raise CodegenError(
-                f"struct assignment requires both sides be the same struct type "
-                f"(got {target_ty.name} and "
-                f"{rhs_ty.name if isinstance(rhs_ty, ast.StructType) else type(rhs_ty).__name__})"
+                f"struct assignment requires both sides be the same "
+                f"struct type (got {type(rhs_ty).__name__} on rhs)"
+            )
+        target_key = self._resolve_struct_name(target_ty)
+        rhs_key = self._resolve_struct_name(rhs_ty)
+        if target_key != rhs_key:
+            raise CodegenError(
+                f"struct assignment requires both sides be the same "
+                f"struct type (got `{target_key}` and `{rhs_key}`)"
             )
         size = self._size_of(target_ty)
         # Compute &src first, push it, then &dst — that way EDX (src) and

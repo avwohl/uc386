@@ -1037,6 +1037,48 @@ def test_break_outside_switch_or_loop_still_rejected():
         _compile("int main(void) { break; return 0; }")
 
 
+# ---- typedef + storage classes --------------------------------------------
+
+def test_typedef_basic_int_resolved_at_parse_time():
+    # uc_core resolves typedef-of-int into BasicType(int) before codegen
+    # ever sees it — no special handling needed.
+    asm = _compile(
+        "typedef int mytype; "
+        "int main(void) { mytype x = 5; return x; }"
+    )
+    assert "mov     eax, 5" in asm
+
+
+def test_typedef_named_struct():
+    asm = _compile(
+        "typedef struct point { int x; int y; } Point; "
+        "int main(void) { Point p; p.x = 5; p.y = 7; return p.x + p.y; }"
+    )
+    assert "sub     esp, 8" in asm
+
+
+def test_typedef_anonymous_struct():
+    # `typedef struct { ... } P;` produces a StructType with name=None
+    # and inline members. We register it under a synthetic name on
+    # first sight.
+    asm = _compile(
+        "typedef struct { int x; int y; } AP; "
+        "int main(void) { AP a; a.x = 1; return a.x; }"
+    )
+    assert "sub     esp, 8" in asm
+
+
+def test_top_level_static_global_works_like_regular():
+    asm = _compile(
+        "static int counter = 7; "
+        "int main(void) { counter = counter + 1; return counter; }"
+    )
+    # Stored in .data like any other initialized global.
+    assert "_counter:" in asm
+    assert "dd      7" in asm
+    assert "[_counter]" in asm
+
+
 # ---- enums ----------------------------------------------------------------
 
 def test_enum_implicit_values_start_at_zero():
