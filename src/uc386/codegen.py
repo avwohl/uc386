@@ -4082,7 +4082,7 @@ class CodeGenerator:
             # bytes are at the same `[ebp - N]` regardless of width because
             # x86 is little-endian.
             size = self._size_of(ty)
-            width = {1: "byte", 2: "word", 4: "dword"}[size]
+            width = {1: "byte", 2: "word", 4: "dword", 8: "dword"}[size]
             instr = "inc" if expr.op == "++" else "dec"
             bump = [f"        {instr}     {width} {addr}"]
         load = self._load_to_eax(addr, ty)
@@ -4120,7 +4120,7 @@ class CodeGenerator:
         else:
             step = 1
             size = self._size_of(target_ty)
-            width = {1: "byte", 2: "word", 4: "dword"}[size]
+            width = {1: "byte", 2: "word", 4: "dword", 8: "dword"}[size]
         op_mnem = "add" if expr.op == "++" else "sub"
 
         out = list(addr_lines)  # eax = &lvalue
