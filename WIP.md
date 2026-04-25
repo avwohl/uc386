@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–31 done. Phase 5 (floats) slices 1–8 done.
-301 tests passing.
+Phase 4 slices 0–31 done. Phase 5 (floats) slices 1–9 done.
+303 tests passing.
 
 ## Bootstrap on the new machine
 
@@ -60,19 +60,17 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in Phase 5 slice 8 (just landed):
-- **Float `++` / `--`.** Pre and post forms via fld + fld1 + faddp
-  (or fsubp). Identifier lvalues only.
+Implemented in Phase 5 slice 9 (just landed):
+- **Float arg width coercion at the call site.** `_func_param_types`
+  table; `_emit_call` looks up expected param types and uses them
+  for the push width. `square(2.5)` for `float square(float)` now
+  narrows to a 4-byte push.
 
 Deliberately not yet implemented:
 - **Variadic function definitions** (callee-side va_list / va_arg /
   va_start). Variadic *call sites* already work.
 - **Static / register storage classes** beyond what cdecl already
   gives.
-- **Auto-narrowing of `double` literals at float-typed param sites.**
-  Right now the caller emits a qword push for an unsuffixed literal
-  passed to a `float` param. A coercion pass at the call site (look
-  up param types) would fix this — currently we just require `2.5f`.
 
 ## Phase 5 design questions (floats — settled, kept here for reference)
 

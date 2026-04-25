@@ -206,6 +206,10 @@ class CodeGenerator:
         # `_type_of` give a Call expression the right type for downstream
         # pointer-arithmetic decisions.
         self._func_return_types: dict[str, ast.TypeNode] = {}
+        # Map from function name to its declared parameter types. Used
+        # by `_emit_call` to coerce arg widths at the call site (e.g.
+        # narrow a `double` literal when the param is `float`).
+        self._func_param_types: dict[str, list[ast.TypeNode]] = {}
         # Module-level variables declared at top scope. `_globals` carries
         # the resolved type (size filled in for unsized arrays);
         # `_global_inits` holds the initializer expression when one was
@@ -256,15 +260,21 @@ class CodeGenerator:
         # the table at the top of each generate() call so the codegen is
         # safe to reuse.
         self._strings = {}
-        # Build the function-return-type table from every declaration in
-        # the unit (defined or extern). Calls to unknown names default to
-        # int in `_type_of`.
+        # Build the function-return-type and param-type tables from
+        # every declaration in the unit (defined or extern). Calls to
+        # unknown names default to int in `_type_of`; arg coercion in
+        # `_emit_call` only fires when the param types are known.
         self._func_return_types = {}
+        self._func_param_types = {}
         for d in unit.declarations:
             if isinstance(d, ast.FunctionDecl):
                 self._func_return_types[d.name] = d.return_type
+                self._func_param_types[d.name] = [
+                    p.param_type for p in d.params
+                ]
             elif isinstance(d, ast.VarDecl) and isinstance(d.var_type, ast.FunctionType):
                 self._func_return_types[d.name] = d.var_type.return_type
+                self._func_param_types[d.name] = list(d.var_type.param_types)
 
         # Reset struct + globals state. Structs need to be registered
         # before globals because a global of struct type will look up the
@@ -2498,9 +2508,22 @@ class CodeGenerator:
         # holds asm lines that produce the destination address in EAX;
         # we push it after the regular args so it lands at the lowest
         # address (= the hidden first param).
+        # If we know the called function's param types, look them up so
+        # we can coerce arg widths (e.g. narrow a `double` literal when
+        # the param is declared `float`). Variadic and indirect calls
+        # fall through to the arg's own type.
+        param_types: list[ast.TypeNode] | None = None
+        if direct is not None and direct in self._func_param_types:
+            param_types = self._func_param_types[direct]
         out: list[str] = []
         total_arg_bytes = 0
-        for arg in reversed(args):
+        for arg_idx, arg in enumerate(reversed(args)):
+            # `reversed` reverses the list; recompute the original index
+            # so we can look up the matching param type.
+            real_idx = len(args) - 1 - arg_idx
+            expected_ty: ast.TypeNode | None = None
+            if param_types is not None and real_idx < len(param_types):
+                expected_ty = param_types[real_idx]
             arg_ty = self._type_of(arg, ctx)
             if isinstance(arg_ty, ast.StructType):
                 size = self._size_of(arg_ty)
@@ -2525,8 +2548,15 @@ class CodeGenerator:
             elif self._is_float_type(arg_ty):
                 # Float arg: evaluate to st(0), then `fstp` into a
                 # freshly-reserved arg slot. cdecl pushes 4 bytes for
-                # `float`, 8 for `double`.
-                size = self._size_of(arg_ty)
+                # `float`, 8 for `double`. If the function's param type
+                # is known and float-typed, coerce the push width to
+                # match it — that's how a `double` literal like `2.5`
+                # narrows to `float` at a `float`-typed param site, and
+                # how `1.5f` widens to `double` symmetrically.
+                effective_ty = arg_ty
+                if expected_ty is not None and self._is_float_type(expected_ty):
+                    effective_ty = expected_ty
+                size = self._size_of(effective_ty)
                 width = "dword" if size == 4 else "qword"
                 out += self._eval_float_to_st0(arg, ctx)
                 out.append(f"        sub     esp, {size}")

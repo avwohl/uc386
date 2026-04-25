@@ -1151,6 +1151,38 @@ def test_double_param_loaded_qword_and_takes_eight_bytes():
     assert "fld     qword [ebp + 8]" in fn_section
 
 
+def test_double_literal_narrowed_at_float_param():
+    # Without a coercion pass, `2.5` (double) at a float param site
+    # would push 8 bytes; the callee'd then misread its frame. With
+    # narrowing, the caller pushes 4 bytes.
+    asm = _compile(
+        "float square(float x) { return x * x; } "
+        "int main(void) { return (int)square(2.5); }"
+    )
+    asm_lines = asm.splitlines()
+    main_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_main:")
+    main_section = "\n".join(asm_lines[main_idx:])
+    # Narrowed to 4-byte float at the call site.
+    assert "sub     esp, 4" in main_section
+    assert "fstp    dword [esp]" in main_section
+    # And no 8-byte qword push for this literal.
+    assert "fstp    qword [esp]" not in main_section
+
+
+def test_float_arg_widened_at_double_param():
+    # The reverse: `1.5f` at a double param. The caller widens to
+    # 8 bytes via the same fld/fstp width swap.
+    asm = _compile(
+        "double scale(double x) { return x * x; } "
+        "int main(void) { return (int)scale(1.5f); }"
+    )
+    asm_lines = asm.splitlines()
+    main_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_main:")
+    main_section = "\n".join(asm_lines[main_idx:])
+    assert "sub     esp, 8" in main_section
+    assert "fstp    qword [esp]" in main_section
+
+
 def test_caller_pushes_float_arg_via_fstp():
     # Use `2.5f` (float-suffixed) so the literal matches the declared
     # param type. Without a coercion pass at the call site, an unsuffixed
