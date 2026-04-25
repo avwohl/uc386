@@ -326,6 +326,74 @@ def test_param_and_local_share_namespace():
         _compile("int f(int x) { int x = 7; return x; } int main(void) { return 0; }")
 
 
+# ---- compound assign / ++ / -- / ternary -----------------------------------
+
+@pytest.mark.parametrize(
+    "op,instr",
+    [
+        ("+=", "add     eax, ecx"),
+        ("-=", "sub     eax, ecx"),
+        ("*=", "imul    eax, ecx"),
+        ("&=", "and     eax, ecx"),
+        ("|=", "or      eax, ecx"),
+        ("^=", "xor     eax, ecx"),
+    ],
+)
+def test_compound_assign_simple(op, instr):
+    asm = _compile(f"int main(void) {{ int x = 1; x {op} 2; return x; }}")
+    assert instr in asm
+    # Result is written back to the lvalue's slot.
+    assert "mov     [ebp - 4], eax" in asm
+
+
+def test_compound_div_uses_idiv():
+    asm = _compile("int main(void) { int x = 10; x /= 3; return x; }")
+    assert "idiv    ecx" in asm
+    assert "mov     [ebp - 4], eax" in asm
+
+
+def test_prefix_increment_loads_new_value():
+    asm = _compile("int main(void) { int x = 5; int y = ++x; return y; }")
+    lines = asm.splitlines()
+    # The prefix bump emits `inc dword [ebp-4]` *before* loading EAX from
+    # that slot. Find them and verify ordering.
+    inc_idx = next(i for i, l in enumerate(lines) if "inc     dword [ebp - 4]" in l)
+    load_idx = next(i for i, l in enumerate(lines) if i > inc_idx and l.strip() == "mov     eax, [ebp - 4]")
+    assert load_idx == inc_idx + 1
+
+
+def test_postfix_increment_loads_old_value():
+    asm = _compile("int main(void) { int x = 5; int y = x++; return y; }")
+    lines = asm.splitlines()
+    # Postfix loads the old value, then bumps in place.
+    load_idx = next(
+        i for i, l in enumerate(lines)
+        if l.strip() == "mov     eax, [ebp - 4]"
+        and i + 1 < len(lines)
+        and "inc     dword [ebp - 4]" in lines[i + 1]
+    )
+    assert load_idx >= 0
+
+
+def test_decrement_uses_dec():
+    asm = _compile("int main(void) { int x = 5; --x; return x; }")
+    assert "dec     dword [ebp - 4]" in asm
+
+
+def test_inc_dec_on_non_identifier_rejected():
+    with pytest.raises(CodegenError, match="must be an identifier"):
+        _compile("int main(void) { int x = 0; ++(x + 1); return 0; }")
+
+
+def test_ternary_emits_cond_branch_and_join():
+    asm = _compile("int main(void) { int x = 1; return x ? 7 : 9; }")
+    assert "_tern_false:" in asm
+    assert "_tern_end:" in asm
+    # True branch loads 7, false branch loads 9.
+    assert "mov     eax, 7" in asm
+    assert "mov     eax, 9" in asm
+
+
 def test_end_to_end_driver(tmp_path):
     src = tmp_path / "hi.c"
     src.write_text("int main(void) { return 0; }\n")

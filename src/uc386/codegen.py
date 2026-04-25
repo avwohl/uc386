@@ -17,8 +17,11 @@ Current scope:
 - `int` locals with arbitrary initializer expressions.
 - Reading a local or parameter in any expression position.
 - Assignment to a local or parameter (`x = expr;`).
-- Unary `+ - ~ !` and binary `+ - * / % & | ^ << >> == != < > <= >=`.
+- Unary `+ - ~ !` and prefix/postfix `++` / `--` (Identifier operand).
+- Binary `+ - * / % & | ^ << >> == != < > <= >=`.
+- Compound assignment `+= -= *= /= %= &= |= ^= <<= >>=` (Identifier lvalue).
 - Logical `&&` and `||` with proper short-circuit evaluation.
+- Ternary `cond ? a : b`.
 - Control flow: `if`/`else`, `while`, `do`/`while`, `for`, `break`, `continue`.
 - Function calls — direct calls only (callee must be an identifier).
 
@@ -349,9 +352,24 @@ class CodeGenerator:
             return self._binary(expr, ctx)
         if isinstance(expr, ast.Call):
             return self._call(expr, ctx)
+        if isinstance(expr, ast.TernaryOp):
+            return self._ternary(expr, ctx)
         raise CodegenError(
             f"expression {type(expr).__name__} not implemented yet"
         )
+
+    def _ternary(self, expr: ast.TernaryOp, ctx: _FuncCtx) -> list[str]:
+        false_label = ctx.label("tern_false")
+        end_label = ctx.label("tern_end")
+        out = self._eval_expr_to_eax(expr.condition, ctx)
+        out.append("        test    eax, eax")
+        out.append(f"        jz      {false_label}")
+        out += self._eval_expr_to_eax(expr.true_expr, ctx)
+        out.append(f"        jmp     {end_label}")
+        out.append(f"{false_label}:")
+        out += self._eval_expr_to_eax(expr.false_expr, ctx)
+        out.append(f"{end_label}:")
+        return out
 
     def _call(self, expr: ast.Call, ctx: _FuncCtx) -> list[str]:
         if not isinstance(expr.func, ast.Identifier):
@@ -373,8 +391,10 @@ class CodeGenerator:
         return out
 
     def _unary(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
+        if expr.op in ("++", "--"):
+            return self._inc_dec(expr, ctx)
         if not expr.is_prefix:
-            raise CodegenError("postfix ++/-- not implemented yet")
+            raise CodegenError(f"postfix `{expr.op}` not implemented yet")
         out = self._eval_expr_to_eax(expr.operand, ctx)
         if expr.op == "+":
             return out
@@ -389,6 +409,27 @@ class CodeGenerator:
                 "        movzx   eax, al",
             ]
         raise CodegenError(f"unary `{expr.op}` not implemented yet")
+
+    def _inc_dec(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
+        if not isinstance(expr.operand, ast.Identifier):
+            raise CodegenError(
+                f"`{expr.op}` operand must be an identifier "
+                f"(got {type(expr.operand).__name__})"
+            )
+        disp = ctx.lookup(expr.operand.name)
+        addr = _ebp_addr(disp)
+        instr = "inc" if expr.op == "++" else "dec"
+        if expr.is_prefix:
+            # ++x: bump in place, then load the new value into EAX.
+            return [
+                f"        {instr}     dword {addr}",
+                f"        mov     eax, {addr}",
+            ]
+        # x++: load old value into EAX, then bump in place. EAX is the result.
+        return [
+            f"        mov     eax, {addr}",
+            f"        {instr}     dword {addr}",
+        ]
 
     # Map from C operator to a one-line "op eax, ecx" instruction.
     _SIMPLE_BINOPS = {
@@ -410,9 +451,25 @@ class CodeGenerator:
         ">=": "setge",
     }
 
+    # Compound-assignment operators desugar to `lvalue = lvalue OP rvalue`.
+    _COMPOUND_OPS = {
+        "+=":  "+",
+        "-=":  "-",
+        "*=":  "*",
+        "/=":  "/",
+        "%=":  "%",
+        "&=":  "&",
+        "|=":  "|",
+        "^=":  "^",
+        "<<=": "<<",
+        ">>=": ">>",
+    }
+
     def _binary(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
         if expr.op == "=":
             return self._assign(expr, ctx)
+        if expr.op in self._COMPOUND_OPS:
+            return self._compound_assign(expr, ctx)
         if expr.op == "&&":
             return self._logical_and(expr, ctx)
         if expr.op == "||":
@@ -499,3 +556,23 @@ class CodeGenerator:
         return self._eval_expr_to_eax(expr.right, ctx) + [
             f"        mov     {_ebp_addr(disp)}, eax",
         ]
+
+    def _compound_assign(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
+        # `x op= rhs` is `x = x op rhs`. For Identifier lvalues, evaluating
+        # the lvalue is side-effect-free, so it's safe to compute it twice
+        # via a synthesized BinaryOp. Pointer/array lvalues will need a
+        # different lowering when those land.
+        if not isinstance(expr.left, ast.Identifier):
+            raise CodegenError(
+                f"compound assignment target must be an identifier "
+                f"(got {type(expr.left).__name__})"
+            )
+        inner = ast.BinaryOp(
+            op=self._COMPOUND_OPS[expr.op],
+            left=expr.left,
+            right=expr.right,
+        )
+        return self._assign(
+            ast.BinaryOp(op="=", left=expr.left, right=inner),
+            ctx,
+        )
