@@ -3869,6 +3869,22 @@ class CodeGenerator:
         ):
             return self._emit_call(expr.args, ctx, direct=callee.name)
 
+        # Implicit-int function declaration (K&R / pre-C99): a Call
+        # whose callee is an undeclared Identifier. Auto-register the
+        # name as `int func()` and emit a direct call. This matches
+        # what gcc does for sources that drop their `#include` and is
+        # what the c-testsuite / GCC torture suite assume.
+        if (
+            isinstance(callee, ast.Identifier)
+            and not ctx.has_local(callee.name)
+            and callee.name not in self._globals
+            and callee.name not in self._extern_vars
+            and callee.name not in self._enum_constants
+        ):
+            self._func_return_types[callee.name] = ast.BasicType(name="int")
+            self._func_param_types[callee.name] = []
+            return self._emit_call(expr.args, ctx, direct=callee.name)
+
         # Indirect call: the callee evaluates to a function address. Push
         # args first (which clobber EAX), then evaluate the callee into
         # EAX last so it survives until the `call`.
