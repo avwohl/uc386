@@ -74,8 +74,10 @@ Current scope:
   assignment uses an inline per-dword copy. `{...}` init walks the
   InitializerList member-by-member with nested `{...}` for struct
   members and tail zero-fill. Struct-by-value params work via
-  caller-side `sub esp + memcpy`; by-value returns aren't yet
-  supported.
+  caller-side `sub esp + memcpy`. Struct-by-value returns use a
+  hidden retptr first arg — caller passes &dst, callee writes
+  there and returns the address. `make().field` and `f(make())`
+  aren't yet supported (need per-call temp slots).
 - Unions: same registry as structs (`_register_struct` branches on
   `is_union`) but laid out with every member at offset 0 and total
   size = `max(sizeof(member))` rounded to the union's alignment.
@@ -473,16 +475,22 @@ class CodeGenerator:
     # ---- functions ------------------------------------------------------
 
     def _function(self, fn: ast.FunctionDecl) -> list[str]:
-        if isinstance(fn.return_type, ast.StructType):
-            raise CodegenError(
-                f"struct return not yet supported (`{fn.name}`)"
-            )
         ctx = _FuncCtx()
         # Parameters live above EBP at cdecl offsets; the first sits at
         # [ebp + 8], and each subsequent param is offset by its predecessor's
         # padded size (4 for scalars / pointers, sizeof(struct) rounded
         # up to 4 for structs passed by value).
+        #
+        # Struct-returning functions take a hidden first param at [ebp+8]
+        # — a pointer to the caller's destination buffer. Real params
+        # shift up by 4 in that case.
         disp = 8
+        if isinstance(fn.return_type, ast.StructType):
+            ctx.alloc_param(
+                "__retptr__", disp,
+                ast.PointerType(base_type=fn.return_type),
+            )
+            disp += 4
         for param in fn.params:
             if param.name is None:
                 continue
@@ -808,6 +816,13 @@ class CodeGenerator:
             return self._index_address(expr, ctx)
         if isinstance(expr, ast.UnaryOp) and expr.op == "*":
             return self._eval_expr_to_eax(expr.operand, ctx)
+        if isinstance(expr, ast.Call):
+            # `make().field` would need a runtime temp slot for the
+            # returned struct. Until we add per-call temps, reject.
+            raise CodegenError(
+                "struct return value can only be used as a variable "
+                "initializer, an assignment rhs, or `return` expression"
+            )
         raise CodegenError(
             f"can't take address of {type(expr).__name__} for `.member`"
         )
@@ -1175,6 +1190,17 @@ class CodeGenerator:
         if isinstance(var_type, ast.ArrayType):
             return self._array_init(var_type, decl.init, disp, ctx, decl.name)
         if isinstance(var_type, ast.StructType):
+            # `struct T s = make(...)` — call `make` with &s as the hidden
+            # retptr instead of allocating a temp and copying.
+            if (
+                isinstance(decl.init, ast.Call)
+                and self._is_struct_returning_call(decl.init, ctx)
+            ):
+                return self._call_into_address(
+                    decl.init,
+                    [f"        lea     eax, {_ebp_addr(disp)}"],
+                    ctx,
+                )
             return self._struct_init(var_type, decl.init, disp, ctx, decl.name)
         return self._eval_expr_to_eax(decl.init, ctx) + self._store_from_eax(
             _ebp_addr(disp), var_type
@@ -1338,9 +1364,119 @@ class CodeGenerator:
                 "        xor     eax, eax",
                 "        jmp     .epilogue",
             ]
+        # Struct-returning functions copy the value into the caller-provided
+        # buffer (the hidden `__retptr__` first arg) rather than dropping
+        # the value into EAX. We forward the retptr in EAX as the return
+        # value so chained struct calls don't need a temp.
+        if "__retptr__" in ctx.slots:
+            retptr_disp = ctx.lookup("__retptr__")
+            ret_ty = ctx.lookup_type("__retptr__").base_type
+            retptr_load = [f"        mov     eax, {_ebp_addr(retptr_disp)}"]
+            if (
+                isinstance(stmt.value, ast.Call)
+                and self._is_struct_returning_call(stmt.value, ctx)
+            ):
+                # Forward our retptr to the inner call so it writes
+                # directly into the caller's buffer.
+                return self._call_into_address(
+                    stmt.value, retptr_load, ctx,
+                ) + ["        jmp     .epilogue"]
+            return self._copy_struct_to_retptr(
+                stmt.value, ret_ty, retptr_disp, ctx
+            ) + ["        jmp     .epilogue"]
         return self._eval_expr_to_eax(stmt.value, ctx) + [
             "        jmp     .epilogue",
         ]
+
+    def _copy_struct_to_retptr(
+        self,
+        src_expr: ast.Expression,
+        ret_ty: ast.TypeNode,
+        retptr_disp: int,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Copy a struct l-value into the function's `__retptr__` buffer.
+
+        Leaves EAX = retptr (the destination address) so callers can
+        chain. Used by `_return` when the function returns a struct and
+        the value is a struct l-value (Identifier, `*p`, `arr[i]`, or a
+        member access).
+        """
+        size = self._size_of(ret_ty)
+        # eax = retptr first (destination); push it for after the source
+        # eval, which clobbers EAX.
+        out = [f"        mov     eax, {_ebp_addr(retptr_disp)}"]
+        out.append("        push    eax")
+        out += self._struct_address(src_expr, ctx)  # eax = &src
+        out.append("        mov     edx, eax")
+        out.append("        pop     ecx")           # ecx = retptr
+        offset = 0
+        while size - offset >= 4:
+            out.append(f"        mov     eax, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], eax")
+            offset += 4
+        if size - offset >= 2:
+            out.append(f"        mov     ax, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], ax")
+            offset += 2
+        if size - offset >= 1:
+            out.append(f"        mov     al, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], al")
+        out.append("        mov     eax, ecx")     # return retptr
+        return out
+
+    def _stripped_callee(self, call: ast.Call) -> ast.Expression:
+        """Strip leading `*`s on a Call's callee (function-typed `*` is idempotent)."""
+        callee = call.func
+        while isinstance(callee, ast.UnaryOp) and callee.op == "*":
+            callee = callee.operand
+        return callee
+
+    def _call_target(self, call: ast.Call) -> str | None:
+        """If the call is direct (a known function name), return that name."""
+        callee = self._stripped_callee(call)
+        if (
+            isinstance(callee, ast.Identifier)
+            and callee.name in self._func_return_types
+        ):
+            return callee.name
+        return None
+
+    def _call_into_address(
+        self,
+        call: ast.Call,
+        retptr_lines: list[str],
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Lower a struct-returning call where the destination is known.
+
+        `retptr_lines` is asm that produces the destination address in
+        EAX; we hand it to `_emit_call` as the hidden first arg. Used by
+        `_var_init`, `_assign`, and `_return` (for chained struct
+        returns).
+        """
+        target = self._call_target(call)
+        if target is not None:
+            return self._emit_call(
+                call.args, ctx, direct=target, retptr=retptr_lines,
+            )
+        return self._emit_call(
+            call.args, ctx,
+            indirect_callee=self._stripped_callee(call),
+            retptr=retptr_lines,
+        )
+
+    def _is_struct_returning_call(self, call: ast.Call, ctx: _FuncCtx) -> bool:
+        """True iff `call` invokes a known function that returns a struct.
+
+        Indirect calls through function pointers always return False —
+        we don't track function-pointer return types yet, so we treat
+        them as "not struct" to avoid spurious detection.
+        """
+        target = self._call_target(call)
+        if target is None:
+            return False
+        return isinstance(self._func_return_types[target], ast.StructType)
 
     # ---- expressions ----------------------------------------------------
 
@@ -1535,9 +1671,18 @@ class CodeGenerator:
         # and `(*f)()` and `(***f)()` all call the same function. Strip
         # leading dereferences from the callee so the lowering doesn't
         # try to actually load through the function address.
-        callee = expr.func
-        while isinstance(callee, ast.UnaryOp) and callee.op == "*":
-            callee = callee.operand
+        callee = self._stripped_callee(expr)
+
+        # Struct-returning calls need a destination buffer; this path is
+        # for "use the return value as an expression," which we only
+        # support when the destination is statically known. `_var_init`,
+        # `_assign`, and `_return` recognize struct-returning calls and
+        # bypass `_call` to provide the retptr directly.
+        if self._is_struct_returning_call(expr, ctx):
+            raise CodegenError(
+                "struct return value can only be used as a variable "
+                "initializer, an assignment rhs, or `return` expression"
+            )
 
         # Direct call: callee names a function declared in this unit
         # (defined or extern). Emit a `call _name` linker reference.
@@ -1559,12 +1704,18 @@ class CodeGenerator:
         *,
         direct: str | None = None,
         indirect_callee: ast.Expression | None = None,
+        retptr: list[str] | None = None,
     ) -> list[str]:
         # cdecl pushes args right-to-left so the leftmost arg ends up at
         # the lowest address (= [ebp+8] in the callee). For scalars we
         # use plain `push eax`; for struct-by-value we reserve `sizeof`
         # bytes via `sub esp, N` and copy the struct's bytes into that
         # window with the same per-dword pattern as `_struct_copy_assign`.
+        #
+        # When `retptr` is provided (for struct-returning callees), it
+        # holds asm lines that produce the destination address in EAX;
+        # we push it after the regular args so it lands at the lowest
+        # address (= the hidden first param).
         out: list[str] = []
         total_arg_bytes = 0
         for arg in reversed(args):
@@ -1593,6 +1744,11 @@ class CodeGenerator:
                 out += self._eval_expr_to_eax(arg, ctx)
                 out.append("        push    eax")
                 total_arg_bytes += 4
+        if retptr is not None:
+            # Push retptr last so it's the leftmost arg (= [ebp+8] in callee).
+            out += retptr
+            out.append("        push    eax")
+            total_arg_bytes += 4
         if direct is not None:
             out.append(f"        call    _{direct}")
         else:
@@ -1600,7 +1756,8 @@ class CodeGenerator:
             out.append("        call    eax")
         if total_arg_bytes:
             out.append(f"        add     esp, {total_arg_bytes}")
-        # Return value is in EAX.
+        # Return value is in EAX. For struct-returning callees, EAX is
+        # the retptr (forwarded by the callee).
         return out
 
     def _unary(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
@@ -1899,9 +2056,20 @@ class CodeGenerator:
         # Struct-to-struct assignment `dst = src` short-circuits to a
         # struct-copy regardless of the lvalue shape. Without this, the
         # rhs's `_eval_expr_to_eax` would try to load the whole struct
-        # into EAX (which `_load_to_eax` rejects).
+        # into EAX (which `_load_to_eax` rejects). When the rhs is a
+        # struct-returning call, we route the call straight into &dst
+        # so there's no intermediate copy.
         target_ty = self._type_of(expr.left, ctx)
         if isinstance(target_ty, ast.StructType):
+            if (
+                isinstance(expr.right, ast.Call)
+                and self._is_struct_returning_call(expr.right, ctx)
+            ):
+                return self._call_into_address(
+                    expr.right,
+                    self._struct_address(expr.left, ctx),
+                    ctx,
+                )
             return self._struct_copy_assign(expr, target_ty, ctx)
 
         # `x = rhs` — direct slot store. Array names aren't lvalues in C.

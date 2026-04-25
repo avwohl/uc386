@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–21 are done. 218 tests passing.
-Slice 22+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–22 are done. 222 tests passing.
+Slice 23+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,14 +60,17 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 21 (just landed):
-- **Unions.** All members at offset 0; total size = max member
-  size. Member access reuses the existing struct paths.
+Implemented in slice 22 (just landed):
+- **Struct return by value.** Hidden retptr first param. Caller
+  passes &dst (for known destinations); callee copies into it and
+  returns retptr in EAX so chained struct calls work without temps.
+  Using a struct return value as a non-destination expression
+  (`make().x`, `f(make())`) still raises pending per-call temp slots.
 
 Deliberately not yet implemented — next slices in roughly this order:
-- **Struct return by value.** Hidden first arg pointing at a
-  caller-allocated buffer. The trickiest piece is the buffer's
-  lifetime — likely a per-call temp area added to the caller's frame.
+- **Per-call struct-return temp slots.** `make().x` and `f(make())`
+  need a runtime temp; track per-function the max struct-return-temp
+  size and add it to the frame.
 - **Designated/nested initializers.** `int arr[3] = {[1] = 5}` and
   `int m[2][3] = {{...}, {...}}` both raise. Multidim arrays would
   also need ArrayType-of-ArrayType slot support.

@@ -818,12 +818,77 @@ def test_struct_param_with_mixed_widths():
     assert "sub     esp, 8" in main
 
 
-def test_struct_return_not_yet_supported():
-    with pytest.raises(CodegenError, match="struct return"):
+def test_struct_return_into_local_init():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "struct point make(int a, int b) { struct point p; p.x = a; p.y = b; return p; } "
+        "int main(void) { struct point s = make(3, 4); return s.x + s.y; }"
+    )
+    asm_lines = asm.splitlines()
+    main_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_main:")
+    main_section = "\n".join(asm_lines[main_idx:])
+    # Caller pushes &s as the hidden first arg.
+    assert "lea     eax, [ebp - 8]" in main_section
+    assert "call    _make" in main_section
+    # Cleanup = 2 args (8) + retptr (4) = 12.
+    assert "add     esp, 12" in main_section
+
+
+def test_struct_return_into_assignment():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "struct point make(void) { struct point p; p.x = 7; p.y = 9; return p; } "
+        "int main(void) { struct point s; s = make(); return s.x; }"
+    )
+    asm_lines = asm.splitlines()
+    main_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_main:")
+    main_section = "\n".join(asm_lines[main_idx:])
+    assert "call    _make" in main_section
+    # Just retptr — no args.
+    assert "add     esp, 4" in main_section
+
+
+def test_struct_return_callee_param_offsets_account_for_retptr():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "struct point make(int a) { struct point p; p.x = a; p.y = a; return p; } "
+        "int main(void) { struct point s = make(5); return s.x; }"
+    )
+    asm_lines = asm.splitlines()
+    fn_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_make:")
+    end_idx = next(i for i, l in enumerate(asm_lines[fn_idx:]) if l.strip() == "ret") + fn_idx
+    fn_section = "\n".join(asm_lines[fn_idx:end_idx])
+    # `a` lives at [ebp + 12] (retptr at [ebp + 8] shifted everything else).
+    assert "[ebp + 12]" in fn_section
+    # The retptr load comes from [ebp + 8].
+    assert "[ebp + 8]" in fn_section
+
+
+def test_chained_struct_return_forwards_retptr():
+    # `return helper()` from within a struct-returning function should pass
+    # our own retptr down rather than allocating a temp.
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "struct point inner(void) { struct point p; p.x = 1; p.y = 2; return p; } "
+        "struct point outer(void) { return inner(); } "
+        "int main(void) { struct point s = outer(); return s.x; }"
+    )
+    asm_lines = asm.splitlines()
+    fn_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_outer:")
+    end_idx = next(i for i, l in enumerate(asm_lines[fn_idx:]) if l.strip() == "ret") + fn_idx
+    fn_section = "\n".join(asm_lines[fn_idx:end_idx])
+    # outer pushes its own retptr (loaded from [ebp + 8]) before calling inner.
+    assert "mov     eax, [ebp + 8]" in fn_section
+    assert "call    _inner" in fn_section
+
+
+def test_struct_return_value_used_in_other_position_rejected():
+    # `make().x` and `f(make())` need a runtime temp slot; defer.
+    with pytest.raises(CodegenError, match="struct"):
         _compile(
             "struct point { int x; int y; }; "
-            "struct point make(int x, int y) { struct point p; p.x = x; p.y = y; return p; } "
-            "int main(void) { return 0; }"
+            "struct point make(void) { struct point p; p.x = 1; p.y = 2; return p; } "
+            "int main(void) { return make().x; }"
         )
 
 
