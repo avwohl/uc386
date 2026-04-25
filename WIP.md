@@ -1,7 +1,41 @@
 # WIP — resume notes for the new machine
 
 Phase 4 slices 0–32 done. Phase 5 (floats) slices 1–9 done.
-va_list slice done. 310 tests passing.
+va_list slice done. uc386's own suite: 310 tests passing.
+
+## ANSI C testsuite runners
+
+Four runner scripts at the repo root mirror uc80's setup:
+
+- `run_ctests.py`  — c-testsuite (https://github.com/c-testsuite/c-testsuite)
+- `run_fujitsu.py` — Fujitsu CompilerTestSuite
+                     (https://github.com/AcademySoftwareFoundation/CompilerTestSuite)
+- `run_sdcc.py`    — SDCC regression (skeleton; template-expansion not ported)
+- `run_gcc_torture.py` — GCC torture suite via llvm-test-suite
+
+Each expects upstream sources cloned at sibling paths under
+`../external/`:
+
+    git clone https://github.com/c-testsuite/c-testsuite.git \
+        ../external/c-testsuite
+
+The runners default to `--compile-only` because the i386 assemble →
+link → run → diff pipeline is not yet wired. Headers in
+`lib/include/` (copied from uc80) are passed via `-I`.
+
+Latest tally — `python run_ctests.py`:
+
+    Total:    220
+    Pass:     173      (compile-only)
+    Compile:   47
+
+To finish the pipeline:
+1. NASM assembly (`-f bin` works; for `-f obj`/`-f elf` we'd need a linker).
+2. A DOS extender stub or DOS/4GW-compatible loader so `bits 32`
+   binaries actually run under DOS.
+3. A libc — uc80's `lib/libc.lib` is Z80; we'd need an i386 port.
+4. A working DOS emulator hookup (dosbox / dosbox-x / dosemu — the
+   latter two are present locally at `/Users/wohl/src/dosemu/`).
 
 ## Bootstrap on the new machine
 

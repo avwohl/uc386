@@ -457,15 +457,63 @@ class CodeGenerator:
             directive = self._DATA_DIRECTIVE[self._size_of(ty)]
             return [f"        {directive}      {value}"]
         if isinstance(ty, ast.PointerType):
-            # Allow `int *p = 0` (null pointer). Pointer-to-other-global
-            # init is rejected pending a clearer use case.
+            # Allow `int *p = 0` (null pointer literal) and
+            # `int *p = &other_global` / `char *s = "literal"` — both
+            # become `dd <label>` so the linker resolves the address.
+            if (
+                isinstance(init, ast.UnaryOp)
+                and init.op == "&"
+                and isinstance(init.operand, ast.Identifier)
+                and init.operand.name in self._globals
+            ):
+                return [f"        dd      _{init.operand.name}"]
+            if isinstance(init, ast.StringLiteral):
+                label = self._intern_string(init.value)
+                return [f"        dd      {label}"]
             value = self._const_eval(init, name)
             return [f"        dd      {value}"]
         if isinstance(ty, ast.ArrayType):
             return self._emit_global_array_init(ty, init, name)
+        if isinstance(ty, ast.StructType):
+            return self._emit_global_struct_init(ty, init, name)
         raise CodegenError(
             f"global `{name}`: unsupported type {type(ty).__name__}"
         )
+
+    def _emit_global_struct_init(
+        self,
+        struct_ty: ast.StructType,
+        init: ast.Expression,
+        name: str,
+    ) -> list[str]:
+        if not isinstance(init, ast.InitializerList):
+            raise CodegenError(
+                f"global `{name}`: struct init must be `{{...}}`"
+            )
+        sname = self._resolve_struct_name(struct_ty)
+        members = self._structs[sname]
+        total = self._struct_sizes[sname]
+        out: list[str] = []
+        cursor = 0
+        for i, (m_name, m_ty, m_off) in enumerate(members):
+            # NASM emits whatever we give it sequentially in `.data`,
+            # so explicit padding bytes are necessary between members
+            # when the struct layout has gaps (e.g. `char` then `int`).
+            if m_off > cursor:
+                out.append(f"        times {m_off - cursor} db 0")
+                cursor = m_off
+            if i < len(init.values):
+                value = init.values[i]
+                out += self._emit_global_init(
+                    m_ty, value, f"{name}.{m_name}",
+                )
+            else:
+                m_size = self._size_of(m_ty)
+                out.append(f"        times {m_size} db 0")
+            cursor = m_off + self._size_of(m_ty)
+        if total > cursor:
+            out.append(f"        times {total - cursor} db 0")
+        return out
 
     def _emit_global_array_init(
         self,
@@ -475,7 +523,6 @@ class CodeGenerator:
     ) -> list[str]:
         elem_type = arr_ty.base_type
         elem_size = self._size_of(elem_type)
-        directive = self._DATA_DIRECTIVE[elem_size]
         length = arr_ty.size.value
 
         if isinstance(init, ast.StringLiteral):
@@ -501,9 +548,28 @@ class CodeGenerator:
                     f"global `{name}`: too many initializers "
                     f"(got {len(init.values)}, array size {length})"
                 )
-            values = [str(self._const_eval(v, name)) for v in init.values]
-            values.extend(["0"] * (length - len(values)))
-            return [f"        {directive}      {', '.join(values)}"]
+            # If the element type is a basic type, the simple `dd v1, v2, ...`
+            # form works. Otherwise (structs, sub-arrays, pointers larger
+            # than dword) we emit each element through `_emit_global_init`
+            # recursively, with NASM `times N db 0` filling any tail.
+            if (
+                isinstance(elem_type, ast.BasicType)
+                and elem_type.name in self._DATA_DIRECTIVE_NAMES
+                and elem_size in self._DATA_DIRECTIVE
+            ):
+                directive = self._DATA_DIRECTIVE[elem_size]
+                values = [
+                    str(self._const_eval(v, name)) for v in init.values
+                ]
+                values.extend(["0"] * (length - len(values)))
+                return [f"        {directive}      {', '.join(values)}"]
+            out: list[str] = []
+            for v in init.values:
+                out += self._emit_global_init(elem_type, v, name)
+            tail_bytes = (length - len(init.values)) * elem_size
+            if tail_bytes > 0:
+                out.append(f"        times {tail_bytes} db 0")
+            return out
 
         raise CodegenError(
             f"global `{name}`: unsupported array initializer "
@@ -512,6 +578,12 @@ class CodeGenerator:
 
     # NASM directives keyed by element size in bytes.
     _DATA_DIRECTIVE = {1: "db", 2: "dw", 4: "dd"}
+    # Names that are safe to emit as a single `dd v1, v2, ...` directive
+    # in a global array init. Anything outside this set (struct, array,
+    # union elements) recursively goes through `_emit_global_init`.
+    _DATA_DIRECTIVE_NAMES = frozenset({
+        "bool", "char", "short", "int", "long",
+    })
 
     def _const_eval(self, expr: ast.Expression, name: str) -> int:
         """Evaluate a compile-time integer constant for a global initializer.
@@ -768,6 +840,22 @@ class CodeGenerator:
             # local. Recurse into the nested statement.
             self._collect_locals(node.stmt, ctx)
             return
+        if isinstance(node, ast.DeclarationList):
+            # Multi-declarator declaration: `int x, *p;` becomes
+            # DeclarationList([VarDecl(x), VarDecl(p)]). Each VarDecl
+            # might be a real local that needs a slot.
+            for decl in node.declarations:
+                self._collect_locals(decl, ctx)
+            return
+        if isinstance(node, (ast.StructDecl, ast.EnumDecl, ast.TypedefDecl)):
+            # In-function type-only declarations (no storage). Register
+            # struct/enum layouts now so any subsequent locals that use
+            # them resolve correctly during slot allocation.
+            if isinstance(node, ast.StructDecl) and node.is_definition:
+                self._register_struct(node)
+            elif isinstance(node, ast.EnumDecl) and node.is_definition:
+                self._register_enum(node)
+            return
         # Statements with no nested locals: ExpressionStmt, ReturnStmt,
         # BreakStmt, ContinueStmt, etc.
 
@@ -776,7 +864,7 @@ class CodeGenerator:
     # transparently for `long *` etc.) but full slot codegen waits on a
     # 64-bit value-tracking pass.
     _SLOT_BASIC_NAMES = frozenset(
-        {"bool", "char", "short", "int", "float", "double"}
+        {"bool", "char", "short", "int", "long", "float", "double"}
     )
 
     def _check_supported_type(self, t: ast.TypeNode, name: str) -> None:
@@ -1408,6 +1496,32 @@ class CodeGenerator:
             if not ctx.continue_targets:
                 raise CodegenError("`continue` outside of a loop")
             return [f"        jmp     {ctx.continue_targets[-1]}"]
+        if isinstance(item, ast.DeclarationList):
+            # `int x, *p, **pp;` parses as DeclarationList of one VarDecl
+            # per declarator. Lower each one in order.
+            out: list[str] = []
+            for decl in item.declarations:
+                out += self._item(decl, ctx)
+            return out
+        if isinstance(item, ast.StructDecl):
+            # In-function struct/union definition (e.g. `struct T { int x; };`
+            # in the middle of a body). Register the layout if it's a
+            # definition; emit no code.
+            if item.is_definition:
+                self._register_struct(item)
+            return []
+        if isinstance(item, ast.EnumDecl):
+            # Likewise for in-function enum definitions.
+            if item.is_definition:
+                self._register_enum(item)
+            return []
+        if isinstance(item, ast.TypedefDecl):
+            # uc_core resolves typedef names at parse time, so the only
+            # thing left at codegen is to register typedef'd structs
+            # whose layout might be needed via `_resolve_struct_name`.
+            # `_resolve_struct_name` already handles inline-member
+            # StructTypes lazily, so there's nothing more to do here.
+            return []
         raise CodegenError(
             f"{type(item).__name__} not implemented yet"
         )
