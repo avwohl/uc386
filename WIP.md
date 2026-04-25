@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–26 are done. 239 tests passing.
-Slice 27+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–28 are done. 247 tests passing.
+Slice 29+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,19 +60,24 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 26 (just landed):
-- **`goto` + labels.** Pre-walked user labels → NASM local labels.
-  Forward and backward gotos work; duplicate label and unknown
-  label both raise.
+Implemented in slices 27–28 (just landed):
+- **Variadic external calls.** `printf(fmt, ...)` works via the
+  existing cdecl arg push (no callee-side va_list yet).
+- **Enums.** `enum c { A, B = 5, C }` registers A=0, B=5, C=6.
+  Identifier lookup falls back to the enum table; `enum c x = B`
+  works as a 4-byte slot.
 
 Deliberately not yet implemented — what's left of Phase 4:
 - **Bitfields.** Niche; `_register_struct` rejects `bit_width != None`.
 - **Floating point.** `float` / `double` slot codegen via x87 or SSE.
   Big topic — likely a phase of its own.
-- **Variadic functions** (`printf`-style `...`).
-- **Goto + labels.** Currently no `LabelStmt`/`GotoStmt` support.
+- **Variadic function definitions** (callee-side va_list / va_arg /
+  va_start). Variadic *call sites* already work.
 - **Static / register storage classes** beyond what cdecl already
   gives.
+- **Typedef.** No special parser support yet — uc_core may already
+  resolve typedefs into their underlying types, in which case there's
+  nothing to do here.
 
 Suggested first move next session: read `CLAUDE.md`. The
 remaining gaps are mostly niche or large topics in their own right.

@@ -1037,6 +1037,88 @@ def test_break_outside_switch_or_loop_still_rejected():
         _compile("int main(void) { break; return 0; }")
 
 
+# ---- enums ----------------------------------------------------------------
+
+def test_enum_implicit_values_start_at_zero():
+    asm = _compile(
+        "enum c { A, B, C }; int main(void) { return B; }"
+    )
+    # `B` is the second enum value → 1.
+    assert "mov     eax, 1" in asm
+
+
+def test_enum_explicit_values_with_implicit_chain():
+    asm = _compile(
+        "enum d { X = 5, Y, Z }; int main(void) { return Z; }"
+    )
+    # X=5, Y=6, Z=7.
+    assert "mov     eax, 7" in asm
+
+
+def test_enum_used_as_type():
+    asm = _compile(
+        "enum c { A, B, C }; "
+        "int main(void) { enum c v = B; return v; }"
+    )
+    # `enum c` slot is 4 bytes; B = 1 stores 1.
+    assert "sub     esp, 4" in asm
+    assert "mov     eax, 1" in asm
+
+
+def test_enum_constant_in_arithmetic():
+    asm = _compile(
+        "enum c { A, B = 10, C }; "
+        "int main(void) { return A + B + C; }"
+    )
+    # 0 + 10 + 11 = 21 (computed at runtime via three separate `mov`s).
+    assert "mov     eax, 0" in asm
+    assert "mov     eax, 10" in asm
+    assert "mov     eax, 11" in asm
+
+
+def test_unknown_enum_constant_is_unknown_identifier():
+    with pytest.raises(CodegenError, match="unknown identifier"):
+        _compile("int main(void) { return UNDEFINED_ENUM_CONST; }")
+
+
+# ---- variadic external calls ----------------------------------------------
+
+def test_variadic_extern_declaration_emits_extern():
+    asm = _compile(
+        'int printf(const char *fmt, ...); '
+        'int main(void) { return 0; }'
+    )
+    assert "extern  _printf" in asm
+
+
+def test_variadic_call_pushes_extra_args_right_to_left():
+    asm = _compile(
+        'int printf(const char *fmt, ...); '
+        'int main(void) { return printf("hi %d %d", 1, 2); }'
+    )
+    asm_lines = asm.splitlines()
+    main_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_main:")
+    main_section = "\n".join(asm_lines[main_idx:])
+    # Three args: format string + 2 ints. Pushed right-to-left.
+    assert "call    _printf" in main_section
+    # Caller cleans up 3 * 4 = 12 bytes.
+    assert "add     esp, 12" in main_section
+    # Both literal ints get loaded.
+    assert "mov     eax, 1" in main_section
+    assert "mov     eax, 2" in main_section
+    # Format string lands as a label load.
+    assert "mov     eax, _uc386_str0" in main_section
+
+
+def test_variadic_call_with_no_extra_args():
+    asm = _compile(
+        'int printf(const char *fmt, ...); '
+        'int main(void) { return printf("hello"); }'
+    )
+    # Only the format string is passed.
+    assert "add     esp, 4" in asm
+
+
 # ---- goto + labels --------------------------------------------------------
 
 def test_goto_forward_jump():

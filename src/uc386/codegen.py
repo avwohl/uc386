@@ -204,6 +204,9 @@ class CodeGenerator:
         # (rounded up to struct alignment).
         self._structs: dict[str, list[tuple[str, ast.TypeNode, int]]] = {}
         self._struct_sizes: dict[str, int] = {}
+        # Enum constant table — `enum c { A, B }` registers A=0, B=1.
+        # Identifiers that aren't slots/globals/functions fall back here.
+        self._enum_constants: dict[str, int] = {}
 
     # ---- top level ------------------------------------------------------
 
@@ -247,9 +250,12 @@ class CodeGenerator:
         # struct's size during validation.
         self._structs = {}
         self._struct_sizes = {}
+        self._enum_constants = {}
         for d in unit.declarations:
             if isinstance(d, ast.StructDecl) and d.is_definition:
                 self._register_struct(d)
+            elif isinstance(d, ast.EnumDecl) and d.is_definition:
+                self._register_enum(d)
         # `StructType` references inside a containing decl (e.g.,
         # `struct point origin;` at top level) carry an empty members
         # list; the layout is owned by `_structs[name]`. Inline struct
@@ -665,13 +671,19 @@ class CodeGenerator:
     _SLOT_BASIC_NAMES = frozenset({"char", "short", "int"})
 
     def _check_supported_type(self, t: ast.TypeNode, name: str) -> None:
-        # Pointers, and arrays / scalars / structs of supported base types.
-        # Slot sizes are rounded up to 4 in `_collect_locals` so adjacent ints
-        # stay 4-aligned. Unsized arrays (`int a[]` without an init) are caught
-        # by `_resolved_var_type` before they reach this check.
+        # Pointers, and arrays / scalars / structs / enums of supported
+        # base types. Slot sizes are rounded up to 4 in `_collect_locals`
+        # so adjacent ints stay 4-aligned. Unsized arrays (`int a[]`
+        # without an init) are caught by `_resolved_var_type` before they
+        # reach this check.
         if isinstance(t, ast.PointerType):
             return
         if isinstance(t, ast.BasicType) and t.name in self._SLOT_BASIC_NAMES:
+            return
+        if isinstance(t, ast.EnumType):
+            # Enums are int-sized; we don't validate that the named enum
+            # exists because anonymous enums (no name) and uses-before-
+            # definition both occur naturally.
             return
         if isinstance(t, ast.ArrayType):
             if t.size is not None and not isinstance(t.size, ast.IntLiteral):
@@ -760,7 +772,28 @@ class CodeGenerator:
                     f"sizeof(struct {t.name}): struct not defined"
                 )
             return self._struct_sizes[t.name]
+        if isinstance(t, ast.EnumType):
+            return 4
         raise CodegenError(f"sizeof not supported for {type(t).__name__}")
+
+    def _register_enum(self, decl: ast.EnumDecl) -> None:
+        """Compute and record each `EnumValue`'s integer constant.
+
+        Per C, an `EnumValue(name, value=None)` takes the previous
+        constant + 1 (starting at 0 for the first). An explicit
+        `value=IntLiteral(n)` sets the cursor; subsequent implicit
+        values continue from there.
+        """
+        cursor = 0
+        for ev in decl.values:
+            if ev.value is not None:
+                cursor = self._const_eval(ev.value, f"enum {decl.name or '?'}.{ev.name}")
+            if ev.name in self._enum_constants:
+                raise CodegenError(
+                    f"duplicate enum constant `{ev.name}`"
+                )
+            self._enum_constants[ev.name] = cursor
+            cursor += 1
 
     def _register_struct(self, decl: ast.StructDecl) -> None:
         """Compute member offsets and total size for a struct definition.
@@ -850,6 +883,8 @@ class CodeGenerator:
             if not members:
                 return 1
             return max(self._alignment_of(mt) for _, mt, _ in members)
+        if isinstance(t, ast.EnumType):
+            return 4
         return 1
 
     @staticmethod
@@ -942,6 +977,9 @@ class CodeGenerator:
             # the exact pointee type doesn't matter — represent it as
             # `void *` (4 bytes, no scaling).
             return ast.PointerType(base_type=ast.BasicType(name="void"))
+        if name in self._enum_constants:
+            # Enum constants are int-typed in C.
+            return ast.BasicType(name="int")
         raise CodegenError(f"unknown identifier `{name}`")
 
     def _identifier_addr_text(self, name: str, ctx: _FuncCtx) -> str:
@@ -977,6 +1015,9 @@ class CodeGenerator:
             # Function decay: the name yields its address (suitable for
             # assigning to a function pointer or passing as an argument).
             return [f"        mov     eax, _{name}"]
+        if name in self._enum_constants:
+            # Enum constants lower as immediate integer loads.
+            return [f"        mov     eax, {self._enum_constants[name]}"]
         raise CodegenError(f"unknown identifier `{name}`")
 
     def _identifier_address(self, name: str, ctx: _FuncCtx) -> list[str]:
