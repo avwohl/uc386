@@ -77,6 +77,38 @@ Deliberately not yet implemented — what's left of Phase 4:
   resolve typedefs into their underlying types, in which case there's
   nothing to do here.
 
-Suggested first move next session: read `CLAUDE.md`. The
-remaining gaps are mostly niche or large topics in their own right.
-Multidim arrays is the most "missing common feature" of the bunch.
+Suggested first move next session: read `CLAUDE.md`. Phase 4 is
+feature-complete for typical C; the remaining gaps are floats
+(Phase 5 territory) and callee-side va_list / va_arg.
+
+## Phase 5 design questions (floats)
+
+Floats need decisions before coding:
+
+1. **x87 FPU vs SSE.** The 386/MS-DOS target leans x87 (8-deep stack
+   register file). SSE only landed in P3-era CPUs and is irrelevant
+   for the DOS runtime. Going with x87 means `fld` / `fstp` /
+   `faddp` etc., and a stack discipline that's quite different from
+   the eax-everywhere model.
+
+2. **Single-pass vs split flow.** Right now `_eval_expr_to_eax`
+   universally produces a 32-bit value in EAX. Floats break that —
+   their value lives on `st(0)` (or in memory). The cleanest fix is
+   a parallel `_eval_expr_to_st0` for float-typed expressions, with
+   `_type_of` driving the dispatch. Mixing int and float in one
+   expression then has to convert at the boundary (`fild [int_slot]`
+   / `fistp [int_slot]`).
+
+3. **Float ABI.** cdecl returns floats on the FPU stack; callers
+   `fstp` to consume. Float args are passed on the cdecl arg stack
+   as 4-byte (float) or 8-byte (double) values. This works fine
+   alongside the existing int args.
+
+4. **Conversions.** Cast int→float (`fild`), float→int (`fistp`,
+   with the FPU control word's rounding mode considered). Promotion
+   rules in arithmetic (int + double → double).
+
+A minimal float slice could cover just storage and FloatLiteral
+init (no arithmetic / no conversions) if we want to land floats
+incrementally. But the bigger win is plumbing the `st(0)` path
+end-to-end first.
