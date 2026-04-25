@@ -1317,34 +1317,55 @@ class CodeGenerator:
             return out
 
         if isinstance(init, ast.InitializerList):
-            if len(init.values) > length:
-                raise CodegenError(
-                    f"`{name}`: too many initializers (got "
-                    f"{len(init.values)}, array size {length})"
-                )
+            # Walk values in source order, allowing `[N] = expr` to jump
+            # the cursor. After all source values, any unfilled slots
+            # get zero-filled. This handles pure-positional, pure-
+            # designated, and mixed forms uniformly.
             out = []
-            for i, value_expr in enumerate(init.values):
-                elem_disp = base_disp + i * elem_size
-                # Nested `{...}` for an array of structs descends into a
-                # struct-init at this element's offset.
+            filled: set[int] = set()
+            cursor = 0
+            for value_expr in init.values:
+                if isinstance(value_expr, ast.DesignatedInit):
+                    if (
+                        len(value_expr.designators) != 1
+                        or not isinstance(value_expr.designators[0], ast.IntLiteral)
+                    ):
+                        raise CodegenError(
+                            f"`{name}`: only single-level integer "
+                            f"designators supported in array init"
+                        )
+                    idx = value_expr.designators[0].value
+                    actual = value_expr.value
+                    cursor = idx + 1
+                else:
+                    idx = cursor
+                    actual = value_expr
+                    cursor += 1
+                if idx < 0 or idx >= length:
+                    raise CodegenError(
+                        f"`{name}`: initializer index {idx} out of range "
+                        f"(array size {length})"
+                    )
+                filled.add(idx)
+                elem_disp = base_disp + idx * elem_size
                 if (
                     isinstance(elem_type, ast.StructType)
-                    and isinstance(value_expr, ast.InitializerList)
+                    and isinstance(actual, ast.InitializerList)
                 ):
                     out += self._struct_init(
-                        elem_type, value_expr, elem_disp, ctx,
-                        f"{name}[{i}]",
+                        elem_type, actual, elem_disp, ctx,
+                        f"{name}[{idx}]",
                     )
                 else:
-                    out += self._eval_expr_to_eax(value_expr, ctx)
+                    out += self._eval_expr_to_eax(actual, ctx)
                     out += self._store_from_eax(_ebp_addr(elem_disp), elem_type)
-            # Tail zero-fill — one element per declared slot beyond what
-            # the initializer specified. Use the byte-level helper so it
-            # works for any element size (including structs).
-            tail_count = length - len(init.values)
-            if tail_count > 0:
-                tail_start = base_disp + len(init.values) * elem_size
-                out += self._zero_fill_at(tail_start, tail_count * elem_size)
+            # Zero-fill any indices the initializer didn't touch. We emit
+            # them in index order so the asm has a predictable shape.
+            for idx in range(length):
+                if idx not in filled:
+                    out += self._zero_fill_at(
+                        base_disp + idx * elem_size, elem_size
+                    )
             return out
 
         raise CodegenError(
@@ -1372,28 +1393,61 @@ class CodeGenerator:
                 f"(got {type(init).__name__})"
             )
         members = self._structs[struct_ty.name]
-        if len(init.values) > len(members):
-            raise CodegenError(
-                f"`{name}`: too many initializers (got "
-                f"{len(init.values)}, struct has {len(members)} members)"
-            )
+        member_index = {m_name: i for i, (m_name, _, _) in enumerate(members)}
+        # Walk source values in order, tracking the implicit cursor. A
+        # `.field = expr` sets the cursor to that member's index; the
+        # next un-designated value continues from cursor + 1. After the
+        # walk, any unfilled members get zero-filled.
         out: list[str] = []
-        for i, (m_name, m_ty, m_off) in enumerate(members):
-            m_disp = base_disp + m_off
-            if i < len(init.values):
-                value = init.values[i]
+        filled: set[int] = set()
+        cursor = 0
+        for value in init.values:
+            if isinstance(value, ast.DesignatedInit):
                 if (
-                    isinstance(m_ty, ast.StructType)
-                    and isinstance(value, ast.InitializerList)
+                    len(value.designators) != 1
+                    or not isinstance(value.designators[0], str)
                 ):
-                    out += self._struct_init(
-                        m_ty, value, m_disp, ctx, f"{name}.{m_name}"
+                    raise CodegenError(
+                        f"`{name}`: only single-level `.field` "
+                        f"designators supported in struct init"
                     )
-                else:
-                    out += self._eval_expr_to_eax(value, ctx)
-                    out += self._store_from_eax(_ebp_addr(m_disp), m_ty)
+                m_name_des = value.designators[0]
+                if m_name_des not in member_index:
+                    raise CodegenError(
+                        f"`{name}`: unknown member `{m_name_des}` in "
+                        f"struct `{struct_ty.name}`"
+                    )
+                idx = member_index[m_name_des]
+                actual = value.value
+                cursor = idx + 1
             else:
-                out += self._zero_fill_at(m_disp, self._size_of(m_ty))
+                if cursor >= len(members):
+                    raise CodegenError(
+                        f"`{name}`: too many initializers (struct has "
+                        f"{len(members)} members)"
+                    )
+                idx = cursor
+                actual = value
+                cursor += 1
+            filled.add(idx)
+            m_name_i, m_ty, m_off = members[idx]
+            m_disp = base_disp + m_off
+            if (
+                isinstance(m_ty, ast.StructType)
+                and isinstance(actual, ast.InitializerList)
+            ):
+                out += self._struct_init(
+                    m_ty, actual, m_disp, ctx, f"{name}.{m_name_i}"
+                )
+            else:
+                out += self._eval_expr_to_eax(actual, ctx)
+                out += self._store_from_eax(_ebp_addr(m_disp), m_ty)
+        # Zero-fill any unfilled members in declaration order.
+        for i, (m_name_i, m_ty, m_off) in enumerate(members):
+            if i not in filled:
+                out += self._zero_fill_at(
+                    base_disp + m_off, self._size_of(m_ty)
+                )
         return out
 
     def _zero_fill_at(self, disp: int, size: int) -> list[str]:

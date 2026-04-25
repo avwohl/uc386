@@ -1037,6 +1037,63 @@ def test_break_outside_switch_or_loop_still_rejected():
         _compile("int main(void) { break; return 0; }")
 
 
+# ---- designated initializers ----------------------------------------------
+
+def test_array_designated_init_skips_zero_fills():
+    asm = _compile(
+        "int main(void) { int arr[5] = {[1] = 10, [3] = 30}; return arr[1]; }"
+    )
+    # Both designated values stored.
+    assert "mov     eax, 10" in asm
+    assert "mov     eax, 30" in asm
+    # Unfilled indices 0, 2, 4 → zero-fills at -20, -12, -4.
+    assert "mov     dword [ebp - 20], 0" in asm
+    assert "mov     dword [ebp - 12], 0" in asm
+    assert "mov     dword [ebp - 4], 0" in asm
+
+
+def test_array_mixed_positional_and_designated():
+    # `{1, 2, [3] = 7, 8}` → arr[0]=1, [1]=2, [2]=0, [3]=7, [4]=8.
+    asm = _compile(
+        "int main(void) { int arr[5] = {1, 2, [3] = 7, 8}; return arr[0]; }"
+    )
+    for v in (1, 2, 7, 8):
+        assert f"mov     eax, {v}" in asm
+    # Index 2 is skipped → zero-filled.
+    assert "mov     dword [ebp - 12], 0" in asm
+
+
+def test_struct_designated_init():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int main(void) { struct point p = {.y = 10, .x = 5}; return p.x + p.y; }"
+    )
+    # Either order in source; codegen emits to each member's offset.
+    assert "mov     eax, 5" in asm
+    assert "mov     [ebp - 8], eax" in asm  # x at offset 0
+    assert "mov     eax, 10" in asm
+    assert "mov     [ebp - 4], eax" in asm  # y at offset 4
+
+
+def test_struct_designated_partial_init_zero_fills_rest():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int main(void) { struct point p = {.y = 5}; return p.x + p.y; }"
+    )
+    assert "mov     eax, 5" in asm
+    assert "mov     [ebp - 4], eax" in asm  # y assigned
+    # x at offset 0 (= -8) zero-filled.
+    assert "mov     dword [ebp - 8], 0" in asm
+
+
+def test_unknown_designated_member_rejected():
+    with pytest.raises(CodegenError, match="member"):
+        _compile(
+            "struct point { int x; int y; }; "
+            "int main(void) { struct point p = {.z = 1}; return 0; }"
+        )
+
+
 # ---- structs --------------------------------------------------------------
 
 def test_struct_local_allocates_full_size():
@@ -1753,7 +1810,7 @@ def test_char_array_init_from_int_list():
 
 
 def test_too_many_initializers_rejected():
-    with pytest.raises(CodegenError, match="too many|exceeds"):
+    with pytest.raises(CodegenError, match="out of range|too many|exceeds"):
         _compile("int main(void) { int arr[2] = {1, 2, 3}; return 0; }")
 
 

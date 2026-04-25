@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–23 are done. 224 tests passing.
-Slice 24+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–24 are done. 229 tests passing.
+Slice 25+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,19 +60,22 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 23 (just landed):
-- **Per-call struct-return temps.** Pre-pass walks the body and
-  allocates a struct-sized buffer per Call site so `make().x`,
-  `f(make())`, and `make(1).x + make(2).x` all work.
+Implemented in slice 24 (just landed):
+- **Designated initializers.** `[N] = value` (arrays) and
+  `.field = value` (structs), mixed with positional, with cursor
+  tracking and zero-fill of unfilled positions.
 
-Deliberately not yet implemented — next slices in roughly this order:
-- **Designated/nested initializers.** `int arr[3] = {[1] = 5}` and
-  `int m[2][3] = {{...}, {...}}` both raise. Multidim arrays would
-  also need ArrayType-of-ArrayType slot support.
+Deliberately not yet implemented — what's left of Phase 4:
+- **Multidim arrays.** `int m[2][3]` would need ArrayType-of-ArrayType
+  slot support and per-row indexing in `_index_address`.
+- **Bitfields.** Niche; `_register_struct` rejects `bit_width != None`.
 - **Floating point.** `float` / `double` slot codegen via x87 or SSE.
   Big topic — likely a phase of its own.
+- **Variadic functions** (`printf`-style `...`).
+- **Goto + labels.** Currently no `LabelStmt`/`GotoStmt` support.
+- **Static / register storage classes** beyond what cdecl already
+  gives.
 
-Suggested first move next session: read `CLAUDE.md`. **Struct copy +
-struct init** is the natural follow-on to slice 17, and **switch/case**
-is the largest remaining language feature. Both are bite-sized slices
-with the infrastructure already in place.
+Suggested first move next session: read `CLAUDE.md`. The
+remaining gaps are mostly niche or large topics in their own right.
+Multidim arrays is the most "missing common feature" of the bunch.
