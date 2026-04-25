@@ -26,6 +26,25 @@ I386_DOS_PREDEFINES = {
     "__MSDOS__": "1",
     "__DOS__": "1",
     "__ILP32__": "1",      # int/long/pointer all 32-bit
+    # GCC builtin type macros — used by lots of period code.
+    "__SIZE_TYPE__": "unsigned long",
+    "__PTRDIFF_TYPE__": "long",
+    "__INTPTR_TYPE__": "long",
+    "__UINTPTR_TYPE__": "unsigned long",
+    "__INT8_TYPE__": "signed char",
+    "__UINT8_TYPE__": "unsigned char",
+    "__INT16_TYPE__": "short",
+    "__UINT16_TYPE__": "unsigned short",
+    "__INT32_TYPE__": "long",
+    "__UINT32_TYPE__": "unsigned long",
+    "__INT64_TYPE__": "long long",
+    "__UINT64_TYPE__": "unsigned long long",
+    "__WCHAR_TYPE__": "unsigned short",
+    "__WINT_TYPE__": "int",
+    "__CHAR16_TYPE__": "unsigned short",
+    "__CHAR32_TYPE__": "unsigned long",
+    # GCC predefines this for sources that probe.
+    "__GNUC__": "4",
 }
 
 
