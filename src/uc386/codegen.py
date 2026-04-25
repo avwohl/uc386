@@ -2207,6 +2207,24 @@ class CodeGenerator:
         width = "dword" if size == 4 else "qword"
         return [f"        fstp    {width} {addr}"]
 
+    def _float_compare(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
+        """Lower a float comparison to a 386-compatible setCC sequence.
+
+        Evaluates left then right (so ST(0) = right, ST(1) = left), then
+        `fucompp` compares and pops both. `fnstsw ax; sahf` lifts the
+        FPU condition codes into the integer flags, and a setCC reads
+        them. The mapping is inverted vs. the integer ops because the
+        FPU compares ST(0) op ST(1) (= right op left).
+        """
+        out = self._eval_float_to_st0(expr.left, ctx)
+        out += self._eval_float_to_st0(expr.right, ctx)
+        out.append("        fucompp")
+        out.append("        fnstsw  ax")
+        out.append("        sahf")
+        out.append(f"        {self._FLOAT_CMP_SETCC[expr.op]}    al")
+        out.append("        movzx   eax, al")
+        return out
+
     def _float_lvalue_addr(self, name: str, ctx: _FuncCtx) -> str:
         """Render the address text for a float-typed Identifier lvalue."""
         if name in ctx.slots:
@@ -2484,6 +2502,22 @@ class CodeGenerator:
         ">=": "setge",
     }
 
+    # setCC mnemonic for float comparisons. We evaluate left then right,
+    # so after both `fld`s ST(0) = right and ST(1) = left. `fucompp`
+    # then sets condition codes describing ST(0) vs ST(1) — i.e.
+    # right vs left. After `fnstsw ax; sahf` the codes land in
+    # ZF (C3 = equal), CF (C0 = ST(0)<ST(1)). To get the C-level
+    # comparison we invert: `left < right` is `right > left` is
+    # ST(0) > ST(1), which is `seta` (CF=0, ZF=0).
+    _FLOAT_CMP_SETCC = {
+        "==": "sete",
+        "!=": "setne",
+        "<":  "seta",
+        ">":  "setb",
+        "<=": "setae",
+        ">=": "setbe",
+    }
+
     # Compound-assignment operators desugar to `lvalue = lvalue OP rvalue`.
     _COMPOUND_OPS = {
         "+=":  "+",
@@ -2509,6 +2543,14 @@ class CodeGenerator:
             return self._logical_or(expr, ctx)
         if expr.op in ("+", "-"):
             return self._add_sub(expr, ctx)
+        # Float comparisons land here as int-typed expressions (their
+        # result fits in EAX), but the operands are floats so the
+        # standard "left to eax, right to ecx" path can't compare them.
+        if expr.op in self._FLOAT_CMP_SETCC:
+            lt = self._type_of(expr.left, ctx)
+            rt = self._type_of(expr.right, ctx)
+            if self._is_float_type(lt) or self._is_float_type(rt):
+                return self._float_compare(expr, ctx)
 
         # Stack-machine eval: left → EAX → stack, right → EAX → ECX, pop EAX.
         out = self._eval_expr_to_eax(expr.left, ctx)

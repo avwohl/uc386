@@ -1126,6 +1126,48 @@ def test_returning_int_cast_of_float_arithmetic():
     assert "fistp" in asm
 
 
+# ---- float comparisons ----------------------------------------------------
+
+@pytest.mark.parametrize(
+    "op,setcc",
+    [
+        ("==", "sete"),
+        ("!=", "setne"),
+        ("<",  "seta"),    # x87 compares ST(0) vs ST(1); after fxch the
+        (">",  "setb"),    # mapping to setCC inverts vs the integer ops.
+        ("<=", "setae"),
+        (">=", "setbe"),
+    ],
+)
+def test_float_comparison_uses_fucompp_and_setcc(op, setcc):
+    asm = _compile(
+        f"int main(void) {{ float a = 1.0; float b = 2.0; return a {op} b; }}"
+    )
+    assert "fucompp" in asm
+    assert "fnstsw  ax" in asm
+    assert "sahf" in asm
+    assert f"{setcc}    al" in asm
+    assert "movzx   eax, al" in asm
+
+
+def test_float_comparison_with_int_promotes():
+    # `a == 0` with `a` float — the int 0 promotes to float.
+    asm = _compile("int main(void) { float a = 1.5; return a == 0; }")
+    # Expect the fild promotion of 0 and a float compare.
+    assert "fild" in asm
+    assert "fucompp" in asm
+
+
+def test_float_comparison_in_if_condition():
+    asm = _compile(
+        "int main(void) { float a = 1.0; float b = 2.0; "
+        "if (a < b) return 1; return 0; }"
+    )
+    # The comparison still produces an int result that drives test+jz.
+    assert "fucompp" in asm
+    assert "test    eax, eax" in asm
+
+
 # ---- bitfields ------------------------------------------------------------
 
 def test_bitfield_struct_size_one_word():

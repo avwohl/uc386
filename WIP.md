@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–31 are done. Phase 5 (floats) slice 1 is done.
-267 tests passing.
+Phase 4 slices 0–31 done. Phase 5 (floats) slices 1–2 done.
+275 tests passing.
 
 ## Bootstrap on the new machine
 
@@ -60,16 +60,11 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in Phase 5 slice 1 (just landed):
-- **Floats (x87).** `float`/`double` locals, FloatLiteral constants
-  pooled in `.data`, arithmetic via faddp/fsubp/fmulp/fdivp, fchs
-  for negation, fild/fistp for int↔float casts, parallel
-  `_eval_float_to_st0` path with auto-promotion of int subexprs.
+Implemented in Phase 5 slice 2 (just landed):
+- **Float comparisons.** `f < g`, `f == 0.0` etc. lower to fucompp +
+  fnstsw + sahf + setCC (386-compatible — no fucomi).
 
 Deliberately not yet implemented — Phase 5 follow-on slices:
-- **Float comparisons.** `f < g`, `f == 0.0`, etc. — `fucomi` then
-  setCC. Modest slice; reuses the existing comparison infrastructure
-  for the result-in-EAX side.
 - **Float function params and returns.** Cdecl pushes 4 / 8 bytes for
   float / double args (already works with the existing arg-push path
   if we route Identifier reads through `_eval_float_to_st0` for float
