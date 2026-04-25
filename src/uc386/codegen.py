@@ -76,8 +76,11 @@ Current scope:
   members and tail zero-fill. Struct-by-value params work via
   caller-side `sub esp + memcpy`. Struct-by-value returns use a
   hidden retptr first arg — caller passes &dst, callee writes
-  there and returns the address. `make().field` and `f(make())`
-  aren't yet supported (need per-call temp slots).
+  there and returns the address. For unbound struct-return values
+  (`make().field`, `f(make())`, `make(1).x + make(2).x`), a
+  per-call-site temp slot is pre-allocated in the caller's frame;
+  each Call gets its own slot so multiple struct-returning calls
+  in one expression don't collide.
 - Unions: same registry as structs (`_register_struct` branches on
   `is_union`) but laid out with every member at offset 0 and total
   size = `max(sizeof(member))` rounded to the union's alignment.
@@ -89,6 +92,8 @@ Current scope:
 
 Anything else raises CodegenError.
 """
+
+import dataclasses
 
 from uc_core import ast
 
@@ -124,6 +129,10 @@ class _FuncCtx:
         # enclosing loop, the way C requires.
         self.break_targets: list[str] = []
         self.continue_targets: list[str] = []
+        # Per-call-site temp slots for struct-returning calls. Keyed by
+        # `id(call_node)` so each Call expression in the function gets
+        # its own buffer (so `make(1).x + make(2).x` works).
+        self.call_temps: dict[int, int] = {}
 
     def alloc_local(self, name: str, ty: "ast.TypeNode", size: int = 4) -> int:
         if name in self.slots:
@@ -133,6 +142,13 @@ class _FuncCtx:
         self.slots[name] = -self.frame_size
         self.types[name] = ty
         return self.slots[name]
+
+    def alloc_call_temp(self, call_node: object, size: int) -> int:
+        """Reserve a frame slot for a struct-returning call's destination."""
+        self.frame_size += size
+        disp = -self.frame_size
+        self.call_temps[id(call_node)] = disp
+        return disp
 
     def alloc_param(self, name: str, disp: int, ty: "ast.TypeNode") -> int:
         # cdecl: caller pushed args right-to-left, then `call` pushed the
@@ -504,6 +520,12 @@ class CodeGenerator:
         # First pass: allocate every local up front so the prologue knows
         # the frame size before we emit body code.
         self._collect_locals(fn.body, ctx)
+        # Second pass: reserve a temp slot for each struct-returning Call
+        # in the body. Some call sites have known destinations (var init,
+        # struct assignment rhs, return chain) and don't actually use the
+        # temp — wasting a few bytes of frame is simpler than tracking
+        # parent context here.
+        self._collect_call_temps(fn.body, ctx)
 
         body = self._compound(fn.body, ctx)
 
@@ -522,6 +544,45 @@ class CodeGenerator:
         out.append("        pop     ebp")
         out.append("        ret")
         return out
+
+    def _collect_call_temps(self, node, ctx: _FuncCtx) -> None:
+        """Pre-allocate a frame slot for every struct-returning Call in `node`.
+
+        We allocate one buffer per Call expression (keyed by `id(call)`)
+        so two struct-returning calls in the same expression — e.g.
+        `make(1).x + make(2).x` — get distinct buffers and don't clobber
+        each other. Some call sites later turn out to have a known
+        destination (var init, struct assignment, return chain) and
+        won't read from the temp, but allocating them anyway keeps this
+        pass context-free.
+        """
+        for sub in self._walk_ast(node):
+            if isinstance(sub, ast.Call) and self._is_struct_returning_call(sub, None):
+                ret_ty = self._func_return_types[self._call_target(sub)]
+                size = (self._size_of(ret_ty) + 3) & ~3
+                ctx.alloc_call_temp(sub, size)
+
+    @staticmethod
+    def _walk_ast(node):
+        """Yield `node` and every nested AST node, dataclass-fields style.
+
+        Used by the call-temp pre-pass; deliberately doesn't try to know
+        about specific node types — anything that's a dataclass gets its
+        fields recursed into.
+        """
+        if node is None:
+            return
+        yield node
+        if dataclasses.is_dataclass(node):
+            for f in dataclasses.fields(node):
+                child = getattr(node, f.name, None)
+                yield from CodeGenerator._walk_ast(child)
+        elif isinstance(node, list):
+            for item in node:
+                yield from CodeGenerator._walk_ast(item)
+        elif isinstance(node, tuple):
+            for item in node:
+                yield from CodeGenerator._walk_ast(item)
 
     def _collect_locals(self, node, ctx: _FuncCtx) -> None:
         """Walk a function body recursively and reserve a slot for every VarDecl.
@@ -817,12 +878,10 @@ class CodeGenerator:
         if isinstance(expr, ast.UnaryOp) and expr.op == "*":
             return self._eval_expr_to_eax(expr.operand, ctx)
         if isinstance(expr, ast.Call):
-            # `make().field` would need a runtime temp slot for the
-            # returned struct. Until we add per-call temps, reject.
-            raise CodegenError(
-                "struct return value can only be used as a variable "
-                "initializer, an assignment rhs, or `return` expression"
-            )
+            # For struct-returning calls, evaluating the call leaves EAX
+            # holding the temp's address (the callee returns the retptr
+            # we passed in) — that's exactly the address `.member` wants.
+            return self._eval_expr_to_eax(expr, ctx)
         raise CodegenError(
             f"can't take address of {type(expr).__name__} for `.member`"
         )
@@ -1603,6 +1662,16 @@ class CodeGenerator:
         if isinstance(expr, ast.BinaryOp):
             return self._binary(expr, ctx)
         if isinstance(expr, ast.Call):
+            if self._is_struct_returning_call(expr, ctx):
+                # Direct EAX returns can't carry a struct; route the
+                # call into a per-call-site temp slot reserved by
+                # `_collect_call_temps`. EAX ends up holding the
+                # temp's address (as the callee returns the retptr),
+                # which is exactly what later `.field` / arg-copy
+                # paths want.
+                disp = ctx.call_temps[id(expr)]
+                retptr_lines = [f"        lea     eax, {_ebp_addr(disp)}"]
+                return self._call_into_address(expr, retptr_lines, ctx)
             return self._call(expr, ctx)
         if isinstance(expr, ast.TernaryOp):
             return self._ternary(expr, ctx)
@@ -1671,18 +1740,10 @@ class CodeGenerator:
         # and `(*f)()` and `(***f)()` all call the same function. Strip
         # leading dereferences from the callee so the lowering doesn't
         # try to actually load through the function address.
+        #
+        # Struct-returning calls are handled in `_eval_expr_to_eax` (via
+        # the per-call temp) before reaching here.
         callee = self._stripped_callee(expr)
-
-        # Struct-returning calls need a destination buffer; this path is
-        # for "use the return value as an expression," which we only
-        # support when the destination is statically known. `_var_init`,
-        # `_assign`, and `_return` recognize struct-returning calls and
-        # bypass `_call` to provide the retptr directly.
-        if self._is_struct_returning_call(expr, ctx):
-            raise CodegenError(
-                "struct return value can only be used as a variable "
-                "initializer, an assignment rhs, or `return` expression"
-            )
 
         # Direct call: callee names a function declared in this unit
         # (defined or extern). Emit a `call _name` linker reference.

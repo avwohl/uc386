@@ -882,14 +882,57 @@ def test_chained_struct_return_forwards_retptr():
     assert "call    _inner" in fn_section
 
 
-def test_struct_return_value_used_in_other_position_rejected():
-    # `make().x` and `f(make())` need a runtime temp slot; defer.
-    with pytest.raises(CodegenError, match="struct"):
-        _compile(
-            "struct point { int x; int y; }; "
-            "struct point make(void) { struct point p; p.x = 1; p.y = 2; return p; } "
-            "int main(void) { return make().x; }"
-        )
+def test_struct_return_member_access():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "struct point make(void) { struct point p; p.x = 5; p.y = 7; return p; } "
+        "int main(void) { return make().x; }"
+    )
+    asm_lines = asm.splitlines()
+    main_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_main:")
+    main_section = "\n".join(asm_lines[main_idx:])
+    # Caller reserves a temp slot for the returned struct, passes its
+    # address as the retptr, and then accesses `.x` from that slot.
+    assert "call    _make" in main_section
+    # main's frame should include space for the temp.
+    sub_lines = [l for l in asm_lines[main_idx:] if "sub     esp," in l]
+    assert sub_lines  # at least one sub esp
+
+
+def test_struct_return_passed_as_arg():
+    # `f(make())` — caller stages the struct in a temp, then memcpy's onto
+    # the stack as a struct-by-value arg.
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "struct point make(void) { struct point p; p.x = 1; p.y = 2; return p; } "
+        "int sum(struct point p) { return p.x + p.y; } "
+        "int main(void) { return sum(make()); }"
+    )
+    asm_lines = asm.splitlines()
+    main_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_main:")
+    main_section = "\n".join(asm_lines[main_idx:])
+    assert "call    _make" in main_section
+    assert "call    _sum" in main_section
+
+
+def test_multiple_struct_returning_calls_get_distinct_temps():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "struct point make(int n) { struct point p; p.x = n; p.y = n; return p; } "
+        "int main(void) { return make(1).x + make(2).x; }"
+    )
+    asm_lines = asm.splitlines()
+    main_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_main:")
+    main_section = "\n".join(asm_lines[main_idx:])
+    # Both calls happen.
+    assert main_section.count("call    _make") == 2
+    # Each gets its own temp — adding a struct-sized temp twice means the
+    # frame is at least 16 bytes (2 * sizeof(struct point)).
+    sub_match = next(
+        l for l in asm_lines[main_idx:] if l.strip().startswith("sub     esp,")
+    )
+    sub_size = int(sub_match.split(",")[1].strip())
+    assert sub_size >= 16
 
 
 # ---- switch / case --------------------------------------------------------
