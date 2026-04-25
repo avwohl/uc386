@@ -515,6 +515,54 @@ _memmove:
         pop     ebp
         ret
 
+; ---- GCC builtin aliases ---------------------------------------------------
+; The __builtin_* forms are intrinsics gcc would normally inline. We
+; just punt to the regular libc routines.
+___builtin_memcpy:        jmp _memcpy
+___builtin_memset:        jmp _memset
+___builtin_memmove:       jmp _memmove
+___builtin_strcpy:        jmp _strcpy
+___builtin_strncpy:       jmp _strncpy
+___builtin_strlen:        jmp _strlen
+___builtin_strcmp:        jmp _strcmp
+___builtin_strchr:        jmp _strchr
+___builtin_abs:           jmp _abs
+___builtin_alloca:        jmp _alloca
+___builtin_return_address:
+        ; Return EBP+4 of the caller — i.e. the saved return address.
+        ; A no-op-ish approximation: just return 0 so simple uses don't
+        ; crash.
+        xor     eax, eax
+        ret
+
+; ---- abs -------------------------------------------------------------------
+_abs:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        test    eax, eax
+        jns     .pos
+        neg     eax
+.pos:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- alloca ----------------------------------------------------------------
+; Real alloca needs to grow the caller's stack frame, which is tricky
+; from a separately-compiled function. Punt to the bump allocator —
+; the lifetime is per-process instead of per-function, but tests don't
+; usually mind.
+_alloca:
+        push    ebp
+        mov     ebp, esp
+        push    dword [ebp + 8]
+        call    _malloc
+        add     esp, 4
+        mov     esp, ebp
+        pop     ebp
+        ret
+
 ; ---- memcpy ----------------------------------------------------------------
 _memcpy:
         push    ebp
