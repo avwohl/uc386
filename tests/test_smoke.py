@@ -674,6 +674,76 @@ def test_unsized_array_without_initializer_rejected():
         _compile("int main(void) { int a[]; return 0; }")
 
 
+# ---- struct by-value params -----------------------------------------------
+
+def test_struct_param_callee_uses_param_offset():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int get_x(struct point p) { return p.x; } "
+        "int main(void) { struct point pt; pt.x = 9; return get_x(pt); }"
+    )
+    asm_lines = asm.splitlines()
+    fn_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_get_x:")
+    fn_section = "\n".join(asm_lines[fn_idx:])
+    # First param at [ebp + 8]; p.x is offset 0 so the lea + read gives us p.x.
+    assert "lea     eax, [ebp + 8]" in fn_section
+    # The actual member load.
+    assert "mov     eax, [eax]" in fn_section
+
+
+def test_struct_param_caller_memcpys_onto_stack():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int get_x(struct point p) { return p.x; } "
+        "int main(void) { struct point pt; pt.x = 9; pt.y = 7; return get_x(pt); }"
+    )
+    asm_lines = asm.splitlines()
+    main_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_main:")
+    main_section = "\n".join(asm_lines[main_idx:])
+    # Caller reserves 8 bytes for the struct arg, then writes the two
+    # dwords into [esp + 0] and [esp + 4].
+    assert "sub     esp, 8" in main_section
+    assert "mov     [esp + 0], eax" in main_section
+    assert "mov     [esp + 4], eax" in main_section
+    # And cleans up after the call.
+    assert "add     esp, 8" in main_section
+
+
+def test_struct_and_int_param_layout():
+    asm = _compile(
+        "struct point { int x; int y; }; "
+        "int f(int n, struct point p) { return n + p.x; } "
+        "int main(void) { struct point q; q.x = 5; return f(3, q); }"
+    )
+    asm_lines = asm.splitlines()
+    fn_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_f:")
+    fn_section = "\n".join(asm_lines[fn_idx:])
+    # `n` at [ebp + 8], struct `p` at [ebp + 12] (since n consumes 4).
+    assert "mov     eax, [ebp + 8]" in fn_section
+    assert "lea     eax, [ebp + 12]" in fn_section
+
+
+def test_struct_param_with_mixed_widths():
+    # struct {char c; int n} — sizeof = 8 (1 byte + 3 pad + 4).
+    asm = _compile(
+        "struct mix { char c; int n; }; "
+        "int f(struct mix m) { return m.n; } "
+        "int main(void) { struct mix x; x.c = 0; x.n = 42; return f(x); }"
+    )
+    main = "\n".join(asm.splitlines()[next(i for i, l in enumerate(asm.splitlines()) if l.strip() == "_main:"):])
+    # Caller reserves 8 bytes for the arg.
+    assert "sub     esp, 8" in main
+
+
+def test_struct_return_not_yet_supported():
+    with pytest.raises(CodegenError, match="struct return"):
+        _compile(
+            "struct point { int x; int y; }; "
+            "struct point make(int x, int y) { struct point p; p.x = x; p.y = y; return p; } "
+            "int main(void) { return 0; }"
+        )
+
+
 # ---- switch / case --------------------------------------------------------
 
 def test_switch_dispatches_with_cmp_and_je():

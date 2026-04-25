@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–19 are done. 206 tests passing.
-Slice 20+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–20 are done. 211 tests passing.
+Slice 21+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,16 +60,20 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 19 (just landed):
-- **Switch / case / default.** Dispatch ladder + body fall-through,
-  chained `case 1: case 2:` flattening, `continue` passes through to
-  enclosing loop (separate break/continue target stacks).
+Implemented in slice 20 (just landed):
+- **Struct by-value params.** Caller reserves `sizeof(struct)` rounded
+  to 4 via `sub esp, N` and copies into the slot; callee accesses via
+  the accumulated param offset. Struct return still raises pending its
+  own slice (the ABI for the hidden first arg + caller-side temp slot
+  is the open design question).
 
 Deliberately not yet implemented — next slices in roughly this order:
-- **Struct by-value params + returns.** Caller copies struct args
-  onto the stack; callee accesses via param offsets. For returns, the
-  cdecl convention has the caller allocate space and pass a hidden
-  first argument pointing at it (struct-return ABI).
+- **Unions.** Same layout as structs but all members at offset 0 and
+  total size = max(member sizes). Member access reuses
+  `_member_address` once the registry distinguishes union from struct.
+- **Struct return by value.** Hidden first arg pointing at a
+  caller-allocated buffer. The trickiest piece is the buffer's
+  lifetime — likely a per-call temp area added to the caller's frame.
 - **Designated/nested initializers.** `int arr[3] = {[1] = 5}` and
   `int m[2][3] = {{...}, {...}}` both raise. Multidim arrays would
   also need ArrayType-of-ArrayType slot support.

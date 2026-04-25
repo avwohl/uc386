@@ -127,13 +127,15 @@ class _FuncCtx:
         self.types[name] = ty
         return self.slots[name]
 
-    def alloc_param(self, name: str, index: int, ty: "ast.TypeNode", size: int = 4) -> int:
+    def alloc_param(self, name: str, disp: int, ty: "ast.TypeNode") -> int:
         # cdecl: caller pushed args right-to-left, then `call` pushed the
         # return address, then we pushed EBP. So the first arg lives at
-        # [ebp + 8], the second at [ebp + 12], etc.
+        # [ebp + 8], the second at [ebp + 12], etc. The caller is
+        # responsible for computing `disp` as it walks the parameter
+        # list — for struct-by-value params, the size isn't 4.
         if name in self.slots:
             raise CodegenError(f"duplicate parameter `{name}`")
-        self.slots[name] = 8 + index * size
+        self.slots[name] = disp
         self.types[name] = ty
         return self.slots[name]
 
@@ -466,15 +468,26 @@ class CodeGenerator:
     # ---- functions ------------------------------------------------------
 
     def _function(self, fn: ast.FunctionDecl) -> list[str]:
+        if isinstance(fn.return_type, ast.StructType):
+            raise CodegenError(
+                f"struct return not yet supported (`{fn.name}`)"
+            )
         ctx = _FuncCtx()
-        # Parameters live above EBP at fixed cdecl offsets; register them
-        # before the locals so a body that references a parameter lowers
-        # correctly. `int` is the only param type we handle today.
-        for i, param in enumerate(fn.params):
+        # Parameters live above EBP at cdecl offsets; the first sits at
+        # [ebp + 8], and each subsequent param is offset by its predecessor's
+        # padded size (4 for scalars / pointers, sizeof(struct) rounded
+        # up to 4 for structs passed by value).
+        disp = 8
+        for param in fn.params:
             if param.name is None:
                 continue
             self._check_supported_type(param.param_type, param.name)
-            ctx.alloc_param(param.name, i, param.param_type)
+            ctx.alloc_param(param.name, disp, param.param_type)
+            if isinstance(param.param_type, ast.StructType):
+                size = self._size_of(param.param_type)
+                disp += (size + 3) & ~3
+            else:
+                disp += 4
         # First pass: allocate every local up front so the prologue knows
         # the frame size before we emit body code.
         self._collect_locals(fn.body, ctx)
@@ -1527,20 +1540,46 @@ class CodeGenerator:
         direct: str | None = None,
         indirect_callee: ast.Expression | None = None,
     ) -> list[str]:
-        # cdecl: push args right-to-left so the first arg ends up at the
-        # lowest address (= [ebp+8] in the callee). C leaves inter-arg
-        # evaluation order unspecified, so right-to-left is fine.
+        # cdecl pushes args right-to-left so the leftmost arg ends up at
+        # the lowest address (= [ebp+8] in the callee). For scalars we
+        # use plain `push eax`; for struct-by-value we reserve `sizeof`
+        # bytes via `sub esp, N` and copy the struct's bytes into that
+        # window with the same per-dword pattern as `_struct_copy_assign`.
         out: list[str] = []
+        total_arg_bytes = 0
         for arg in reversed(args):
-            out += self._eval_expr_to_eax(arg, ctx)
-            out.append("        push    eax")
+            arg_ty = self._type_of(arg, ctx)
+            if isinstance(arg_ty, ast.StructType):
+                size = self._size_of(arg_ty)
+                padded = (size + 3) & ~3
+                # Compute &arg first; once it's in EDX we can reserve and copy.
+                out += self._struct_address(arg, ctx)
+                out.append("        mov     edx, eax")
+                out.append(f"        sub     esp, {padded}")
+                offset = 0
+                while size - offset >= 4:
+                    out.append(f"        mov     eax, [edx + {offset}]")
+                    out.append(f"        mov     [esp + {offset}], eax")
+                    offset += 4
+                if size - offset >= 2:
+                    out.append(f"        mov     ax, [edx + {offset}]")
+                    out.append(f"        mov     [esp + {offset}], ax")
+                    offset += 2
+                if size - offset >= 1:
+                    out.append(f"        mov     al, [edx + {offset}]")
+                    out.append(f"        mov     [esp + {offset}], al")
+                total_arg_bytes += padded
+            else:
+                out += self._eval_expr_to_eax(arg, ctx)
+                out.append("        push    eax")
+                total_arg_bytes += 4
         if direct is not None:
             out.append(f"        call    _{direct}")
         else:
             out += self._eval_expr_to_eax(indirect_callee, ctx)
             out.append("        call    eax")
-        if args:
-            out.append(f"        add     esp, {4 * len(args)}")
+        if total_arg_bytes:
+            out.append(f"        add     esp, {total_arg_bytes}")
         # Return value is in EAX.
         return out
 
