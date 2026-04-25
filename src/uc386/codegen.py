@@ -650,9 +650,15 @@ class CodeGenerator:
         # Walk source values, honouring `.field = value` designators.
         # `slot_values[i]` is the expr to emit for member i, or absent
         # for "zero-fill this member".
+        # Apply brace elision: group flat values targeting compound
+        # members into per-member InitializerLists (e.g. PT's int c[4]
+        # eats the next 4 flat values).
+        elided_values = self._elide_braces_for_struct(
+            init.values, members, name,
+        )
         slot_values: dict[int, ast.Expression] = {}
         cursor = 0
-        for value in init.values:
+        for value in elided_values:
             if isinstance(value, ast.DesignatedInit):
                 if (
                     len(value.designators) != 1
@@ -732,6 +738,150 @@ class CodeGenerator:
             out.append(f"        times {total - emit_cursor} db 0")
         return out
 
+    def _elide_braces_for_struct(
+        self,
+        values: list,
+        members: list,
+        name: str,
+    ) -> list:
+        """Brace-elide a flat init-value run for a struct.
+
+        Walks `values` and `members` in parallel. For each non-designated
+        value: if the member is compound (struct/array) with leaf_count
+        > 1, gather that many subsequent flat values into a synthetic
+        InitializerList. Designated values pass through untouched.
+        """
+        out = []
+        cursor = 0
+        i = 0
+        n = len(members)
+        while i < len(values):
+            v = values[i]
+            if isinstance(v, ast.DesignatedInit):
+                out.append(v)
+                i += 1
+                continue
+            if cursor >= n:
+                out.append(v)
+                i += 1
+                continue
+            _, m_ty, _ = members[cursor]
+            cursor += 1
+            if isinstance(v, ast.InitializerList):
+                out.append(v)
+                i += 1
+                continue
+            leaves = self._leaf_slot_count(m_ty)
+            if leaves <= 1:
+                out.append(v)
+                i += 1
+                continue
+            # Collect up to `leaves` flat values into a synthetic list.
+            group = []
+            j = i
+            while j < len(values) and j - i < leaves:
+                vj = values[j]
+                if isinstance(vj, (ast.DesignatedInit, ast.InitializerList)):
+                    break
+                group.append(vj)
+                j += 1
+            if len(group) == leaves:
+                out.append(ast.InitializerList(values=group))
+                i = j
+            else:
+                out.append(v)
+                i += 1
+        return out
+
+    def _leaf_slot_count(self, t: ast.TypeNode) -> int:
+        """Recursively count scalar leaves in `t`.
+
+        Used by the brace-elision pre-pass to know how many flat
+        positional values to consume per array element. Anonymous-union
+        members at the same offset count once.
+        """
+        if isinstance(t, ast.ArrayType):
+            if not isinstance(t.size, ast.IntLiteral):
+                return 1
+            return t.size.value * self._leaf_slot_count(t.base_type)
+        if isinstance(t, ast.StructType):
+            try:
+                sname = self._resolve_struct_name(t)
+            except CodegenError:
+                return 1
+            members = self._structs.get(sname, [])
+            count = 0
+            seen_off = set()
+            for _, m_ty, off in members:
+                if off in seen_off:
+                    continue
+                seen_off.add(off)
+                count += self._leaf_slot_count(m_ty)
+            return count or 1
+        return 1
+
+    def _elide_braces_for_array(
+        self,
+        values: list,
+        elem_type: ast.TypeNode,
+        name: str,
+    ) -> list:
+        """Group flat positional values into per-element InitializerLists.
+
+        For `PT cases[] = { v1, v2, v3, ... }` where PT is a struct, the
+        C standard says positional values flow through the array's
+        nested aggregates. We group the next K leaf values into one
+        synthesized InitializerList per array element when K = the
+        struct's member count and the values aren't already wrapped.
+
+        Designated array initializers reset the cursor; we hand them
+        through unchanged. Single-element arrays of struct also fall
+        through normally.
+        """
+        # Only worth doing if the element is a struct/union/array with
+        # known layout and there's a flat run that exceeds 1 value per
+        # element.
+        if not isinstance(elem_type, (ast.StructType, ast.ArrayType)):
+            return values
+        leaf_count = self._leaf_slot_count(elem_type)
+        if leaf_count <= 1:
+            return values
+
+        out = []
+        i = 0
+        while i < len(values):
+            v = values[i]
+            if isinstance(v, ast.DesignatedInit):
+                # Designators can target individual array elements; keep
+                # them as-is, but their value might itself need elision
+                # if it's flat-multi.
+                out.append(v)
+                i += 1
+                continue
+            if isinstance(v, ast.InitializerList):
+                out.append(v)
+                i += 1
+                continue
+            # Flat value — gather up to leaf_count consecutive flat
+            # values into an InitializerList for one element.
+            group = []
+            j = i
+            while j < len(values) and j - i < leaf_count:
+                vj = values[j]
+                if isinstance(vj, (ast.DesignatedInit, ast.InitializerList)):
+                    break
+                group.append(vj)
+                j += 1
+            if len(group) == leaf_count:
+                out.append(ast.InitializerList(values=group))
+                i = j
+            else:
+                # Couldn't form a complete group — pass through, let
+                # the downstream type-check raise a clearer error.
+                out.append(v)
+                i += 1
+        return out
+
     def _emit_global_array_init(
         self,
         arr_ty: ast.ArrayType,
@@ -760,13 +910,14 @@ class CodeGenerator:
             return [f"        db      {', '.join(parts)}"]
 
         if isinstance(init, ast.InitializerList):
+            values = self._elide_braces_for_array(init.values, elem_type, name)
             # Walk values once, allowing `[N] = expr` to jump the cursor
             # the same way local-array init does. The result is a
             # by-index map from designated-or-positional slots to
             # (value-expr, kind) pairs; gaps zero-fill.
             slots: dict[int, ast.Expression] = {}
             cursor = 0
-            for value in init.values:
+            for value in values:
                 if isinstance(value, ast.DesignatedInit):
                     if (
                         len(value.designators) != 1
@@ -904,6 +1055,88 @@ class CodeGenerator:
         if run:
             chunks.append("'" + "".join(run) + "'")
         return ", ".join(chunks) if chunks else "0"
+
+    def _select_generic_arm(
+        self, expr: ast.GenericSelection, ctx: _FuncCtx,
+    ) -> ast.Expression:
+        """Pick the matching arm of a `_Generic(ctrl, T1: e1, T2: e2, ...)`.
+
+        Per C11, the controlling expression's type (after the usual
+        decays — but not integer promotions) is matched against each
+        listed type. The matching expression is selected; if none
+        matches, the `default:` association is used (None type-key).
+        Falls back to the first arm if neither match nor default.
+        """
+        ctrl_ty = self._type_of(expr.controlling_expr, ctx)
+        ctrl_ty = self._strip_qualifiers(ctrl_ty)
+        # Decay arrays to pointers and functions to pointers, the way
+        # _Generic sees the controlling expression.
+        if isinstance(ctrl_ty, ast.ArrayType):
+            ctrl_ty = ast.PointerType(base_type=ctrl_ty.base_type)
+        elif isinstance(ctrl_ty, ast.FunctionType):
+            ctrl_ty = ast.PointerType(base_type=ctrl_ty)
+        default_arm: ast.Expression | None = None
+        for assoc_ty, arm in expr.associations:
+            if assoc_ty is None:
+                default_arm = arm
+                continue
+            if self._types_equal(ctrl_ty, self._strip_qualifiers(assoc_ty)):
+                return arm
+        if default_arm is not None:
+            return default_arm
+        # Fall back to the first arm if a match is required and none
+        # was found — keeps codegen producing *something*.
+        return expr.associations[0][1]
+
+    @staticmethod
+    def _strip_qualifiers(t: ast.TypeNode) -> ast.TypeNode:
+        # Top-level const/volatile are ignored for `_Generic` matching.
+        # Inner qualifiers (on a pointer's pointee) stay — that's per
+        # the standard.
+        if isinstance(t, ast.BasicType):
+            return ast.BasicType(name=t.name, is_signed=t.is_signed)
+        return t
+
+    def _types_equal(self, a: ast.TypeNode, b: ast.TypeNode) -> bool:
+        """Best-effort C type equality for `_Generic` matching.
+
+        Compares structural shape: BasicType by name + signedness,
+        PointerType by base, ArrayType by element + size, StructType
+        and EnumType by registered name.
+        """
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, ast.BasicType):
+            if a.name != b.name:
+                return False
+            # Treat default-int signedness as equal to explicit signed.
+            sa = True if a.is_signed is None else a.is_signed
+            sb = True if b.is_signed is None else b.is_signed
+            return sa == sb
+        if isinstance(a, ast.PointerType):
+            return self._types_equal(a.base_type, b.base_type)
+        if isinstance(a, ast.ArrayType):
+            if not self._types_equal(a.base_type, b.base_type):
+                return False
+            if a.size is None or b.size is None:
+                return a.size is None and b.size is None
+            if isinstance(a.size, ast.IntLiteral) and isinstance(b.size, ast.IntLiteral):
+                return a.size.value == b.size.value
+            return False
+        if isinstance(a, ast.StructType):
+            return self._resolve_struct_name(a) == self._resolve_struct_name(b)
+        if isinstance(a, ast.EnumType):
+            return (a.name or "") == (b.name or "")
+        if isinstance(a, ast.FunctionType):
+            if not self._types_equal(a.return_type, b.return_type):
+                return False
+            if len(a.param_types) != len(b.param_types):
+                return False
+            return all(
+                self._types_equal(pa, pb)
+                for pa, pb in zip(a.param_types, b.param_types)
+            )
+        return False
 
     def _intern_string(self, value: str) -> str:
         if value in self._strings:
@@ -1259,7 +1492,8 @@ class CodeGenerator:
                 cursor += 1
             n = max_idx + 1
         elif isinstance(decl.init, ast.StringLiteral):
-            # +1 reserves a slot for the trailing null byte.
+            # +1 reserves a slot for the trailing null byte. Wide
+            # strings count by codepoint, not by encoded byte length.
             n = len(decl.init.value) + 1
         else:
             raise CodegenError(
@@ -2321,6 +2555,38 @@ class CodeGenerator:
         length = arr_type.size.value
 
         if isinstance(init, ast.StringLiteral):
+            is_wide = getattr(init, "is_wide", False)
+            if is_wide:
+                # `wchar_t s[] = L"...";` — each codepoint becomes one
+                # array element of `elem_size` bytes (typically 2 for
+                # `unsigned short`/wchar_t on this target). Range-check
+                # against the slot's payload width, then store.
+                codepoints = [ord(c) for c in init.value] + [0]
+                if len(codepoints) > length:
+                    raise CodegenError(
+                        f"`{name}`: wide string init exceeds array size {length}"
+                    )
+                width_keyword = self._ZERO_WIDTHS.get(elem_size)
+                if width_keyword is None:
+                    raise CodegenError(
+                        f"`{name}`: wide string element size {elem_size} unsupported"
+                    )
+                out: list[str] = []
+                for i, cp in enumerate(codepoints):
+                    # NASM doesn't accept `mov word [..], 65535` if the
+                    # operand width disagrees with the value; we know
+                    # the element fits because the source code declared
+                    # the array of this element type.
+                    addr = _ebp_addr(base_disp + i * elem_size)
+                    out.append(
+                        f"        mov     {width_keyword} {addr}, {cp & ((1 << (elem_size * 8)) - 1)}"
+                    )
+                for i in range(len(codepoints), length):
+                    addr = _ebp_addr(base_disp + i * elem_size)
+                    out.append(
+                        f"        mov     {width_keyword} {addr}, 0"
+                    )
+                return out
             if not (
                 isinstance(elem_type, ast.BasicType)
                 and elem_type.name == "char"
@@ -2973,6 +3239,9 @@ class CodeGenerator:
             # non-expression, EAX is left at whatever the last emitted
             # code put there — undefined but not crashing.
             return self._compound(expr.body, ctx)
+        if isinstance(expr, ast.GenericSelection):
+            chosen = self._select_generic_arm(expr, ctx)
+            return self._eval_expr_to_eax(chosen, ctx)
         raise CodegenError(
             f"expression {type(expr).__name__} not implemented yet"
         )
