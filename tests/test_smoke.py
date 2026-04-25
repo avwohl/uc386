@@ -1293,6 +1293,35 @@ def test_float_compound_assign_to_identifier():
     assert "fstp    dword [ebp - 4]" in asm
 
 
+def test_float_compound_assign_to_array_element():
+    asm = _compile(
+        "int main(void) { float arr[3]; arr[1] = 1.0f; "
+        "arr[1] += 0.5f; return (int)arr[1]; }"
+    )
+    # Compound load + faddp + store-through-ecx.
+    assert "faddp" in asm
+    assert "fst     dword [ecx]" in asm
+
+
+def test_float_compound_assign_to_struct_member():
+    asm = _compile(
+        "struct p { float x; }; "
+        "int main(void) { struct p s; s.x = 1.0f; "
+        "s.x *= 2.0f; return (int)s.x; }"
+    )
+    assert "fmulp" in asm
+    assert "fst     dword [ecx]" in asm
+
+
+def test_float_compound_assign_through_pointer():
+    asm = _compile(
+        "int main(void) { float x = 2.0f; float *p = &x; "
+        "*p -= 1.0f; return (int)x; }"
+    )
+    assert "fsubp" in asm
+    assert "fst     dword [ecx]" in asm
+
+
 # ---- float globals --------------------------------------------------------
 
 def test_float_global_initialized_in_data():

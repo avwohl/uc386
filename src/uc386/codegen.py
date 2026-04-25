@@ -2279,9 +2279,10 @@ class CodeGenerator:
 
         Identifier lvalues use the simple desugar (re-evaluating an
         Identifier is side-effect-free) so `f += rhs` becomes
-        `f = f + rhs`. Non-Identifier float compound assignment isn't
-        yet supported — it needs the address-once dance with the FPU
-        stack as the working register.
+        `f = f + rhs`. For `arr[i]`, `*p`, and `s.m` lvalues we compute
+        the address once into EAX, push it, `fld` the current value,
+        evaluate the rhs to st(0), apply `faddp`/`fsubp`/`fmulp`/
+        `fdivp`, pop the address back into ECX, and `fst` through it.
         """
         op = self._COMPOUND_OPS[expr.op]
         if isinstance(expr.left, ast.Identifier):
@@ -2289,10 +2290,38 @@ class CodeGenerator:
             return self._float_assign(
                 ast.BinaryOp(op="=", left=expr.left, right=inner), ctx,
             )
-        raise CodegenError(
-            f"float compound assignment to {type(expr.left).__name__} "
-            f"not yet supported"
-        )
+        if isinstance(expr.left, ast.UnaryOp) and expr.left.op == "*":
+            addr_lines = self._eval_expr_to_eax(expr.left.operand, ctx)
+        elif isinstance(expr.left, ast.Index):
+            addr_lines = self._index_address(expr.left, ctx)
+        elif isinstance(expr.left, ast.Member):
+            addr_lines = self._member_address(expr.left, ctx)
+        else:
+            raise CodegenError(
+                f"float compound assignment to "
+                f"{type(expr.left).__name__} not supported"
+            )
+        op_to_mnem = {
+            "+": "faddp",
+            "-": "fsubp",
+            "*": "fmulp",
+            "/": "fdivp",
+        }
+        if op not in op_to_mnem:
+            raise CodegenError(
+                f"float compound op `{expr.op}` not supported"
+            )
+        target_ty = self._type_of(expr.left, ctx)
+        size = self._size_of(target_ty)
+        width = "dword" if size == 4 else "qword"
+        out = list(addr_lines)
+        out.append("        push    eax")            # save addr
+        out.append(f"        fld     {width} [eax]") # current value to st0
+        out += self._eval_float_to_st0(expr.right, ctx)
+        out.append(f"        {op_to_mnem[op]}   st1, st0")
+        out.append("        pop     ecx")
+        out.append(f"        fst     {width} [ecx]")
+        return out
 
     def _eval_to_bool_eax(self, expr: ast.Expression, ctx: _FuncCtx) -> list[str]:
         """Evaluate `expr` and leave EAX = 0 (false) or 1 (true).
