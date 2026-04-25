@@ -90,10 +90,10 @@ def test_unknown_identifier_rejected():
         _compile("int main(void) { return x; }")
 
 
-def test_unsupported_type_local_rejected():
-    # `float` isn't yet a supported slot type — full FP codegen comes later.
+def test_complex_type_local_rejected():
+    # `_Complex` isn't a supported slot type. (`float` and `double` are.)
     with pytest.raises(CodegenError, match="not supported|only"):
-        _compile("int main(void) { float f; return 0; }")
+        _compile("int main(void) { _Complex float c; return 0; }")
 
 
 @pytest.mark.parametrize(
@@ -1035,6 +1035,95 @@ def test_break_outside_switch_or_loop_still_rejected():
     # The error message changed wording with slice 19 but still mentions "outside".
     with pytest.raises(CodegenError, match="outside"):
         _compile("int main(void) { break; return 0; }")
+
+
+# ---- floats (Phase 5) -----------------------------------------------------
+
+def test_float_literal_emits_data_constant():
+    asm = _compile("int main(void) { float x = 1.5; return 0; }")
+    assert "section .data" in asm
+    # Float constant gets a unique label. `1.5` parses as a double
+    # literal (no `f` suffix), so the pool entry is qword; the store
+    # narrows to dword via x87's automatic precision conversion.
+    assert any("_uc386_float" in l for l in asm.splitlines())
+    assert "fld     qword [_uc386_float" in asm
+    assert "fstp    dword [ebp - 4]" in asm
+
+
+def test_float_local_copy():
+    asm = _compile(
+        "int main(void) { float x = 1.5; float y = x; return 0; }"
+    )
+    # Reading `x` is fld dword from its slot.
+    assert "fld     dword [ebp - 4]" in asm
+    # Writing `y` is fstp dword to its slot.
+    assert "fstp    dword [ebp - 8]" in asm
+
+
+def test_float_addition():
+    asm = _compile(
+        "int main(void) { float x = 1.5; float y = 2.5; float z = x + y; return 0; }"
+    )
+    # Both operands fld'd, then faddp combines.
+    assert "faddp" in asm
+
+
+def test_float_division():
+    asm = _compile(
+        "int main(void) { float x = 6.0; float y = 2.0; float z = x / y; return 0; }"
+    )
+    assert "fdivp" in asm
+
+
+def test_cast_float_to_int_uses_fistp():
+    asm = _compile(
+        "int main(void) { float x = 1.5; int n = (int)x; return n; }"
+    )
+    assert "fistp" in asm
+
+
+def test_cast_int_to_float_uses_fild():
+    asm = _compile(
+        "int main(void) { int n = 5; float f = (float)n; return 0; }"
+    )
+    assert "fild" in asm
+
+
+def test_double_local_eight_byte_slot():
+    asm = _compile("int main(void) { double x = 1.5; return 0; }")
+    # Slot rounds up to 4-aligned but the value is 8 bytes wide; we
+    # emit a `qword` load/store and the frame includes 8 bytes.
+    assert "fld     qword" in asm
+    assert "fstp    qword [ebp - 8]" in asm
+
+
+def test_float_unary_negate():
+    asm = _compile(
+        "int main(void) { float x = 1.5; float y = -x; return 0; }"
+    )
+    # Float negation is fchs.
+    assert "fchs" in asm
+
+
+def test_mixed_int_float_in_arithmetic():
+    # `1.5 + 2` — int promotes to float, sum is float.
+    asm = _compile(
+        "int main(void) { float r = 1.5 + 2; return (int)r; }"
+    )
+    # int->float promotion uses fild somewhere.
+    assert "fild" in asm
+    # And the addition itself.
+    assert "faddp" in asm
+
+
+def test_returning_int_cast_of_float_arithmetic():
+    # The return statement evaluates a float-typed expression but stores
+    # an int — the conversion uses fistp.
+    asm = _compile(
+        "int main(void) { return (int)(1.5 + 2.5); }"
+    )
+    assert "faddp" in asm
+    assert "fistp" in asm
 
 
 # ---- bitfields ------------------------------------------------------------

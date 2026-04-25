@@ -52,6 +52,14 @@ Current scope:
   integer-promotion rules. Stores narrow via `mov byte [...], al` /
   `mov word [...], ax`, leaving the other bytes of a (4-aligned) slot
   unread.
+- Floats: `float` and `double` lower through the x87 FPU. A parallel
+  `_eval_float_to_st0` produces values on st(0); `_eval_expr_to_eax`
+  auto-converts float-typed expressions via `fistp` through a stack
+  scratch. Arithmetic uses `faddp/fsubp/fmulp/fdivp st1, st0`;
+  negation is `fchs`. FloatLiteral constants are interned in `.data`
+  and loaded with `fld dword/qword`. Int↔float casts use `fild` /
+  `fistp` through the stack. Float comparisons, by-value
+  params/returns, and global init aren't supported yet.
 - `sizeof(type)` and `sizeof(expr)` lower to a compile-time `mov eax, N`
   via the same `_size_of` used by pointer arithmetic. `sizeof(expr)`
   does not evaluate its operand — only the static type matters.
@@ -213,6 +221,10 @@ class CodeGenerator:
         # `(bit_offset, bit_width)` for members declared as `int x:N`.
         # Members not in the dict are byte-aligned (regular) members.
         self._struct_bitfields: dict[str, dict[str, tuple[int, int]]] = {}
+        # Float-constant table: (value, size_in_bytes) → label. Floats
+        # don't have an immediate-load instruction on x87, so every
+        # FloatLiteral becomes a labeled constant in `.data`.
+        self._float_constants: dict[tuple[float, int], str] = {}
 
     # ---- top level ------------------------------------------------------
 
@@ -258,6 +270,7 @@ class CodeGenerator:
         self._struct_sizes = {}
         self._struct_bitfields = {}
         self._enum_constants = {}
+        self._float_constants = {}
         for d in unit.declarations:
             if isinstance(d, ast.StructDecl) and d.is_definition:
                 self._register_struct(d)
@@ -318,25 +331,64 @@ class CodeGenerator:
         return out
 
     def _data_section(self) -> list[str]:
-        # Initialized globals + interned string literals share `.data`.
-        # Skip the section header entirely when neither is present so we
-        # don't emit an empty section.
+        # Initialized globals + interned string literals + float
+        # constants share `.data`. Skip the section header entirely
+        # when none of them are present.
         initialized_globals = sorted(
             name for name in self._globals if name in self._global_inits
         )
-        if not self._strings and not initialized_globals:
+        if (
+            not self._strings
+            and not initialized_globals
+            and not self._float_constants
+        ):
             return []
         out = ["        section .data"]
         # Stable order for reproducible output.
         for value, label in sorted(self._strings.items(), key=lambda kv: kv[1]):
             out.append(f"{label}:")
             out.append(f"        db      {self._render_string(value)}, 0")
+        for (value, size), label in sorted(
+            self._float_constants.items(), key=lambda kv: kv[1]
+        ):
+            # NASM accepts decimal float literals in `dd` (32-bit
+            # single) and `dq` (64-bit double); it converts to the
+            # appropriate IEEE-754 bit pattern at assemble time.
+            directive = "dd" if size == 4 else "dq"
+            out.append(f"{label}:")
+            out.append(f"        {directive}      {value!r}")
         for name in initialized_globals:
             ty = self._globals[name]
             init = self._global_inits[name]
             out.append(f"_{name}:")
             out += self._emit_global_init(ty, init, name)
         return out
+
+    def _intern_float(self, value: float, size: int) -> str:
+        key = (value, size)
+        if key in self._float_constants:
+            return self._float_constants[key]
+        label = f"_uc386_float{len(self._float_constants)}"
+        self._float_constants[key] = label
+        return label
+
+    @staticmethod
+    def _is_float_type(t: ast.TypeNode) -> bool:
+        return isinstance(t, ast.BasicType) and t.name in ("float", "double")
+
+    def _float_promotion(self, lt: ast.TypeNode, rt: ast.TypeNode) -> ast.TypeNode:
+        """C usual-arithmetic-conversions for a float-or-int + float-or-int pair.
+
+        If either side is `double`, the result is `double`. Otherwise (at
+        least one side is `float`), the result is `float`. Pure integer
+        cases don't reach here.
+        """
+        if (
+            (isinstance(lt, ast.BasicType) and lt.name == "double")
+            or (isinstance(rt, ast.BasicType) and rt.name == "double")
+        ):
+            return ast.BasicType(name="double")
+        return ast.BasicType(name="float")
 
     def _bss_section(self) -> list[str]:
         uninit = sorted(
@@ -675,7 +727,9 @@ class CodeGenerator:
     # `long long` are *known* sizes (so pointer-arithmetic scaling works
     # transparently for `long *` etc.) but full slot codegen waits on a
     # 64-bit value-tracking pass.
-    _SLOT_BASIC_NAMES = frozenset({"bool", "char", "short", "int"})
+    _SLOT_BASIC_NAMES = frozenset(
+        {"bool", "char", "short", "int", "float", "double"}
+    )
 
     def _check_supported_type(self, t: ast.TypeNode, name: str) -> None:
         # Pointers, and arrays / scalars / structs / enums of supported
@@ -755,6 +809,8 @@ class CodeGenerator:
         "int": 4,
         "long": 4,          # i386: long is 32-bit
         "long long": 8,
+        "float": 4,         # x87 single precision
+        "double": 8,        # x87 double precision
         "void": 1,          # GCC convention; standard C disallows arithmetic on void*
     }
 
@@ -1489,6 +1545,11 @@ class CodeGenerator:
                     ctx,
                 )
             return self._struct_init(var_type, decl.init, disp, ctx, decl.name)
+        if self._is_float_type(var_type):
+            # Float locals get their init value via st0 + fstp.
+            return self._eval_float_to_st0(decl.init, ctx) + self._store_st0_to(
+                _ebp_addr(disp), var_type
+            )
         return self._eval_expr_to_eax(decl.init, ctx) + self._store_from_eax(
             _ebp_addr(disp), var_type
         )
@@ -1844,6 +1905,8 @@ class CodeGenerator:
             return ast.BasicType(name="int")
         if isinstance(expr, ast.NullptrLiteral):
             return ast.PointerType(base_type=ast.BasicType(name="void"))
+        if isinstance(expr, ast.FloatLiteral):
+            return ast.BasicType(name="float" if expr.is_float else "double")
         if isinstance(expr, ast.StringLiteral):
             return ast.PointerType(base_type=ast.BasicType(name="char", is_const=True))
         if isinstance(expr, ast.UnaryOp):
@@ -1859,7 +1922,11 @@ class CodeGenerator:
             if expr.op in ("++", "--"):
                 # Mutation in place; the expression's type matches the operand.
                 return self._type_of(expr.operand, ctx)
-            # `+ - ~ !` produce int.
+            # `+` and `-` propagate float through; `~ !` always produce int.
+            if expr.op in ("+", "-"):
+                inner = self._type_of(expr.operand, ctx)
+                if self._is_float_type(inner):
+                    return inner
             return ast.BasicType(name="int")
         if isinstance(expr, ast.Index):
             arr_type = self._type_of(expr.array, ctx)
@@ -1894,12 +1961,27 @@ class CodeGenerator:
                 return self._type_of(expr.left, ctx)
             if expr.op in self._COMPOUND_OPS:
                 return self._type_of(expr.left, ctx)
+            # `*` `/` (and the relational/bitwise ops) need to know if
+            # either operand is float — the result of `1.5 * 2` is float,
+            # not int.
+            lt = self._type_of(expr.left, ctx)
+            rt = self._type_of(expr.right, ctx)
             if expr.op in self._INT_RESULT_BINOPS:
+                # Pointer-arithmetic promotion above doesn't apply here,
+                # but float promotion does for `*` and `/`.
+                if expr.op in ("*", "/", "%") and (
+                    self._is_float_type(lt) or self._is_float_type(rt)
+                ):
+                    if expr.op == "%":
+                        # C: % is integer-only; if either side is float
+                        # the program is ill-formed.
+                        raise CodegenError(
+                            "`%` requires integer operands"
+                        )
+                    return self._float_promotion(lt, rt)
                 return ast.BasicType(name="int")
             # `+` and `-`: pointer ± int → pointer; pointer - pointer → int.
             # Arrays count as pointer-like via decay.
-            lt = self._type_of(expr.left, ctx)
-            rt = self._type_of(expr.right, ctx)
             l_ptr = self._is_pointer_like(lt)
             r_ptr = self._is_pointer_like(rt)
             if l_ptr and r_ptr:
@@ -1908,6 +1990,10 @@ class CodeGenerator:
                 return lt
             if r_ptr:
                 return rt
+            # Float promotion: if either operand is float, the result is
+            # float (or double if either is double).
+            if self._is_float_type(lt) or self._is_float_type(rt):
+                return self._float_promotion(lt, rt)
             return ast.BasicType(name="int")
         if isinstance(expr, ast.TernaryOp):
             # Both arms should agree in well-formed C; pick the true arm.
@@ -1926,6 +2012,15 @@ class CodeGenerator:
         return ast.BasicType(name="int")
 
     def _eval_expr_to_eax(self, expr: ast.Expression, ctx: _FuncCtx) -> list[str]:
+        # Float-typed expressions live on the FPU stack; if a caller
+        # wants the value in EAX (e.g. `int x = (float)n`), evaluate to
+        # st(0) then convert via `fistp` through a stack scratch slot.
+        if self._is_float_type(self._type_of(expr, ctx)):
+            out = self._eval_float_to_st0(expr, ctx)
+            out.append("        sub     esp, 4")
+            out.append("        fistp   dword [esp]")
+            out.append("        pop     eax")
+            return out
         if isinstance(expr, ast.IntLiteral):
             return [f"        mov     eax, {expr.value}"]
         if isinstance(expr, ast.CharLiteral):
@@ -1979,6 +2074,146 @@ class CodeGenerator:
         raise CodegenError(
             f"expression {type(expr).__name__} not implemented yet"
         )
+
+    # ---- float (x87) lowering ------------------------------------------
+
+    def _eval_float_to_st0(self, expr: ast.Expression, ctx: _FuncCtx) -> list[str]:
+        """Lower a float-or-int expression so its value sits at st(0).
+
+        Int-typed sub-expressions are evaluated to EAX first, then
+        promoted via `fild` from a stack scratch (since x87 has no
+        register-direct int load). The caller is responsible for
+        consuming the value off the FPU stack — every code path here
+        leaves exactly one extra value on st(0).
+        """
+        ty = self._type_of(expr, ctx)
+        if not self._is_float_type(ty):
+            # Promote int → float via stack scratch.
+            out = self._eval_expr_to_eax(expr, ctx)
+            out.append("        push    eax")
+            out.append("        fild    dword [esp]")
+            out.append("        add     esp, 4")
+            return out
+        # Float-typed expression. Dispatch by node.
+        if isinstance(expr, ast.FloatLiteral):
+            size = 4 if ty.name == "float" else 8
+            label = self._intern_float(expr.value, size)
+            width = "dword" if size == 4 else "qword"
+            return [f"        fld     {width} [{label}]"]
+        if isinstance(expr, ast.Identifier):
+            return self._float_identifier_load(expr.name, ctx)
+        if isinstance(expr, ast.UnaryOp):
+            if expr.op == "+":
+                return self._eval_float_to_st0(expr.operand, ctx)
+            if expr.op == "-":
+                return self._eval_float_to_st0(expr.operand, ctx) + [
+                    "        fchs",
+                ]
+            raise CodegenError(
+                f"unary `{expr.op}` not supported on float operand"
+            )
+        if isinstance(expr, ast.BinaryOp):
+            return self._float_binop(expr, ctx)
+        if isinstance(expr, ast.Cast):
+            return self._float_cast(expr, ctx)
+        if isinstance(expr, ast.TernaryOp):
+            return self._float_ternary(expr, ctx)
+        if isinstance(expr, ast.Member):
+            return self._float_member_load(expr, ctx)
+        if isinstance(expr, ast.Index):
+            return self._float_index_load(expr, ctx)
+        raise CodegenError(
+            f"float expression {type(expr).__name__} not implemented yet"
+        )
+
+    def _float_identifier_load(self, name: str, ctx: _FuncCtx) -> list[str]:
+        """`fld` a float-typed Identifier (local, param, or global)."""
+        ty = self._identifier_type(name, ctx)
+        size = self._size_of(ty)
+        width = "dword" if size == 4 else "qword"
+        if name in ctx.slots:
+            disp = ctx.lookup(name)
+            return [f"        fld     {width} {_ebp_addr(disp)}"]
+        if name in self._globals:
+            return [f"        fld     {width} [_{name}]"]
+        raise CodegenError(f"unknown identifier `{name}`")
+
+    def _float_member_load(self, expr: ast.Member, ctx: _FuncCtx) -> list[str]:
+        ty = self._type_of(expr, ctx)
+        size = self._size_of(ty)
+        width = "dword" if size == 4 else "qword"
+        return self._member_address(expr, ctx) + [
+            f"        fld     {width} [eax]",
+        ]
+
+    def _float_index_load(self, expr: ast.Index, ctx: _FuncCtx) -> list[str]:
+        ty = self._type_of(expr, ctx)
+        size = self._size_of(ty)
+        width = "dword" if size == 4 else "qword"
+        return self._index_address(expr, ctx) + [
+            f"        fld     {width} [eax]",
+        ]
+
+    def _float_binop(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
+        # x87 binop pattern: load left, load right, then `f<op>p st1, st0`
+        # which pops st(0) and combines with st(1), leaving the result
+        # on st(0). NASM accepts the implicit one-operand form too, but
+        # the explicit form documents the intent better.
+        op_to_mnem = {
+            "+": "faddp",
+            "-": "fsubp",
+            "*": "fmulp",
+            "/": "fdivp",
+        }
+        if expr.op not in op_to_mnem:
+            raise CodegenError(
+                f"binary `{expr.op}` not supported on float operands"
+            )
+        out = self._eval_float_to_st0(expr.left, ctx)
+        out += self._eval_float_to_st0(expr.right, ctx)
+        out.append(f"        {op_to_mnem[expr.op]}   st1, st0")
+        return out
+
+    def _float_cast(self, expr: ast.Cast, ctx: _FuncCtx) -> list[str]:
+        """Cast to a float target. The source may be int or float."""
+        target = expr.target_type
+        source_ty = self._type_of(expr.expr, ctx)
+        if self._is_float_type(source_ty):
+            # Float-to-float cast — for our purposes (single x87 path),
+            # the bit-pattern conversion would happen on store, but on
+            # st(0) the value is in 80-bit form regardless. Just leave
+            # it on st(0); the eventual fstp picks the width.
+            return self._eval_float_to_st0(expr.expr, ctx)
+        # Int-to-float — `_eval_float_to_st0` already promotes via fild
+        # when the operand is int-typed.
+        return self._eval_float_to_st0(expr.expr, ctx)
+
+    def _float_ternary(self, expr: ast.TernaryOp, ctx: _FuncCtx) -> list[str]:
+        false_label = ctx.label("ftern_false")
+        end_label = ctx.label("ftern_end")
+        out = self._eval_expr_to_eax(expr.condition, ctx)
+        out.append("        test    eax, eax")
+        out.append(f"        jz      {false_label}")
+        out += self._eval_float_to_st0(expr.true_expr, ctx)
+        out.append(f"        jmp     {end_label}")
+        out.append(f"{false_label}:")
+        out += self._eval_float_to_st0(expr.false_expr, ctx)
+        out.append(f"{end_label}:")
+        return out
+
+    def _store_st0_to(self, addr: str, ty: ast.TypeNode) -> list[str]:
+        """`fstp` the top of the FPU stack into memory at `addr`."""
+        size = self._size_of(ty)
+        width = "dword" if size == 4 else "qword"
+        return [f"        fstp    {width} {addr}"]
+
+    def _float_lvalue_addr(self, name: str, ctx: _FuncCtx) -> str:
+        """Render the address text for a float-typed Identifier lvalue."""
+        if name in ctx.slots:
+            return _ebp_addr(ctx.lookup(name))
+        if name in self._globals:
+            return f"[_{name}]"
+        raise CodegenError(f"unknown identifier `{name}`")
 
     def _index_address(self, expr: ast.Index, ctx: _FuncCtx) -> list[str]:
         """Compute &(expr.array[expr.index]) into eax.
@@ -2436,6 +2671,12 @@ class CodeGenerator:
                 raise CodegenError(
                     f"cannot assign to array `{expr.left.name}`"
                 )
+            if self._is_float_type(ty):
+                # Float lvalue → fstp from st(0) to the slot/global.
+                addr = self._float_lvalue_addr(expr.left.name, ctx)
+                return self._eval_float_to_st0(
+                    expr.right, ctx
+                ) + self._store_st0_to(addr, ty)
             return self._eval_expr_to_eax(expr.right, ctx) + self._identifier_store(
                 expr.left.name, ctx
             )

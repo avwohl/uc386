@@ -1,8 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–31 are done. 257 tests passing.
-Phase 4 is feature-complete for typical C; the remaining gaps
-are floats (Phase 5 territory) and callee-side va_list / va_arg.
+Phase 4 slices 0–31 are done. Phase 5 (floats) slice 1 is done.
+267 tests passing.
 
 ## Bootstrap on the new machine
 
@@ -61,27 +60,31 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 31 (just landed):
-- **Bit-fields.** Adjacent same-type bit-fields pack into a 32-bit
-  storage unit; reads use shr+and (+sign-extend), writes RMW the
-  storage. Cross-unit splitting starts a new unit cleanly.
+Implemented in Phase 5 slice 1 (just landed):
+- **Floats (x87).** `float`/`double` locals, FloatLiteral constants
+  pooled in `.data`, arithmetic via faddp/fsubp/fmulp/fdivp, fchs
+  for negation, fild/fistp for int↔float casts, parallel
+  `_eval_float_to_st0` path with auto-promotion of int subexprs.
 
-Deliberately not yet implemented — what's left of Phase 4:
-- **Floating point.** `float` / `double` slot codegen via x87 or SSE.
-  Big topic — likely a phase of its own.
+Deliberately not yet implemented — Phase 5 follow-on slices:
+- **Float comparisons.** `f < g`, `f == 0.0`, etc. — `fucomi` then
+  setCC. Modest slice; reuses the existing comparison infrastructure
+  for the result-in-EAX side.
+- **Float function params and returns.** Cdecl pushes 4 / 8 bytes for
+  float / double args (already works with the existing arg-push path
+  if we route Identifier reads through `_eval_float_to_st0` for float
+  params). Returns ride st(0) — small `_return` change.
+- **Float globals init.** `double pi = 3.14;` at top level — the
+  existing `.data` emission needs to recognize float types and use
+  `dq` / `dd` instead of `_const_eval`.
+
+Other deferred features:
 - **Variadic function definitions** (callee-side va_list / va_arg /
   va_start). Variadic *call sites* already work.
 - **Static / register storage classes** beyond what cdecl already
   gives.
-- **Typedef.** No special parser support yet — uc_core may already
-  resolve typedefs into their underlying types, in which case there's
-  nothing to do here.
 
-Suggested first move next session: read `CLAUDE.md`. Phase 4 is
-feature-complete for typical C; the remaining gaps are floats
-(Phase 5 territory) and callee-side va_list / va_arg.
-
-## Phase 5 design questions (floats)
+## Phase 5 design questions (floats — settled, kept here for reference)
 
 Floats need decisions before coding:
 
