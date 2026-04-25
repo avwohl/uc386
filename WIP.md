@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–18 are done. 197 tests passing.
-Slice 19+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–19 are done. 206 tests passing.
+Slice 20+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,17 +60,16 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 18 (just landed):
-- **Struct init + struct copy.** `struct foo s = {a, b}` walks members
-  with tail zero-fill; nested `{{...}, {...}}` for struct arrays
-  recurses. `s1 = s2` copies sizeof bytes inline (per-dword + tail).
-  Global struct init and by-value params/returns still deferred.
+Implemented in slice 19 (just landed):
+- **Switch / case / default.** Dispatch ladder + body fall-through,
+  chained `case 1: case 2:` flattening, `continue` passes through to
+  enclosing loop (separate break/continue target stacks).
 
 Deliberately not yet implemented — next slices in roughly this order:
-- **Switch / case.** `switch (x) { case 1: ...; default: ... }` —
-  dispatch via `cmp eax, V; je .case_V`, fall-through, `break`
-  resolves to the switch end (extend the `loops` stack to also carry
-  switch ends).
+- **Struct by-value params + returns.** Caller copies struct args
+  onto the stack; callee accesses via param offsets. For returns, the
+  cdecl convention has the caller allocate space and pass a hidden
+  first argument pointing at it (struct-return ABI).
 - **Designated/nested initializers.** `int arr[3] = {[1] = 5}` and
   `int m[2][3] = {{...}, {...}}` both raise. Multidim arrays would
   also need ArrayType-of-ArrayType slot support.

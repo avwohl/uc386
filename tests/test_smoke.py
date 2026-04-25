@@ -674,6 +674,108 @@ def test_unsized_array_without_initializer_rejected():
         _compile("int main(void) { int a[]; return 0; }")
 
 
+# ---- switch / case --------------------------------------------------------
+
+def test_switch_dispatches_with_cmp_and_je():
+    asm = _compile(
+        "int main(void) { int x = 2; switch (x) { case 1: x = 10; break; "
+        "case 2: x = 20; break; } return x; }"
+    )
+    # Each case emits a `cmp eax, value; je <case_label>` pair.
+    assert "cmp     eax, 1" in asm
+    assert "cmp     eax, 2" in asm
+    # At least one `je .L*_case` jump should appear in the dispatch.
+    assert any("je      .L" in l and "_case" in l for l in asm.splitlines())
+
+
+def test_switch_break_jumps_to_switch_end():
+    asm = _compile(
+        "int main(void) { int x = 1; switch (x) { case 1: x = 5; break; "
+        "case 2: x = 99; } return x; }"
+    )
+    asm_lines = asm.splitlines()
+    end_label_line = next(l for l in asm_lines if l.endswith("_switch_end:"))
+    end_label = end_label_line.rstrip(":").lstrip()
+    assert any(f"jmp     {end_label}" in l for l in asm_lines)
+
+
+def test_switch_default_falls_through_when_no_case_matches():
+    asm = _compile(
+        "int main(void) { int x = 99; switch (x) { case 1: x = 10; break; "
+        "default: x = 0; } return x; }"
+    )
+    # Default body executes — the assignment to 0 should appear.
+    assert "mov     eax, 0" in asm
+    # And the default label should be referenced as a jmp target from the dispatch tail.
+    assert "_default:" in asm
+
+
+def test_switch_no_match_no_default_skips_body():
+    asm = _compile(
+        "int main(void) { int hit = 0; int x = 99; switch (x) { "
+        "case 1: hit = 1; break; case 2: hit = 2; break; } return hit; }"
+    )
+    # Without a default, the dispatch tail jumps to switch_end.
+    asm_lines = asm.splitlines()
+    assert any(
+        "jmp     .L" in l and "_switch_end" in l for l in asm_lines
+    )
+
+
+def test_switch_fall_through_without_break():
+    asm = _compile(
+        "int sum(int x) { int s = 0; switch (x) { "
+        "case 1: s = s + 1; case 2: s = s + 2; case 3: s = s + 3; } return s; } "
+        "int main(void) { return sum(1); }"
+    )
+    asm_lines = asm.splitlines()
+    fn_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_sum:")
+    end_idx = next(i for i, l in enumerate(asm_lines[fn_idx:]) if l.strip() == "ret") + fn_idx
+    fn_section = asm_lines[fn_idx:end_idx]
+    # All three add operations are present (one per case body).
+    add_count = sum(1 for l in fn_section if "add     eax, ecx" in l)
+    assert add_count >= 3
+
+
+def test_switch_continue_passes_to_enclosing_loop():
+    asm = _compile(
+        "int main(void) { int sum = 0; for (int i = 0; i < 5; i = i + 1) { "
+        "switch (i) { case 2: continue; } sum = sum + i; } return sum; }"
+    )
+    asm_lines = asm.splitlines()
+    step_label_line = next(l for l in asm_lines if l.endswith("_for_step:"))
+    step_label = step_label_line.rstrip(":").lstrip()
+    assert any(f"jmp     {step_label}" in l for l in asm_lines)
+
+
+def test_switch_evaluates_expression_only_once():
+    asm = _compile(
+        "int counter = 0; "
+        "int next(void) { counter = counter + 1; return counter; } "
+        "int main(void) { switch (next()) { case 1: break; case 2: break; } "
+        "return counter; }"
+    )
+    asm_lines = asm.splitlines()
+    main_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_main:")
+    main_section = "\n".join(asm_lines[main_idx:])
+    # `next()` is the switch expression — exactly one call site in main.
+    assert main_section.count("call    _next") == 1
+
+
+def test_non_constant_case_value_rejected():
+    with pytest.raises(CodegenError):
+        _compile(
+            "int main(void) { int x = 0; int n = 5; "
+            "switch (x) { case n: break; } return 0; }"
+        )
+
+
+def test_break_outside_switch_or_loop_still_rejected():
+    # The error message changed wording with slice 19 but still mentions "outside".
+    with pytest.raises(CodegenError, match="outside"):
+        _compile("int main(void) { break; return 0; }")
+
+
 # ---- structs --------------------------------------------------------------
 
 def test_struct_local_allocates_full_size():

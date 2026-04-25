@@ -22,7 +22,10 @@ Current scope:
 - Compound assignment `+= -= *= /= %= &= |= ^= <<= >>=` (Identifier lvalue).
 - Logical `&&` and `||` with proper short-circuit evaluation.
 - Ternary `cond ? a : b`.
-- Control flow: `if`/`else`, `while`, `do`/`while`, `for`, `break`, `continue`.
+- Control flow: `if`/`else`, `while`, `do`/`while`, `for`,
+  `switch`/`case`/`default`, `break`, `continue`. `continue` inside
+  a switch escapes to the enclosing loop (separate break/continue
+  target stacks).
 - Function calls — direct (`call _name` for known function-name
   callees) and indirect (`call eax` after evaluating an arbitrary
   function-pointer expression). Leading `*`s on the callee are
@@ -108,7 +111,12 @@ class _FuncCtx:
         self.frame_size: int = 0          # bytes reserved by `sub esp, frame_size`
         self._next_label: int = 0
         # Stack of (continue_target, break_target) for the enclosing loops.
-        self.loops: list[tuple[str, str]] = []
+        # Stack of jump targets for control-flow keywords. Loops push to
+        # both stacks; switches push only to `break_targets`. Splitting
+        # the stacks lets `continue` inside a switch resolve to the
+        # enclosing loop, the way C requires.
+        self.break_targets: list[str] = []
+        self.continue_targets: list[str] = []
 
     def alloc_local(self, name: str, ty: "ast.TypeNode", size: int = 4) -> int:
         if name in self.slots:
@@ -524,6 +532,16 @@ class CodeGenerator:
                 self._collect_locals(node.init, ctx)
             self._collect_locals(node.body, ctx)
             return
+        if isinstance(node, ast.SwitchStmt):
+            self._collect_locals(node.body, ctx)
+            return
+        if isinstance(node, ast.CaseStmt):
+            # `case 1: case 2: VarDecl;` nests CaseStmts; each level's
+            # `stmt` may eventually be a real declaration or a compound.
+            # Recursing is enough — the next layer will be another
+            # CaseStmt (and recurse further) or a real statement.
+            self._collect_locals(node.stmt, ctx)
+            return
         # Statements with no nested locals: ExpressionStmt, ReturnStmt,
         # BreakStmt, ContinueStmt, etc.
 
@@ -934,14 +952,16 @@ class CodeGenerator:
             return self._do_while(item, ctx)
         if isinstance(item, ast.ForStmt):
             return self._for(item, ctx)
+        if isinstance(item, ast.SwitchStmt):
+            return self._switch(item, ctx)
         if isinstance(item, ast.BreakStmt):
-            if not ctx.loops:
-                raise CodegenError("`break` outside of a loop")
-            return [f"        jmp     {ctx.loops[-1][1]}"]
+            if not ctx.break_targets:
+                raise CodegenError("`break` outside of a loop or switch")
+            return [f"        jmp     {ctx.break_targets[-1]}"]
         if isinstance(item, ast.ContinueStmt):
-            if not ctx.loops:
+            if not ctx.continue_targets:
                 raise CodegenError("`continue` outside of a loop")
-            return [f"        jmp     {ctx.loops[-1][0]}"]
+            return [f"        jmp     {ctx.continue_targets[-1]}"]
         raise CodegenError(
             f"{type(item).__name__} not implemented yet"
         )
@@ -963,7 +983,8 @@ class CodeGenerator:
     def _while(self, stmt: ast.WhileStmt, ctx: _FuncCtx) -> list[str]:
         top = ctx.label("while_top")
         end = ctx.label("while_end")
-        ctx.loops.append((top, end))
+        ctx.break_targets.append(end)
+        ctx.continue_targets.append(top)
         try:
             out = [f"{top}:"]
             out += self._eval_expr_to_eax(stmt.condition, ctx)
@@ -973,7 +994,8 @@ class CodeGenerator:
             out.append(f"        jmp     {top}")
             out.append(f"{end}:")
         finally:
-            ctx.loops.pop()
+            ctx.break_targets.pop()
+            ctx.continue_targets.pop()
         return out
 
     def _do_while(self, stmt: ast.DoWhileStmt, ctx: _FuncCtx) -> list[str]:
@@ -981,7 +1003,8 @@ class CodeGenerator:
         cont = ctx.label("do_cont")
         end = ctx.label("do_end")
         # `continue` jumps to the condition test, not the top of the body.
-        ctx.loops.append((cont, end))
+        ctx.break_targets.append(end)
+        ctx.continue_targets.append(cont)
         try:
             out = [f"{top}:"]
             out += self._item(stmt.body, ctx)
@@ -991,7 +1014,8 @@ class CodeGenerator:
             out.append(f"        jnz     {top}")
             out.append(f"{end}:")
         finally:
-            ctx.loops.pop()
+            ctx.break_targets.pop()
+            ctx.continue_targets.pop()
         return out
 
     def _for(self, stmt: ast.ForStmt, ctx: _FuncCtx) -> list[str]:
@@ -1010,16 +1034,94 @@ class CodeGenerator:
             out.append("        test    eax, eax")
             out.append(f"        jz      {end}")
         # `continue` jumps to the step, not the top.
-        ctx.loops.append((step, end))
+        ctx.break_targets.append(end)
+        ctx.continue_targets.append(step)
         try:
             out += self._item(stmt.body, ctx)
         finally:
-            ctx.loops.pop()
+            ctx.break_targets.pop()
+            ctx.continue_targets.pop()
         out.append(f"{step}:")
         if stmt.update is not None:
             out += self._eval_expr_to_eax(stmt.update, ctx)
         out.append(f"        jmp     {top}")
         out.append(f"{end}:")
+        return out
+
+    def _switch(self, stmt: ast.SwitchStmt, ctx: _FuncCtx) -> list[str]:
+        """Lower `switch (expr) { case V: ...; default: ...; }`.
+
+        The expression evaluates once into EAX. We flatten the body into
+        a sequence of label declarations and ordinary statements so that
+        chained `case 1: case 2: stmt;` (which the parser nests as
+        `CaseStmt(1, CaseStmt(2, stmt))`) and a `case`'s nested labeled
+        statement are all handled uniformly. Then we emit a dispatch
+        ladder of `cmp eax, V; je .case_V` followed by a tail jump to
+        the default (or end), then walk the flattened entries to
+        materialize each label inline above the statements that follow.
+
+        `break` resolves via `ctx.break_targets`; `continue` deliberately
+        does NOT push to `continue_targets` here, so a `continue` inside
+        the switch escapes to the enclosing loop (as C requires).
+        """
+        if not isinstance(stmt.body, ast.CompoundStmt):
+            raise CodegenError("switch body must be a compound statement")
+        end_label = ctx.label("switch_end")
+
+        # Flatten: each entry is one of
+        #   ("case", value, label)        — case label declaration
+        #   ("default", None, label)      — default label declaration
+        #   ("body", None, stmt)          — ordinary statement
+        # Adjacent `case 1: case 2: stmt;` produces case/case/body in that order.
+        entries: list[tuple[str, int | None, object]] = []
+        default_label: str | None = None
+
+        def expand(node):
+            nonlocal default_label
+            while isinstance(node, ast.CaseStmt):
+                if node.value is None:
+                    if default_label is not None:
+                        raise CodegenError(
+                            "multiple `default` labels in switch"
+                        )
+                    default_label = ctx.label("default")
+                    entries.append(("default", None, default_label))
+                else:
+                    value = self._const_eval(node.value, "case")
+                    entries.append(("case", value, ctx.label("case")))
+                node = node.stmt
+            entries.append(("body", None, node))
+
+        for item in stmt.body.items:
+            if isinstance(item, ast.CaseStmt):
+                expand(item)
+            else:
+                entries.append(("body", None, item))
+
+        # Eval the controlling expression once.
+        out = self._eval_expr_to_eax(stmt.expr, ctx)
+
+        # Dispatch ladder. The tail `jmp` catches any value not matched
+        # by a case; if there's no `default`, fall through to end_label.
+        for kind, value, target in entries:
+            if kind == "case":
+                out.append(f"        cmp     eax, {value}")
+                out.append(f"        je      {target}")
+        out.append(f"        jmp     {default_label or end_label}")
+
+        # Body emission. Case/default entries materialize labels; body
+        # entries lower their statement.
+        ctx.break_targets.append(end_label)
+        try:
+            for kind, _, target in entries:
+                if kind in ("case", "default"):
+                    out.append(f"{target}:")
+                else:
+                    out += self._item(target, ctx)
+        finally:
+            ctx.break_targets.pop()
+
+        out.append(f"{end_label}:")
         return out
 
     def _expr_stmt(self, stmt: ast.ExpressionStmt, ctx: _FuncCtx) -> list[str]:
