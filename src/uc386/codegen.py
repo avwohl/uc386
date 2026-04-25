@@ -1055,7 +1055,7 @@ class CodeGenerator:
         )
 
     # NASM directives keyed by element size in bytes.
-    _DATA_DIRECTIVE = {1: "db", 2: "dw", 4: "dd"}
+    _DATA_DIRECTIVE = {1: "db", 2: "dw", 4: "dd", 8: "dq"}
     # Names that are safe to emit as a single `dd v1, v2, ...` directive
     # in a global array init. Anything outside this set (struct, array,
     # union elements) recursively goes through `_emit_global_init`.
