@@ -24,6 +24,9 @@ Current scope:
 - Ternary `cond ? a : b`.
 - Control flow: `if`/`else`, `while`, `do`/`while`, `for`, `break`, `continue`.
 - Function calls — direct calls only (callee must be an identifier).
+- Pointer locals/params (`int *p`), `&x` (Identifier only), `*expr`,
+  and store-through-pointer assignment `*p = rhs`. Pointer arithmetic
+  not implemented yet — needs type-info plumbing for size scaling.
 
 Anything else raises CodegenError.
 """
@@ -136,7 +139,7 @@ class CodeGenerator:
         for i, param in enumerate(fn.params):
             if param.name is None:
                 continue
-            self._check_int_type(param.param_type, param.name)
+            self._check_supported_type(param.param_type, param.name)
             ctx.alloc_param(param.name, i)
         # First pass: allocate every local up front so the prologue knows
         # the frame size before we emit body code.
@@ -168,7 +171,7 @@ class CodeGenerator:
         nested-block redeclaration of an existing name raises.
         """
         if isinstance(node, ast.VarDecl):
-            self._check_int_type(node.var_type, node.name)
+            self._check_supported_type(node.var_type, node.name)
             ctx.alloc_local(node.name)
             return
         if isinstance(node, ast.CompoundStmt):
@@ -192,12 +195,17 @@ class CodeGenerator:
         # BreakStmt, ContinueStmt, etc.
 
     @staticmethod
-    def _check_int_type(t: ast.TypeNode, name: str) -> None:
-        if not isinstance(t, ast.BasicType) or t.name != "int":
-            raise CodegenError(
-                f"local `{name}`: only `int` locals are supported "
-                f"(got {type(t).__name__})"
-            )
+    def _check_supported_type(t: ast.TypeNode, name: str) -> None:
+        # Both ints and pointers occupy a single 4-byte slot in flat-32.
+        # short/char/long-long codegen comes later.
+        if isinstance(t, ast.PointerType):
+            return
+        if isinstance(t, ast.BasicType) and t.name == "int":
+            return
+        raise CodegenError(
+            f"`{name}`: only `int` and pointer types are supported "
+            f"(got {type(t).__name__})"
+        )
 
     # ---- statements -----------------------------------------------------
 
@@ -393,6 +401,15 @@ class CodeGenerator:
     def _unary(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
         if expr.op in ("++", "--"):
             return self._inc_dec(expr, ctx)
+        if expr.op == "&":
+            return self._address_of(expr, ctx)
+        if expr.op == "*":
+            # Dereference: load the pointer value into EAX, then read from
+            # the address it holds. Operand may be any expression that
+            # produces a 32-bit address.
+            return self._eval_expr_to_eax(expr.operand, ctx) + [
+                "        mov     eax, [eax]",
+            ]
         if not expr.is_prefix:
             raise CodegenError(f"postfix `{expr.op}` not implemented yet")
         out = self._eval_expr_to_eax(expr.operand, ctx)
@@ -409,6 +426,18 @@ class CodeGenerator:
                 "        movzx   eax, al",
             ]
         raise CodegenError(f"unary `{expr.op}` not implemented yet")
+
+    def _address_of(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
+        # Only `&identifier` for now — no `&*p` (which is a no-op anyway),
+        # no `&arr[i]` (arrays don't exist yet). Pointer-to-pointer falls
+        # out naturally because the slot is just 4 bytes.
+        if not isinstance(expr.operand, ast.Identifier):
+            raise CodegenError(
+                f"`&` operand must be an identifier "
+                f"(got {type(expr.operand).__name__})"
+            )
+        disp = ctx.lookup(expr.operand.name)
+        return [f"        lea     eax, {_ebp_addr(disp)}"]
 
     def _inc_dec(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
         if not isinstance(expr.operand, ast.Identifier):
@@ -547,15 +576,26 @@ class CodeGenerator:
         return out
 
     def _assign(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
-        if not isinstance(expr.left, ast.Identifier):
-            raise CodegenError(
-                f"assignment target must be an identifier "
-                f"(got {type(expr.left).__name__})"
-            )
-        disp = ctx.lookup(expr.left.name)
-        return self._eval_expr_to_eax(expr.right, ctx) + [
-            f"        mov     {_ebp_addr(disp)}, eax",
-        ]
+        # `x = rhs` — direct slot store.
+        if isinstance(expr.left, ast.Identifier):
+            disp = ctx.lookup(expr.left.name)
+            return self._eval_expr_to_eax(expr.right, ctx) + [
+                f"        mov     {_ebp_addr(disp)}, eax",
+            ]
+        # `*p = rhs` — store-through-pointer. Evaluate the pointer expr
+        # first, save its value, then evaluate rhs into EAX (so the result
+        # of the whole assignment expression is rhs, as C requires).
+        if isinstance(expr.left, ast.UnaryOp) and expr.left.op == "*":
+            out = self._eval_expr_to_eax(expr.left.operand, ctx)
+            out.append("        push    eax")
+            out += self._eval_expr_to_eax(expr.right, ctx)
+            out.append("        pop     ecx")
+            out.append("        mov     [ecx], eax")
+            return out
+        raise CodegenError(
+            f"assignment target must be an identifier or `*ptr` "
+            f"(got {type(expr.left).__name__})"
+        )
 
     def _compound_assign(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
         # `x op= rhs` is `x = x op rhs`. For Identifier lvalues, evaluating

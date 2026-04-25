@@ -394,6 +394,45 @@ def test_ternary_emits_cond_branch_and_join():
     assert "mov     eax, 9" in asm
 
 
+# ---- pointers --------------------------------------------------------------
+
+def test_address_of_emits_lea():
+    asm = _compile("int main(void) { int x = 0; int *p = &x; return 0; }")
+    assert "lea     eax, [ebp - 4]" in asm
+
+
+def test_dereference_loads_through_eax():
+    asm = _compile("int main(void) { int x = 7; int *p = &x; return *p; }")
+    # Load pointer value, then read through it.
+    assert "mov     eax, [ebp - 8]" in asm
+    assert "mov     eax, [eax]" in asm
+
+
+def test_store_through_pointer_writes_via_ecx():
+    asm = _compile("int main(void) { int x = 0; int *p = &x; *p = 42; return x; }")
+    # Pointer evaluated first (push eax), rhs into eax, pop into ecx, store.
+    assert "push    eax" in asm
+    assert "pop     ecx" in asm
+    assert "mov     [ecx], eax" in asm
+
+
+def test_address_of_non_identifier_rejected():
+    with pytest.raises(CodegenError, match="`&` operand"):
+        _compile("int main(void) { return &(1 + 2); }")
+
+
+def test_pointer_param_passed_as_int():
+    # int*-typed param shares a 4-byte slot at [ebp+8].
+    asm = _compile(
+        "int deref(int *p) { return *p; } "
+        "int main(void) { int x = 5; return deref(&x); }"
+    )
+    assert "mov     eax, [ebp + 8]" in asm
+    assert "mov     eax, [eax]" in asm
+    # Caller passes &x as the argument.
+    assert "lea     eax, [ebp - 4]" in asm
+
+
 def test_end_to_end_driver(tmp_path):
     src = tmp_path / "hi.c"
     src.write_text("int main(void) { return 0; }\n")
