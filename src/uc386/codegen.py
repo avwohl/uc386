@@ -2135,6 +2135,8 @@ class CodeGenerator:
         if isinstance(expr, ast.BinaryOp):
             if expr.op == "=":
                 return self._float_assign(expr, ctx)
+            if expr.op in self._COMPOUND_OPS:
+                return self._float_compound_assign(expr, ctx)
             return self._float_binop(expr, ctx)
         if isinstance(expr, ast.Cast):
             return self._float_cast(expr, ctx)
@@ -2240,33 +2242,56 @@ class CodeGenerator:
         Uses `fst` (store without pop) instead of `fstp` so the new
         value stays on st(0) — that lets a float assignment expression
         be consumed (e.g. `(f = 1.5f) + 1.0f`) without an extra reload.
+        For non-Identifier lvalues we compute the address once into EAX,
+        push it, then evaluate the rhs to st(0) and pop the address back
+        into ECX before storing.
         """
         ty = self._type_of(expr.left, ctx)
         size = self._size_of(ty)
         width = "dword" if size == 4 else "qword"
-        out = self._eval_float_to_st0(expr.right, ctx)
         if isinstance(expr.left, ast.Identifier):
             addr = self._float_lvalue_addr(expr.left.name, ctx)
+            out = self._eval_float_to_st0(expr.right, ctx)
             out.append(f"        fst     {width} {addr}")
             return out
+        # Non-Identifier lvalues: compute address first (clobbers eax),
+        # push it, then evaluate the float rhs onto st(0), pop the
+        # address into ecx, and `fst` through it.
         if isinstance(expr.left, ast.UnaryOp) and expr.left.op == "*":
-            # `*p = rhs` for float pointee — eval pointer first, then
-            # we'd need the float on st0 alongside the pointer in eax.
-            # Easiest: store float to a temp, eval pointer, fld back.
-            # Defer until we have a clear use-case.
+            addr_lines = self._eval_expr_to_eax(expr.left.operand, ctx)
+        elif isinstance(expr.left, ast.Index):
+            addr_lines = self._index_address(expr.left, ctx)
+        elif isinstance(expr.left, ast.Member):
+            addr_lines = self._member_address(expr.left, ctx)
+        else:
             raise CodegenError(
-                "assignment through a float pointer not yet supported"
+                f"float assignment to {type(expr.left).__name__} not supported"
             )
-        if isinstance(expr.left, ast.Index):
-            raise CodegenError(
-                "assignment to a float array element not yet supported"
-            )
-        if isinstance(expr.left, ast.Member):
-            raise CodegenError(
-                "assignment to a float struct member not yet supported"
+        out = list(addr_lines)
+        out.append("        push    eax")
+        out += self._eval_float_to_st0(expr.right, ctx)
+        out.append("        pop     ecx")
+        out.append(f"        fst     {width} [ecx]")
+        return out
+
+    def _float_compound_assign(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
+        """Lower `lvalue op= rhs` where the value is float-typed.
+
+        Identifier lvalues use the simple desugar (re-evaluating an
+        Identifier is side-effect-free) so `f += rhs` becomes
+        `f = f + rhs`. Non-Identifier float compound assignment isn't
+        yet supported — it needs the address-once dance with the FPU
+        stack as the working register.
+        """
+        op = self._COMPOUND_OPS[expr.op]
+        if isinstance(expr.left, ast.Identifier):
+            inner = ast.BinaryOp(op=op, left=expr.left, right=expr.right)
+            return self._float_assign(
+                ast.BinaryOp(op="=", left=expr.left, right=inner), ctx,
             )
         raise CodegenError(
-            f"float assignment to {type(expr.left).__name__} not supported"
+            f"float compound assignment to {type(expr.left).__name__} "
+            f"not yet supported"
         )
 
     def _float_compare(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:

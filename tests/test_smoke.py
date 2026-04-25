@@ -1210,6 +1210,43 @@ def test_float_return_into_float_local():
     assert "fstp    dword [ebp" in main_section
 
 
+# ---- float lvalue stores --------------------------------------------------
+
+def test_float_array_element_assignment():
+    asm = _compile(
+        "int main(void) { float arr[3]; arr[1] = 1.5f; return (int)arr[1]; }"
+    )
+    # The element address goes through ECX; fst writes through it.
+    assert "fst     dword [ecx]" in asm
+
+
+def test_float_struct_member_assignment():
+    asm = _compile(
+        "struct point { float x; float y; }; "
+        "int main(void) { struct point p; p.x = 1.5f; return (int)p.x; }"
+    )
+    assert "fst     dword [ecx]" in asm
+
+
+def test_float_pointer_deref_assignment():
+    asm = _compile(
+        "int main(void) { float x = 0.0f; float *p = &x; *p = 1.5f; return (int)x; }"
+    )
+    assert "fst     dword [ecx]" in asm
+
+
+def test_float_compound_assign_to_identifier():
+    # `f += 1.5f` desugars to `f = f + 1.5f` and works through the
+    # existing Identifier float-assign path.
+    asm = _compile(
+        "int main(void) { float f = 1.0f; f += 1.5f; return (int)f; }"
+    )
+    # The addition lands as faddp.
+    assert "faddp" in asm
+    # And the result stores back to f's slot.
+    assert "fstp    dword [ebp - 4]" in asm
+
+
 # ---- float globals --------------------------------------------------------
 
 def test_float_global_initialized_in_data():

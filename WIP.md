@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–31 done. Phase 5 (floats) slices 1–4 done.
-286 tests passing.
+Phase 4 slices 0–31 done. Phase 5 (floats) slices 1–5 done.
+290 tests passing.
 
 ## Bootstrap on the new machine
 
@@ -60,11 +60,10 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in Phase 5 slice 4 (just landed):
-- **Float globals + float assignment expressions.** Initialized
-  float/double globals emit `dd`/`dq`; uninitialized go to `.bss`.
-  `_float_assign` uses `fst` (no pop) so float assignment expressions
-  carry their value through.
+Implemented in Phase 5 slice 5 (just landed):
+- **Float lvalue stores + Identifier compound assign.** `*p = f`,
+  `arr[i] = f`, `s.m = f` all work via the address-once dance.
+  `f += rhs` desugars through the Identifier path.
 
 Deliberately not yet implemented — Phase 5 follow-on slices:
 
@@ -73,10 +72,10 @@ Other deferred features:
   va_start). Variadic *call sites* already work.
 - **Static / register storage classes** beyond what cdecl already
   gives.
-- **Compound assign / `*p =` / `arr[i] =` / `s.m =` for floats.**
-  Currently `_float_assign` only handles `Identifier` lvalues; the
-  others raise. Adds a temp-slot dance (store float to stack, eval
-  pointer/index/member-address to eax, fld back, fstp).
+- **Compound assign on non-Identifier float lvalues.** `arr[i] += f`
+  etc. — needs address-once with the FPU stack as the working
+  register. The simple ones (`Identifier += f`, plain `*p = f`,
+  `arr[i] = f`, `s.m = f`) already work as of slice 5.
 - **Auto-narrowing of `double` literals at float-typed param sites.**
   Right now the caller emits a qword push for an unsuffixed literal
   passed to a `float` param. A coercion pass at the call site (look
