@@ -90,9 +90,10 @@ def test_unknown_identifier_rejected():
         _compile("int main(void) { return x; }")
 
 
-def test_non_int_local_rejected():
-    with pytest.raises(CodegenError, match="only `int`"):
-        _compile("int main(void) { char c; return 0; }")
+def test_unsupported_type_local_rejected():
+    # `float` isn't yet a supported slot type — full FP codegen comes later.
+    with pytest.raises(CodegenError, match="not supported|only"):
+        _compile("int main(void) { float f; return 0; }")
 
 
 @pytest.mark.parametrize(
@@ -680,6 +681,115 @@ def test_array_initialization_not_yet_supported():
 def test_unsized_array_local_rejected():
     with pytest.raises(CodegenError, match="size"):
         _compile("int main(void) { int a[]; return 0; }")
+
+
+# ---- char / short codegen --------------------------------------------------
+
+def test_char_local_signed_load():
+    asm = _compile("int main(void) { char c = 5; return c; }")
+    # Signed char default → sign-extend on load.
+    assert "movsx   eax, byte [ebp - 4]" in asm
+    # Init writes only the low byte.
+    assert "mov     byte [ebp - 4], al" in asm
+
+
+def test_unsigned_char_zero_extends():
+    asm = _compile("int main(void) { unsigned char c = 200; return c; }")
+    # `unsigned char` → zero-extend on load.
+    assert "movzx   eax, byte [ebp - 4]" in asm
+
+
+def test_short_local_signed_load_word_sized():
+    asm = _compile("int main(void) { short s = 1234; return s; }")
+    assert "movsx   eax, word [ebp - 4]" in asm
+    assert "mov     word [ebp - 4], ax" in asm
+
+
+def test_unsigned_short_zero_extends_word():
+    asm = _compile("int main(void) { unsigned short s = 60000; return s; }")
+    assert "movzx   eax, word [ebp - 4]" in asm
+
+
+def test_char_slot_pads_to_four_bytes():
+    # A single char still consumes a 4-byte slot so a following int stays
+    # 4-aligned at [ebp - 8].
+    asm = _compile("int main(void) { char c = 1; int x = 2; return x; }")
+    assert "sub     esp, 8" in asm
+    assert "mov     [ebp - 8], eax" in asm
+
+
+def test_char_array_packs_bytes():
+    # `char arr[5]` is genuinely 5 bytes of payload, but the slot is rounded
+    # up to a multiple of 4 so the next local stays aligned.
+    asm = _compile(
+        "int main(void) { char arr[5]; int x = 0; return x; }"
+    )
+    assert "sub     esp, 12" in asm
+    # `x` lives at [ebp - 12] (the int that follows the rounded-up array slot).
+    assert "mov     [ebp - 12], eax" in asm
+
+
+def test_char_array_index_load_uses_byte():
+    asm = _compile(
+        "int main(void) { char arr[4]; arr[0] = 65; return arr[0]; }"
+    )
+    # Address arithmetic still happens, but the element scaling uses
+    # sizeof(char)=1, so no shl appears for the byte offset.
+    assert "lea     eax, [ebp - 4]" in asm
+    # Store goes through `mov byte [ecx], al`.
+    assert "mov     byte [ecx], al" in asm
+    # Load uses signed byte.
+    assert "movsx   eax, byte [eax]" in asm
+
+
+def test_char_param_loaded_with_movsx():
+    asm = _compile(
+        "int f(char c) { return c; } int main(void) { return f(65); }"
+    )
+    assert "movsx   eax, byte [ebp + 8]" in asm
+
+
+def test_dereference_char_pointer_uses_movsx():
+    # The pre-slice 10 bug was `*char_ptr` reading 4 bytes; now it reads 1.
+    asm = _compile(
+        "int main(void) { char c = 65; char *p = &c; return *p; }"
+    )
+    assert "movsx   eax, byte [eax]" in asm
+
+
+def test_store_through_char_pointer_writes_byte():
+    asm = _compile(
+        "int main(void) { char c = 0; char *p = &c; *p = 7; return c; }"
+    )
+    assert "mov     byte [ecx], al" in asm
+
+
+def test_char_increment_uses_byte_inc():
+    asm = _compile("int main(void) { char c = 0; ++c; return c; }")
+    assert "inc     byte [ebp - 4]" in asm
+    # And the read after still sign-extends.
+    assert "movsx   eax, byte [ebp - 4]" in asm
+
+
+def test_char_pointer_arithmetic_steps_by_one_after_subword_lands():
+    # Same assertion as before — pointer scaling for char* is still 1 byte.
+    # Re-verifying after sub-word load lands.
+    asm = _compile(
+        'int puts(const char *s); '
+        'int main(void) { const char *p = "abc"; p = p + 1; return 0; }'
+    )
+    assert "shl     eax, 2" not in asm
+    assert "add     eax, ecx" in asm
+
+
+def test_int_locals_unchanged_by_subword_pass():
+    # Regression: int slots still emit plain `mov eax, [...]` and
+    # `mov [...], eax`, no movsx/movzx anywhere.
+    asm = _compile("int main(void) { int x = 5; int y = x; return y; }")
+    assert "mov     eax, [ebp - 4]" in asm
+    assert "mov     [ebp - 8], eax" in asm
+    assert "movsx" not in asm
+    assert "movzx" not in asm
 
 
 def test_end_to_end_driver(tmp_path):

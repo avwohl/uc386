@@ -32,11 +32,17 @@ Current scope:
   pointer slot step by `sizeof(*p)` rather than 1. Adding two pointers
   and subtracting a pointer from an integer are rejected.
 - Arrays (uninitialized only): `int arr[N]` allocates `N * sizeof(elem)`
-  bytes on the frame, an array name decays to its address in
-  expression context, and `arr[i]` reads/writes through
-  base + i*sizeof(elem). Array assignment, `++arr` / `--arr`, and
-  brace-initialization `int arr[N] = {...}` all raise pending the
-  InitializerList pass.
+  bytes on the frame (rounded up to a 4-byte boundary), an array name
+  decays to its address in expression context, and `arr[i]` reads/writes
+  through base + i*sizeof(elem) at the element's natural width. Array
+  assignment, `++arr` / `--arr`, and brace-initialization
+  `int arr[N] = {...}` all raise pending the InitializerList pass.
+- Sub-word scalars: `char`, `short`, and their unsigned variants are
+  first-class slot types. Loads use `movsx` (signed) or `movzx`
+  (unsigned) so EAX always holds a 32-bit working value matching C's
+  integer-promotion rules. Stores narrow via `mov byte [...], al` /
+  `mov word [...], ax`, leaving the other bytes of a (4-aligned) slot
+  unread.
 - String literals: interned per-translation-unit, emitted as
   null-terminated bytes in `.data` with labels like `_uc386_strN`.
 - `extern` declarations (FunctionDecls without bodies) emit NASM
@@ -276,7 +282,13 @@ class CodeGenerator:
         """
         if isinstance(node, ast.VarDecl):
             self._check_supported_type(node.var_type, node.name)
-            ctx.alloc_local(node.name, node.var_type, self._size_of(node.var_type))
+            # Round slot size up to a 4-byte boundary so a `char`-sized slot
+            # doesn't push subsequent int slots off-alignment. Arrays whose
+            # payload isn't a multiple of 4 (e.g. `char arr[5]`) get padded
+            # the same way.
+            raw = self._size_of(node.var_type)
+            slot = (raw + 3) & ~3
+            ctx.alloc_local(node.name, node.var_type, slot)
             return
         if isinstance(node, ast.CompoundStmt):
             for item in node.items:
@@ -298,14 +310,20 @@ class CodeGenerator:
         # Statements with no nested locals: ExpressionStmt, ReturnStmt,
         # BreakStmt, ContinueStmt, etc.
 
+    # Scalar BasicType names that have first-class slot support. `long` and
+    # `long long` are *known* sizes (so pointer-arithmetic scaling works
+    # transparently for `long *` etc.) but full slot codegen waits on a
+    # 64-bit value-tracking pass.
+    _SLOT_BASIC_NAMES = frozenset({"char", "short", "int"})
+
     @classmethod
     def _check_supported_type(cls, t: ast.TypeNode, name: str) -> None:
-        # Ints, pointers, and arrays of supported types are allowed as slot
-        # types. `int` and pointer slots take 4 bytes; arrays take
-        # length*sizeof(elem). short/char/long-long slot codegen comes later.
+        # Pointers, and arrays / scalars of supported base types. Slot sizes
+        # are rounded up to 4 in `_collect_locals` so adjacent ints stay
+        # 4-aligned.
         if isinstance(t, ast.PointerType):
             return
-        if isinstance(t, ast.BasicType) and t.name == "int":
+        if isinstance(t, ast.BasicType) and t.name in cls._SLOT_BASIC_NAMES:
             return
         if isinstance(t, ast.ArrayType):
             if t.size is None:
@@ -317,8 +335,8 @@ class CodeGenerator:
             cls._check_supported_type(t.base_type, name)
             return
         raise CodegenError(
-            f"`{name}`: only `int`, pointer, and array types are supported "
-            f"(got {type(t).__name__})"
+            f"`{name}`: only `int`/`short`/`char`, pointer, and array "
+            f"types are supported (got {type(t).__name__})"
         )
 
     @staticmethod
@@ -356,6 +374,45 @@ class CodeGenerator:
                 raise CodegenError("sizeof(array): size must be an integer literal")
             return t.size.value * cls._size_of(t.base_type)
         raise CodegenError(f"sizeof not supported for {type(t).__name__}")
+
+    @staticmethod
+    def _is_unsigned(t: ast.TypeNode) -> bool:
+        # `is_signed=None` is the language default — signed for char/short/int.
+        return isinstance(t, ast.BasicType) and t.is_signed is False
+
+    def _load_to_eax(self, addr: str, ty: ast.TypeNode) -> list[str]:
+        """Lines that load a value of type `ty` from `addr` into EAX.
+
+        Sub-word loads sign- or zero-extend (per signedness) so callers can
+        treat EAX uniformly as a 32-bit working value, matching C's integer
+        promotion rules.
+        """
+        size = self._size_of(ty)
+        if size == 4:
+            return [f"        mov     eax, {addr}"]
+        if size == 2:
+            mnem = "movzx" if self._is_unsigned(ty) else "movsx"
+            return [f"        {mnem}   eax, word {addr}"]
+        if size == 1:
+            mnem = "movzx" if self._is_unsigned(ty) else "movsx"
+            return [f"        {mnem}   eax, byte {addr}"]
+        raise CodegenError(f"can't load size-{size} value into eax")
+
+    def _store_from_eax(self, addr: str, ty: ast.TypeNode) -> list[str]:
+        """Lines that store EAX (treated as `ty`) to `addr`.
+
+        For sub-word types we narrow via the low half of EAX (`ax`/`al`),
+        leaving the higher bytes of the slot untouched — the load helper
+        above only reads the meaningful bytes anyway.
+        """
+        size = self._size_of(ty)
+        if size == 4:
+            return [f"        mov     {addr}, eax"]
+        if size == 2:
+            return [f"        mov     word {addr}, ax"]
+        if size == 1:
+            return [f"        mov     byte {addr}, al"]
+        raise CodegenError(f"can't store size-{size} value from eax")
 
     # ---- statements -----------------------------------------------------
 
@@ -489,9 +546,9 @@ class CodeGenerator:
             raise CodegenError(
                 f"array initialization not yet supported (`{decl.name}`)"
             )
-        return self._eval_expr_to_eax(decl.init, ctx) + [
-            f"        mov     {_ebp_addr(disp)}, eax",
-        ]
+        return self._eval_expr_to_eax(decl.init, ctx) + self._store_from_eax(
+            _ebp_addr(disp), decl.var_type
+        )
 
     def _return(self, stmt: ast.ReturnStmt, ctx: _FuncCtx) -> list[str]:
         if stmt.value is None:
@@ -592,7 +649,7 @@ class CodeGenerator:
             # address of its first element, not the bytes at that slot.
             if isinstance(ty, ast.ArrayType):
                 return [f"        lea     eax, {_ebp_addr(disp)}"]
-            return [f"        mov     eax, {_ebp_addr(disp)}"]
+            return self._load_to_eax(_ebp_addr(disp), ty)
         if isinstance(expr, ast.Index):
             return self._index_load(expr, ctx)
         if isinstance(expr, ast.UnaryOp):
@@ -633,9 +690,10 @@ class CodeGenerator:
         return out
 
     def _index_load(self, expr: ast.Index, ctx: _FuncCtx) -> list[str]:
-        # Read through the computed element address. Sub-word loads come
-        # with `char` / `short` codegen later — every element is 4 bytes for now.
-        return self._index_address(expr, ctx) + ["        mov     eax, [eax]"]
+        # Read through the computed element address using a width matching
+        # the element type — `arr[i]` for `char arr[]` reads one byte.
+        elem_ty = self._type_of(expr, ctx)
+        return self._index_address(expr, ctx) + self._load_to_eax("[eax]", elem_ty)
 
     def _ternary(self, expr: ast.TernaryOp, ctx: _FuncCtx) -> list[str]:
         false_label = ctx.label("tern_false")
@@ -676,11 +734,12 @@ class CodeGenerator:
             return self._address_of(expr, ctx)
         if expr.op == "*":
             # Dereference: load the pointer value into EAX, then read from
-            # the address it holds. Operand may be any expression that
-            # produces a 32-bit address.
-            return self._eval_expr_to_eax(expr.operand, ctx) + [
-                "        mov     eax, [eax]",
-            ]
+            # the address it holds. The load width follows the pointee
+            # type — `*char_ptr` reads one byte (sign-extended), not four.
+            pointee_ty = self._type_of(expr, ctx)
+            return self._eval_expr_to_eax(expr.operand, ctx) + self._load_to_eax(
+                "[eax]", pointee_ty
+            )
         if not expr.is_prefix:
             raise CodegenError(f"postfix `{expr.op}` not implemented yet")
         out = self._eval_expr_to_eax(expr.operand, ctx)
@@ -733,15 +792,21 @@ class CodeGenerator:
         if isinstance(ty, ast.PointerType):
             step = self._size_of(ty.base_type)
             instr = "add" if expr.op == "++" else "sub"
-            bump = f"        {instr}     dword {addr}, {step}"
+            bump = [f"        {instr}     dword {addr}, {step}"]
         else:
+            # `inc byte/word/dword` for char/short/int. The slot's payload
+            # bytes are at the same `[ebp - N]` regardless of width because
+            # x86 is little-endian.
+            size = self._size_of(ty)
+            width = {1: "byte", 2: "word", 4: "dword"}[size]
             instr = "inc" if expr.op == "++" else "dec"
-            bump = f"        {instr}     dword {addr}"
+            bump = [f"        {instr}     {width} {addr}"]
+        load = self._load_to_eax(addr, ty)
         if expr.is_prefix:
             # ++x: bump in place, then load the new value into EAX.
-            return [bump, f"        mov     eax, {addr}"]
+            return bump + load
         # x++: load old value into EAX, then bump in place. EAX is the result.
-        return [f"        mov     eax, {addr}", bump]
+        return load + bump
 
     @staticmethod
     def _scale_reg(reg: str, size: int) -> list[str]:
@@ -962,27 +1027,31 @@ class CodeGenerator:
                     f"cannot assign to array `{expr.left.name}`"
                 )
             disp = ctx.lookup(expr.left.name)
-            return self._eval_expr_to_eax(expr.right, ctx) + [
-                f"        mov     {_ebp_addr(disp)}, eax",
-            ]
+            return self._eval_expr_to_eax(expr.right, ctx) + self._store_from_eax(
+                _ebp_addr(disp), ty
+            )
         # `*p = rhs` — store-through-pointer. Evaluate the pointer expr
         # first, save its value, then evaluate rhs into EAX (so the result
-        # of the whole assignment expression is rhs, as C requires).
+        # of the whole assignment expression is rhs, as C requires). The
+        # store width follows the pointee type so `*char_ptr = 65` writes
+        # one byte, not four.
         if isinstance(expr.left, ast.UnaryOp) and expr.left.op == "*":
+            pointee_ty = self._type_of(expr.left, ctx)
             out = self._eval_expr_to_eax(expr.left.operand, ctx)
             out.append("        push    eax")
             out += self._eval_expr_to_eax(expr.right, ctx)
             out.append("        pop     ecx")
-            out.append("        mov     [ecx], eax")
+            out += self._store_from_eax("[ecx]", pointee_ty)
             return out
         # `arr[i] = rhs` — same shape as `*ptr = rhs`, but the address
         # comes from element-arithmetic rather than a single load.
         if isinstance(expr.left, ast.Index):
+            elem_ty = self._type_of(expr.left, ctx)
             out = self._index_address(expr.left, ctx)
             out.append("        push    eax")
             out += self._eval_expr_to_eax(expr.right, ctx)
             out.append("        pop     ecx")
-            out.append("        mov     [ecx], eax")
+            out += self._store_from_eax("[ecx]", elem_ty)
             return out
         raise CodegenError(
             f"assignment target must be an identifier, `*ptr`, or `arr[i]` "

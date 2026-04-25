@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–9 are done. 99 tests passing.
-Slice 10+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–10 are done. 112 tests passing.
+Slice 11+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,24 +60,21 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 9 (just landed):
-- **Arrays (uninitialized).** `int arr[N]` allocates `N*sizeof(elem)`
-  on the frame; array names decay to addresses; `arr[i]` reads/writes
-  via base+i*sizeof(elem); `&arr[i]` produces the element address
-  without dereferencing.
+Implemented in slice 10 (just landed):
+- **Sub-word codegen.** `char`/`short`/`unsigned char`/`unsigned short`
+  as locals, params, pointer derefs, and array elements. Loads use
+  `movsx`/`movzx`; stores narrow via `mov byte/word`. Slot sizes
+  rounded up to 4-byte alignment.
 
 Deliberately not yet implemented — next slices in roughly this order:
 - **Array initialization.** `int arr[N] = {a, b, c};` and string-init
   `char s[] = "hi";` need `InitializerList` lowering — store each
   value to its slot, optionally zero the tail.
-- **`char` / `short` codegen.** Size-aware load (`movsx` / `movzx`
-  for sub-word) and store (`mov byte`/`mov word`). Today every slot
-  is 4 bytes regardless of declared type. `char *p` arithmetic works,
-  but `*p` still emits a 4-byte load — that's a latent bug this slice
-  fixes. Also makes `char arr[N]` strings genuinely useful.
 - **Globals.** Same lowering model as locals but in `.data`/`.bss`
   with named labels instead of `[ebp + disp]`.
-- **Casts.** `(int)x`, `(char *)p`, etc.
+- **Casts.** `(int)x`, `(char *)p`, etc. With sub-word codegen landed,
+  many casts are no-ops at the asm level (the load already extends);
+  narrowing casts need explicit truncation.
 - **Compound assignment to non-Identifier lvalues.** `arr[i] += 5` and
   `*p += 5` currently raise. Needs lowering that computes the address
   once into a temp slot rather than re-evaluating the lvalue twice.
@@ -85,8 +82,11 @@ Deliberately not yet implemented — next slices in roughly this order:
   any non-Identifier callee.
 - **`sizeof` operator.** `_size_of` already exists internally; just
   need to wire `SizeofExpr` and `SizeofType` into expression eval.
+- **Floating point.** `float` / `double` slot codegen via x87 or SSE.
+  Big topic — likely a phase of its own.
 
-Suggested first move next session: read `CLAUDE.md`. Sub-word codegen
-is probably the highest-leverage next slice — it closes the
-`*char_ptr` correctness gap and unlocks meaningful char/short locals
-and `char arr[]` strings.
+Suggested first move next session: read `CLAUDE.md`. Either
+**array/string initialization** (cheap with sub-word landed and
+unlocks meaningful `char s[] = "hi";`) or **sizeof** (small, mostly
+plumbing, lets test code use real `sizeof(arr)` instead of hardcoded
+sizes) is the natural next slice.
