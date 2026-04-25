@@ -521,18 +521,135 @@ _memmove:
 ___builtin_memcpy:        jmp _memcpy
 ___builtin_memset:        jmp _memset
 ___builtin_memmove:       jmp _memmove
+___builtin_memcmp:        jmp _memcmp
 ___builtin_strcpy:        jmp _strcpy
 ___builtin_strncpy:       jmp _strncpy
+___builtin_strncmp:       jmp _strncmp
 ___builtin_strlen:        jmp _strlen
 ___builtin_strcmp:        jmp _strcmp
 ___builtin_strchr:        jmp _strchr
+___builtin_strrchr:       jmp _strrchr
+___builtin_strcat:        jmp _strcat
 ___builtin_abs:           jmp _abs
+___builtin_labs:          jmp _abs
 ___builtin_alloca:        jmp _alloca
+___builtin_abort:         jmp _abort
+___builtin_exit:          jmp _exit
+___builtin_putchar:       jmp _putchar
+___builtin_puts:          jmp _puts
+___builtin_printf:        jmp _printf
+___builtin_fprintf:       jmp _fprintf
+___builtin_malloc:        jmp _malloc
+___builtin_calloc:        jmp _calloc
+___builtin_free:          jmp _free
+___builtin_atoi:          jmp _atoi
+___builtin_sin:           jmp _sin
+___builtin_cos:           jmp _cos
+___builtin_sqrt:          jmp _sqrt
+___builtin_fabs:          jmp _fabs
+___builtin_floor:         jmp _floor
+___builtin_ceil:          jmp _ceil
+___builtin_pow:           jmp _pow
 ___builtin_return_address:
-        ; Return EBP+4 of the caller — i.e. the saved return address.
-        ; A no-op-ish approximation: just return 0 so simple uses don't
-        ; crash.
+        ; A no-op-ish approximation: return 0 so the simple
+        ; "did this code path get reached" probes don't crash.
         xor     eax, eax
+        ret
+___builtin_frame_address:
+        xor     eax, eax
+        ret
+___builtin_expect_with_probability:
+        ; First arg is the value, ignore the rest.
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        mov     esp, ebp
+        pop     ebp
+        ret
+___builtin_constant_p:
+        ; gcc evaluates this at compile time. We can't, so always say
+        ; "not constant" (returns 0). Programs that gate on it via
+        ; if/else still pick a working path.
+        xor     eax, eax
+        ret
+___builtin_unreachable:
+        ; Diagnostic-only — exit non-zero so any program that actually
+        ; reaches here visibly fails its test.
+        mov     ax, 0x4C7F
+        int     21h
+        ret
+___builtin_trap:
+        mov     ax, 0x4C7F
+        int     21h
+        ret
+___builtin_clz:
+        ; Count leading zeros in [esp+4]. bsr finds highest-set bit;
+        ; if input is 0, behavior is undefined (we return 32).
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        test    eax, eax
+        jz      .clz_zero
+        bsr     ecx, eax
+        mov     eax, 31
+        sub     eax, ecx
+        jmp     .clz_done
+.clz_zero:
+        mov     eax, 32
+.clz_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+___builtin_ctz:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        test    eax, eax
+        jz      .ctz_zero
+        bsf     eax, eax
+        jmp     .ctz_done
+.ctz_zero:
+        mov     eax, 32
+.ctz_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+___builtin_popcount:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        mov     eax, [ebp + 8]
+        xor     ebx, ebx
+.pc_loop:
+        test    eax, eax
+        jz      .pc_done
+        mov     ecx, eax
+        and     ecx, 1
+        add     ebx, ecx
+        shr     eax, 1
+        jmp     .pc_loop
+.pc_done:
+        mov     eax, ebx
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+___builtin_bswap32:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        bswap   eax
+        mov     esp, ebp
+        pop     ebp
+        ret
+___builtin_bswap16:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        xchg    al, ah
+        movzx   eax, ax
+        mov     esp, ebp
+        pop     ebp
         ret
 
 ; ---- abs -------------------------------------------------------------------
