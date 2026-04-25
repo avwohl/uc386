@@ -23,11 +23,24 @@ The runners default to `--compile-only` because the i386 assemble →
 link → run → diff pipeline is not yet wired. Headers in
 `lib/include/` (copied from uc80) are passed via `-I`.
 
-Latest tally — `python run_ctests.py`:
+Latest tally — `python run_ctests.py --full` and
+`python run_gcc_torture.py --full`:
 
-    Total:    220
-    Pass:     219      (compile-only)
-    Compile:    1      (00216 — kitchen-sink init-list test)
+    c-testsuite     214 / 220   (97.3%)  — running for real
+    gcc-c-torture   729 / 1514  (48.2%)  — running for real
+
+The full run-mode pipeline is wired:
+uc386 → .asm → bundle libc.asm → nasm -f bin → unicorn-engine →
+diff stdout against the test's `.expected` (or check exit code).
+INT 21h is intercepted by `src/uc386/dos_emu.py` so DOS-style
+syscalls reach a Python-side handler.
+
+The remaining c-testsuite gaps cluster around: 00216 (init-list
+torture), 00186 (sprintf), 00187 (real file I/O), 00204 (struct
+va_arg in detail), 00218 (8-bit unsigned-enum bit-field), and
+the const-qualifier edge of `_Generic` (00219). The torture
+gaps cluster around K&R-only constructs the parser still
+chokes on, missing libc functions, and codegen edges.
 
 To finish the pipeline:
 1. NASM assembly (`-f bin` works; for `-f obj`/`-f elf` we'd need a linker).
