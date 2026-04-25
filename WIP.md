@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
 Phase 4 slices 0–32 done. Phase 5 (floats) slices 1–9 done.
-306 tests passing.
+va_list slice done. 310 tests passing.
 
 ## Bootstrap on the new machine
 
@@ -60,18 +60,19 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in Phase 4 slice 32 (just landed):
-- **Function-static locals.** `static int x = 0;` inside a function
-  now lives in `.data`/`.bss` under a mangled label (`_func__x`)
-  and persists across calls. Read/write transparently through
-  `ctx.local_static_labels`.
+Implemented in the va_list slice (just landed):
+- **Variadic function definitions.** User supplies
+  `typedef char *va_list;`; uc_core's parser handles
+  `va_arg(ap, T)` as a builtin form, and uc386 lowers va_start
+  (lea past the last named param) / va_arg (read + advance) /
+  va_end (no-op).
 
 Deliberately not yet implemented:
-- **Variadic function definitions** (callee-side va_list / va_arg /
-  va_start). Variadic *call sites* already work; va_arg etc. would
-  need stdarg.h preprocessor support or builtin recognition.
 - **`register` storage class.** It's just a hint; we ignore it. No
   correctness gap.
+- **Implicit `va_list` typedef.** Currently the user must declare
+  `typedef char *va_list;` themselves. A small uc_core change could
+  predefine it, but it's not blocking real code.
 
 ## Phase 5 design questions (floats — settled, kept here for reference)
 

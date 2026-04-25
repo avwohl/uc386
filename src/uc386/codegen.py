@@ -1893,6 +1893,85 @@ class CodeGenerator:
         out.append("        mov     eax, ecx")     # return retptr
         return out
 
+    # ---- variadic builtins (va_start / va_arg / va_end) -----------------
+
+    def _va_start(self, args: list[ast.Expression], ctx: _FuncCtx) -> list[str]:
+        """Lower `va_start(ap, last)`: ap = (char *)&last + sizeof_padded(last).
+
+        cdecl pushes args right-to-left so the variadic args follow
+        immediately after the last named param's stack slot. We compute
+        that address with a single `lea` and store it into `ap`.
+        """
+        if len(args) != 2:
+            raise CodegenError("va_start expects exactly 2 arguments")
+        ap_expr, last_expr = args
+        if not isinstance(last_expr, ast.Identifier):
+            raise CodegenError(
+                "va_start: second argument must name a parameter"
+            )
+        last_name = last_expr.name
+        if last_name not in ctx.slots:
+            raise CodegenError(
+                f"va_start: `{last_name}` is not a parameter or local"
+            )
+        last_disp = ctx.lookup(last_name)
+        last_padded = (self._size_of(ctx.lookup_type(last_name)) + 3) & ~3
+        after_disp = last_disp + last_padded
+        out = [f"        lea     eax, {_ebp_addr(after_disp)}"]
+        if not isinstance(ap_expr, ast.Identifier):
+            raise CodegenError(
+                "va_start: first argument must be an identifier"
+            )
+        out += self._identifier_store(ap_expr.name, ctx)
+        return out
+
+    def _va_arg_int(self, expr: ast.VaArgExpr, ctx: _FuncCtx) -> list[str]:
+        """Lower `va_arg(ap, T)` where T is integer/pointer-typed.
+
+        Saves the current `ap` into ECX, advances `ap` by the argument's
+        slot size (rounded up to 4), then loads through ECX into EAX
+        with the target type's natural width.
+        """
+        ap_addr = self._va_arg_ap_addr(expr, ctx)
+        target_ty = expr.target_type
+        target_size = self._size_of(target_ty)
+        advance = (target_size + 3) & ~3
+        out = [
+            f"        mov     ecx, {ap_addr}",
+            f"        add     dword {ap_addr}, {advance}",
+        ]
+        out += self._load_to_eax("[ecx]", target_ty)
+        return out
+
+    def _va_arg_float(self, expr: ast.VaArgExpr, ctx: _FuncCtx) -> list[str]:
+        """Lower `va_arg(ap, T)` for `float`/`double` — leaves the
+        value on st(0). Note: in cdecl, float args are promoted to
+        double when passed through `...`, so `va_arg(ap, float)` is
+        usually a programmer error; we still handle it by reading 4
+        bytes if the user explicitly asks."""
+        ap_addr = self._va_arg_ap_addr(expr, ctx)
+        target_ty = expr.target_type
+        target_size = self._size_of(target_ty)
+        advance = (target_size + 3) & ~3
+        width = "dword" if target_size == 4 else "qword"
+        return [
+            f"        mov     ecx, {ap_addr}",
+            f"        add     dword {ap_addr}, {advance}",
+            f"        fld     {width} [ecx]",
+        ]
+
+    def _va_arg_ap_addr(self, expr: ast.VaArgExpr, ctx: _FuncCtx) -> str:
+        """Resolve `expr.ap` to a memory operand (e.g. `[ebp - 4]`).
+
+        We need an addressable form (not just a value) because va_arg
+        must mutate the slot to advance past the argument.
+        """
+        if not isinstance(expr.ap, ast.Identifier):
+            raise CodegenError(
+                "va_arg: ap must be an identifier (lvalue)"
+            )
+        return self._identifier_addr_text(expr.ap.name, ctx)
+
     def _stripped_callee(self, call: ast.Call) -> ast.Expression:
         """Strip leading `*`s on a Call's callee (function-typed `*` is idempotent)."""
         callee = call.func
@@ -2067,6 +2146,8 @@ class CodeGenerator:
         if isinstance(expr, (ast.SizeofExpr, ast.SizeofType)):
             # `sizeof` returns size_t; treat it as int for our flat-32 ABI.
             return ast.BasicType(name="int")
+        if isinstance(expr, ast.VaArgExpr):
+            return expr.target_type
         if isinstance(expr, ast.Cast):
             return expr.target_type
         if isinstance(expr, ast.Call):
@@ -2127,6 +2208,8 @@ class CodeGenerator:
             return self._ternary(expr, ctx)
         if isinstance(expr, ast.Cast):
             return self._cast(expr, ctx)
+        if isinstance(expr, ast.VaArgExpr):
+            return self._va_arg_int(expr, ctx)
         if isinstance(expr, ast.SizeofType):
             return [f"        mov     eax, {self._size_of(expr.target_type)}"]
         if isinstance(expr, ast.SizeofExpr):
@@ -2199,6 +2282,8 @@ class CodeGenerator:
             # cdecl, so we just emit the standard call sequence —
             # `_call`'s post-call cleanup doesn't touch the FPU stack.
             return self._call(expr, ctx)
+        if isinstance(expr, ast.VaArgExpr):
+            return self._va_arg_float(expr, ctx)
         raise CodegenError(
             f"float expression {type(expr).__name__} not implemented yet"
         )
@@ -2515,6 +2600,17 @@ class CodeGenerator:
         # Struct-returning calls are handled in `_eval_expr_to_eax` (via
         # the per-call temp) before reaching here.
         callee = self._stripped_callee(expr)
+
+        # Variadic builtins. `va_start(ap, last)` writes the address
+        # past `last` into `ap`; `va_end(ap)` is a no-op (cdecl needs
+        # no per-call cleanup) — we still produce a 0 in EAX so the
+        # call's value is defined when the user accidentally consumes
+        # it. `va_arg` is handled at expression eval (see VaArgExpr).
+        if isinstance(callee, ast.Identifier):
+            if callee.name == "va_start":
+                return self._va_start(expr.args, ctx)
+            if callee.name == "va_end":
+                return ["        xor     eax, eax"]
 
         # Direct call: callee names a function declared in this unit
         # (defined or extern). Emit a `call _name` linker reference.

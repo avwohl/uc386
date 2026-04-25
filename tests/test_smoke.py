@@ -1665,6 +1665,83 @@ def test_unknown_enum_constant_is_unknown_identifier():
         _compile("int main(void) { return UNDEFINED_ENUM_CONST; }")
 
 
+# ---- va_list (callee-side variadic) ---------------------------------------
+
+def test_va_start_va_arg_va_end_compile():
+    asm = _compile(
+        "typedef char *va_list; "
+        "int sum(int n, ...) { "
+        "  va_list ap; "
+        "  va_start(ap, n); "
+        "  int total = 0; "
+        "  for (int i = 0; i < n; i = i + 1) { "
+        "    total = total + va_arg(ap, int); "
+        "  } "
+        "  va_end(ap); "
+        "  return total; "
+        "} "
+        "int main(void) { return sum(3, 10, 20, 30); }"
+    )
+    # va_start: ap = &n + 4. n is at [ebp + 8] so we lea [ebp + 12]
+    # and store that into ap's slot.
+    assert "lea     eax, [ebp + 12]" in asm
+
+
+def test_va_arg_advances_pointer_and_loads():
+    asm = _compile(
+        "typedef char *va_list; "
+        "int first(int n, ...) { "
+        "  va_list ap; "
+        "  va_start(ap, n); "
+        "  int v = va_arg(ap, int); "
+        "  return v; "
+        "} "
+        "int main(void) { return first(0, 42); }"
+    )
+    asm_lines = asm.splitlines()
+    fn_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_first:")
+    end_idx = next(i for i, l in enumerate(asm_lines[fn_idx:]) if l.strip() == "ret") + fn_idx
+    fn_section = "\n".join(asm_lines[fn_idx:end_idx])
+    # va_arg(ap, int): read *ap as int, advance ap by 4.
+    # Look for: load ap into ecx, advance ap, then load via [ecx].
+    assert any("add     dword [ebp - " in l and ", 4" in l for l in fn_section.splitlines())
+    # The load itself is `mov eax, [ecx]` (int width).
+    assert "mov     eax, [ecx]" in fn_section
+
+
+def test_va_arg_double_advances_eight_bytes():
+    asm = _compile(
+        "typedef char *va_list; "
+        "double first(int n, ...) { "
+        "  va_list ap; "
+        "  va_start(ap, n); "
+        "  double v = va_arg(ap, double); "
+        "  return v; "
+        "} "
+        "int main(void) { return (int)first(1, 1.5); }"
+    )
+    asm_lines = asm.splitlines()
+    fn_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_first:")
+    end_idx = next(i for i, l in enumerate(asm_lines[fn_idx:]) if l.strip() == "ret") + fn_idx
+    fn_section = "\n".join(asm_lines[fn_idx:end_idx])
+    # va_arg(ap, double): advance ap by 8.
+    assert any("add     dword [ebp - " in l and ", 8" in l for l in fn_section.splitlines())
+    # And the value loads through fld qword.
+    assert "fld     qword [ecx]" in fn_section
+
+
+def test_va_end_emits_no_code():
+    asm = _compile(
+        "typedef char *va_list; "
+        "int f(int n, ...) { va_list ap; va_start(ap, n); va_end(ap); return n; } "
+        "int main(void) { return f(0); }"
+    )
+    # va_end(ap) is a no-op; just verify nothing strange shows up.
+    # (No specific instruction to assert; presence of `_f` in the output
+    # plus successful compilation is enough.)
+    assert "_f:" in asm
+
+
 # ---- variadic external calls ----------------------------------------------
 
 def test_variadic_extern_declaration_emits_extern():
