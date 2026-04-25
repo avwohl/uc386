@@ -121,7 +121,9 @@ def run_test(
     from uc386.dos_emu import assemble_and_run
 
     timeout = SLOW_TESTS.get(test_num, 10)
-    insn_limit = 2_000_000_000 if test_num in SLOW_TESTS else 200_000_000
+    insn_limit = (
+        20_000_000_000 if test_num in SLOW_TESTS else 200_000_000
+    )
     try:
         emu_res = assemble_and_run(
             asm_file, timeout_seconds=timeout, instruction_limit=insn_limit,

@@ -206,10 +206,17 @@ def run(
         if res.exit_code is None and not res.error:
             res.error = f"unicorn: {e}"
 
-    if res.exit_code is None and res.error is None and not res.timed_out:
-        # Ran off the end of the program without exiting. Treat as exit 0.
-        res.exit_code = 0
     res.instructions_executed = insn_count[0]
+    if res.exit_code is None and res.error is None and not res.timed_out:
+        # No explicit exit. Either we ran off the end of the binary
+        # (treat as exit 0) or unicorn's wallclock timeout fired (treat
+        # as timeout). Distinguish by checking EIP — if it's still
+        # within the binary, the wallclock killed us.
+        eip = mu.reg_read(UC_X86_REG_EIP)
+        if CODE_BASE <= eip < CODE_BASE + len(binary):
+            res.timed_out = True
+        else:
+            res.exit_code = 0
     return res
 
 

@@ -64,19 +64,23 @@ def run_test(c_file: Path, *, compile_only: bool = True) -> tuple[str, str]:
     if compile_only:
         return "pass", ""
 
-    com_file = asm_file.with_suffix(".com")
+    sys.path.insert(0, str(UC386_DIR / "src"))
+    from uc386.dos_emu import assemble_and_run
     try:
-        result = subprocess.run(
-            ["nasm", "-f", "bin", str(asm_file), "-o", str(com_file)],
-            capture_output=True, text=True, timeout=30,
+        emu_res = assemble_and_run(
+            asm_file, timeout_seconds=10, instruction_limit=200_000_000,
         )
-    except subprocess.TimeoutExpired:
-        return "asm", "nasm timed out"
-    if result.returncode != 0:
-        return "asm", result.stderr.strip()[:200]
-    if com_file.stat().st_size > MAX_COM_SIZE:
-        return "skip", f"binary too large ({com_file.stat().st_size} bytes)"
-    return "skip", "run stage not yet wired (need DOS extender + libc + emulator)"
+    except Exception as e:
+        return "asm", f"emu: {type(e).__name__}: {e}"
+
+    if emu_res.error:
+        return "run", emu_res.error[:300]
+    if emu_res.timed_out:
+        return "timeout", f"timeout (after {emu_res.instructions_executed} insns)"
+    # GCC torture: success = exit 0, failure = abort (any non-zero exit).
+    if emu_res.exit_code != 0:
+        return "run", f"exit {emu_res.exit_code}"
+    return "pass", ""
 
 
 def main():

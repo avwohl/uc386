@@ -3210,7 +3210,15 @@ class CodeGenerator:
         if isinstance(expr, ast.Identifier):
             return self._identifier_type(expr.name, ctx)
         if isinstance(expr, ast.IntLiteral):
-            return ast.BasicType(name="int")
+            # Honor the L/U suffixes per C: 17L → long, 17U → unsigned int,
+            # 17LL → long long. Used by `_Generic` matching, mostly.
+            name = "int"
+            if getattr(expr, "is_long", False):
+                name = "long"
+            return ast.BasicType(
+                name=name,
+                is_signed=(False if getattr(expr, "is_unsigned", False) else None),
+            )
         if isinstance(expr, ast.CharLiteral):
             # Per C, a character constant has type `int`, not `char`.
             return ast.BasicType(name="int")
@@ -3923,19 +3931,41 @@ class CodeGenerator:
                     out.append(f"        mov     [esp + {offset}], al")
                 total_arg_bytes += padded
             elif self._is_float_type(arg_ty):
-                # Float arg: evaluate to st(0), then `fstp` into a
-                # freshly-reserved arg slot. cdecl pushes 4 bytes for
-                # `float`, 8 for `double`. If the function's param type
-                # is known and float-typed, coerce the push width to
-                # match it — that's how a `double` literal like `2.5`
-                # narrows to `float` at a `float`-typed param site, and
-                # how `1.5f` widens to `double` symmetrically.
-                effective_ty = arg_ty
-                if expected_ty is not None and self._is_float_type(expected_ty):
-                    effective_ty = expected_ty
-                size = self._size_of(effective_ty)
+                # Float arg. If the param is also float, push that width
+                # (narrow double→float or widen float→double as needed).
+                # If the param is an integer-family type, convert via
+                # fistp and push 4 bytes. For variadic args (no
+                # expected_ty available), C promotes float→double, so
+                # we always push 8 bytes.
+                if expected_ty is not None and not self._is_float_type(expected_ty):
+                    out += self._eval_float_to_st0(arg, ctx)
+                    out.append("        sub     esp, 4")
+                    out.append("        fistp   dword [esp]")
+                    total_arg_bytes += 4
+                else:
+                    if expected_ty is not None and self._is_float_type(expected_ty):
+                        effective_ty = expected_ty
+                    else:
+                        # Variadic — promote float to double.
+                        effective_ty = ast.BasicType(name="double")
+                    size = self._size_of(effective_ty)
+                    width = "dword" if size == 4 else "qword"
+                    out += self._eval_float_to_st0(arg, ctx)
+                    out.append(f"        sub     esp, {size}")
+                    out.append(f"        fstp    {width} [esp]")
+                    total_arg_bytes += size
+            elif (
+                expected_ty is not None
+                and self._is_float_type(expected_ty)
+            ):
+                # Integer arg → float param: load int into FPU via fild,
+                # then fstp at expected float width.
+                out += self._eval_expr_to_eax(arg, ctx)
+                out.append("        push    eax")
+                out.append("        fild    dword [esp]")
+                out.append("        add     esp, 4")
+                size = self._size_of(expected_ty)
                 width = "dword" if size == 4 else "qword"
-                out += self._eval_float_to_st0(arg, ctx)
                 out.append(f"        sub     esp, {size}")
                 out.append(f"        fstp    {width} [esp]")
                 total_arg_bytes += size

@@ -25,6 +25,7 @@ I386_DOS_PREDEFINES = {
     "__i386__": "1",
     "__MSDOS__": "1",
     "__DOS__": "1",
+    "__ILP32__": "1",      # int/long/pointer all 32-bit
 }
 
 

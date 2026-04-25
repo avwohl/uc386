@@ -577,6 +577,7 @@ _memset:
 _fprintf:
         push    ebp
         mov     ebp, esp
+        sub     esp, 8
         push    ebx
         push    esi
         push    edi
@@ -588,6 +589,7 @@ _fprintf:
 _printf:
         push    ebp
         mov     ebp, esp
+        sub     esp, 8                ; [ebp-4] = zero_pad flag (per-spec)
         push    ebx
         push    esi
         push    edi
@@ -612,9 +614,9 @@ _printf:
         jmp     .next
 .pcent:
         inc     esi
-        ; Parse flags and width — we honor just '0' and a numeric width.
+        ; Parse flags and width.
         xor     ecx, ecx              ; width
-        xor     dh, dh                ; flag bits: bit 0 = leading zero
+        mov     byte [ebp - 4], 0     ; zero_pad flag
 .flags:
         mov     al, [esi]
         cmp     al, '0'
@@ -622,7 +624,7 @@ _printf:
         ; '0' as a flag only if followed by another digit; otherwise it's
         ; a zero-width specifier (rare). Simpler: mark zero-pad and let
         ; the width loop consume subsequent digits.
-        or      dh, 1
+        mov     byte [ebp - 4], 1
         inc     esi
         jmp     .flags
 .nf:
@@ -772,36 +774,53 @@ _printf:
 .pd_dec:
         mov     eax, [edi]
         add     edi, 4
-        ; Render signed decimal. Width = ECX, zero-pad if dh & 1.
+        movzx   ebx, byte [ebp - 4]
+        push    ebx
+        push    ecx
         call    _printf_emit_dec
+        add     esp, 8
         jmp     .next
 
 .pd_udec:
         mov     eax, [edi]
         add     edi, 4
+        movzx   ebx, byte [ebp - 4]
+        push    ebx
+        push    ecx
         call    _printf_emit_udec
+        add     esp, 8
         jmp     .next
 
 .pd_hex:
         mov     eax, [edi]
         add     edi, 4
+        movzx   ebx, byte [ebp - 4]   ; zero_pad
+        push    ebx
+        push    ecx                   ; width
         push    0                     ; 0 = lowercase
         call    _printf_emit_hex
-        add     esp, 4
+        add     esp, 12
         jmp     .next
 
 .pd_HEX:
         mov     eax, [edi]
         add     edi, 4
+        movzx   ebx, byte [ebp - 4]
+        push    ebx
+        push    ecx
         push    1                     ; 1 = uppercase
         call    _printf_emit_hex
-        add     esp, 4
+        add     esp, 12
         jmp     .next
 
 .pd_oct:
         mov     eax, [edi]
         add     edi, 4
+        movzx   ebx, byte [ebp - 4]
+        push    ebx
+        push    ecx
         call    _printf_emit_oct
+        add     esp, 8
         jmp     .next
 
 .pd_ptr:
@@ -855,63 +874,27 @@ _printf:
 ; via INT 21h AH=02. They DO NOT update any caller bytes-written
 ; counter — printf's overall return is approximate. They preserve EBX
 ; (caller's count register), ESI/EDI.
+;
+; All four helpers accept extra args on the caller's stack:
+;   [esp+4] = width  (minimum field width; 0 = no padding)
+;   [esp+8] = zero_pad (0 = pad with spaces; 1 = pad with '0')
+; The hex helper additionally consumes [esp+12] = uppercase (0 / 1).
 
 ; ---- print signed decimal in EAX -------------------------------------------
+; In:  EAX = value, [esp + 4] = width, [esp + 8] = zero_pad.
 _printf_emit_dec:
         push    ebp
         mov     ebp, esp
-        sub     esp, 24              ; tmp digits buffer (well clear of saved regs)
+        sub     esp, 32
         push    esi
         push    edi
         push    ebx
-        ; If negative, emit '-' first and negate.
+        mov     ebx, 0               ; sign flag
         test    eax, eax
         jns     .pos
-        push    eax
-        mov     edx, '-'
-        mov     ah, 0x02
-        int     21h
-        pop     eax
+        mov     ebx, 1
         neg     eax
 .pos:
-        lea     edi, [ebp - 4]       ; one-past-end of buffer (sentinel)
-        mov     byte [edi], 0
-.l:
-        xor     edx, edx
-        mov     esi, 10
-        div     esi
-        add     dl, '0'
-        dec     edi
-        mov     [edi], dl
-        test    eax, eax
-        jnz     .l
-.print:
-        mov     al, [edi]
-        test    al, al
-        jz      .done
-        movzx   edx, al
-        push    eax
-        mov     ah, 0x02
-        int     21h
-        pop     eax
-        inc     edi
-        jmp     .print
-.done:
-        pop     ebx
-        pop     edi
-        pop     esi
-        mov     esp, ebp
-        pop     ebp
-        ret
-
-; ---- print unsigned decimal in EAX -----------------------------------------
-_printf_emit_udec:
-        push    ebp
-        mov     ebp, esp
-        sub     esp, 24
-        push    esi
-        push    edi
-        push    ebx
         lea     edi, [ebp - 4]
         mov     byte [edi], 0
 .l:
@@ -923,18 +906,60 @@ _printf_emit_udec:
         mov     [edi], dl
         test    eax, eax
         jnz     .l
-.p:
-        mov     al, [edi]
-        test    al, al
-        jz      .d
-        movzx   edx, al
-        push    eax
-        mov     ah, 0x02
-        int     21h
-        pop     eax
-        inc     edi
-        jmp     .p
-.d:
+        ; Forward to padded helper. Stack [ebp+8]=width, [ebp+12]=zero_pad
+        ; (caller pushed in that order before calling us).
+        push    dword [ebp + 12]      ; zero_pad
+        push    dword [ebp + 8]       ; width
+        push    edi                   ; digits ptr
+        push    ebx                   ; sign flag
+        call    _emit_padded_digits_wp
+        add     esp, 16
+        pop     ebx
+        pop     edi
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- print unsigned decimal in EAX -----------------------------------------
+; In:  EAX = value, [esp + 4] = width, [esp + 8] = zero_pad.
+_printf_emit_udec:
+        push    ebp
+        mov     ebp, esp
+        sub     esp, 32
+        push    esi
+        push    edi
+        push    ebx
+        xor     ebx, ebx
+        lea     edi, [ebp - 4]
+        mov     byte [edi], 0
+.l:
+        xor     edx, edx
+        mov     esi, 10
+        div     esi
+        add     dl, '0'
+        dec     edi
+        mov     [edi], dl
+        test    eax, eax
+        jnz     .l
+        ; Width/zero-pad may not be on the stack if caller is the float
+        ; helper (which calls us without those args). Detect by checking
+        ; the literal stack frame size — but simpler: the float helper
+        ; doesn't use width/zero-pad anyway, so it's safe to read whatever
+        ; happens to be there as long as we don't crash. The width path
+        ; still works for direct printf calls.
+        ;
+        ; The safer route: the float helper passes (ebx=0 sign, edi=digits)
+        ; and would call _emit_padded_digits (no width). We do the same
+        ; here when this function was called WITHOUT width pushed.
+        ; In practice, printf always pushes width+zero_pad before calling
+        ; us, so the [ebp+8]/[ebp+12] reads are valid.
+        push    dword [ebp + 12]
+        push    dword [ebp + 8]
+        push    edi
+        push    ebx
+        call    _emit_padded_digits_wp
+        add     esp, 16
         pop     ebx
         pop     edi
         pop     esi
@@ -943,15 +968,17 @@ _printf_emit_udec:
         ret
 
 ; ---- print hex (32-bit, lowercase or uppercase) ----------------------------
-; In:  EAX = value, [esp + 4] = uppercase flag (0 or 1)
+; In:  EAX = value, [esp + 4] = uppercase flag (0 or 1),
+;      [esp + 8] = width, [esp + 12] = zero_pad
 _printf_emit_hex:
         push    ebp
         mov     ebp, esp
-        sub     esp, 24
+        sub     esp, 32
         push    esi
         push    edi
         push    ebx
         mov     ecx, [ebp + 8]       ; uppercase flag
+        xor     ebx, ebx             ; sign flag
         lea     edi, [ebp - 4]
         mov     byte [edi], 0
 .l:
@@ -975,18 +1002,13 @@ _printf_emit_hex:
         shr     eax, 4
         test    eax, eax
         jnz     .l
-.p:
-        mov     al, [edi]
-        test    al, al
-        jz      .d
-        movzx   edx, al
-        push    eax
-        mov     ah, 0x02
-        int     21h
-        pop     eax
-        inc     edi
-        jmp     .p
-.d:
+        ; Push width/zero-pad from caller's stack frame to ours.
+        push    dword [ebp + 16]     ; zero_pad
+        push    dword [ebp + 12]     ; width
+        push    edi
+        push    ebx
+        call    _emit_padded_digits_wp
+        add     esp, 16
         pop     ebx
         pop     edi
         pop     esi
@@ -998,10 +1020,11 @@ _printf_emit_hex:
 _printf_emit_oct:
         push    ebp
         mov     ebp, esp
-        sub     esp, 24
+        sub     esp, 32
         push    esi
         push    edi
         push    ebx
+        xor     ebx, ebx
         lea     edi, [ebp - 4]
         mov     byte [edi], 0
 .l:
@@ -1013,18 +1036,143 @@ _printf_emit_oct:
         shr     eax, 3
         test    eax, eax
         jnz     .l
-.p:
-        mov     al, [edi]
+        push    dword [ebp + 12]
+        push    dword [ebp + 8]
+        push    edi
+        push    ebx
+        call    _emit_padded_digits_wp
+        add     esp, 16
+        pop     ebx
+        pop     edi
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- _emit_padded_digits(sign_flag, digits_ptr) ----------------------------
+; Stack: [ret][sign][digits]. Emits sign + digits, no padding.
+; (Width/zero-pad handled by _emit_padded_digits_wp variant.)
+_emit_padded_digits:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        mov     esi, [ebp + 12]      ; digits ptr
+        mov     eax, [ebp + 8]       ; sign flag
+        test    eax, eax
+        jz      .nosign
+        mov     edx, '-'
+        mov     ah, 0x02
+        int     21h
+.nosign:
+.l:
+        mov     al, [esi]
         test    al, al
         jz      .d
         movzx   edx, al
+        mov     ah, 0x02
+        int     21h
+        inc     esi
+        jmp     .l
+.d:
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- _emit_padded_digits_wp(sign, digits, width, zero_pad) -----------------
+; Honors the printf width + zero-pad flags. width=0 means no padding.
+; If zero_pad and we have a sign, the sign goes BEFORE the zero-padding.
+; If !zero_pad, the sign goes after the spaces.
+_emit_padded_digits_wp:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        push    edi
+        push    ebx
+        ; ESI = digits ptr; count chars (excluding sentinel).
+        mov     esi, [ebp + 12]
+        xor     edi, edi
+.cl:
+        cmp     byte [esi + edi], 0
+        je      .ce
+        inc     edi
+        jmp     .cl
+.ce:
+        ; EDI = digit count.
+        mov     ecx, [ebp + 16]      ; width
+        mov     ebx, [ebp + 20]      ; zero_pad
+        ; pad_count = max(0, width - (digit_count + sign_flag)).
+        mov     eax, ecx
+        sub     eax, edi
+        cmp     dword [ebp + 8], 0
+        je      .ns
+        sub     eax, 1
+.ns:
+        test    eax, eax
+        jle     .nopad
+        ; If zero_pad, emit sign first then pad with '0'. Else pad
+        ; with spaces then sign.
+        test    ebx, ebx
+        jz      .spadl
+        ; sign?
+        cmp     dword [ebp + 8], 0
+        je      .zpad
         push    eax
+        mov     edx, '-'
         mov     ah, 0x02
         int     21h
         pop     eax
-        inc     edi
-        jmp     .p
-.d:
+.zpad:
+        mov     ecx, eax
+.zl:
+        test    ecx, ecx
+        jz      .digits_only
+        push    ecx
+        mov     edx, '0'
+        mov     ah, 0x02
+        int     21h
+        pop     ecx
+        dec     ecx
+        jmp     .zl
+.spadl:
+        mov     ecx, eax
+.spl:
+        test    ecx, ecx
+        jz      .signsp
+        push    ecx
+        mov     edx, ' '
+        mov     ah, 0x02
+        int     21h
+        pop     ecx
+        dec     ecx
+        jmp     .spl
+.signsp:
+        cmp     dword [ebp + 8], 0
+        je      .digits_only
+        mov     edx, '-'
+        mov     ah, 0x02
+        int     21h
+        jmp     .digits_only
+.nopad:
+        ; No padding: sign then digits.
+        cmp     dword [ebp + 8], 0
+        je      .digits_only
+        mov     edx, '-'
+        mov     ah, 0x02
+        int     21h
+.digits_only:
+        ; Emit digits.
+        mov     esi, [ebp + 12]
+.dl:
+        mov     al, [esi]
+        test    al, al
+        jz      .done
+        movzx   edx, al
+        mov     ah, 0x02
+        int     21h
+        inc     esi
+        jmp     .dl
+.done:
         pop     ebx
         pop     edi
         pop     esi
@@ -1066,7 +1214,10 @@ _printf_emit_double:
         ; precision==0 → round-to-nearest integer.
         fistp   dword [ebp - 16]
         mov     eax, [ebp - 16]
+        push    dword 0              ; zero_pad
+        push    dword 0              ; width
         call    _printf_emit_udec
+        add     esp, 8
         jmp     .end
 .with_frac:
         ; Multiply value by 10^precision (loop, default rounding).
@@ -1100,7 +1251,10 @@ _printf_emit_double:
         mov     [ebp - 24], edx     ; fractional part
         ; Emit integer.
         mov     eax, [ebp - 20]
+        push    dword 0              ; zero_pad
+        push    dword 0              ; width
         call    _printf_emit_udec
+        add     esp, 8
         ; Emit '.'.
         mov     edx, '.'
         mov     ah, 0x02
