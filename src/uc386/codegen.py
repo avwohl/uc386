@@ -422,6 +422,18 @@ class CodeGenerator:
         """
         # Scalar globals with a literal init.
         if isinstance(ty, ast.BasicType):
+            if self._is_float_type(ty):
+                # Float globals must initialize from a float literal —
+                # the existing `_const_eval` is integer-only and would
+                # reject a FloatLiteral. NASM accepts the decimal form
+                # in `dd` / `dq` and converts to IEEE-754.
+                if not isinstance(init, ast.FloatLiteral):
+                    raise CodegenError(
+                        f"global `{name}`: float init must be a "
+                        f"floating-point literal"
+                    )
+                directive = "dd" if ty.name == "float" else "dq"
+                return [f"        {directive}      {init.value!r}"]
             value = self._const_eval(init, name)
             directive = self._DATA_DIRECTIVE[self._size_of(ty)]
             return [f"        {directive}      {value}"]
@@ -2121,6 +2133,8 @@ class CodeGenerator:
                 f"unary `{expr.op}` not supported on float operand"
             )
         if isinstance(expr, ast.BinaryOp):
+            if expr.op == "=":
+                return self._float_assign(expr, ctx)
             return self._float_binop(expr, ctx)
         if isinstance(expr, ast.Cast):
             return self._float_cast(expr, ctx)
@@ -2219,6 +2233,41 @@ class CodeGenerator:
         size = self._size_of(ty)
         width = "dword" if size == 4 else "qword"
         return [f"        fstp    {width} {addr}"]
+
+    def _float_assign(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
+        """Lower `lvalue = rhs` where `lvalue` is float-typed.
+
+        Uses `fst` (store without pop) instead of `fstp` so the new
+        value stays on st(0) — that lets a float assignment expression
+        be consumed (e.g. `(f = 1.5f) + 1.0f`) without an extra reload.
+        """
+        ty = self._type_of(expr.left, ctx)
+        size = self._size_of(ty)
+        width = "dword" if size == 4 else "qword"
+        out = self._eval_float_to_st0(expr.right, ctx)
+        if isinstance(expr.left, ast.Identifier):
+            addr = self._float_lvalue_addr(expr.left.name, ctx)
+            out.append(f"        fst     {width} {addr}")
+            return out
+        if isinstance(expr.left, ast.UnaryOp) and expr.left.op == "*":
+            # `*p = rhs` for float pointee — eval pointer first, then
+            # we'd need the float on st0 alongside the pointer in eax.
+            # Easiest: store float to a temp, eval pointer, fld back.
+            # Defer until we have a clear use-case.
+            raise CodegenError(
+                "assignment through a float pointer not yet supported"
+            )
+        if isinstance(expr.left, ast.Index):
+            raise CodegenError(
+                "assignment to a float array element not yet supported"
+            )
+        if isinstance(expr.left, ast.Member):
+            raise CodegenError(
+                "assignment to a float struct member not yet supported"
+            )
+        raise CodegenError(
+            f"float assignment to {type(expr.left).__name__} not supported"
+        )
 
     def _float_compare(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
         """Lower a float comparison to a 386-compatible setCC sequence.

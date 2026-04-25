@@ -1210,6 +1210,52 @@ def test_float_return_into_float_local():
     assert "fstp    dword [ebp" in main_section
 
 
+# ---- float globals --------------------------------------------------------
+
+def test_float_global_initialized_in_data():
+    asm = _compile(
+        "float pi = 3.14f; int main(void) { return (int)pi; }"
+    )
+    assert "section .data" in asm
+    assert "_pi:" in asm
+    assert "dd      3.14" in asm
+
+
+def test_double_global_initialized_in_data():
+    asm = _compile(
+        "double e = 2.718; int main(void) { return (int)e; }"
+    )
+    assert "_e:" in asm
+    assert "dq      2.718" in asm
+
+
+def test_uninitialized_float_global_in_bss():
+    asm = _compile(
+        "float counter; int main(void) { return (int)counter; }"
+    )
+    assert "section .bss" in asm
+    assert "_counter:" in asm
+    assert "resb    4" in asm
+
+
+def test_float_global_read_uses_fld():
+    asm = _compile(
+        "float pi = 3.14f; int main(void) { float p = pi; return (int)p; }"
+    )
+    assert "fld     dword [_pi]" in asm
+
+
+def test_float_global_write_uses_fst():
+    # `_float_assign` uses `fst` (no pop) so the assignment expression's
+    # value stays on st(0) for chained uses; the trailing fistp/fstp at
+    # the consumer site pops it.
+    asm = _compile(
+        "float counter; "
+        "int main(void) { counter = 1.5f; return 0; }"
+    )
+    assert "fst     dword [_counter]" in asm
+
+
 # ---- float comparisons ----------------------------------------------------
 
 @pytest.mark.parametrize(

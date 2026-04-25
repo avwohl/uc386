@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–31 done. Phase 5 (floats) slices 1–3 done.
-281 tests passing.
+Phase 4 slices 0–31 done. Phase 5 (floats) slices 1–4 done.
+286 tests passing.
 
 ## Bootstrap on the new machine
 
@@ -60,21 +60,27 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in Phase 5 slice 3 (just landed):
-- **Float function params and returns.** Cdecl-correct: caller fstp's
-  args into the stack window, callee fld's from `[ebp + offset]`,
-  return value rides st(0).
+Implemented in Phase 5 slice 4 (just landed):
+- **Float globals + float assignment expressions.** Initialized
+  float/double globals emit `dd`/`dq`; uninitialized go to `.bss`.
+  `_float_assign` uses `fst` (no pop) so float assignment expressions
+  carry their value through.
 
 Deliberately not yet implemented — Phase 5 follow-on slices:
-- **Float globals init.** `double pi = 3.14;` at top level — the
-  existing `.data` emission needs to recognize float types and use
-  `dq` / `dd` instead of `_const_eval`.
 
 Other deferred features:
 - **Variadic function definitions** (callee-side va_list / va_arg /
   va_start). Variadic *call sites* already work.
 - **Static / register storage classes** beyond what cdecl already
   gives.
+- **Compound assign / `*p =` / `arr[i] =` / `s.m =` for floats.**
+  Currently `_float_assign` only handles `Identifier` lvalues; the
+  others raise. Adds a temp-slot dance (store float to stack, eval
+  pointer/index/member-address to eax, fld back, fstp).
+- **Auto-narrowing of `double` literals at float-typed param sites.**
+  Right now the caller emits a qword push for an unsuffixed literal
+  passed to a `float` param. A coercion pass at the call site (look
+  up param types) would fix this — currently we just require `2.5f`.
 
 ## Phase 5 design questions (floats — settled, kept here for reference)
 
