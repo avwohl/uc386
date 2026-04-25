@@ -174,14 +174,25 @@ class _FuncCtx:
         # labels so two functions with the same `static int x` don't
         # collide.
         self.func_name: str = ""
+        # Back-pointer to the CodeGenerator so `enter_scope` /
+        # `exit_scope` can drive the struct-tag alias chain stored on
+        # the codegen. Set by `_function` immediately after construction.
+        self._codegen_ref: object | None = None
 
     def enter_scope(self) -> None:
         self.slots.append({})
         self.types.append({})
+        # `_struct_aliases` lives on the CodeGenerator, not on the
+        # _FuncCtx — `_codegen_ref` is wired by `_function` so this
+        # method can keep the per-block scope chains in sync.
+        if self._codegen_ref is not None:
+            self._codegen_ref._struct_aliases.append({})
 
     def exit_scope(self) -> None:
         self.slots.pop()
         self.types.pop()
+        if self._codegen_ref is not None:
+            self._codegen_ref._struct_aliases.pop()
 
     def alloc_local(
         self,
@@ -367,6 +378,12 @@ class CodeGenerator:
         self._structs = {}
         self._struct_sizes = {}
         self._struct_bitfields = {}
+        # Tag-name → registry key, scope chain. Each `_register_struct`
+        # at file scope (or inside a compound) pushes the binding into
+        # `_struct_aliases[-1]`. Inner blocks may shadow an outer T with
+        # a separately-registered key, so `_resolve_struct_name` walks
+        # the chain top-down.
+        self._struct_aliases: list[dict[str, str]] = [{}]
         self._enum_constants = {}
         self._float_constants = {}
         for d in top_decls:
@@ -929,6 +946,7 @@ class CodeGenerator:
         ctx = _FuncCtx()
         ctx.return_type = fn.return_type
         ctx.func_name = fn.name
+        ctx._codegen_ref = self
         # Parameters live above EBP at cdecl offsets; the first sits at
         # [ebp + 8], and each subsequent param is offset by its predecessor's
         # padded size. For scalars/pointers/floats that's `(size + 3) & ~3`
@@ -1304,15 +1322,50 @@ class CodeGenerator:
         no name — the parser doesn't synthesize a separate StructDecl
         for it. We register on first sight here using either the
         struct's name or a synthetic id-based key.
+
+        Tag scoping: when `t.members` is empty (a forward reference by
+        name) and `t.name` is bound in the alias chain
+        (`_struct_aliases`), use that mapping. When `t.members` is
+        present, the inline layout is authoritative — register it under
+        an id-keyed entry so a later block with a same-tag shadowing
+        struct doesn't redirect the lookup.
         """
-        if t.name and t.name in self._structs:
-            return t.name
+        # First chance: a tag-only reference (no inline members) routes
+        # through the alias chain.
+        if t.name and not t.members:
+            aliased = self._resolve_struct_alias(t.name)
+            if aliased is not None and aliased in self._structs:
+                return aliased
+            if t.name in self._structs:
+                return t.name
         if t.members:
-            key = t.name or f"__anon_struct_{id(t)}"
+            # The inline-members shape is authoritative — if the alias
+            # chain currently maps the tag to a struct with different
+            # members, the inline `t` is a separate definition (could be
+            # a nested-scope shadow, or just two unrelated `struct T {x}`
+            # declarations). Anchor by node id when the inline shape
+            # doesn't match an already-aliased layout.
+            if t.name:
+                aliased = self._resolve_struct_alias(t.name)
+                if aliased is not None and aliased in self._structs:
+                    existing = [name for name, _, _ in self._structs[aliased]]
+                    incoming = [m.name for m in t.members if m.name is not None]
+                    if existing == incoming:
+                        return aliased
+                    # Fall through to id-key.
+                else:
+                    # First sight of this tag. Register under the tag.
+                    from types import SimpleNamespace
+                    self._register_struct(SimpleNamespace(
+                        name=t.name, members=t.members, is_union=t.is_union,
+                    ))
+                    after = self._resolve_struct_alias(t.name)
+                    if after is not None:
+                        return after
+                    if t.name in self._structs:
+                        return t.name
+            key = f"__inline_{id(t)}"
             if key not in self._structs:
-                # Synthesize a minimal StructDecl-shaped object so we can
-                # reuse `_register_struct`. SimpleNamespace is enough; the
-                # method only reads name / members / is_union.
                 from types import SimpleNamespace
                 self._register_struct(SimpleNamespace(
                     name=key, members=t.members, is_union=t.is_union,
@@ -1365,6 +1418,16 @@ class CodeGenerator:
                 self._enum_constants[ev.name] = cursor
             cursor += 1
 
+    def _resolve_struct_alias(self, name: str) -> str | None:
+        """Walk the scope chain for `name`, return the registry key.
+
+        Returns None if the tag isn't bound at any active scope.
+        """
+        for scope in reversed(self._struct_aliases):
+            if name in scope:
+                return scope[name]
+        return None
+
     def _register_struct(self, decl: ast.StructDecl) -> None:
         """Compute member offsets and total size for a struct definition.
 
@@ -1377,11 +1440,30 @@ class CodeGenerator:
         member name) get their inner members promoted into the parent's
         namespace at the parent's offset for the anonymous block — that's
         the C11 "anonymous member" semantics.
+
+        When `decl.name` already names a struct in the current scope's
+        alias chain, this is a no-op (idempotent register). When it's
+        bound in an outer scope, we mangle to a fresh key and update
+        the topmost alias dict so inner-scope lookups see the new
+        layout.
         """
-        if decl.name in self._structs:
-            # Idempotent: tolerate multiple `struct foo { ... }` definitions
-            # if they happen to repeat. Conflicting definitions aren't
-            # detected here.
+        if decl.name:
+            top = self._struct_aliases[-1]
+            if decl.name in top:
+                # Same scope already has a binding — idempotent.
+                return
+            existing_outer = self._resolve_struct_alias(decl.name)
+            if existing_outer is not None:
+                # Outer scope's `struct T` is being shadowed. Mangle the
+                # inner one to a unique key.
+                key = f"{decl.name}#{len(self._structs)}"
+            else:
+                key = decl.name
+            top[decl.name] = key
+            decl_name = key
+        else:
+            decl_name = None
+        if decl_name and decl_name in self._structs:
             return
         # Validate every member up front. Unions and structs share the
         # same per-member checks; only the layout step differs.
@@ -1433,8 +1515,8 @@ class CodeGenerator:
                 if size > total:
                     total = size
             total = (total + max_align - 1) & ~(max_align - 1)
-            self._structs[decl.name] = members
-            self._struct_sizes[decl.name] = total
+            self._structs[decl_name] = members
+            self._struct_sizes[decl_name] = total
             return
 
         # Struct layout. Two cursors run in parallel: a byte cursor for
@@ -1488,10 +1570,10 @@ class CodeGenerator:
                 unit_offset = offset + self._size_of(m.member_type)
         total = unit_offset + (4 if unit_used > 0 else 0)
         total = (total + max_align - 1) & ~(max_align - 1)
-        self._structs[decl.name] = members
-        self._struct_sizes[decl.name] = total
+        self._structs[decl_name] = members
+        self._struct_sizes[decl_name] = total
         if bitfields:
-            self._struct_bitfields[decl.name] = bitfields
+            self._struct_bitfields[decl_name] = bitfields
 
     def _member_layout(
         self, struct_name: str, member: str
