@@ -27,7 +27,7 @@ Latest tally — `python run_ctests.py --full` and
 `python run_gcc_torture.py --full`:
 
     c-testsuite     214 / 220   (97.3%)  — running for real
-    gcc-c-torture   729 / 1514  (48.2%)  — running for real
+    gcc-c-torture   989 / 1514  (65.3%)  — running for real
 
 The full run-mode pipeline is wired:
 uc386 → .asm → bundle libc.asm → nasm -f bin → unicorn-engine →
@@ -35,12 +35,18 @@ diff stdout against the test's `.expected` (or check exit code).
 INT 21h is intercepted by `src/uc386/dos_emu.py` so DOS-style
 syscalls reach a Python-side handler.
 
-The remaining c-testsuite gaps cluster around: 00216 (init-list
-torture), 00186 (sprintf), 00187 (real file I/O), 00204 (struct
+Remaining c-testsuite gaps: 00216 (init-list torture), 00187
+(real file I/O), 00200 (shift-type subtleties), 00204 (struct
 va_arg in detail), 00218 (8-bit unsigned-enum bit-field), and
-the const-qualifier edge of `_Generic` (00219). The torture
-gaps cluster around K&R-only constructs the parser still
-chokes on, missing libc functions, and codegen edges.
+the const-qualifier edge of `_Generic` (00219).
+
+Remaining torture gaps cluster around features that each warrant
+their own day-long slice:
+  - long long arithmetic (real 64-bit ops; ~110 tests)
+  - inline asm (`asm("...")`)
+  - __complex__ types
+  - nested function definitions (gcc extension)
+  - VaArgExpr address-of and struct va_arg edges
 
 To finish the pipeline:
 1. NASM assembly (`-f bin` works; for `-f obj`/`-f elf` we'd need a linker).
