@@ -26,8 +26,8 @@ link → run → diff pipeline is not yet wired. Headers in
 Latest tally — `python run_ctests.py`:
 
     Total:    220
-    Pass:     173      (compile-only)
-    Compile:   47
+    Pass:     219      (compile-only)
+    Compile:    1      (00216 — kitchen-sink init-list test)
 
 To finish the pipeline:
 1. NASM assembly (`-f bin` works; for `-f obj`/`-f elf` we'd need a linker).
