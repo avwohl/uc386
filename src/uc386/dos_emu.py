@@ -1,0 +1,298 @@
+"""i386 emulator harness for uc386's NASM-bin output.
+
+Loads a flat binary produced by `nasm -f bin` at virtual address 0
+(matching NASM's default `org 0`), runs it under unicorn-engine in
+32-bit protected-mode-ish, and intercepts INT 21h so the program's
+DOS-style I/O calls reach a Python-side handler.
+
+The implemented INT 21h functions cover what uc386's mini-libc and
+the c-testsuite / Fujitsu / GCC-torture programs actually use:
+
+    AH=02   putchar (AL)                       → emu.stdout
+    AH=09   print '$'-terminated string (DS:EDX → emu.stdout
+    AH=40   write handle (BX=fd, CX=count, DS:EDX=buf) → stdout/stderr
+    AH=4C   exit (AL)
+    AH=00   terminate (= exit 1)
+
+Returns a `Result` with stdout text, stderr text, exit_code, timed_out
+flag, and any error string from unicorn.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+import struct
+
+import unicorn
+from unicorn import Uc, UC_ARCH_X86, UC_MODE_32, UC_HOOK_INTR, UcError
+from unicorn.x86_const import (
+    UC_X86_REG_EAX, UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDX,
+    UC_X86_REG_ESI, UC_X86_REG_EDI, UC_X86_REG_EBP, UC_X86_REG_ESP,
+    UC_X86_REG_EIP, UC_X86_REG_EFLAGS,
+)
+
+
+# Memory layout
+#   0x00000000 .. 0x00800000   code/data (8 MB) — the loaded binary lives here
+#   0x00800000 .. 0x01000000   heap (8 MB, growable in principle)
+#   0x01000000 .. 0x01100000   stack (1 MB, top at 0x010FFFF0)
+CODE_BASE = 0x00000000
+CODE_SIZE = 0x00800000
+HEAP_BASE = 0x00800000
+HEAP_SIZE = 0x00800000
+STACK_BASE = 0x01000000
+STACK_SIZE = 0x00100000
+STACK_TOP = STACK_BASE + STACK_SIZE - 16
+
+
+@dataclass
+class Result:
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: int | None = None
+    timed_out: bool = False
+    error: str | None = None
+    # bytes consumed by INT 21h string ops, useful for diagnostics
+    instructions_executed: int | None = None
+
+
+def _read_cstr(uc: Uc, addr: int, max_len: int = 4096, term: bytes = b"\x00") -> bytes:
+    """Read a `term`-terminated string starting at `addr`."""
+    out = b""
+    for _ in range(max_len):
+        b = uc.mem_read(addr, 1)
+        if b == term:
+            break
+        out += b
+        addr += 1
+    return out
+
+
+def run(
+    binary: bytes | Path,
+    *,
+    timeout_seconds: float = 10.0,
+    instruction_limit: int = 50_000_000,
+    stdin_bytes: bytes = b"",
+    argv: list[str] | None = None,
+) -> Result:
+    """Emulate a flat-binary i386 program; return its stdout + exit code."""
+    if isinstance(binary, Path):
+        binary = binary.read_bytes()
+
+    mu = Uc(UC_ARCH_X86, UC_MODE_32)
+    mu.mem_map(CODE_BASE, CODE_SIZE)
+    mu.mem_map(STACK_BASE, STACK_SIZE)
+
+    # Load the program at address 0 (matches NASM `-f bin` default org 0).
+    mu.mem_write(CODE_BASE, binary)
+
+    # Initialize stack near the top of the stack region. Push a fake return
+    # address (0xFFFFFFFF) so `ret` from the entry function ends up at an
+    # unmapped location — we treat that as a clean exit. Entry doesn't
+    # actually return for our test programs (they call INT 21h AH=4C), but
+    # this protects against malformed code.
+    esp = STACK_TOP
+    mu.reg_write(UC_X86_REG_ESP, esp)
+    mu.reg_write(UC_X86_REG_EBP, esp)
+
+    res = Result()
+    stdin_pos = [0]
+
+    def _write_stdout(s: bytes) -> None:
+        # Translate '\r\n' to '\n' (DOS line endings → POSIX) so test diffs
+        # against `.expected` files written on Unix line up.
+        text = s.decode("latin1", errors="replace").replace("\r\n", "\n")
+        res.stdout += text
+
+    def _write_stderr(s: bytes) -> None:
+        text = s.decode("latin1", errors="replace").replace("\r\n", "\n")
+        res.stderr += text
+
+    def on_int(uc, intno, user_data):
+        if intno != 0x21:
+            res.error = f"unexpected interrupt {intno:#x}"
+            uc.emu_stop()
+            return
+        eax = uc.reg_read(UC_X86_REG_EAX)
+        ah = (eax >> 8) & 0xFF
+        al = eax & 0xFF
+        if ah == 0x4C or ah == 0x00:
+            res.exit_code = al
+            uc.emu_stop()
+            return
+        if ah == 0x02:
+            # putchar in DL on real DOS, but we accept AL too for codegen
+            # convenience. Look at DL primarily.
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            ch = bytes([edx & 0xFF])
+            _write_stdout(ch)
+            return
+        if ah == 0x06:
+            # Direct console I/O: DL=char (or 0xFF for input). Output only.
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            dl = edx & 0xFF
+            if dl != 0xFF:
+                _write_stdout(bytes([dl]))
+            return
+        if ah == 0x09:
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            s = _read_cstr(uc, edx, term=b"$")
+            _write_stdout(s)
+            return
+        if ah == 0x40:
+            # write(fd, buf, count): BX=fd, CX=count, DS:EDX=buf
+            ebx = uc.reg_read(UC_X86_REG_EBX)
+            ecx = uc.reg_read(UC_X86_REG_ECX)
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            count = ecx & 0xFFFF  # spec is 16-bit count, but tolerate larger
+            data = bytes(uc.mem_read(edx, count))
+            fd = ebx & 0xFFFF
+            if fd == 1:
+                _write_stdout(data)
+            elif fd == 2:
+                _write_stderr(data)
+            # Return bytes-written in AX; CF clear on success.
+            new_eax = (eax & ~0xFFFF) | (count & 0xFFFF)
+            uc.reg_write(UC_X86_REG_EAX, new_eax)
+            return
+        if ah == 0x3F:
+            # read(fd, buf, count): BX=fd, CX=count, DS:EDX=buf. Only fd=0
+            # (stdin) handled.
+            ebx = uc.reg_read(UC_X86_REG_EBX)
+            ecx = uc.reg_read(UC_X86_REG_ECX)
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            count = ecx & 0xFFFF
+            fd = ebx & 0xFFFF
+            if fd == 0:
+                start = stdin_pos[0]
+                end = min(start + count, len(stdin_bytes))
+                chunk = stdin_bytes[start:end]
+                if chunk:
+                    uc.mem_write(edx, chunk)
+                stdin_pos[0] = end
+                actual = len(chunk)
+            else:
+                actual = 0
+            new_eax = (eax & ~0xFFFF) | (actual & 0xFFFF)
+            uc.reg_write(UC_X86_REG_EAX, new_eax)
+            return
+        # Unimplemented — record and exit.
+        res.error = f"unimplemented INT 21h AH={ah:#04x}"
+        uc.emu_stop()
+
+    mu.hook_add(UC_HOOK_INTR, on_int)
+
+    # Set up an instruction-count limit hook to bound runaway programs.
+    insn_count = [0]
+
+    def on_code(uc, address, size, user_data):
+        insn_count[0] += 1
+        if insn_count[0] >= instruction_limit:
+            res.timed_out = True
+            uc.emu_stop()
+
+    mu.hook_add(unicorn.UC_HOOK_CODE, on_code)
+
+    try:
+        mu.emu_start(
+            CODE_BASE,
+            CODE_BASE + len(binary),
+            timeout=int(timeout_seconds * 1_000_000),
+        )
+    except UcError as e:
+        # Don't overwrite an already-set error / exit.
+        if res.exit_code is None and not res.error:
+            res.error = f"unicorn: {e}"
+
+    if res.exit_code is None and res.error is None and not res.timed_out:
+        # Ran off the end of the program without exiting. Treat as exit 0.
+        res.exit_code = 0
+    res.instructions_executed = insn_count[0]
+    return res
+
+
+LIBC_ASM_PATH = Path(__file__).resolve().parents[2] / "lib" / "i386_dos_libc.asm"
+
+
+def _libc_provided_symbols() -> set[str]:
+    """Names defined by the bundled libc.asm — these get their `extern`
+    declarations stripped from user code before nasm sees them.
+    """
+    syms: set[str] = set()
+    if not LIBC_ASM_PATH.exists():
+        return syms
+    for line in LIBC_ASM_PATH.read_text().splitlines():
+        s = line.strip()
+        if s.startswith(";") or not s:
+            continue
+        # Match `_name:` at the start of a line (label definition).
+        if s.startswith("_") and ":" in s:
+            label = s.split(":", 1)[0].strip()
+            if label.startswith("_") and label[1:].replace("_", "").isalnum():
+                syms.add(label[1:])
+    return syms
+
+
+def bundle_user_asm(asm_path: Path) -> Path:
+    """Strip `extern _name` lines for libc-provided symbols and append
+    `lib/i386_dos_libc.asm`. Writes the merged asm next to `asm_path`
+    with a `.bundled.asm` suffix and returns its path.
+    """
+    libc_syms = _libc_provided_symbols()
+    user_lines = asm_path.read_text().splitlines()
+    out_lines: list[str] = []
+    for line in user_lines:
+        s = line.strip()
+        # Strip lines like `extern _printf` for any libc-provided name.
+        if s.startswith("extern "):
+            name = s[7:].strip().rstrip(",")
+            if name.startswith("_") and name[1:] in libc_syms:
+                continue
+        out_lines.append(line)
+    bundled = asm_path.with_suffix(".bundled.asm")
+    bundled.write_text(
+        "\n".join(out_lines) + "\n\n; ==== bundled libc ====\n"
+        + LIBC_ASM_PATH.read_text()
+    )
+    return bundled
+
+
+def assemble_and_run(
+    asm_path: Path,
+    *,
+    timeout_seconds: float = 10.0,
+    instruction_limit: int = 50_000_000,
+    bundle_libc: bool = True,
+    keep_intermediate: bool = False,
+) -> Result:
+    """Convenience: optionally bundle libc, nasm-assemble (-f bin), and run.
+
+    The output binary lives next to `asm_path` with `.bin` suffix.
+    """
+    import subprocess
+    if bundle_libc:
+        asm_to_assemble = bundle_user_asm(asm_path)
+    else:
+        asm_to_assemble = asm_path
+    bin_path = asm_to_assemble.with_suffix(".bin")
+    proc = subprocess.run(
+        ["nasm", "-f", "bin", str(asm_to_assemble), "-o", str(bin_path)],
+        capture_output=True, text=True, timeout=15,
+    )
+    if proc.returncode != 0:
+        return Result(error=f"nasm: {proc.stderr.strip()[:400]}")
+    res = run(
+        bin_path,
+        timeout_seconds=timeout_seconds,
+        instruction_limit=instruction_limit,
+    )
+    if not keep_intermediate:
+        try:
+            bin_path.unlink()
+            if bundle_libc:
+                asm_to_assemble.unlink()
+        except FileNotFoundError:
+            pass
+    return res

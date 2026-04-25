@@ -115,25 +115,38 @@ def run_test(
     if compile_only:
         return "pass", ""
 
-    # === Below here is wired-future work; --compile-only flag skips it. ===
-    com_file = asm_file.with_suffix(".com")
-    nasm_cmd = ["nasm", "-f", "bin", str(asm_file), "-o", str(com_file)]
+    # ---- assemble + run via the unicorn-engine harness ----
+    # Lazy import so the compile-only path doesn't pay for unicorn.
+    sys.path.insert(0, str(UC386_DIR / "src"))
+    from uc386.dos_emu import assemble_and_run
+
+    timeout = SLOW_TESTS.get(test_num, 10)
     try:
-        result = subprocess.run(
-            nasm_cmd, capture_output=True, text=True, timeout=15,
+        emu_res = assemble_and_run(
+            asm_file, timeout_seconds=timeout, instruction_limit=200_000_000,
         )
-    except subprocess.TimeoutExpired:
-        return "asm", "nasm timed out"
-    if result.returncode != 0:
-        return "asm", result.stderr.strip()[:400]
+    except Exception as e:
+        return "asm", f"emu: {type(e).__name__}: {e}"
 
-    if com_file.stat().st_size > MAX_COM_SIZE:
-        return "skip", f"binary {com_file.stat().st_size} bytes too large"
+    if emu_res.error:
+        return "run", emu_res.error[:300]
+    if emu_res.timed_out:
+        return "timeout", f"timeout (after {emu_res.instructions_executed} insns)"
 
-    # Run stage isn't wired yet — DOS extender + libc + emulator setup
-    # is its own project. When it lands, parse stdout and diff against
-    # `resolve_expected(c_file, test_num)`.
-    return "skip", "run stage not yet wired (need DOS extender + libc + emulator)"
+    expected = resolve_expected(c_file, test_num)
+    if expected is None:
+        # No expected output — pass iff exit code is 0.
+        if emu_res.exit_code != 0:
+            return "run", f"exit {emu_res.exit_code}"
+        return "pass", ""
+
+    expected_text = expected.read_text()
+    actual_text = emu_res.stdout
+    if expected_text != actual_text:
+        return "output", f"got {actual_text!r} expected {expected_text!r}"
+    if emu_res.exit_code != 0:
+        return "run", f"exit {emu_res.exit_code}"
+    return "pass", ""
 
 
 def main():
