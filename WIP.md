@@ -1,7 +1,8 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–29 are done. 251 tests passing.
-Slice 30+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–30 are done. 254 tests passing.
+Phase 4 is feature-complete for typical C; remaining slices are
+niche or rise to the level of new phases — see below.
 
 ## Bootstrap on the new machine
 
@@ -60,10 +61,9 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 29 (just landed):
-- **Typedef'd structs.** `typedef struct { ... } P;` and named-tag
-  versions register the layout lazily via `_resolve_struct_name`.
-  Anonymous typedef'd structs get a synthetic registry key.
+Implemented in slice 30 (just landed):
+- **`_Bool` + `nullptr`.** `_Bool` slots as a byte; `nullptr` lowers
+  to `mov eax, 0` and types as `void *`.
 
 Deliberately not yet implemented — what's left of Phase 4:
 - **Bitfields.** Niche; `_register_struct` rejects `bit_width != None`.

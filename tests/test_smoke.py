@@ -1037,6 +1037,31 @@ def test_break_outside_switch_or_loop_still_rejected():
         _compile("int main(void) { break; return 0; }")
 
 
+# ---- _Bool + nullptr ------------------------------------------------------
+
+def test_bool_local_size_one_byte():
+    asm = _compile("int main(void) { _Bool b = 1; return b; }")
+    # Bool slot is 1 byte (rounded to 4-aligned slot), and store narrows to byte.
+    assert "mov     byte [ebp - 4], al" in asm
+    # Read uses byte load.
+    assert "movsx   eax, byte [ebp - 4]" in asm or "movzx   eax, byte [ebp - 4]" in asm
+
+
+def test_nullptr_lowers_to_zero():
+    asm = _compile("int main(void) { int *p = nullptr; return p == nullptr; }")
+    # `nullptr` is just integer 0 in expression position.
+    assert "mov     eax, 0" in asm
+    # And can compare equal to it.
+    assert "sete    al" in asm
+
+
+def test_nullptr_in_pointer_arithmetic_position():
+    # `nullptr + 0` shouldn't blow up — treat as a pointer-sized zero.
+    asm = _compile("int main(void) { int *p = nullptr; if (p) return 1; return 0; }")
+    # The if-condition tests p (4-byte slot) for non-zero.
+    assert "test    eax, eax" in asm
+
+
 # ---- typedef + storage classes --------------------------------------------
 
 def test_typedef_basic_int_resolved_at_parse_time():

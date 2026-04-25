@@ -668,7 +668,7 @@ class CodeGenerator:
     # `long long` are *known* sizes (so pointer-arithmetic scaling works
     # transparently for `long *` etc.) but full slot codegen waits on a
     # 64-bit value-tracking pass.
-    _SLOT_BASIC_NAMES = frozenset({"char", "short", "int"})
+    _SLOT_BASIC_NAMES = frozenset({"bool", "char", "short", "int"})
 
     def _check_supported_type(self, t: ast.TypeNode, name: str) -> None:
         # Pointers, and arrays / scalars / structs / enums of supported
@@ -742,6 +742,7 @@ class CodeGenerator:
     # any pointee type the parser produces, even ones we don't yet support
     # as full slot types — `char *p; p + 1;` works without `*p` working.
     _BASIC_SIZES = {
+        "bool": 1,          # C99 _Bool
         "char": 1,
         "short": 2,
         "int": 4,
@@ -1712,6 +1713,8 @@ class CodeGenerator:
         if isinstance(expr, ast.CharLiteral):
             # Per C, a character constant has type `int`, not `char`.
             return ast.BasicType(name="int")
+        if isinstance(expr, ast.NullptrLiteral):
+            return ast.PointerType(base_type=ast.BasicType(name="void"))
         if isinstance(expr, ast.StringLiteral):
             return ast.PointerType(base_type=ast.BasicType(name="char", is_const=True))
         if isinstance(expr, ast.UnaryOp):
@@ -1800,6 +1803,11 @@ class CodeGenerator:
             # `'a'` is an integer constant in C — its parser-level value is
             # already the character code, so it lowers exactly like IntLiteral.
             return [f"        mov     eax, {expr.value}"]
+        if isinstance(expr, ast.NullptrLiteral):
+            # `nullptr` is the integer 0 with pointer type. Loading 0 into
+            # EAX gives the right value for both pointer-init and pointer
+            # comparison contexts.
+            return ["        mov     eax, 0"]
         if isinstance(expr, ast.StringLiteral):
             label = self._intern_string(expr.value)
             return [f"        mov     eax, {label}"]
