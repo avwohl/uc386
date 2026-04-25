@@ -31,12 +31,14 @@ Current scope:
   difference that is then divided by `sizeof(*p)`. `++p` / `p--` on a
   pointer slot step by `sizeof(*p)` rather than 1. Adding two pointers
   and subtracting a pointer from an integer are rejected.
-- Arrays (uninitialized only): `int arr[N]` allocates `N * sizeof(elem)`
-  bytes on the frame (rounded up to a 4-byte boundary), an array name
-  decays to its address in expression context, and `arr[i]` reads/writes
-  through base + i*sizeof(elem) at the element's natural width. Array
-  assignment, `++arr` / `--arr`, and brace-initialization
-  `int arr[N] = {...}` all raise pending the InitializerList pass.
+- Arrays: `int arr[N]` allocates `N * sizeof(elem)` bytes on the frame
+  (rounded up to a 4-byte boundary), an array name decays to its
+  address in expression context, and `arr[i]` reads/writes through
+  base + i*sizeof(elem) at the element's natural width.
+  Brace-initialization `int arr[N] = {a, b, c}` is supported, with
+  per-element stores and tail zero-fill; `char arr[] = "..."` lays out
+  the bytes plus null terminator, with size inferred when omitted.
+  Array assignment and `++arr` / `--arr` still raise.
 - Sub-word scalars: `char`, `short`, and their unsigned variants are
   first-class slot types. Loads use `movsx` (signed) or `movzx`
   (unsigned) so EAX always holds a 32-bit working value matching C's
@@ -281,14 +283,15 @@ class CodeGenerator:
         nested-block redeclaration of an existing name raises.
         """
         if isinstance(node, ast.VarDecl):
-            self._check_supported_type(node.var_type, node.name)
+            var_type = self._resolved_var_type(node)
+            self._check_supported_type(var_type, node.name)
             # Round slot size up to a 4-byte boundary so a `char`-sized slot
             # doesn't push subsequent int slots off-alignment. Arrays whose
             # payload isn't a multiple of 4 (e.g. `char arr[5]`) get padded
             # the same way.
-            raw = self._size_of(node.var_type)
+            raw = self._size_of(var_type)
             slot = (raw + 3) & ~3
-            ctx.alloc_local(node.name, node.var_type, slot)
+            ctx.alloc_local(node.name, var_type, slot)
             return
         if isinstance(node, ast.CompoundStmt):
             for item in node.items:
@@ -320,15 +323,14 @@ class CodeGenerator:
     def _check_supported_type(cls, t: ast.TypeNode, name: str) -> None:
         # Pointers, and arrays / scalars of supported base types. Slot sizes
         # are rounded up to 4 in `_collect_locals` so adjacent ints stay
-        # 4-aligned.
+        # 4-aligned. Unsized arrays (`int a[]` without an init) are caught
+        # by `_resolved_var_type` before they reach this check.
         if isinstance(t, ast.PointerType):
             return
         if isinstance(t, ast.BasicType) and t.name in cls._SLOT_BASIC_NAMES:
             return
         if isinstance(t, ast.ArrayType):
-            if t.size is None:
-                raise CodegenError(f"`{name}`: array must have a size")
-            if not isinstance(t.size, ast.IntLiteral):
+            if t.size is not None and not isinstance(t.size, ast.IntLiteral):
                 raise CodegenError(
                     f"`{name}`: array size must be an integer literal"
                 )
@@ -337,6 +339,32 @@ class CodeGenerator:
         raise CodegenError(
             f"`{name}`: only `int`/`short`/`char`, pointer, and array "
             f"types are supported (got {type(t).__name__})"
+        )
+
+    @staticmethod
+    def _resolved_var_type(decl: ast.VarDecl) -> ast.TypeNode:
+        """Return the var's type with any unsized-array size filled in.
+
+        `int arr[] = {1, 2, 3}` and `char s[] = "hi"` both leave the
+        ArrayType's `size` as None; the size is implied by the initializer.
+        Resolve it here so allocation and codegen can treat the slot as a
+        fully-sized array thereafter.
+        """
+        t = decl.var_type
+        if not isinstance(t, ast.ArrayType) or t.size is not None:
+            return t
+        if isinstance(decl.init, ast.InitializerList):
+            n = len(decl.init.values)
+        elif isinstance(decl.init, ast.StringLiteral):
+            # +1 reserves a slot for the trailing null byte.
+            n = len(decl.init.value) + 1
+        else:
+            raise CodegenError(
+                f"unsized array `{decl.name}` requires an initializer"
+            )
+        return ast.ArrayType(
+            base_type=t.base_type,
+            size=ast.IntLiteral(value=n),
         )
 
     @staticmethod
@@ -539,15 +567,86 @@ class CodeGenerator:
             # Uninitialized — leave the slot as-is. Reading it is UB, but
             # we don't pre-zero unless required.
             return []
-        if isinstance(decl.var_type, ast.ArrayType):
-            # `int arr[3] = {...};` requires walking an InitializerList and
-            # storing each element to its slot. Comes with the InitializerList
-            # codegen pass.
-            raise CodegenError(
-                f"array initialization not yet supported (`{decl.name}`)"
-            )
+        # Use the *resolved* type (size filled in for unsized arrays), so
+        # `_array_init` and `_store_from_eax` see a concrete shape.
+        var_type = ctx.lookup_type(decl.name)
+        if isinstance(var_type, ast.ArrayType):
+            return self._array_init(var_type, decl.init, disp, ctx, decl.name)
         return self._eval_expr_to_eax(decl.init, ctx) + self._store_from_eax(
-            _ebp_addr(disp), decl.var_type
+            _ebp_addr(disp), var_type
+        )
+
+    # Width keyword for `mov <width> [...], 0` inline zero stores. Used by
+    # the array zero-fill loop.
+    _ZERO_WIDTHS = {1: "byte", 2: "word", 4: "dword"}
+
+    def _array_init(
+        self,
+        arr_type: ast.ArrayType,
+        init: ast.Expression,
+        base_disp: int,
+        ctx: _FuncCtx,
+        name: str,
+    ) -> list[str]:
+        """Lower an array initializer to per-element stores plus tail zero-fill.
+
+        - `int arr[N] = {a, b, c}` walks the InitializerList; if the list
+          is shorter than the declared size, the remaining elements are
+          zeroed.
+        - `char arr[N] = "..."` lays the string bytes out, appends a null
+          terminator, and zero-fills any padding.
+        - Anything else is rejected — designated initializers and nested
+          {} for multidim arrays are still TODOs.
+        """
+        elem_type = arr_type.base_type
+        elem_size = self._size_of(elem_type)
+        length = arr_type.size.value
+
+        if isinstance(init, ast.StringLiteral):
+            if not (
+                isinstance(elem_type, ast.BasicType)
+                and elem_type.name == "char"
+            ):
+                raise CodegenError(
+                    f"`{name}`: string initializer requires a char array"
+                )
+            # Lay out the bytes, append a null. ASCII string literals only
+            # for now — escape handling lives in `_render_string` for the
+            # `.data` path; for inline init we just pull byte values.
+            bytes_to_store = list(init.value.encode()) + [0]
+            if len(bytes_to_store) > length:
+                raise CodegenError(
+                    f"`{name}`: string initializer exceeds array size {length}"
+                )
+            out: list[str] = []
+            for i, byte in enumerate(bytes_to_store):
+                addr = _ebp_addr(base_disp + i * elem_size)
+                out.append(f"        mov     byte {addr}, {byte}")
+            for i in range(len(bytes_to_store), length):
+                addr = _ebp_addr(base_disp + i * elem_size)
+                out.append(f"        mov     byte {addr}, 0")
+            return out
+
+        if isinstance(init, ast.InitializerList):
+            if len(init.values) > length:
+                raise CodegenError(
+                    f"`{name}`: too many initializers (got "
+                    f"{len(init.values)}, array size {length})"
+                )
+            out = []
+            for i, value_expr in enumerate(init.values):
+                addr = _ebp_addr(base_disp + i * elem_size)
+                out += self._eval_expr_to_eax(value_expr, ctx)
+                out += self._store_from_eax(addr, elem_type)
+            zero_width = self._ZERO_WIDTHS[elem_size]
+            for i in range(len(init.values), length):
+                addr = _ebp_addr(base_disp + i * elem_size)
+                out.append(f"        mov     {zero_width} {addr}, 0")
+            return out
+
+        raise CodegenError(
+            f"`{name}`: unsupported array initializer "
+            f"({type(init).__name__})"
         )
 
     def _return(self, stmt: ast.ReturnStmt, ctx: _FuncCtx) -> list[str]:

@@ -673,14 +673,99 @@ def test_array_increment_rejected():
         _compile("int main(void) { int a[3]; ++a; return 0; }")
 
 
-def test_array_initialization_not_yet_supported():
-    with pytest.raises(CodegenError, match="initializ"):
-        _compile("int main(void) { int a[3] = {1, 2, 3}; return 0; }")
-
-
-def test_unsized_array_local_rejected():
-    with pytest.raises(CodegenError, match="size"):
+def test_unsized_array_without_initializer_rejected():
+    with pytest.raises(CodegenError, match="initializer|size"):
         _compile("int main(void) { int a[]; return 0; }")
+
+
+# ---- array initialization --------------------------------------------------
+
+def test_int_array_init_inline_stores():
+    asm = _compile("int main(void) { int arr[3] = {1, 2, 3}; return 0; }")
+    assert "sub     esp, 12" in asm
+    # Each value lands at the right element offset: arr[0] at -12, arr[1] at -8, arr[2] at -4.
+    asm_lines = asm.splitlines()
+    for value, disp in [(1, -12), (2, -8), (3, -4)]:
+        idx = next(
+            i for i, l in enumerate(asm_lines) if l.strip() == f"mov     eax, {value}"
+        )
+        assert asm_lines[idx + 1].strip() == f"mov     [ebp - {-disp}], eax"
+
+
+def test_int_array_underspecified_zero_fills_tail():
+    # arr[0] = 10, arr[1] = 20, arr[2..4] zeroed.
+    asm = _compile("int main(void) { int arr[5] = {10, 20}; return 0; }")
+    assert "sub     esp, 20" in asm
+    assert "mov     eax, 10" in asm
+    assert "mov     eax, 20" in asm
+    # Tail elements zeroed via direct memory writes.
+    assert "mov     dword [ebp - 12], 0" in asm
+    assert "mov     dword [ebp - 8], 0" in asm
+    assert "mov     dword [ebp - 4], 0" in asm
+
+
+def test_int_array_inferred_size_from_init():
+    asm = _compile("int main(void) { int arr[] = {7, 8, 9, 10}; return 0; }")
+    # Size inferred from the four-element initializer → 16 bytes.
+    assert "sub     esp, 16" in asm
+    for value in (7, 8, 9, 10):
+        assert f"mov     eax, {value}" in asm
+
+
+def test_char_array_string_init_inferred_size():
+    asm = _compile('int main(void) { char s[] = "hi"; return 0; }')
+    # 'h' (104), 'i' (105), '\\0' → 3 bytes payload, slot rounds to 4.
+    assert "sub     esp, 4" in asm
+    assert "mov     byte [ebp - 4], 104" in asm
+    assert "mov     byte [ebp - 3], 105" in asm
+    assert "mov     byte [ebp - 2], 0" in asm
+
+
+def test_char_array_string_init_with_padding():
+    # `char t[5] = "hi"` writes h, i, null, then zero-fills the remaining bytes.
+    asm = _compile('int main(void) { char t[5] = "hi"; return 0; }')
+    assert "sub     esp, 8" in asm  # 5 rounds to 8
+    assert "mov     byte [ebp - 8], 104" in asm
+    assert "mov     byte [ebp - 7], 105" in asm
+    assert "mov     byte [ebp - 6], 0" in asm
+    assert "mov     byte [ebp - 5], 0" in asm
+    assert "mov     byte [ebp - 4], 0" in asm
+
+
+def test_char_array_init_from_int_list():
+    # `char arr[3] = {65, 66, 67}` — each int store narrows to a byte.
+    asm = _compile("int main(void) { char arr[3] = {65, 66, 67}; return 0; }")
+    assert "sub     esp, 4" in asm  # 3 bytes rounds to 4
+    # Each store goes through `mov byte [...], al` after `mov eax, value`.
+    assert "mov     byte [ebp - 4], al" in asm
+    assert "mov     byte [ebp - 3], al" in asm
+    assert "mov     byte [ebp - 2], al" in asm
+
+
+def test_too_many_initializers_rejected():
+    with pytest.raises(CodegenError, match="too many|exceeds"):
+        _compile("int main(void) { int arr[2] = {1, 2, 3}; return 0; }")
+
+
+def test_string_init_too_long_rejected():
+    # "hi" + null = 3 bytes, but only 2 slots available.
+    with pytest.raises(CodegenError, match="exceeds"):
+        _compile('int main(void) { char s[2] = "hi"; return 0; }')
+
+
+def test_string_init_for_int_array_rejected():
+    with pytest.raises(CodegenError, match="char"):
+        _compile('int main(void) { int arr[3] = "hi"; return 0; }')
+
+
+def test_array_init_then_indexed_read():
+    # End-to-end: initialize, then read an element back.
+    asm = _compile("int main(void) { int arr[3] = {1, 2, 3}; return arr[1]; }")
+    # Init writes 1, 2, 3 to the slots.
+    assert "mov     eax, 2" in asm
+    assert "mov     [ebp - 8], eax" in asm
+    # Final return loads through the indexed address.
+    assert "mov     eax, [eax]" in asm
 
 
 # ---- char / short codegen --------------------------------------------------

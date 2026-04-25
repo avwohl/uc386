@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–10 are done. 112 tests passing.
-Slice 11+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–11 are done. 121 tests passing.
+Slice 12+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,16 +60,17 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 10 (just landed):
-- **Sub-word codegen.** `char`/`short`/`unsigned char`/`unsigned short`
-  as locals, params, pointer derefs, and array elements. Loads use
-  `movsx`/`movzx`; stores narrow via `mov byte/word`. Slot sizes
-  rounded up to 4-byte alignment.
+Implemented in slice 11 (just landed):
+- **Array initialization.** `int arr[N] = {a, b, c}` with tail
+  zero-fill, inferred-size unsized arrays (`int arr[] = {...}`,
+  `char s[] = "hi"`), and string init for `char arr[N]` with
+  null-terminator and padding. Driven by `_resolved_var_type` and a
+  new `_array_init`.
 
 Deliberately not yet implemented — next slices in roughly this order:
-- **Array initialization.** `int arr[N] = {a, b, c};` and string-init
-  `char s[] = "hi";` need `InitializerList` lowering — store each
-  value to its slot, optionally zero the tail.
+- **`sizeof` operator.** `_size_of` already exists internally; just
+  need to wire `SizeofExpr` and `SizeofType` into expression eval and
+  type-resolve the operand. Small, high-utility.
 - **Globals.** Same lowering model as locals but in `.data`/`.bss`
   with named labels instead of `[ebp + disp]`.
 - **Casts.** `(int)x`, `(char *)p`, etc. With sub-word codegen landed,
@@ -80,13 +81,17 @@ Deliberately not yet implemented — next slices in roughly this order:
   once into a temp slot rather than re-evaluating the lvalue twice.
 - **Function pointers / indirect calls.** Currently `_call` rejects
   any non-Identifier callee.
-- **`sizeof` operator.** `_size_of` already exists internally; just
-  need to wire `SizeofExpr` and `SizeofType` into expression eval.
+- **CharLiteral.** `char c = 'a'` would currently raise — `'a'` is a
+  CharLiteral (value=97) but `_eval_expr_to_eax` doesn't handle it
+  yet. Trivially adding it would unlock more idiomatic char tests.
+- **Designated/nested initializers.** `int arr[3] = {[1] = 5}` and
+  `int m[2][3] = {{...}, {...}}` both raise. Multidim arrays would
+  also need ArrayType-of-ArrayType slot support.
 - **Floating point.** `float` / `double` slot codegen via x87 or SSE.
   Big topic — likely a phase of its own.
 
-Suggested first move next session: read `CLAUDE.md`. Either
-**array/string initialization** (cheap with sub-word landed and
-unlocks meaningful `char s[] = "hi";`) or **sizeof** (small, mostly
-plumbing, lets test code use real `sizeof(arr)` instead of hardcoded
-sizes) is the natural next slice.
+Suggested first move next session: read `CLAUDE.md`. **`sizeof`** is
+the natural next slice — small, lets the test suite write real
+`sizeof(arr)` / `sizeof(int)` instead of hardcoded magic numbers.
+**Globals** would be the next architectural step (a new lowering
+pathway, similar shape to slice 4).
