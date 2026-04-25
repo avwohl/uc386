@@ -571,6 +571,20 @@ _memset:
 ;
 ; Returns total bytes written.
 
+; fprintf(FILE *stream, const char *fmt, ...) — we ignore the stream
+; (everything goes to stdout) and reuse printf's format engine. The
+; stream arg sits at [ebp+8], fmt at [ebp+12], varargs at [ebp+16]+.
+_fprintf:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    esi
+        push    edi
+        mov     esi, [ebp + 12]      ; fmt
+        lea     edi, [ebp + 16]      ; first vararg
+        xor     ebx, ebx
+        jmp     _printf.next         ; reuse the format-engine body
+
 _printf:
         push    ebp
         mov     ebp, esp
@@ -1020,121 +1034,105 @@ _printf_emit_oct:
 
 ; ---- print double on st(0) with given precision ----------------------------
 ; In:  st(0) = value, [esp + 4] = precision (digits after .)
-; The integer part is rendered via _printf_emit_dec on a truncated copy;
-; the fractional part is rendered as zero-padded digits.
+;
+; Strategy: scale by 10^precision, round-to-nearest via the default FCW,
+; then split into integer/fractional parts. Emit integer-part decimals
+; via _printf_emit_udec, then '.', then `precision` digits with leading
+; zeros. This avoids the truncation drift you get from per-digit
+; fistp + multiply-by-10.
 _printf_emit_double:
         push    ebp
         mov     ebp, esp
-        sub     esp, 32
+        sub     esp, 64
         push    esi
         push    edi
         push    ebx
-        ; Save FCW, set rounding to truncation for the integer-part fistp.
         fnstcw  [ebp - 4]
-        mov     ax, [ebp - 4]
-        or      ax, 0x0C00
-        mov     [ebp - 6], ax
-        fldcw   [ebp - 6]
-        ; Detect negative: if value < 0, emit '-' and negate via fchs.
-        fldz
-        fcompp                        ; pops both: compare value vs 0
-        ; Wait — fcompp pops both operands, including the value we wanted.
-        ; Use a copy instead: fld value (already on stack), then fldz, fcomi.
-        ; Restart: push the value back from the user (trickier). Simpler:
-        ; we duplicate the value first.
-        ; (Reload by re-caller is awkward; instead skip negative handling for now.)
-        ; --- For the simple case, just fistp the integer part. ---
-        ; But fcompp consumed st0/st1. The harness loaded just st0 with the
-        ; value. After fcompp, the FPU stack is empty. We need to rebuild.
-        ; A clean approach: caller must leave value in st0; we duplicate.
-        ; ... refactor: redo this whole helper with a cleaner sequence below.
-        ; Drop straight to integer-part rendering with the simpler path:
-        ; we rely on the caller having loaded the value before this call.
-        ; Reload by restoring? Not possible. Rather than fix this bottom
-        ; up, make a simpler implementation in `_printf_emit_double_v2`.
-        jmp     _printf_emit_double_v2.entry
-
-; v2 — call entry expects value still on st0. Caller pushes precision.
-_printf_emit_double_v2:
-.entry:
-        ; Stack frame already set up by caller (_printf_emit_double).
-        ; Detect sign: fst st1 (duplicate), fldz, fxch, fcompp -> CF/ZF.
-        ; Simpler: fabs + fld value-original + ftst + emit '-' if negative.
-        ; Approach: copy via fst, then test the original.
-        fst     qword [ebp - 16]      ; save original (without popping)
-        ftst                          ; compare st0 to 0; sets C0/C2/C3
+        ; Detect sign.
+        ftst
         fnstsw  ax
         sahf
-        jae     .nonneg               ; if value >= 0 skip negate
-        ; Emit '-'
-        mov     edx, '-'
+        jae     .nonneg
         push    eax
+        mov     edx, '-'
         mov     ah, 0x02
         int     21h
         pop     eax
-        mov     eax, [ebp - 16 - 4]   ; bump outer EBX (caller's saved ebx)
-                                      ; — at [ebp - 28] given our pushes
-        ; The caller's EBX is at [ebp - 28] (3 pushes after sub esp,32).
-        ; We just keep total-bytes-written tracking less precise here.
-        fchs                          ; negate value on st0
+        fchs
 .nonneg:
-        ; Truncate to integer: copy + fistp dword tmp32.
-        fld     st0                   ; dup
-        fistp   dword [ebp - 8]       ; integer part → tmp32 (truncated)
-        ; Emit integer part as decimal.
-        mov     eax, [ebp - 8]
-        push    edi
-        push    esi
-        ; We want to print the integer part. Reuse _printf_emit_udec
-        ; (we're already non-negative here).
+        mov     ecx, [ebp + 8]      ; precision
+        test    ecx, ecx
+        jnz     .with_frac
+        ; precision==0 → round-to-nearest integer.
+        fistp   dword [ebp - 16]
+        mov     eax, [ebp - 16]
         call    _printf_emit_udec
-        pop     esi
-        pop     edi
-        ; Fractional handling: if precision > 0, print '.', then for each
-        ; digit i in 0..prec-1: value = (value - floor(value)) * 10;
-        ; digit = (int)value; emit; value -= digit.
-        mov     ecx, [ebp + 8]        ; precision
+        jmp     .end
+.with_frac:
+        ; Multiply value by 10^precision (loop, default rounding).
+.scale:
         test    ecx, ecx
-        jz      .pure_int
-        ; Emit '.'
-        push    ecx
-        mov     edx, '.'
-        mov     ah, 0x02
-        int     21h
-        pop     ecx
-        ; Subtract integer part from st0: st0 = st0 - tmp32 (as float).
-        fild    dword [ebp - 8]
-        fsubp   st1, st0               ; st0 = original - integer
-.fl:
-        test    ecx, ecx
-        jz      .fdone
-        ; Multiply by 10
+        jz      .scaled
         push    dword 10
         fild    dword [esp]
         add     esp, 4
         fmulp   st1, st0
-        ; Truncate to int → digit
-        fld     st0
-        fistp   dword [ebp - 8]
-        ; Subtract digit
-        fild    dword [ebp - 8]
-        fsubp   st1, st0
-        ; Emit digit
-        mov     eax, [ebp - 8]
-        and     eax, 0x0F
-        add     eax, '0'
-        push    ecx
-        mov     edx, eax
+        dec     ecx
+        jmp     .scale
+.scaled:
+        ; Round to nearest 32-bit int.
+        fistp   dword [ebp - 16]
+        mov     eax, [ebp - 16]
+        ; Compute 10^precision in EBX.
+        mov     ebx, 1
+        mov     ecx, [ebp + 8]
+.pow:
+        test    ecx, ecx
+        jz      .pow_done
+        imul    ebx, ebx, 10
+        dec     ecx
+        jmp     .pow
+.pow_done:
+        ; eax / ebx = integer; eax % ebx = fractional.
+        xor     edx, edx
+        div     ebx
+        mov     [ebp - 20], eax     ; integer part
+        mov     [ebp - 24], edx     ; fractional part
+        ; Emit integer.
+        mov     eax, [ebp - 20]
+        call    _printf_emit_udec
+        ; Emit '.'.
+        mov     edx, '.'
         mov     ah, 0x02
         int     21h
-        pop     ecx
+        ; Render fractional digits into a buffer with leading zeros.
+        ; Buffer at [ebp - 56 .. ebp - 33]; we lay out right-to-left.
+        mov     ecx, [ebp + 8]      ; precision (buffer length)
+        lea     esi, [ebp - 33]     ; one-past-end
+        mov     byte [esi], 0
+        mov     eax, [ebp - 24]     ; fractional value
+.fd:
+        test    ecx, ecx
+        jz      .fdone
+        xor     edx, edx
+        mov     edi, 10
+        div     edi
+        add     dl, '0'
+        dec     esi
+        mov     [esi], dl
         dec     ecx
-        jmp     .fl
+        jmp     .fd
 .fdone:
-.pure_int:
-        ; Pop the value off st0 if still there.
-        fstp    st0
-        ; Restore FCW.
+.fp:
+        mov     al, [esi]
+        test    al, al
+        jz      .end
+        movzx   edx, al
+        mov     ah, 0x02
+        int     21h
+        inc     esi
+        jmp     .fp
+.end:
         fldcw   [ebp - 4]
         pop     ebx
         pop     edi
@@ -1147,12 +1145,18 @@ _printf_emit_double_v2:
 ; A 1 MB heap allocated from the BSS, served bump-style. free is a no-op.
 ; This is wildly insufficient for real programs but enough for the
 ; allocator test suites' small workloads.
+;
+; stdin/stdout/stderr are FILE pointers — we don't really track files,
+; but the variables exist so user code that writes through them links.
 
 section .bss
 __heap:         resb 0x100000        ; 1 MB heap
 __heap_end:
 section .data
 __heap_ptr:     dd __heap
+_stdin:         dd 0
+_stdout:        dd 1
+_stderr:        dd 2
 section .text
 
 _malloc:

@@ -414,8 +414,19 @@ class CodeGenerator:
         # initializer.
         self._globals = {}
         self._global_inits = {}
+        # Extern declarations at file scope: name → declared type. Looked
+        # up like globals, but no storage allocated; the linker resolves
+        # the symbol. NASM `extern _name` is emitted in the header.
+        self._extern_vars: dict[str, ast.TypeNode] = {}
         for d in top_decls:
             if isinstance(d, ast.VarDecl) and not isinstance(d.var_type, ast.FunctionType):
+                if (
+                    getattr(d, "storage_class", None) == "extern"
+                    and d.init is None
+                ):
+                    self._extern_vars[d.name] = self._resolved_var_type(d)
+                    extern_list.append(d.name)
+                    continue
                 resolved = self._resolved_var_type(d)
                 self._check_supported_type(resolved, d.name)
                 self._globals[d.name] = resolved
@@ -425,6 +436,7 @@ class CodeGenerator:
                             f"global `{d.name}` has multiple initializers"
                         )
                     self._global_inits[d.name] = d.init
+        extern_list = sorted(set(extern_list))
 
         lines: list[str] = []
         lines += self._header(extern_list)
@@ -1531,14 +1543,18 @@ class CodeGenerator:
             f"struct types are supported (got {type(t).__name__})"
         )
 
-    @staticmethod
-    def _resolved_var_type(decl: ast.VarDecl) -> ast.TypeNode:
+    def _resolved_var_type(self, decl: ast.VarDecl) -> ast.TypeNode:
         """Return the var's type with any unsized-array size filled in.
 
         `int arr[] = {1, 2, 3}` and `char s[] = "hi"` both leave the
         ArrayType's `size` as None; the size is implied by the initializer.
         Resolve it here so allocation and codegen can treat the slot as a
         fully-sized array thereafter.
+
+        Brace elision: for `T arr[] = { v0, v1, ... }` where T is a
+        compound type with K leaf scalars, every K flat values map to one
+        array element. The implied length is then `count / K` rather
+        than `count`.
 
         For initializer lists with designators (`{5, [2] = 2, 3}`), the
         cursor jumps and subsequent values continue from the new index, so
@@ -1548,6 +1564,12 @@ class CodeGenerator:
         if not isinstance(t, ast.ArrayType) or t.size is not None:
             return t
         if isinstance(decl.init, ast.InitializerList):
+            try:
+                leaves = self._leaf_slot_count(t.base_type)
+            except (CodegenError, KeyError):
+                leaves = 1
+            if leaves < 1:
+                leaves = 1
             cursor = 0
             max_idx = -1
             for value in decl.init.values:
@@ -1557,11 +1579,38 @@ class CodeGenerator:
                         and isinstance(value.designators[0], ast.IntLiteral)
                     ):
                         cursor = value.designators[0].value
-                idx = cursor
-                if idx > max_idx:
-                    max_idx = idx
+                    if cursor > max_idx:
+                        max_idx = cursor
+                    cursor += 1
+                    continue
+                # A positional value already wrapped in `{}` consumes one
+                # element regardless of leaf_count. A flat value in a
+                # leaves > 1 array consumes 1/leaves of an element.
+                if isinstance(value, ast.InitializerList):
+                    if cursor > max_idx:
+                        max_idx = cursor
+                    cursor += 1
+                    continue
+                # Flat value: contributes a fraction of an element.
+                if cursor > max_idx:
+                    max_idx = cursor
+                # We approximate by counting flat values against the
+                # current element. Bump cursor only when the element is
+                # filled. Simpler approximation: count all flat values
+                # toward leaves, advance cursor when leaves accumulate.
+                # But mixing ILs and flats requires per-element bookkeeping.
+                # For the common all-flat case, just total / leaves.
                 cursor += 1
-            n = max_idx + 1
+            # If all values were flat (no IL/Designators), the value
+            # count divided by leaves gives the right element count.
+            all_flat = all(
+                not isinstance(v, (ast.DesignatedInit, ast.InitializerList))
+                for v in decl.init.values
+            )
+            if all_flat and leaves > 1:
+                n = (len(decl.init.values) + leaves - 1) // leaves
+            else:
+                n = max_idx + 1
         elif isinstance(decl.init, ast.StringLiteral):
             # +1 reserves a slot for the trailing null byte. Wide
             # strings count by codepoint, not by encoded byte length.
@@ -2113,6 +2162,8 @@ class CodeGenerator:
             return ctx.lookup_type(name)
         if name in self._globals:
             return self._globals[name]
+        if name in self._extern_vars:
+            return self._extern_vars[name]
         if name in self._func_return_types:
             # A function name in expression context decays to a function
             # pointer. We don't compute pointer arithmetic on functions, so
@@ -2134,7 +2185,7 @@ class CodeGenerator:
         name = ctx.local_static_labels.get(name, name)
         if ctx.has_local(name):
             return _ebp_addr(ctx.lookup(name))
-        if name in self._globals:
+        if name in self._globals or name in self._extern_vars:
             return f"[_{name}]"
         raise CodegenError(f"unknown identifier `{name}`")
 
@@ -2148,8 +2199,8 @@ class CodeGenerator:
                 # Array decay: yield the slot's address, not its bytes.
                 return [f"        lea     eax, {_ebp_addr(disp)}"]
             return self._load_to_eax(_ebp_addr(disp), ty)
-        if name in self._globals:
-            ty = self._globals[name]
+        if name in self._globals or name in self._extern_vars:
+            ty = self._globals.get(name) or self._extern_vars[name]
             label = f"_{name}"
             if isinstance(ty, ast.ArrayType):
                 # The label IS the address in flat-32; load it as an immediate.
@@ -2169,7 +2220,7 @@ class CodeGenerator:
         name = ctx.local_static_labels.get(name, name)
         if ctx.has_local(name):
             return [f"        lea     eax, {_ebp_addr(ctx.lookup(name))}"]
-        if name in self._globals:
+        if name in self._globals or name in self._extern_vars:
             return [f"        mov     eax, _{name}"]
         if name in self._func_return_types:
             # `&fn` and `fn` produce the same address, just like for arrays.
