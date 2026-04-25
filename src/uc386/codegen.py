@@ -9,14 +9,18 @@ on every modern dev box, supports OMF object output for DOS toolchains
 Watcom-era ecosystem.
 
 Current scope:
-- `int main(void) { ... }` and other functions returning int.
+- Functions taking and returning `int`. cdecl ABI: caller pushes args
+  right-to-left, callee accesses via `[ebp + 8 + 4*i]`, caller cleans
+  the stack with `add esp, 4*N`. Return value in EAX.
+- `_start` calls `_main` with no args and exits via INT 21h/4Ch.
 - Integer-literal returns and bare `return;`.
 - `int` locals with arbitrary initializer expressions.
-- Reading a local in any expression position.
-- Assignment to a local (`x = expr;`) as an expression statement.
+- Reading a local or parameter in any expression position.
+- Assignment to a local or parameter (`x = expr;`).
 - Unary `+ - ~ !` and binary `+ - * / % & | ^ << >> == != < > <= >=`.
 - Logical `&&` and `||` with proper short-circuit evaluation.
 - Control flow: `if`/`else`, `while`, `do`/`while`, `for`, `break`, `continue`.
+- Function calls — direct calls only (callee must be an identifier).
 
 Anything else raises CodegenError.
 """
@@ -28,29 +32,47 @@ class CodegenError(NotImplementedError):
     """Raised when the AST contains a construct codegen can't handle yet."""
 
 
+def _ebp_addr(disp: int) -> str:
+    """Render an EBP-relative address. Locals have negative disp, params positive."""
+    if disp < 0:
+        return f"[ebp - {-disp}]"
+    return f"[ebp + {disp}]"
+
+
 class _FuncCtx:
-    """Per-function lowering state: locals, label generator, loop stack."""
+    """Per-function lowering state: locals, params, label gen, loop stack."""
 
     def __init__(self) -> None:
-        self.locals: dict[str, int] = {}  # name -> positive offset; address is [ebp - offset]
+        # Maps a name to its signed displacement from EBP. Locals are
+        # negative (below EBP), params are positive (above the saved EBP
+        # and return address — first param is at +8 in cdecl).
+        self.slots: dict[str, int] = {}
         self.frame_size: int = 0          # bytes reserved by `sub esp, frame_size`
         self._next_label: int = 0
         # Stack of (continue_target, break_target) for the enclosing loops.
         self.loops: list[tuple[str, str]] = []
 
-    def alloc(self, name: str, size: int = 4) -> int:
-        if name in self.locals:
-            raise CodegenError(f"redeclaration of local `{name}`")
-        # Each local sits at the next 4-byte slot. For ints (4 bytes) this
-        # is also natural alignment.
+    def alloc_local(self, name: str, size: int = 4) -> int:
+        if name in self.slots:
+            raise CodegenError(f"redeclaration of `{name}`")
+        # Each local sits at the next 4-byte slot below EBP.
         self.frame_size += size
-        self.locals[name] = self.frame_size
-        return self.locals[name]
+        self.slots[name] = -self.frame_size
+        return self.slots[name]
+
+    def alloc_param(self, name: str, index: int, size: int = 4) -> int:
+        # cdecl: caller pushed args right-to-left, then `call` pushed the
+        # return address, then we pushed EBP. So the first arg lives at
+        # [ebp + 8], the second at [ebp + 12], etc.
+        if name in self.slots:
+            raise CodegenError(f"duplicate parameter `{name}`")
+        self.slots[name] = 8 + index * size
+        return self.slots[name]
 
     def lookup(self, name: str) -> int:
-        if name not in self.locals:
+        if name not in self.slots:
             raise CodegenError(f"unknown identifier `{name}`")
-        return self.locals[name]
+        return self.slots[name]
 
     def label(self, hint: str) -> str:
         self._next_label += 1
@@ -105,6 +127,14 @@ class CodeGenerator:
 
     def _function(self, fn: ast.FunctionDecl) -> list[str]:
         ctx = _FuncCtx()
+        # Parameters live above EBP at fixed cdecl offsets; register them
+        # before the locals so a body that references a parameter lowers
+        # correctly. `int` is the only param type we handle today.
+        for i, param in enumerate(fn.params):
+            if param.name is None:
+                continue
+            self._check_int_type(param.param_type, param.name)
+            ctx.alloc_param(param.name, i)
         # First pass: allocate every local up front so the prologue knows
         # the frame size before we emit body code.
         self._collect_locals(fn.body, ctx)
@@ -136,7 +166,7 @@ class CodeGenerator:
         """
         if isinstance(node, ast.VarDecl):
             self._check_int_type(node.var_type, node.name)
-            ctx.alloc(node.name)
+            ctx.alloc_local(node.name)
             return
         if isinstance(node, ast.CompoundStmt):
             for item in node.items:
@@ -286,13 +316,13 @@ class CodeGenerator:
         return self._eval_expr_to_eax(stmt.expr, ctx)
 
     def _var_init(self, decl: ast.VarDecl, ctx: _FuncCtx) -> list[str]:
-        offset = ctx.lookup(decl.name)
+        disp = ctx.lookup(decl.name)
         if decl.init is None:
             # Uninitialized — leave the slot as-is. Reading it is UB, but
             # we don't pre-zero unless required.
             return []
         return self._eval_expr_to_eax(decl.init, ctx) + [
-            f"        mov     [ebp - {offset}], eax",
+            f"        mov     {_ebp_addr(disp)}, eax",
         ]
 
     def _return(self, stmt: ast.ReturnStmt, ctx: _FuncCtx) -> list[str]:
@@ -311,15 +341,36 @@ class CodeGenerator:
         if isinstance(expr, ast.IntLiteral):
             return [f"        mov     eax, {expr.value}"]
         if isinstance(expr, ast.Identifier):
-            offset = ctx.lookup(expr.name)
-            return [f"        mov     eax, [ebp - {offset}]"]
+            disp = ctx.lookup(expr.name)
+            return [f"        mov     eax, {_ebp_addr(disp)}"]
         if isinstance(expr, ast.UnaryOp):
             return self._unary(expr, ctx)
         if isinstance(expr, ast.BinaryOp):
             return self._binary(expr, ctx)
+        if isinstance(expr, ast.Call):
+            return self._call(expr, ctx)
         raise CodegenError(
             f"expression {type(expr).__name__} not implemented yet"
         )
+
+    def _call(self, expr: ast.Call, ctx: _FuncCtx) -> list[str]:
+        if not isinstance(expr.func, ast.Identifier):
+            raise CodegenError(
+                f"only direct calls are supported "
+                f"(got {type(expr.func).__name__})"
+            )
+        # cdecl: push args right-to-left so the first arg ends up at the
+        # lowest address (= [ebp+8] in the callee). C leaves inter-arg
+        # evaluation order unspecified, so right-to-left is fine.
+        out: list[str] = []
+        for arg in reversed(expr.args):
+            out += self._eval_expr_to_eax(arg, ctx)
+            out.append("        push    eax")
+        out.append(f"        call    _{expr.func.name}")
+        if expr.args:
+            out.append(f"        add     esp, {4 * len(expr.args)}")
+        # Return value is in EAX.
+        return out
 
     def _unary(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
         if not expr.is_prefix:
@@ -444,7 +495,7 @@ class CodeGenerator:
                 f"assignment target must be an identifier "
                 f"(got {type(expr.left).__name__})"
             )
-        offset = ctx.lookup(expr.left.name)
+        disp = ctx.lookup(expr.left.name)
         return self._eval_expr_to_eax(expr.right, ctx) + [
-            f"        mov     [ebp - {offset}], eax",
+            f"        mov     {_ebp_addr(disp)}, eax",
         ]

@@ -269,6 +269,63 @@ def test_logical_or_short_circuits():
     assert sum(1 for line in asm.splitlines() if "jnz     .L" in line and "_or_true" in line) == 2
 
 
+# ---- function calls and parameters -----------------------------------------
+
+def test_parameter_read_uses_positive_offset():
+    # cdecl: first param at [ebp + 8], second at [ebp + 12].
+    asm = _compile("int add(int a, int b) { return a + b; } int main(void) { return 0; }")
+    assert "mov     eax, [ebp + 8]" in asm
+    assert "mov     eax, [ebp + 12]" in asm
+
+
+def test_parameter_can_be_assigned():
+    asm = _compile("int f(int x) { x = x + 1; return x; } int main(void) { return 0; }")
+    assert "mov     [ebp + 8], eax" in asm
+
+
+def test_call_pushes_args_right_to_left_and_cleans_up():
+    asm = _compile(
+        "int add(int a, int b) { return a + b; } "
+        "int main(void) { return add(2, 3); }"
+    )
+    lines = asm.splitlines()
+    # Find the call site in main; arg pushes happen just above it.
+    call_idx = next(i for i, l in enumerate(lines) if l.strip() == "call    _add")
+    pushes = [l for l in lines[call_idx - 4:call_idx] if "push    eax" in l]
+    assert len(pushes) == 2
+    # Last arg (3) is loaded first, pushed first → ends up at higher address.
+    assert "mov     eax, 3" in lines[call_idx - 4]
+    assert "mov     eax, 2" in lines[call_idx - 2]
+    # Caller cleans up 2 args * 4 bytes.
+    assert lines[call_idx + 1].strip() == "add     esp, 8"
+
+
+def test_call_with_no_args_no_cleanup():
+    asm = _compile("int g(void) { return 5; } int main(void) { return g(); }")
+    assert "call    _g" in asm
+    # No `add esp, ...` should follow the call (zero-arg cleanup is elided).
+    assert "add     esp" not in asm.split("call    _g")[1].splitlines()[0]
+
+
+def test_indirect_call_rejected():
+    # Calling a function pointer (or any non-Identifier callee) isn't supported yet.
+    with pytest.raises(CodegenError, match="direct calls"):
+        _compile(
+            "int main(void) { int x = 0; return (x ? main : main)(); }"
+        )
+
+
+def test_duplicate_parameter_rejected():
+    with pytest.raises(CodegenError, match="duplicate parameter"):
+        _compile("int f(int x, int x) { return x; } int main(void) { return 0; }")
+
+
+def test_param_and_local_share_namespace():
+    # A local can't shadow a parameter (flat scope).
+    with pytest.raises(CodegenError, match="redeclaration"):
+        _compile("int f(int x) { int x = 7; return x; } int main(void) { return 0; }")
+
+
 def test_end_to_end_driver(tmp_path):
     src = tmp_path / "hi.c"
     src.write_text("int main(void) { return 0; }\n")
