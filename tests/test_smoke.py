@@ -1578,6 +1578,49 @@ def test_top_level_static_global_works_like_regular():
     assert "[_counter]" in asm
 
 
+def test_function_static_local_initialized_in_data():
+    asm = _compile(
+        "int counter(void) { static int x = 0; x = x + 1; return x; } "
+        "int main(void) { counter(); return counter(); }"
+    )
+    # The static lives in .data with a function-mangled name, not a frame slot.
+    assert "section .data" in asm
+    assert "counter_x:" in asm or "counter__x:" in asm
+    # Initialized to 0 once.
+    assert "dd      0" in asm
+    # And the function reads/writes the global label, not [ebp - 4].
+    asm_lines = asm.splitlines()
+    fn_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_counter:")
+    end_idx = next(i for i, l in enumerate(asm_lines[fn_idx:]) if l.strip() == "ret") + fn_idx
+    fn_section = "\n".join(asm_lines[fn_idx:end_idx])
+    # No frame is reserved for `x` (only the param/return scaffolding).
+    # The static is referenced by its `<func>__x` global label.
+    assert any("counter__x" in l for l in fn_section.splitlines())
+
+
+def test_function_static_local_uninitialized_in_bss():
+    asm = _compile(
+        "int once(void) { static int x; x = 5; return x; } "
+        "int main(void) { return once(); }"
+    )
+    assert "section .bss" in asm
+    assert any("once_x:" in l or "once__x:" in l for l in asm.splitlines())
+
+
+def test_function_static_does_not_count_against_frame():
+    # A static local should not increase the function's `sub esp, N`.
+    asm_with_static = _compile(
+        "int f(void) { static int x = 0; return x; } "
+        "int main(void) { return f(); }"
+    )
+    # `f` has no frame locals — so no `sub esp, ...` for f itself.
+    asm_lines = asm_with_static.splitlines()
+    fn_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_f:")
+    end_idx = next(i for i, l in enumerate(asm_lines[fn_idx:]) if l.strip() == "ret") + fn_idx
+    fn_section = asm_lines[fn_idx:end_idx]
+    assert not any("sub     esp," in l for l in fn_section)
+
+
 # ---- enums ----------------------------------------------------------------
 
 def test_enum_implicit_values_start_at_zero():

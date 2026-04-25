@@ -150,6 +150,15 @@ class _FuncCtx:
         # The current function's declared return type. Used by `_return`
         # to dispatch float-returning functions to the FPU stack.
         self.return_type: ast.TypeNode | None = None
+        # Function-static local name → mangled global label. A
+        # `static int x = 0;` inside `f` becomes the global
+        # `_f__x` in `.data`/`.bss` instead of a frame slot, so the
+        # value persists across calls.
+        self.local_static_labels: dict[str, str] = {}
+        # The current function's name. Used to mangle static-local
+        # labels so two functions with the same `static int x` don't
+        # collide.
+        self.func_name: str = ""
 
     def alloc_local(self, name: str, ty: "ast.TypeNode", size: int = 4) -> int:
         if name in self.slots:
@@ -587,6 +596,7 @@ class CodeGenerator:
     def _function(self, fn: ast.FunctionDecl) -> list[str]:
         ctx = _FuncCtx()
         ctx.return_type = fn.return_type
+        ctx.func_name = fn.name
         # Parameters live above EBP at cdecl offsets; the first sits at
         # [ebp + 8], and each subsequent param is offset by its predecessor's
         # padded size. For scalars/pointers/floats that's `(size + 3) & ~3`
@@ -704,6 +714,20 @@ class CodeGenerator:
         if isinstance(node, ast.VarDecl):
             var_type = self._resolved_var_type(node)
             self._check_supported_type(var_type, node.name)
+            # `static int x = ...;` inside a function: don't reserve a
+            # frame slot. Instead register the variable as a global with
+            # a function-mangled label so the value persists across
+            # calls. The same identifier inside the function body
+            # transparently routes through `local_static_labels` →
+            # `_globals` for reads and writes.
+            if node.storage_class == "static":
+                mangled = f"_{ctx.func_name}__{node.name}"
+                key = mangled[1:]  # strip leading `_` to match _globals keys
+                self._globals[key] = var_type
+                if node.init is not None:
+                    self._global_inits[key] = node.init
+                ctx.local_static_labels[node.name] = key
+                return
             # Round slot size up to a 4-byte boundary so a `char`-sized slot
             # doesn't push subsequent int slots off-alignment. Arrays whose
             # payload isn't a multiple of 4 (e.g. `char arr[5]`) get padded
@@ -1198,6 +1222,9 @@ class CodeGenerator:
     # ---- identifier resolution (local vs global) ----------------------
 
     def _identifier_type(self, name: str, ctx: _FuncCtx) -> ast.TypeNode:
+        # A `static` local lives as a global under a mangled name; route
+        # through the remapping table so callers don't need to know.
+        name = ctx.local_static_labels.get(name, name)
         if name in ctx.slots:
             return ctx.lookup_type(name)
         if name in self._globals:
@@ -1220,6 +1247,7 @@ class CodeGenerator:
         `_inc_dec` (for `inc/dec dword [...]`-style instructions) where
         `_load_to_eax` / `_store_from_eax` would be overkill.
         """
+        name = ctx.local_static_labels.get(name, name)
         if name in ctx.slots:
             return _ebp_addr(ctx.lookup(name))
         if name in self._globals:
@@ -1228,6 +1256,7 @@ class CodeGenerator:
 
     def _identifier_load(self, name: str, ctx: _FuncCtx) -> list[str]:
         """Lines that produce the value (or, for arrays/functions, the address) of `name` in eax."""
+        name = ctx.local_static_labels.get(name, name)
         if name in ctx.slots:
             ty = ctx.lookup_type(name)
             disp = ctx.lookup(name)
@@ -1253,6 +1282,7 @@ class CodeGenerator:
 
     def _identifier_address(self, name: str, ctx: _FuncCtx) -> list[str]:
         """Lines that compute &name into eax — for `&id` and as the base for indexing."""
+        name = ctx.local_static_labels.get(name, name)
         if name in ctx.slots:
             return [f"        lea     eax, {_ebp_addr(ctx.lookup(name))}"]
         if name in self._globals:
@@ -1264,6 +1294,7 @@ class CodeGenerator:
 
     def _identifier_store(self, name: str, ctx: _FuncCtx) -> list[str]:
         """Lines that store eax to the slot for `name`, with width per type."""
+        name = ctx.local_static_labels.get(name, name)
         ty = self._identifier_type(name, ctx)
         if name in ctx.slots:
             return self._store_from_eax(_ebp_addr(ctx.lookup(name)), ty)
@@ -1546,6 +1577,11 @@ class CodeGenerator:
         return self._eval_expr_to_eax(stmt.expr, ctx)
 
     def _var_init(self, decl: ast.VarDecl, ctx: _FuncCtx) -> list[str]:
+        # `static` locals were registered as globals during
+        # `_collect_locals`; their initializer fires once at program
+        # load via the `.data` emission, not on every call.
+        if decl.storage_class == "static":
+            return []
         disp = ctx.lookup(decl.name)
         if decl.init is None:
             # Uninitialized — leave the slot as-is. Reading it is UB, but
@@ -2169,7 +2205,10 @@ class CodeGenerator:
 
     def _float_identifier_load(self, name: str, ctx: _FuncCtx) -> list[str]:
         """`fld` a float-typed Identifier (local, param, or global)."""
+        # `_identifier_type` already handles the static-local remap, but
+        # we resolve here too so the slot/global lookups below match.
         ty = self._identifier_type(name, ctx)
+        name = ctx.local_static_labels.get(name, name)
         size = self._size_of(ty)
         width = "dword" if size == 4 else "qword"
         if name in ctx.slots:
@@ -2409,6 +2448,7 @@ class CodeGenerator:
 
     def _float_lvalue_addr(self, name: str, ctx: _FuncCtx) -> str:
         """Render the address text for a float-typed Identifier lvalue."""
+        name = ctx.local_static_labels.get(name, name)
         if name in ctx.slots:
             return _ebp_addr(ctx.lookup(name))
         if name in self._globals:
