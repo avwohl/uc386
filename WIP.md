@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–15 are done. 167 tests passing.
-Slice 16+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–16 are done. 176 tests passing.
+Slice 17+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,26 +60,22 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 15 (just landed):
-- **Function pointers + CharLiteral.** Indirect calls via `call eax`
-  on any non-Identifier callee or any Identifier that isn't a known
-  function name. Function names decay to `mov eax, _name`. Leading
-  `*`s on callees are stripped. `'A'` lowers to `mov eax, 65`.
+Implemented in slice 16 (just landed):
+- **Compound assignment to non-Identifier lvalues.** `arr[i] += rhs`
+  and `*p += rhs` evaluate the address once, then load/op/store
+  through it. Sub-word widths and pointer scaling both flow through
+  the same path.
 
 Deliberately not yet implemented — next slices in roughly this order:
-- **Compound assignment to non-Identifier lvalues.** `arr[i] += 5` and
-  `*p += 5` currently raise. Needs lowering that computes the address
-  once into a temp slot rather than re-evaluating the lvalue twice.
 - **Designated/nested initializers.** `int arr[3] = {[1] = 5}` and
   `int m[2][3] = {{...}, {...}}` both raise. Multidim arrays would
   also need ArrayType-of-ArrayType slot support.
 - **Floating point.** `float` / `double` slot codegen via x87 or SSE.
   Big topic — likely a phase of its own.
 
-Suggested first move next session: read `CLAUDE.md`. **Compound
-assignment to non-Identifier lvalues** (`arr[i] += 5`, `*p += 5`) is
-the smallest remaining gap — needs to compute the address once into
-a temp slot rather than re-evaluating the lvalue twice. After that,
-**structs/unions** is probably the largest remaining piece of Phase 4
-(member layout, `.field` / `->field` access, struct returns by
-value).
+Suggested first move next session: read `CLAUDE.md`. **Structs and
+unions** is the biggest remaining piece of Phase 4 — member layout,
+`.field` / `->field` access, taking `&struct.field`, eventually
+struct return-by-value (probably its own slice). After structs, the
+remaining gaps (designated init, floats, switch/case) are mostly
+optional polish or new phases.

@@ -1486,20 +1486,117 @@ class CodeGenerator:
 
     def _compound_assign(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
         # `x op= rhs` is `x = x op rhs`. For Identifier lvalues, evaluating
-        # the lvalue is side-effect-free, so it's safe to compute it twice
-        # via a synthesized BinaryOp. Pointer/array lvalues will need a
-        # different lowering when those land.
-        if not isinstance(expr.left, ast.Identifier):
+        # the lvalue is side-effect-free, so the simple desugaring works.
+        # For `arr[i]` and `*p`, re-evaluating the lvalue would compute the
+        # address (and any side effects in `i` or `p`) twice — we instead
+        # compute it once and keep it on the stack while we read, op, store.
+        op = self._COMPOUND_OPS[expr.op]
+
+        if isinstance(expr.left, ast.Identifier):
+            ty = self._identifier_type(expr.left.name, ctx)
+            if isinstance(ty, ast.ArrayType):
+                raise CodegenError(
+                    f"cannot assign to array `{expr.left.name}`"
+                )
+            inner = ast.BinaryOp(op=op, left=expr.left, right=expr.right)
+            return self._assign(
+                ast.BinaryOp(op="=", left=expr.left, right=inner),
+                ctx,
+            )
+
+        if isinstance(expr.left, ast.Index):
+            addr_lines = self._index_address(expr.left, ctx)
+        elif isinstance(expr.left, ast.UnaryOp) and expr.left.op == "*":
+            # The pointer operand evaluates once into eax — that's the
+            # address we'll read from and write back to.
+            addr_lines = self._eval_expr_to_eax(expr.left.operand, ctx)
+        else:
             raise CodegenError(
-                f"compound assignment target must be an identifier "
+                f"compound assignment target must be an identifier, `*ptr`, or `arr[i]` "
                 f"(got {type(expr.left).__name__})"
             )
-        inner = ast.BinaryOp(
-            op=self._COMPOUND_OPS[expr.op],
-            left=expr.left,
-            right=expr.right,
-        )
-        return self._assign(
-            ast.BinaryOp(op="=", left=expr.left, right=inner),
-            ctx,
-        )
+
+        target_ty = self._type_of(expr.left, ctx)
+        rhs_ty = self._type_of(expr.right, ctx)
+
+        out = addr_lines                                       # eax = lvalue address
+        out.append("        push    eax")                       # save addr for the store
+        out += self._load_to_eax("[eax]", target_ty)            # eax = current value
+        out.append("        push    eax")                       # left operand on stack
+        out += self._eval_expr_to_eax(expr.right, ctx)          # eax = rhs
+        out += self._apply_binop_post_eval(op, target_ty, rhs_ty)  # eax = new value
+        out.append("        pop     ecx")                       # ecx = saved addr
+        out += self._store_from_eax("[ecx]", target_ty)         # *addr = new value
+        return out
+
+    def _apply_binop_post_eval(
+        self,
+        op: str,
+        lt: ast.TypeNode,
+        rt: ast.TypeNode,
+    ) -> list[str]:
+        """Compute `(stack_top OP eax) → eax`, with C semantics.
+
+        Used by compound-assign on non-Identifier lvalues, where the
+        loaded current value is on the stack and the rhs has just been
+        evaluated into EAX. Mirrors `_add_sub`'s pointer-scaling rules
+        for `+` and `-`; everything else is the integer instruction
+        sequence shared with `_binary`.
+        """
+        l_ptr = self._is_pointer_like(lt)
+        r_ptr = self._is_pointer_like(rt)
+
+        if op in ("+", "-"):
+            if l_ptr and r_ptr:
+                if op == "+":
+                    raise CodegenError("cannot add two pointers")
+                size = self._size_of(lt.base_type)
+                out = [
+                    "        mov     ecx, eax",
+                    "        pop     eax",
+                    "        sub     eax, ecx",
+                ]
+                out += self._unscale_eax(size)
+                return out
+            if l_ptr:
+                size = self._size_of(lt.base_type)
+                out = self._scale_reg("eax", size)
+                out.append("        mov     ecx, eax")
+                out.append("        pop     eax")
+                mnem = "add" if op == "+" else "sub"
+                out.append(f"        {mnem}     eax, ecx")
+                return out
+            if r_ptr:
+                if op == "-":
+                    raise CodegenError(
+                        "cannot subtract a pointer from an integer"
+                    )
+                size = self._size_of(rt.base_type)
+                out = ["        pop     ecx"]
+                out += self._scale_reg("ecx", size)
+                out.append("        add     eax, ecx")
+                return out
+            out = ["        mov     ecx, eax", "        pop     eax"]
+            mnem = "add" if op == "+" else "sub"
+            out.append(f"        {mnem}     eax, ecx")
+            return out
+
+        # All other ops: int-only. Same instruction sequences as `_binary`'s
+        # tail.
+        out = ["        mov     ecx, eax", "        pop     eax"]
+        if op in self._SIMPLE_BINOPS:
+            out.append(f"        {self._SIMPLE_BINOPS[op]}")
+            return out
+        if op == "/":
+            return out + ["        cdq", "        idiv    ecx"]
+        if op == "%":
+            return out + [
+                "        cdq",
+                "        idiv    ecx",
+                "        mov     eax, edx",
+            ]
+        if op == "<<":
+            return out + ["        shl     eax, cl"]
+        if op == ">>":
+            return out + ["        sar     eax, cl"]
+        raise CodegenError(f"compound op `{op}=` not implemented yet")

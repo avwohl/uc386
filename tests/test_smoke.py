@@ -674,6 +674,73 @@ def test_unsized_array_without_initializer_rejected():
         _compile("int main(void) { int a[]; return 0; }")
 
 
+# ---- compound assignment to non-Identifier lvalues ------------------------
+
+def test_index_compound_add_assign():
+    asm = _compile("int main(void) { int arr[3]; arr[1] = 5; arr[1] += 7; return arr[1]; }")
+    # arr[1] += 7: address computed once, loaded, added, stored.
+    assert "mov     eax, [eax]" in asm   # current value load
+    assert "add     eax, ecx" in asm
+    assert "mov     [ecx], eax" in asm   # store back
+
+
+def test_index_compound_does_not_recompute_index():
+    # Only one `lea` for arr's base in the compound assign — the previous
+    # naive desugar `arr[i] = arr[i] + rhs` would have emitted two.
+    asm = _compile("int main(void) { int arr[5]; arr[2] += 1; return 0; }")
+    asm_lines = asm.splitlines()
+    lea_count = sum(1 for l in asm_lines if "lea     eax, [ebp - 20]" in l)
+    assert lea_count == 1
+
+
+def test_index_compound_subtract_assign():
+    asm = _compile("int main(void) { int arr[3]; arr[1] = 10; arr[1] -= 3; return arr[1]; }")
+    assert "sub     eax, ecx" in asm
+
+
+def test_index_compound_multiply_assign():
+    asm = _compile("int main(void) { int arr[3]; arr[0] = 5; arr[0] *= 2; return arr[0]; }")
+    assert "imul    eax, ecx" in asm
+
+
+def test_index_compound_divide_assign():
+    asm = _compile("int main(void) { int arr[3]; arr[0] = 10; arr[0] /= 3; return arr[0]; }")
+    assert "cdq" in asm
+    assert "idiv    ecx" in asm
+
+
+def test_index_compound_bitwise_assign():
+    asm = _compile("int main(void) { int arr[3]; arr[0] = 12; arr[0] &= 5; return arr[0]; }")
+    assert "and     eax, ecx" in asm
+
+
+def test_pointer_deref_compound_assign():
+    asm = _compile("int main(void) { int x = 0; int *p = &x; *p += 7; return x; }")
+    # Pointer evaluated once, pushed, value loaded, added, stored back.
+    assert "mov     eax, [eax]" in asm
+    assert "add     eax, ecx" in asm
+    assert "mov     [ecx], eax" in asm
+
+
+def test_char_index_compound_assign_uses_byte_widths():
+    asm = _compile(
+        "int main(void) { char arr[4]; arr[0] = 1; arr[0] += 5; return arr[0]; }"
+    )
+    # Sub-word load and store widths.
+    assert "movsx   eax, byte [eax]" in asm
+    assert "mov     byte [ecx], al" in asm
+
+
+def test_pointer_lvalue_compound_scales_when_pointee():
+    # `*pp` is `int *`; `*pp += 1` should scale 1 by sizeof(int) = 4.
+    asm = _compile(
+        "int main(void) { int x = 0; int *p = &x; int **pp = &p; "
+        "*pp += 1; return 0; }"
+    )
+    assert "shl     eax, 2" in asm
+    assert "mov     [ecx], eax" in asm
+
+
 # ---- function pointers + CharLiteral --------------------------------------
 
 def test_charliteral_init_loads_ascii_value():
