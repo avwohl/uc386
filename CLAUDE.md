@@ -30,11 +30,14 @@ See `README.md` for the public roadmap (Phase 0–6).
 - Functions get a standard `push ebp / mov ebp, esp / sub esp, N / ... / mov esp, ebp / pop ebp / ret` frame.
 - Falling off the end of any function leaves EAX = 0 (correct for `main` per C99; deterministic for others until full codegen lands).
 - `int` locals supported: addressed as `[ebp - N]`, allocated in a single up-front pass over the function body. All slots are 4 bytes regardless of declared size — type-aware sizing comes when `short`/`char` codegen lands.
-- Expressions: integer literals, identifier reads, unary `+ - ~ !`, binary `+ - * / % & | ^ << >> == != < > <= >=`, and assignment `=` (lvalue must be an identifier). No calls, casts, `&&`/`||`, or pointer/array ops yet.
+- Expressions: integer literals, identifier reads, unary `+ - ~ !`, binary `+ - * / % & | ^ << >> == != < > <= >= && ||`, and assignment `=` (lvalue must be an identifier). No calls, casts, or pointer/array ops yet.
+- Control flow: `if`/`else`, `while`, `do`/`while`, `for`, `break`, `continue`. Labels are function-local (NASM `.LN_*`), generated via a per-function counter. Loop targets live on a stack on the function context so `break`/`continue` resolve to the innermost loop.
 - Stack-machine evaluation: left → EAX → push, right → EAX → ECX, pop EAX, op. Comparisons land via `cmp` + `setCC al` + `movzx eax, al`. Division/modulo via `cdq` + `idiv ecx`. Right shift is `sar` (signed); will branch to `shr` when type info reaches codegen.
+- Locals are allocated in a single recursive pre-pass over the whole function (including nested blocks, if-branches, loop bodies, for-init). Flat scope — redeclaring a name in a nested block raises.
 
 ## Session log
 
 - **2026-04-25 — Phase 0**: Replaced codegen stub with NASM emitter for `int main` + integer-literal returns. Picked NASM as the assembler target.
 - **2026-04-25 — Phase 4 slice 1**: `int` locals with integer-literal initializers and identifier reads in returns. Frame layout: locals stacked at `[ebp - 4]`, `[ebp - 8]`, etc. Single-pass collection in the prologue. 5 new tests; 13 total passing.
 - **2026-04-25 — Phase 4 slice 2**: Arithmetic, bitwise, shift, comparison binary ops; unary `- + ~ !`; assignment to identifiers; ExpressionStmt. Stack-machine eval. 21 new tests; 34 total passing.
+- **2026-04-25 — Phase 4 slice 3**: Control flow — `if`/`else`, `while`, `do`/`while`, `for`, `break`, `continue` — plus `&&` and `||` short-circuit. Per-function label counter; loop stack for break/continue targets. `_collect_locals` made recursive so for-init declarations get slots. 11 new tests; 45 total passing.

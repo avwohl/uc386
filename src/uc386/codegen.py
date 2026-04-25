@@ -15,6 +15,8 @@ Current scope:
 - Reading a local in any expression position.
 - Assignment to a local (`x = expr;`) as an expression statement.
 - Unary `+ - ~ !` and binary `+ - * / % & | ^ << >> == != < > <= >=`.
+- Logical `&&` and `||` with proper short-circuit evaluation.
+- Control flow: `if`/`else`, `while`, `do`/`while`, `for`, `break`, `continue`.
 
 Anything else raises CodegenError.
 """
@@ -27,11 +29,14 @@ class CodegenError(NotImplementedError):
 
 
 class _FuncCtx:
-    """Per-function lowering state: local variable layout."""
+    """Per-function lowering state: locals, label generator, loop stack."""
 
     def __init__(self) -> None:
         self.locals: dict[str, int] = {}  # name -> positive offset; address is [ebp - offset]
         self.frame_size: int = 0          # bytes reserved by `sub esp, frame_size`
+        self._next_label: int = 0
+        # Stack of (continue_target, break_target) for the enclosing loops.
+        self.loops: list[tuple[str, str]] = []
 
     def alloc(self, name: str, size: int = 4) -> int:
         if name in self.locals:
@@ -46,6 +51,10 @@ class _FuncCtx:
         if name not in self.locals:
             raise CodegenError(f"unknown identifier `{name}`")
         return self.locals[name]
+
+    def label(self, hint: str) -> str:
+        self._next_label += 1
+        return f".L{self._next_label}_{hint}"
 
 
 class CodeGenerator:
@@ -118,14 +127,36 @@ class CodeGenerator:
         out.append("        ret")
         return out
 
-    def _collect_locals(self, block: ast.CompoundStmt, ctx: _FuncCtx) -> None:
-        for item in block.items:
-            if isinstance(item, ast.VarDecl):
-                self._check_int_type(item.var_type, item.name)
-                ctx.alloc(item.name)
-            elif isinstance(item, ast.CompoundStmt):
+    def _collect_locals(self, node, ctx: _FuncCtx) -> None:
+        """Walk a function body recursively and reserve a slot for every VarDecl.
+
+        Slots are flat across the whole function — no per-block scopes, so a
+        for-init `int i = 0` reuses the same slot across iterations and a
+        nested-block redeclaration of an existing name raises.
+        """
+        if isinstance(node, ast.VarDecl):
+            self._check_int_type(node.var_type, node.name)
+            ctx.alloc(node.name)
+            return
+        if isinstance(node, ast.CompoundStmt):
+            for item in node.items:
                 self._collect_locals(item, ctx)
-            # Other statement types: nothing to allocate yet.
+            return
+        if isinstance(node, ast.IfStmt):
+            self._collect_locals(node.then_branch, ctx)
+            if node.else_branch is not None:
+                self._collect_locals(node.else_branch, ctx)
+            return
+        if isinstance(node, (ast.WhileStmt, ast.DoWhileStmt)):
+            self._collect_locals(node.body, ctx)
+            return
+        if isinstance(node, ast.ForStmt):
+            if node.init is not None:
+                self._collect_locals(node.init, ctx)
+            self._collect_locals(node.body, ctx)
+            return
+        # Statements with no nested locals: ExpressionStmt, ReturnStmt,
+        # BreakStmt, ContinueStmt, etc.
 
     @staticmethod
     def _check_int_type(t: ast.TypeNode, name: str) -> None:
@@ -152,9 +183,101 @@ class CodeGenerator:
             return self._compound(item, ctx)
         if isinstance(item, ast.ExpressionStmt):
             return self._expr_stmt(item, ctx)
+        if isinstance(item, ast.IfStmt):
+            return self._if(item, ctx)
+        if isinstance(item, ast.WhileStmt):
+            return self._while(item, ctx)
+        if isinstance(item, ast.DoWhileStmt):
+            return self._do_while(item, ctx)
+        if isinstance(item, ast.ForStmt):
+            return self._for(item, ctx)
+        if isinstance(item, ast.BreakStmt):
+            if not ctx.loops:
+                raise CodegenError("`break` outside of a loop")
+            return [f"        jmp     {ctx.loops[-1][1]}"]
+        if isinstance(item, ast.ContinueStmt):
+            if not ctx.loops:
+                raise CodegenError("`continue` outside of a loop")
+            return [f"        jmp     {ctx.loops[-1][0]}"]
         raise CodegenError(
             f"{type(item).__name__} not implemented yet"
         )
+
+    def _if(self, stmt: ast.IfStmt, ctx: _FuncCtx) -> list[str]:
+        else_label = ctx.label("else")
+        end_label = ctx.label("endif")
+        out = self._eval_expr_to_eax(stmt.condition, ctx)
+        out.append("        test    eax, eax")
+        out.append(f"        jz      {else_label if stmt.else_branch else end_label}")
+        out += self._item(stmt.then_branch, ctx)
+        if stmt.else_branch is not None:
+            out.append(f"        jmp     {end_label}")
+            out.append(f"{else_label}:")
+            out += self._item(stmt.else_branch, ctx)
+        out.append(f"{end_label}:")
+        return out
+
+    def _while(self, stmt: ast.WhileStmt, ctx: _FuncCtx) -> list[str]:
+        top = ctx.label("while_top")
+        end = ctx.label("while_end")
+        ctx.loops.append((top, end))
+        try:
+            out = [f"{top}:"]
+            out += self._eval_expr_to_eax(stmt.condition, ctx)
+            out.append("        test    eax, eax")
+            out.append(f"        jz      {end}")
+            out += self._item(stmt.body, ctx)
+            out.append(f"        jmp     {top}")
+            out.append(f"{end}:")
+        finally:
+            ctx.loops.pop()
+        return out
+
+    def _do_while(self, stmt: ast.DoWhileStmt, ctx: _FuncCtx) -> list[str]:
+        top = ctx.label("do_top")
+        cont = ctx.label("do_cont")
+        end = ctx.label("do_end")
+        # `continue` jumps to the condition test, not the top of the body.
+        ctx.loops.append((cont, end))
+        try:
+            out = [f"{top}:"]
+            out += self._item(stmt.body, ctx)
+            out.append(f"{cont}:")
+            out += self._eval_expr_to_eax(stmt.condition, ctx)
+            out.append("        test    eax, eax")
+            out.append(f"        jnz     {top}")
+            out.append(f"{end}:")
+        finally:
+            ctx.loops.pop()
+        return out
+
+    def _for(self, stmt: ast.ForStmt, ctx: _FuncCtx) -> list[str]:
+        top = ctx.label("for_top")
+        step = ctx.label("for_step")
+        end = ctx.label("for_end")
+        out: list[str] = []
+        if stmt.init is not None:
+            if isinstance(stmt.init, ast.Expression):
+                out += self._eval_expr_to_eax(stmt.init, ctx)
+            else:
+                out += self._item(stmt.init, ctx)
+        out.append(f"{top}:")
+        if stmt.condition is not None:
+            out += self._eval_expr_to_eax(stmt.condition, ctx)
+            out.append("        test    eax, eax")
+            out.append(f"        jz      {end}")
+        # `continue` jumps to the step, not the top.
+        ctx.loops.append((step, end))
+        try:
+            out += self._item(stmt.body, ctx)
+        finally:
+            ctx.loops.pop()
+        out.append(f"{step}:")
+        if stmt.update is not None:
+            out += self._eval_expr_to_eax(stmt.update, ctx)
+        out.append(f"        jmp     {top}")
+        out.append(f"{end}:")
+        return out
 
     def _expr_stmt(self, stmt: ast.ExpressionStmt, ctx: _FuncCtx) -> list[str]:
         if stmt.expr is None:
@@ -239,6 +362,10 @@ class CodeGenerator:
     def _binary(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
         if expr.op == "=":
             return self._assign(expr, ctx)
+        if expr.op == "&&":
+            return self._logical_and(expr, ctx)
+        if expr.op == "||":
+            return self._logical_or(expr, ctx)
 
         # Stack-machine eval: left → EAX → stack, right → EAX → ECX, pop EAX.
         out = self._eval_expr_to_eax(expr.left, ctx)
@@ -278,6 +405,38 @@ class CodeGenerator:
                 "        movzx   eax, al",
             ]
         raise CodegenError(f"binary `{expr.op}` not implemented yet")
+
+    def _logical_and(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
+        false_label = ctx.label("and_false")
+        end_label = ctx.label("and_end")
+        out = self._eval_expr_to_eax(expr.left, ctx)
+        out.append("        test    eax, eax")
+        out.append(f"        jz      {false_label}")
+        out += self._eval_expr_to_eax(expr.right, ctx)
+        out.append("        test    eax, eax")
+        out.append(f"        jz      {false_label}")
+        out.append("        mov     eax, 1")
+        out.append(f"        jmp     {end_label}")
+        out.append(f"{false_label}:")
+        out.append("        xor     eax, eax")
+        out.append(f"{end_label}:")
+        return out
+
+    def _logical_or(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
+        true_label = ctx.label("or_true")
+        end_label = ctx.label("or_end")
+        out = self._eval_expr_to_eax(expr.left, ctx)
+        out.append("        test    eax, eax")
+        out.append(f"        jnz     {true_label}")
+        out += self._eval_expr_to_eax(expr.right, ctx)
+        out.append("        test    eax, eax")
+        out.append(f"        jnz     {true_label}")
+        out.append("        xor     eax, eax")
+        out.append(f"        jmp     {end_label}")
+        out.append(f"{true_label}:")
+        out.append("        mov     eax, 1")
+        out.append(f"{end_label}:")
+        return out
 
     def _assign(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
         if not isinstance(expr.left, ast.Identifier):
