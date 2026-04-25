@@ -23,7 +23,10 @@ Current scope:
 - Logical `&&` and `||` with proper short-circuit evaluation.
 - Ternary `cond ? a : b`.
 - Control flow: `if`/`else`, `while`, `do`/`while`, `for`, `break`, `continue`.
-- Function calls — direct calls only (callee must be an identifier).
+- Function calls — direct (`call _name` for known function-name
+  callees) and indirect (`call eax` after evaluating an arbitrary
+  function-pointer expression). Leading `*`s on the callee are
+  stripped (`(*fp)()` ≡ `fp()`).
 - Pointer locals/params (`int *p`), `&x` / `&arr[i]`, `*expr`, and
   store-through-pointer assignment `*p = rhs`.
 - Pointer arithmetic with C scaling rules: `p + n` and `n + p` scale
@@ -599,6 +602,12 @@ class CodeGenerator:
             return ctx.lookup_type(name)
         if name in self._globals:
             return self._globals[name]
+        if name in self._func_return_types:
+            # A function name in expression context decays to a function
+            # pointer. We don't compute pointer arithmetic on functions, so
+            # the exact pointee type doesn't matter — represent it as
+            # `void *` (4 bytes, no scaling).
+            return ast.PointerType(base_type=ast.BasicType(name="void"))
         raise CodegenError(f"unknown identifier `{name}`")
 
     def _identifier_addr_text(self, name: str, ctx: _FuncCtx) -> str:
@@ -615,26 +624,35 @@ class CodeGenerator:
         raise CodegenError(f"unknown identifier `{name}`")
 
     def _identifier_load(self, name: str, ctx: _FuncCtx) -> list[str]:
-        """Lines that produce the value (or, for arrays, the address) of `name` in eax."""
-        ty = self._identifier_type(name, ctx)
+        """Lines that produce the value (or, for arrays/functions, the address) of `name` in eax."""
         if name in ctx.slots:
+            ty = ctx.lookup_type(name)
             disp = ctx.lookup(name)
             if isinstance(ty, ast.ArrayType):
                 # Array decay: yield the slot's address, not its bytes.
                 return [f"        lea     eax, {_ebp_addr(disp)}"]
             return self._load_to_eax(_ebp_addr(disp), ty)
-        # Global path.
-        label = f"_{name}"
-        if isinstance(ty, ast.ArrayType):
-            # The label IS the address in flat-32; load it as an immediate.
-            return [f"        mov     eax, {label}"]
-        return self._load_to_eax(f"[{label}]", ty)
+        if name in self._globals:
+            ty = self._globals[name]
+            label = f"_{name}"
+            if isinstance(ty, ast.ArrayType):
+                # The label IS the address in flat-32; load it as an immediate.
+                return [f"        mov     eax, {label}"]
+            return self._load_to_eax(f"[{label}]", ty)
+        if name in self._func_return_types:
+            # Function decay: the name yields its address (suitable for
+            # assigning to a function pointer or passing as an argument).
+            return [f"        mov     eax, _{name}"]
+        raise CodegenError(f"unknown identifier `{name}`")
 
     def _identifier_address(self, name: str, ctx: _FuncCtx) -> list[str]:
         """Lines that compute &name into eax — for `&id` and as the base for indexing."""
         if name in ctx.slots:
             return [f"        lea     eax, {_ebp_addr(ctx.lookup(name))}"]
         if name in self._globals:
+            return [f"        mov     eax, _{name}"]
+        if name in self._func_return_types:
+            # `&fn` and `fn` produce the same address, just like for arrays.
             return [f"        mov     eax, _{name}"]
         raise CodegenError(f"unknown identifier `{name}`")
 
@@ -945,6 +963,9 @@ class CodeGenerator:
             return self._identifier_type(expr.name, ctx)
         if isinstance(expr, ast.IntLiteral):
             return ast.BasicType(name="int")
+        if isinstance(expr, ast.CharLiteral):
+            # Per C, a character constant has type `int`, not `char`.
+            return ast.BasicType(name="int")
         if isinstance(expr, ast.StringLiteral):
             return ast.PointerType(base_type=ast.BasicType(name="char", is_const=True))
         if isinstance(expr, ast.UnaryOp):
@@ -1008,6 +1029,10 @@ class CodeGenerator:
 
     def _eval_expr_to_eax(self, expr: ast.Expression, ctx: _FuncCtx) -> list[str]:
         if isinstance(expr, ast.IntLiteral):
+            return [f"        mov     eax, {expr.value}"]
+        if isinstance(expr, ast.CharLiteral):
+            # `'a'` is an integer constant in C — its parser-level value is
+            # already the character code, so it lowers exactly like IntLiteral.
             return [f"        mov     eax, {expr.value}"]
         if isinstance(expr, ast.StringLiteral):
             label = self._intern_string(expr.value)
@@ -1085,21 +1110,49 @@ class CodeGenerator:
         return out
 
     def _call(self, expr: ast.Call, ctx: _FuncCtx) -> list[str]:
-        if not isinstance(expr.func, ast.Identifier):
-            raise CodegenError(
-                f"only direct calls are supported "
-                f"(got {type(expr.func).__name__})"
-            )
+        # In C, `*f` on a function-typed expression is idempotent — `f()`
+        # and `(*f)()` and `(***f)()` all call the same function. Strip
+        # leading dereferences from the callee so the lowering doesn't
+        # try to actually load through the function address.
+        callee = expr.func
+        while isinstance(callee, ast.UnaryOp) and callee.op == "*":
+            callee = callee.operand
+
+        # Direct call: callee names a function declared in this unit
+        # (defined or extern). Emit a `call _name` linker reference.
+        if (
+            isinstance(callee, ast.Identifier)
+            and callee.name in self._func_return_types
+        ):
+            return self._emit_call(expr.args, ctx, direct=callee.name)
+
+        # Indirect call: the callee evaluates to a function address. Push
+        # args first (which clobber EAX), then evaluate the callee into
+        # EAX last so it survives until the `call`.
+        return self._emit_call(expr.args, ctx, indirect_callee=callee)
+
+    def _emit_call(
+        self,
+        args: list[ast.Expression],
+        ctx: _FuncCtx,
+        *,
+        direct: str | None = None,
+        indirect_callee: ast.Expression | None = None,
+    ) -> list[str]:
         # cdecl: push args right-to-left so the first arg ends up at the
         # lowest address (= [ebp+8] in the callee). C leaves inter-arg
         # evaluation order unspecified, so right-to-left is fine.
         out: list[str] = []
-        for arg in reversed(expr.args):
+        for arg in reversed(args):
             out += self._eval_expr_to_eax(arg, ctx)
             out.append("        push    eax")
-        out.append(f"        call    _{expr.func.name}")
-        if expr.args:
-            out.append(f"        add     esp, {4 * len(expr.args)}")
+        if direct is not None:
+            out.append(f"        call    _{direct}")
+        else:
+            out += self._eval_expr_to_eax(indirect_callee, ctx)
+            out.append("        call    eax")
+        if args:
+            out.append(f"        add     esp, {4 * len(args)}")
         # Return value is in EAX.
         return out
 

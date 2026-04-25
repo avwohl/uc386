@@ -1,7 +1,7 @@
 # WIP — resume notes for the new machine
 
-Phase 4 slices 0–14 are done. 161 tests passing.
-Slice 15+ is the next logical work — see "Where the codegen stands" below.
+Phase 4 slices 0–15 are done. 167 tests passing.
+Slice 16+ is the next logical work — see "Where the codegen stands" below.
 
 ## Bootstrap on the new machine
 
@@ -60,30 +60,26 @@ Implemented (Phase 4):
 - Direct function calls; bodyless declarations emit `extern _name`.
 - String literals → `.data` section, interned per translation unit.
 
-Implemented in slice 14 (just landed):
-- **Casts.** `(T)expr` — pointer casts and within-int-family casts are
-  no-ops; narrowing to char/short emits `movsx`/`movzx` of `al`/`ax`.
-  `_type_of(Cast)` returns the target so subsequent pointer arithmetic
-  scales by the right pointee size.
+Implemented in slice 15 (just landed):
+- **Function pointers + CharLiteral.** Indirect calls via `call eax`
+  on any non-Identifier callee or any Identifier that isn't a known
+  function name. Function names decay to `mov eax, _name`. Leading
+  `*`s on callees are stripped. `'A'` lowers to `mov eax, 65`.
 
 Deliberately not yet implemented — next slices in roughly this order:
 - **Compound assignment to non-Identifier lvalues.** `arr[i] += 5` and
   `*p += 5` currently raise. Needs lowering that computes the address
   once into a temp slot rather than re-evaluating the lvalue twice.
-- **Function pointers / indirect calls.** Currently `_call` rejects
-  any non-Identifier callee.
-- **CharLiteral.** `char c = 'a'` would currently raise — `'a'` is a
-  CharLiteral (value=97) but `_eval_expr_to_eax` doesn't handle it
-  yet. Trivially adding it would unlock more idiomatic char tests.
 - **Designated/nested initializers.** `int arr[3] = {[1] = 5}` and
   `int m[2][3] = {{...}, {...}}` both raise. Multidim arrays would
   also need ArrayType-of-ArrayType slot support.
 - **Floating point.** `float` / `double` slot codegen via x87 or SSE.
   Big topic — likely a phase of its own.
 
-Suggested first move next session: read `CLAUDE.md`. **Function
-pointers / indirect calls** is the smallest remaining slice — one
-branch in `_call` to evaluate a non-Identifier callee into a register
-and emit `call eax`. Then **CharLiteral** support (one expression
-handler, makes `'a'` work) and **compound-assign to lvalues** would
-round out Phase 4.
+Suggested first move next session: read `CLAUDE.md`. **Compound
+assignment to non-Identifier lvalues** (`arr[i] += 5`, `*p += 5`) is
+the smallest remaining gap — needs to compute the address once into
+a temp slot rather than re-evaluating the lvalue twice. After that,
+**structs/unions** is probably the largest remaining piece of Phase 4
+(member layout, `.field` / `->field` access, struct returns by
+value).

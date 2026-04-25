@@ -308,12 +308,8 @@ def test_call_with_no_args_no_cleanup():
     assert "add     esp" not in asm.split("call    _g")[1].splitlines()[0]
 
 
-def test_indirect_call_rejected():
-    # Calling a function pointer (or any non-Identifier callee) isn't supported yet.
-    with pytest.raises(CodegenError, match="direct calls"):
-        _compile(
-            "int main(void) { int x = 0; return (x ? main : main)(); }"
-        )
+# Indirect calls landed in slice 15 — the previous "rejected" test is gone.
+# The positive coverage lives in the function-pointer section below.
 
 
 def test_duplicate_parameter_rejected():
@@ -676,6 +672,100 @@ def test_array_increment_rejected():
 def test_unsized_array_without_initializer_rejected():
     with pytest.raises(CodegenError, match="initializer|size"):
         _compile("int main(void) { int a[]; return 0; }")
+
+
+# ---- function pointers + CharLiteral --------------------------------------
+
+def test_charliteral_init_loads_ascii_value():
+    # `'A'` is a CharLiteral with value=65; lowers to a plain integer load.
+    asm = _compile("int main(void) { char c = 'A'; return c; }")
+    assert "mov     eax, 65" in asm
+
+
+def test_charliteral_in_arithmetic():
+    asm = _compile("int main(void) { return 'a' + 1; }")
+    assert "mov     eax, 97" in asm
+    assert "mov     eax, 1" in asm
+    assert "add     eax, ecx" in asm
+
+
+def test_function_name_in_value_position_loads_address():
+    asm = _compile(
+        "int helper(void) { return 5; } "
+        "int main(void) { int (*fp)(void) = helper; return 0; }"
+    )
+    # `helper` in value position yields its label as an immediate.
+    assert "mov     eax, _helper" in asm
+
+
+def test_indirect_call_through_function_pointer():
+    asm = _compile(
+        "int helper(void) { return 5; } "
+        "int main(void) { int (*fp)(void) = helper; return fp(); }"
+    )
+    asm_lines = asm.splitlines()
+    main_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_main:")
+    main_section = "\n".join(asm_lines[main_idx:])
+    # Indirect call through eax, not a direct call to _helper.
+    assert "call    eax" in main_section
+    # The direct call shouldn't appear in main (it's only in main if we
+    # mistakenly emitted `call _helper`).
+    assert "call    _helper" not in main_section
+
+
+def test_call_through_dereferenced_pointer_same_as_direct_pointer():
+    # `(*fp)()` and `fp()` produce the same call sequence — leading `*` is
+    # idempotent on function-typed values.
+    asm_a = _compile(
+        "int helper(void) { return 5; } "
+        "int main(void) { int (*fp)(void) = helper; return fp(); }"
+    )
+    asm_b = _compile(
+        "int helper(void) { return 5; } "
+        "int main(void) { int (*fp)(void) = helper; return (*fp)(); }"
+    )
+    # Both should emit `call eax` in main; ignore the function definitions.
+    def main_body(asm: str) -> str:
+        lines = asm.splitlines()
+        main_idx = next(i for i, l in enumerate(lines) if l.strip() == "_main:")
+        return "\n".join(lines[main_idx:])
+    assert "call    eax" in main_body(asm_a)
+    assert "call    eax" in main_body(asm_b)
+
+
+def test_indirect_call_with_args_pushes_then_calls():
+    asm = _compile(
+        "int add(int a, int b) { return a + b; } "
+        "int main(void) { int (*fp)(int, int) = add; return fp(2, 3); }"
+    )
+    asm_lines = asm.splitlines()
+    main_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_main:")
+    main_section = "\n".join(asm_lines[main_idx:])
+    # Args pushed, then call eax, then stack cleanup.
+    assert "call    eax" in main_section
+    assert "add     esp, 8" in main_section
+
+
+def test_function_pointer_passed_as_argument():
+    # Pass a function pointer through cdecl, call it indirectly inside.
+    asm = _compile(
+        "int twice(int (*f)(int), int x) { return f(x) + f(x); } "
+        "int square(int x) { return x * x; } "
+        "int main(void) { return twice(square, 3); }"
+    )
+    asm_lines = asm.splitlines()
+    # `twice` calls through its parameter slot — indirect.
+    twice_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_twice:")
+    end_idx = next(
+        i for i, l in enumerate(asm_lines)
+        if i > twice_idx and l.strip() == "ret"
+    )
+    twice_section = "\n".join(asm_lines[twice_idx:end_idx])
+    assert "call    eax" in twice_section
+    # `main` passes square by name (loaded as immediate).
+    main_idx = next(i for i, l in enumerate(asm_lines) if l.strip() == "_main:")
+    main_section = "\n".join(asm_lines[main_idx:])
+    assert "mov     eax, _square" in main_section
 
 
 # ---- casts ----------------------------------------------------------------
