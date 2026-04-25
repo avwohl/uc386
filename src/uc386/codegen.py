@@ -356,6 +356,10 @@ class CodeGenerator:
         self._compound_globals: list[
             tuple[str, ast.TypeNode, ast.Expression]
         ] = []
+        # Set transiently during brace-elision so the recursive consumer
+        # can ask `_type_of` whether a value is itself a struct
+        # expression matching a struct member's type.
+        self._elision_ctx: _FuncCtx | None = None
         # Build the function-return-type and param-type tables from
         # every declaration in the unit (defined or extern). Calls to
         # unknown names default to int in `_type_of`; arg coercion in
@@ -749,51 +753,109 @@ class CodeGenerator:
         """Brace-elide a flat init-value run for a struct.
 
         Walks `values` and `members` in parallel. For each non-designated
-        value: if the member is compound (struct/array) with leaf_count
-        > 1, gather that many subsequent flat values into a synthetic
-        InitializerList. Designated values pass through untouched.
+        value: if the member is a compound (struct/array) and the value
+        isn't already wrapped, consume enough subsequent values to fill
+        the member, recursively descending into nested compounds. Brace
+        elision lets things like `struct U {u8 a; struct S s; u8 b; struct T t;}`
+        with init `{3, 5,6,7,8, 4, "huhu", 43}` work — the right values
+        flow into S's members and T's `s[16]; a` shape.
         """
-        out = []
-        cursor = 0
-        i = 0
-        n = len(members)
-        while i < len(values):
+        out, i = self._consume_for_members(values, 0, members)
+        # Tail values past the last member fall through verbatim so the
+        # downstream walker raises "too many initializers".
+        out.extend(values[i:])
+        return out
+
+    def _consume_for_members(
+        self, values: list, i: int, members: list,
+    ) -> tuple[list, int]:
+        """Consume values for a struct's members, returning (out, new_i).
+
+        `out` is a list of length len(members), one per member; each
+        entry is either a single value (scalar member) or a synthesized
+        InitializerList (compound member that ate multiple flat values).
+        Designators stop consumption — the caller passes them through.
+        """
+        out: list = []
+        for _, m_ty, _ in members:
+            if i >= len(values):
+                break
             v = values[i]
             if isinstance(v, ast.DesignatedInit):
+                # Pass the designated value through; caller resolves.
                 out.append(v)
                 i += 1
                 continue
-            if cursor >= n:
-                out.append(v)
-                i += 1
-                continue
-            _, m_ty, _ = members[cursor]
-            cursor += 1
-            if isinstance(v, ast.InitializerList):
-                out.append(v)
-                i += 1
-                continue
-            leaves = self._leaf_slot_count(m_ty)
-            if leaves <= 1:
-                out.append(v)
-                i += 1
-                continue
-            # Collect up to `leaves` flat values into a synthetic list.
-            group = []
-            j = i
-            while j < len(values) and j - i < leaves:
-                vj = values[j]
-                if isinstance(vj, (ast.DesignatedInit, ast.InitializerList)):
+            taken, i = self._consume_one_member(values, i, m_ty)
+            out.append(taken)
+        return out, i
+
+    def _consume_one_member(
+        self, values: list, i: int, m_ty: ast.TypeNode,
+    ) -> tuple:
+        """Take one logical value for a member of type `m_ty`, possibly
+        synthesizing an InitializerList by recursively eliding inside.
+        Returns (taken_value, new_i).
+        """
+        v = values[i]
+        # Already wrapped — pass through.
+        if isinstance(v, ast.InitializerList):
+            return v, i + 1
+        if isinstance(m_ty, ast.StructType):
+            # If `v` is itself a struct-valued expression matching this
+            # member type, pass it through — it's a struct copy, not a
+            # flat-value run to elide. We cheaply infer the type from
+            # the *current* function context if one is active.
+            ctx = self._elision_ctx
+            if ctx is not None:
+                try:
+                    v_ty = self._type_of(v, ctx)
+                except CodegenError:
+                    v_ty = None
+                if isinstance(v_ty, ast.StructType):
+                    try:
+                        if (
+                            self._resolve_struct_name(v_ty)
+                            == self._resolve_struct_name(m_ty)
+                        ):
+                            return v, i + 1
+                    except CodegenError:
+                        pass
+            try:
+                sname = self._resolve_struct_name(m_ty)
+                inner_members = self._structs.get(sname, [])
+            except CodegenError:
+                return v, i + 1
+            if not inner_members:
+                return v, i + 1
+            inner_vals, new_i = self._consume_for_members(
+                values, i, inner_members,
+            )
+            return ast.InitializerList(values=inner_vals), new_i
+        if isinstance(m_ty, ast.ArrayType):
+            # `char a[N] = "..."` — the string is one value satisfying
+            # the whole array.
+            if isinstance(v, ast.StringLiteral):
+                return v, i + 1
+            # Build a synthetic InitializerList by consuming one logical
+            # value per array element.
+            length = (
+                m_ty.size.value if isinstance(m_ty.size, ast.IntLiteral)
+                else 0
+            )
+            elem_ty = m_ty.base_type
+            inner_vals: list = []
+            for _ in range(length):
+                if i >= len(values):
                     break
-                group.append(vj)
-                j += 1
-            if len(group) == leaves:
-                out.append(ast.InitializerList(values=group))
-                i = j
-            else:
-                out.append(v)
-                i += 1
-        return out
+                vv = values[i]
+                if isinstance(vv, ast.DesignatedInit):
+                    break
+                taken, i = self._consume_one_member(values, i, elem_ty)
+                inner_vals.append(taken)
+            return ast.InitializerList(values=inner_vals), i
+        # Scalar: take one value.
+        return v, i + 1
 
     def _leaf_slot_count(self, t: ast.TypeNode) -> int:
         """Recursively count scalar leaves in `t`.
@@ -2546,6 +2608,15 @@ class CodeGenerator:
                     [f"        lea     eax, {_ebp_addr(disp)}"],
                     ctx,
                 )
+            # `struct T s = src;` where src is an l-value of struct type
+            # (e.g. `*pls`, `arr[i]`, `outer.inner`) — perform a struct
+            # copy from src to s rather than expecting `{...}`.
+            if not isinstance(decl.init, ast.InitializerList):
+                rhs_ty = self._type_of(decl.init, ctx)
+                if isinstance(rhs_ty, ast.StructType):
+                    return self._struct_copy_from_expr(
+                        decl.init, disp, var_type, ctx,
+                    )
             return self._struct_init(var_type, decl.init, disp, ctx, decl.name)
         if self._is_float_type(var_type):
             # Float locals get their init value via st0 + fstp.
@@ -2642,9 +2713,14 @@ class CodeGenerator:
         if isinstance(init, ast.InitializerList):
             # Brace-elide flat positional values into per-element
             # InitializerLists when the element is a compound type.
-            iter_values = self._elide_braces_for_array(
-                init.values, elem_type, name,
-            )
+            prev_ctx = self._elision_ctx
+            self._elision_ctx = ctx
+            try:
+                iter_values = self._elide_braces_for_array(
+                    init.values, elem_type, name,
+                )
+            finally:
+                self._elision_ctx = prev_ctx
             # Walk values in source order, allowing `[N] = expr` to jump
             # the cursor. After all source values, any unfilled slots
             # get zero-filled. This handles pure-positional, pure-
@@ -2723,7 +2799,12 @@ class CodeGenerator:
         members = self._structs[self._resolve_struct_name(struct_ty)]
         member_index = {m_name: i for i, (m_name, _, _) in enumerate(members)}
         # Brace-elide flat values for compound members.
-        elided_values = self._elide_braces_for_struct(init.values, members, name)
+        prev_ctx = self._elision_ctx
+        self._elision_ctx = ctx
+        try:
+            elided_values = self._elide_braces_for_struct(init.values, members, name)
+        finally:
+            self._elision_ctx = prev_ctx
         # Walk source values in order, tracking the implicit cursor. A
         # `.field = expr` sets the cursor to that member's index; the
         # next un-designated value continues from cursor + 1. After the
@@ -2788,6 +2869,9 @@ class CodeGenerator:
                     m_ty, actual, m_disp, ctx, f"{name}.{m_name_i}"
                 )
             else:
+                if self._size_of(m_ty) > 4:
+                    import sys as _s
+                    print(f"DBG struct_init big member {name}.{m_name_i} m_ty={m_ty!r} actual={type(actual).__name__}", file=_s.stderr)
                 out += self._eval_expr_to_eax(actual, ctx)
                 out += self._store_from_eax(_ebp_addr(m_disp), m_ty)
         # Zero-fill any unfilled members in declaration order.
@@ -4271,6 +4355,37 @@ class CodeGenerator:
             f"assignment target must be an identifier, `*ptr`, `arr[i]`, "
             f"or `s.m` (got {type(expr.left).__name__})"
         )
+
+    def _struct_copy_from_expr(
+        self,
+        src_expr: ast.Expression,
+        dest_disp: int,
+        target_ty: ast.StructType,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Copy a struct from `src_expr` into the local at `[ebp + dest_disp]`.
+
+        Used by `struct T s = lvalue_expr;` initializers when the rhs
+        isn't an InitializerList (e.g. `*pls`, `arr[i]`, `outer.inner`).
+        Bytes are copied per-dword with a byte tail.
+        """
+        size = self._size_of(target_ty)
+        out = self._struct_address(src_expr, ctx)              # eax = &src
+        out.append("        mov     edx, eax")                  # edx = &src
+        out.append(f"        lea     ecx, {_ebp_addr(dest_disp)}")
+        offset = 0
+        while size - offset >= 4:
+            out.append(f"        mov     eax, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], eax")
+            offset += 4
+        if size - offset >= 2:
+            out.append(f"        mov     ax, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], ax")
+            offset += 2
+        if size - offset >= 1:
+            out.append(f"        mov     al, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], al")
+        return out
 
     def _struct_copy_assign(
         self,
