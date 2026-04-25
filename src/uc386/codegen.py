@@ -4185,6 +4185,15 @@ class CodeGenerator:
         "<=": "setle",
         ">=": "setge",
     }
+    # Unsigned variants — used when either operand is unsigned-typed.
+    _CMP_SETCC_UNSIGNED = {
+        "==": "sete",
+        "!=": "setne",
+        "<":  "setb",
+        ">":  "seta",
+        "<=": "setbe",
+        ">=": "setae",
+    }
 
     # setCC mnemonic for float comparisons. We evaluate left then right,
     # so after both `fld`s ST(0) = right and ST(1) = left. `fucompp`
@@ -4253,11 +4262,24 @@ class CodeGenerator:
             out.append(f"        {self._SIMPLE_BINOPS[expr.op]}")
             return out
         if expr.op == "/":
+            lt = self._type_of(expr.left, ctx)
+            if self._is_unsigned(lt) or self._is_unsigned(self._type_of(expr.right, ctx)):
+                return out + [
+                    "        xor     edx, edx",
+                    "        div     ecx",
+                ]
             return out + [
                 "        cdq",
                 "        idiv    ecx",
             ]
         if expr.op == "%":
+            lt = self._type_of(expr.left, ctx)
+            if self._is_unsigned(lt) or self._is_unsigned(self._type_of(expr.right, ctx)):
+                return out + [
+                    "        xor     edx, edx",
+                    "        div     ecx",
+                    "        mov     eax, edx",
+                ]
             return out + [
                 "        cdq",
                 "        idiv    ecx",
@@ -4268,15 +4290,21 @@ class CodeGenerator:
                 "        shl     eax, cl",
             ]
         if expr.op == ">>":
-            # Signed int → arithmetic shift. Unsigned will branch here once
-            # type info is plumbed through codegen.
-            return out + [
-                "        sar     eax, cl",
-            ]
+            # Unsigned operand → logical shift; otherwise arithmetic.
+            lt = self._type_of(expr.left, ctx)
+            if self._is_unsigned(lt):
+                return out + ["        shr     eax, cl"]
+            return out + ["        sar     eax, cl"]
         if expr.op in self._CMP_SETCC:
+            lt = self._type_of(expr.left, ctx)
+            rt = self._type_of(expr.right, ctx)
+            unsigned = self._is_unsigned(lt) or self._is_unsigned(rt)
+            table = (
+                self._CMP_SETCC_UNSIGNED if unsigned else self._CMP_SETCC
+            )
             return out + [
                 "        cmp     eax, ecx",
-                f"        {self._CMP_SETCC[expr.op]}    al",
+                f"        {table[expr.op]}    al",
                 "        movzx   eax, al",
             ]
         raise CodegenError(f"binary `{expr.op}` not implemented yet")
