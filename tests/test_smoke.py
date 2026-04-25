@@ -433,6 +433,45 @@ def test_pointer_param_passed_as_int():
     assert "lea     eax, [ebp - 4]" in asm
 
 
+# ---- string literals + externs --------------------------------------------
+
+def test_string_literal_loads_data_label():
+    asm = _compile('int puts(const char *s); int main(void) { puts("hi"); return 0; }')
+    assert "mov     eax, _uc386_str0" in asm
+    assert "section .data" in asm
+    assert "_uc386_str0:" in asm
+    assert "db      'hi', 0" in asm
+
+
+def test_extern_emitted_for_undefined_function():
+    asm = _compile('int puts(const char *s); int main(void) { return puts("x"); }')
+    assert "extern  _puts" in asm
+
+
+def test_extern_not_emitted_when_function_is_defined_locally():
+    asm = _compile(
+        "int helper(void) { return 1; } "
+        "int main(void) { return helper(); }"
+    )
+    assert "extern" not in asm
+
+
+def test_string_literals_are_interned():
+    asm = _compile(
+        'int puts(const char *s); int main(void) { puts("hi"); puts("hi"); return 0; }'
+    )
+    # Same content → one label only.
+    assert asm.count("_uc386_str0:") == 1
+    assert "_uc386_str1" not in asm
+
+
+def test_string_literal_with_special_chars():
+    asm = _compile('int puts(const char *s); int main(void) { puts("a\\nb"); return 0; }')
+    # Newline (0x0A) should appear as a numeric byte segment between the
+    # printable runs, not be embedded in the quoted form.
+    assert "'a', 10, 'b', 0" in asm
+
+
 def test_end_to_end_driver(tmp_path):
     src = tmp_path / "hi.c"
     src.write_text("int main(void) { return 0; }\n")

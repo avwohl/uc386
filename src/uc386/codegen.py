@@ -27,6 +27,10 @@ Current scope:
 - Pointer locals/params (`int *p`), `&x` (Identifier only), `*expr`,
   and store-through-pointer assignment `*p = rhs`. Pointer arithmetic
   not implemented yet — needs type-info plumbing for size scaling.
+- String literals: interned per-translation-unit, emitted as
+  null-terminated bytes in `.data` with labels like `_uc386_strN`.
+- `extern` declarations (FunctionDecls without bodies) emit NASM
+  `extern _name` at the top so calls can be resolved by the linker.
 
 Anything else raises CodegenError.
 """
@@ -90,6 +94,9 @@ class CodeGenerator:
 
     def __init__(self, module_name: str = "main"):
         self.module_name = module_name
+        # Module-level state populated during generate(). Strings are
+        # interned by content so identical literals share a label.
+        self._strings: dict[str, str] = {}
 
     # ---- top level ------------------------------------------------------
 
@@ -101,23 +108,87 @@ class CodeGenerator:
         if not any(fn.name == "main" for fn in functions):
             raise CodegenError("uc386 requires a `main` function definition")
 
+        # Names declared but not defined in this unit become NASM externs.
+        # The parser represents bodyless function declarations as either a
+        # FunctionDecl with body=None or a VarDecl whose var_type is a
+        # FunctionType — handle both.
+        defined_names = {fn.name for fn in functions}
+        externs: set[str] = set()
+        for d in unit.declarations:
+            if isinstance(d, ast.FunctionDecl) and d.body is None:
+                externs.add(d.name)
+            elif isinstance(d, ast.VarDecl) and isinstance(d.var_type, ast.FunctionType):
+                externs.add(d.name)
+        externs -= defined_names
+        extern_list = sorted(externs)
+        # Strings are collected lazily as expressions get lowered; reset
+        # the table at the top of each generate() call so the codegen is
+        # safe to reuse.
+        self._strings = {}
+
         lines: list[str] = []
-        lines += self._header()
+        lines += self._header(extern_list)
         lines += self._start_stub()
+        function_blocks: list[list[str]] = []
         for fn in functions:
+            function_blocks.append(self._function(fn))
+        for block in function_blocks:
             lines.append("")
-            lines += self._function(fn)
+            lines += block
+        if self._strings:
+            lines.append("")
+            lines += self._data_section()
         return "\n".join(lines) + "\n"
 
-    def _header(self) -> list[str]:
-        return [
+    def _header(self, externs: list[str]) -> list[str]:
+        out = [
             f"; uc386 codegen output",
             f"; module: {self.module_name}",
             f"        bits 32",
+        ]
+        for name in externs:
+            out.append(f"        extern  _{name}")
+        out += [
             f"        section .text",
             f"        global _start",
             "",
         ]
+        return out
+
+    def _data_section(self) -> list[str]:
+        out = ["        section .data"]
+        # Stable order for reproducible output.
+        for value, label in sorted(self._strings.items(), key=lambda kv: kv[1]):
+            out.append(f"{label}:")
+            out.append(f"        db      {self._render_string(value)}, 0")
+        return out
+
+    @staticmethod
+    def _render_string(s: str) -> str:
+        # NASM `db` strings: ASCII chars in single-quoted segments, control
+        # bytes as numeric literals, segments comma-separated. Build a list
+        # of chunks and join.
+        chunks: list[str] = []
+        run: list[str] = []
+        for ch in s:
+            code = ord(ch)
+            if 0x20 <= code < 0x7F and ch not in ("'", "\\"):
+                run.append(ch)
+                continue
+            if run:
+                chunks.append("'" + "".join(run) + "'")
+                run = []
+            chunks.append(str(code))
+        if run:
+            chunks.append("'" + "".join(run) + "'")
+        return ", ".join(chunks) if chunks else "0"
+
+    def _intern_string(self, value: str) -> str:
+        if value in self._strings:
+            return self._strings[value]
+        label = f"_uc386_str{len(self._strings)}"
+        self._strings[value] = label
+        return label
 
     def _start_stub(self) -> list[str]:
         # _start: call user main, take its int return in EAX, exit DOS via
@@ -351,6 +422,9 @@ class CodeGenerator:
     def _eval_expr_to_eax(self, expr: ast.Expression, ctx: _FuncCtx) -> list[str]:
         if isinstance(expr, ast.IntLiteral):
             return [f"        mov     eax, {expr.value}"]
+        if isinstance(expr, ast.StringLiteral):
+            label = self._intern_string(expr.value)
+            return [f"        mov     eax, {label}"]
         if isinstance(expr, ast.Identifier):
             disp = ctx.lookup(expr.name)
             return [f"        mov     eax, {_ebp_addr(disp)}"]
