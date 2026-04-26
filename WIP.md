@@ -27,8 +27,8 @@ Latest tally — `python run_ctests.py --full` and
 `python run_gcc_torture.py --full`:
 
     c-testsuite     215 / 220   (97.7%)  — running for real
-    gcc-c-torture  1453 / 1514  (96.0%)  — running for real
-    Combined       1668 / 1734  (96.2%)
+    gcc-c-torture  1464 / 1514  (96.7%)  — running for real
+    Combined       1679 / 1734  (96.8%)
 
 The full run-mode pipeline is wired:
 uc386 → .asm → bundle libc.asm → nasm -f bin → unicorn-engine →

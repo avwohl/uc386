@@ -262,3 +262,21 @@ See `README.md` for the public roadmap (Phase 0–6).
   **Result: 1453/1514 gcc-c-torture** (up from 1445 in the same session). Combined with c-testsuite at 215/220, the pipeline now passes 1668 / 1734 (96.2%).
 
   **Remaining ~61 torture failures** cluster around heavyweight features that warrant their own slices: vector types via `__attribute__((vector_size))` (~16 tests), full _Complex arithmetic (`+`/`-`/`*`/`/`/`==` on _Complex values; ~8 tests), variable-length arrays (~4 tests), GCC nested functions with `__label__` cross-function gotos (~9 tests; needs trampolines), long-long bit-field `++`/`--`, _Decimal64, `__int128`, `typeof` in type contexts, anonymous struct/union members in initializers, GCC `cond ?: alt` shorthand, and a few preprocessor edge cases (e.g. `L'1'` inside a macro body).
+- **2026-04-26 — torture sweep more (1453 → 1464)**: full _Complex arithmetic and a few more wins.
+  - **`_Complex T` arithmetic (`+ - * /`).** Component-wise FPU code in `_complex_addsub_into_top`, `_complex_mul_into_top`, `_complex_div_into_top`. Each uses a stack scratch slot to materialize each operand before computing component-wise.
+  - **`_Complex T` unary (`+ - ~`).** `_complex_neg_into_top` flips both halves; `_complex_conj_into_top` flips only imag.
+  - **`(_Complex T) scalar` cast.** `_cast_to_complex_into_top` stores the scalar as the real part with imag = 0.
+  - **Complex equality (`== / !=`).** `_complex_compare` materializes both operands, compares each half on the FPU via `fucompp`, ANDs the two booleans (or NANDs for `!=`).
+  - **Complex global init.** `_emit_global_complex_init` lays out `_Complex T x = real + imag*i` as two IEEE-754 halves via a new `_const_eval_complex` that folds compile-time complex arithmetic.
+  - **Imaginary FloatLiteral as a complex value.** `1.0i` typed as `_Complex T`; `_collect_call_temps` reserves a per-literal temp; `_complex_value_address` writes (0, value) into it on demand.
+  - **Real-valued operands auto-promote to (val, 0)** in complex context so `1.0 + 14.0 * (1.0fi)` works with mixed scalar / imaginary operands.
+  - **`cond ?: alt` GCC ternary shorthand.** When `?` is immediately followed by `:`, the true branch is the cond itself.
+  - **`__extension__` before any expression.** `_parse_unary` skips noise at its start so `__extension__ 1i` parses.
+  - **Brace-elision for `struct{char w[N];} arr[K] = {"a","b",...}`.** The elider stops a partial group after a StringLiteral so each string maps to its own struct element rather than bundling into one.
+  - **Brace-elision for `struct a arr[] = {1,2,3,...,N}`** with N not a multiple of leaf count: trailing partial group is wrapped (zero-fills the unfilled members).
+  - **Complex temp-collection fallback** uses the structural complex-detector when the live `_type_of` fails (because the local-scope chain has been exited by the time the temp pass runs).
+  - **`_complex_value_address(Call)`** for a complex-returning call routes through the per-call temp slot via `_call_into_address`.
+
+  **Result: 1464/1514 gcc-c-torture** (up from 1453). Combined with c-testsuite at 215/220, the pipeline now passes 1679 / 1734 (96.8%).
+
+  **Remaining 50 torture failures** cluster around: vector types via `__attribute__((vector_size))` (~17 tests), VLA / typedef VLA (~4), nested functions referencing outer labels (~7), `_Complex int` / `_Complex long int` (1), `__int128` (1), `_Decimal64` (1), full `typeof` in type contexts (2), GCC range case labels (`case L ... U:`) (1), anonymous struct/union member init (1), header-comment parsing edges, and a couple of preprocessor edge cases.
