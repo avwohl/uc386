@@ -2899,17 +2899,19 @@ class CodeGenerator:
                     and (l_vec or r_vec)
                 ):
                     return True
-                # Scalar broadcast: vector op int.
-                def _is_scalar_int(t):
-                    return (
-                        isinstance(t, ast.BasicType)
-                        and t.name in (
-                            "int", "char", "short", "long",
-                        )
+                # Scalar broadcast: vector op scalar (int or float).
+                # Float-vector codegen isn't implemented yet; the path
+                # raises a clean CodegenError when the elem type is
+                # float, but we still need to allocate a temp so later
+                # routing doesn't KeyError.
+                def _is_scalar(t):
+                    return isinstance(t, ast.BasicType) and t.name in (
+                        "int", "char", "short", "long", "long long",
+                        "bool", "float", "double", "long double",
                     )
-                if l_vec and _is_scalar_int(rt):
+                if l_vec and _is_scalar(rt):
                     return True
-                if r_vec and _is_scalar_int(lt):
+                if r_vec and _is_scalar(lt):
                     return True
             if isinstance(node, ast.UnaryOp):
                 opt = self._type_of(node.operand, ctx)
@@ -9294,6 +9296,11 @@ class CodeGenerator:
                 isinstance(rt, ast.ArrayType)
                 and getattr(rt, "is_vector", False)
             )
+            # Float-vector path: per-element FPU operations.
+            if self._is_float_type(elem_ty):
+                return self._float_vector_binary(
+                    expr, vec_ty, elem_ty, elem_size, count, disp, ctx,
+                )
             # Scalar broadcast — vec op scalar / scalar op vec.
             if l_vec and not r_vec:
                 # eval scalar to ECX once (push), then loop over vec.
@@ -9379,6 +9386,29 @@ class CodeGenerator:
             return out
         # UnaryOp.
         if isinstance(expr, ast.UnaryOp):
+            # Float-vector unary: per-element FPU.
+            if self._is_float_type(elem_ty):
+                if expr.op not in ("-", "+"):
+                    raise CodegenError(
+                        f"float vector unary `{expr.op}` not supported"
+                    )
+                width = "dword" if elem_size == 4 else "qword"
+                out += self._vector_value_address(expr.operand, ctx)
+                out.append("        push    eax")
+                for i in range(count):
+                    offset = i * elem_size
+                    out.append("        mov     edx, [esp]")
+                    if offset:
+                        out.append(f"        fld     {width} [edx + {offset}]")
+                    else:
+                        out.append(f"        fld     {width} [edx]")
+                    if expr.op == "-":
+                        out.append("        fchs")
+                    addr = _ebp_addr(disp + offset)
+                    out.append(f"        fstp    {width} {addr}")
+                out.append("        add     esp, 4")
+                out.append(f"        lea     eax, {_ebp_addr(disp)}")
+                return out
             out += self._vector_value_address(expr.operand, ctx)
             out.append("        push    eax")              # [esp] = &operand
             for i in range(count):
@@ -9388,10 +9418,6 @@ class CodeGenerator:
                     f"[edx + {offset}]" if offset else "[edx]",
                     elem_ty,
                 )
-                if self._is_float_type(elem_ty):
-                    raise CodegenError(
-                        "float vectors not yet supported"
-                    )
                 out += self._vector_int_unop(expr.op, elem_ty)
                 addr = _ebp_addr(disp + offset)
                 out += self._store_from_eax(addr, elem_ty)
@@ -9401,6 +9427,122 @@ class CodeGenerator:
         raise CodegenError(
             f"vector eval: unexpected node {type(expr).__name__}"
         )
+
+    def _float_vector_binary(
+        self,
+        expr: ast.BinaryOp,
+        vec_ty: ast.ArrayType,
+        elem_ty: ast.TypeNode,
+        elem_size: int,
+        count: int,
+        disp: int,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Float-vector arithmetic: per-element FPU ops `+ - * /`.
+
+        Both operands' addresses are computed and pushed onto the
+        stack; the loop loads elements via `fld`, applies the op
+        via `faddp`/`fsubp`/`fmulp`/`fdivp`, then `fstp`s into the
+        temp's element slot. Scalar broadcast (vec op float, float
+        op vec) loads the scalar to st(0) once before the loop and
+        leaves it pinned (load fresh per element since faddp pops).
+        """
+        op = expr.op
+        op_map = {"+": "faddp", "-": "fsubp", "*": "fmulp", "/": "fdivp"}
+        if op not in op_map:
+            raise CodegenError(
+                f"float vector op `{op}` not supported"
+            )
+        fop = op_map[op]
+        width = "dword" if elem_size == 4 else "qword"
+        lt = self._type_of(expr.left, ctx)
+        rt = self._type_of(expr.right, ctx)
+        l_vec = (
+            isinstance(lt, ast.ArrayType)
+            and getattr(lt, "is_vector", False)
+        )
+        r_vec = (
+            isinstance(rt, ast.ArrayType)
+            and getattr(rt, "is_vector", False)
+        )
+        out: list[str] = []
+        if l_vec and not r_vec:
+            # vec op float-scalar — store the scalar at a stack slot
+            # for repeated load.
+            out += self._eval_float_to_st0(expr.right, ctx)
+            scalar_size = self._size_of(rt) if isinstance(rt, ast.BasicType) else 8
+            scalar_w = "dword" if scalar_size == 4 else "qword"
+            out.append(f"        sub     esp, {scalar_size}")
+            out.append(f"        fstp    {scalar_w} [esp]")
+            out += self._vector_value_address(expr.left, ctx)
+            out.append("        push    eax")          # [esp] = &vec
+            for i in range(count):
+                offset = i * elem_size
+                # Load vec[i] (st0), then load scalar (st1).
+                out.append("        mov     edx, [esp]")
+                if offset:
+                    out.append(f"        fld     {width} [edx + {offset}]")
+                else:
+                    out.append(f"        fld     {width} [edx]")
+                out.append(f"        fld     {scalar_w} [esp + 4]")
+                out.append(f"        {fop}   st1, st0")
+                addr = _ebp_addr(disp + offset)
+                out.append(f"        fstp    {width} {addr}")
+            out.append(f"        add     esp, {4 + scalar_size}")
+            out.append(f"        lea     eax, {_ebp_addr(disp)}")
+            return out
+        if r_vec and not l_vec:
+            # float-scalar op vec.
+            out += self._eval_float_to_st0(expr.left, ctx)
+            scalar_size = self._size_of(lt) if isinstance(lt, ast.BasicType) else 8
+            scalar_w = "dword" if scalar_size == 4 else "qword"
+            out.append(f"        sub     esp, {scalar_size}")
+            out.append(f"        fstp    {scalar_w} [esp]")
+            out += self._vector_value_address(expr.right, ctx)
+            out.append("        push    eax")
+            for i in range(count):
+                offset = i * elem_size
+                # st0 = scalar; st1 = vec[i] — but op order matters.
+                # Load scalar first (becomes st1 after vec[i] load).
+                out.append(f"        fld     {scalar_w} [esp + 4]")
+                out.append("        mov     edx, [esp]")
+                if offset:
+                    out.append(f"        fld     {width} [edx + {offset}]")
+                else:
+                    out.append(f"        fld     {width} [edx]")
+                # st0 = vec[i], st1 = scalar; we want scalar op vec[i]
+                # i.e. st1 OP st0 → result in st1, pop. fop's two-
+                # arg form already does st1 = st1 OP st0, then pop.
+                out.append("        fxch    st1")  # now st0=scalar, st1=vec[i]
+                out.append(f"        {fop}   st1, st0")
+                addr = _ebp_addr(disp + offset)
+                out.append(f"        fstp    {width} {addr}")
+            out.append(f"        add     esp, {4 + scalar_size}")
+            out.append(f"        lea     eax, {_ebp_addr(disp)}")
+            return out
+        # Both vectors: per-element FPU.
+        out += self._vector_value_address(expr.right, ctx)
+        out.append("        push    eax")
+        out += self._vector_value_address(expr.left, ctx)
+        out.append("        push    eax")
+        for i in range(count):
+            offset = i * elem_size
+            out.append("        mov     edx, [esp]")
+            if offset:
+                out.append(f"        fld     {width} [edx + {offset}]")
+            else:
+                out.append(f"        fld     {width} [edx]")
+            out.append("        mov     edx, [esp + 4]")
+            if offset:
+                out.append(f"        fld     {width} [edx + {offset}]")
+            else:
+                out.append(f"        fld     {width} [edx]")
+            out.append(f"        {fop}   st1, st0")
+            addr = _ebp_addr(disp + offset)
+            out.append(f"        fstp    {width} {addr}")
+        out.append("        add     esp, 8")
+        out.append(f"        lea     eax, {_ebp_addr(disp)}")
+        return out
 
     def _vector_int_binop(
         self, op: str, elem_ty: ast.TypeNode
@@ -9495,8 +9637,24 @@ class CodeGenerator:
         if isinstance(expr.left, ast.Identifier):
             ty = self._identifier_type(expr.left.name, ctx)
             if isinstance(ty, ast.ArrayType):
-                raise CodegenError(
-                    f"cannot assign to array `{expr.left.name}`"
+                # Vector compound assign `v op= rhs` desugars to
+                # `v = v op rhs`. We need to allocate a temp for
+                # the synthesized BinaryOp via `_collect_call_temps`,
+                # but at this point that's already run. Workaround:
+                # synthesize the BinaryOp and pre-allocate its temp
+                # here.
+                if not getattr(ty, "is_vector", False):
+                    raise CodegenError(
+                        f"cannot assign to array `{expr.left.name}`"
+                    )
+                inner = ast.BinaryOp(
+                    op=op, left=expr.left, right=expr.right,
+                )
+                size = (self._size_of(ty) + 3) & ~3
+                ctx.alloc_call_temp(inner, size)
+                return self._assign(
+                    ast.BinaryOp(op="=", left=expr.left, right=inner),
+                    ctx,
                 )
             inner = ast.BinaryOp(op=op, left=expr.left, right=expr.right)
             return self._assign(
