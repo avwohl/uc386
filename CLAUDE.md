@@ -356,3 +356,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Vector compound assign `v op= rhs`** for Identifier lvalues: synthesize `v op rhs` BinaryOp and pre-allocate its temp slot at compound-assign time (the regular call-temp pre-pass had already run).
 
   **Result: 1409/1514 gcc-c-torture** (up from 1386, +23 tests). Smoke 310/310. Combined with c-testsuite (215/220), the pipeline now passes 1624/1734 (93.7%). simd-1 through simd-6 all pass (5/5 simd tests); scal-to-vec1, -2, -3 all pass (after fixing the scalar-OP-vec FPU op direction — turned out the fxch+fop dance was producing the wrong sign on subtraction; the correct sequence is just `fld scalar; fld vec[i]; fop st1, st0` which computes `scalar OP vec[i]` directly without any swap).
+- **2026-04-26 — libc gap-filling (1409 → 1415)**: small additional wins from missing libc functions and a hardcoded-zero stub.
+  - **`memchr(s, c, n)`** — byte-by-byte scan returning a pointer or NULL. Closes memchr-1.c.
+  - **`__builtin_copysign[f|l]`** — clear x's sign bit on the high half, OR in y's sign bit. Closes pr44683.c.
+  - **`__builtin_frame_address(0)`** was hardcoded to `xor eax, eax; ret`. Now sets up its own ebp and returns `[ebp]` (the caller's saved EBP). Only level 0 is supported. Closes frame-address.c.
+  - **`__builtin_clrsbll(long long)`** — count leading redundant sign bits on a 64-bit value, minus the sign bit itself. Required to satisfy the linker for builtin-bitops-1.c (test still fails at runtime on other bitops).
+  - **Float globals: `inf` / `nan` as IEEE-754 bit-pattern hex.** Python's `repr(float('inf'))` produces `'inf'` which NASM rejects. Now we emit the IEEE-754 bit pattern (`dd 0x7F800000` etc.) for inf/nan in float-typed globals.
+
+  **Result: 1415/1514 gcc-c-torture** (up from 1409, +6 tests). Combined with c-testsuite still 215/220, the pipeline now passes 1630/1734 (94.0%).
