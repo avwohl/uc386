@@ -152,3 +152,8 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **uc_core: `_optimize_binary` is_long/is_long_long uses `tc.uint_max` / `tc.ulong_max`, not hardcoded 0xFFFFFFFF.** Previously `is_long = ... or mask >= 0xFFFFFFFF` — on uc80 (16-bit int) this signals "doesn't fit in int", but on uc386 where int and long are both 32-bit, mask=0xFFFFFFFF is just "fits in unsigned int" and doesn't imply long. The wrong is_long bit then leaked through `_literal_mask` (which returns long_long_mask when is_long is True and value > long_max), pushing nested folds (`(2147483647*2U) + 1U`) into long-long. Comparing against the actual type_config widths fixes it.
 
   **Result: 1214/1514 gcc-c-torture**. Combined with c-testsuite, 1429 / 1734 (82.4%).
+- **2026-04-25 — torture cluster: va_arg / va_start lvalue forms (1214 → 1218)**:
+  - **`va_arg(*pap, T)`** and **`va_arg(arr[i], T)`** / **`va_arg(s.m, T)`**. New `_va_arg_read_and_advance` helper computes `&ap` for any lvalue form (Identifier / `*p` / Index / Member), loads the va_list pointer into ECX, and bumps the storage at `[ebx]`. The Identifier path keeps the same fast `[ebp - N]` operand. All three va_arg variants (int, float, struct, long-long) and va_arg-via-Cast paths route through it.
+  - **`va_start(arr[i], last)`**, `va_start(s.m, ...)`, `va_start(*pap, ...)`. Computes the destination's address and stores the variadic-args pointer at `[address]`. Generalizes from the previous Identifier-only path.
+
+  **Result: 1218/1514 gcc-c-torture** (up from 1214).

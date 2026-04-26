@@ -3481,29 +3481,39 @@ class CodeGenerator:
         last_disp = ctx.lookup(last_name)
         last_padded = (self._size_of(ctx.lookup_type(last_name)) + 3) & ~3
         after_disp = last_disp + last_padded
-        out = [f"        lea     eax, {_ebp_addr(after_disp)}"]
-        if not isinstance(ap_expr, ast.Identifier):
+        # Compute the destination's address (where ap lives) into ECX,
+        # then store the variadic-args pointer at [ecx]. Supports any
+        # lvalue form (Identifier / Index / Member / *p).
+        if isinstance(ap_expr, ast.Identifier):
+            out = [f"        lea     eax, {_ebp_addr(after_disp)}"]
+            out += self._identifier_store(ap_expr.name, ctx)
+            return out
+        if isinstance(ap_expr, ast.Index):
+            addr_lines = self._index_address(ap_expr, ctx)
+        elif isinstance(ap_expr, ast.Member):
+            addr_lines = self._member_address(ap_expr, ctx)
+        elif isinstance(ap_expr, ast.UnaryOp) and ap_expr.op == "*":
+            addr_lines = self._eval_expr_to_eax(ap_expr.operand, ctx)
+        else:
             raise CodegenError(
-                "va_start: first argument must be an identifier"
+                "va_start: first argument must be an lvalue "
+                f"(got {type(ap_expr).__name__})"
             )
-        out += self._identifier_store(ap_expr.name, ctx)
+        out = list(addr_lines)
+        out.append("        mov     ecx, eax")
+        out.append(f"        lea     eax, {_ebp_addr(after_disp)}")
+        out.append("        mov     [ecx], eax")
         return out
 
     def _va_arg_int(self, expr: ast.VaArgExpr, ctx: _FuncCtx) -> list[str]:
         """Lower `va_arg(ap, T)` where T is integer/pointer-typed.
 
-        Saves the current `ap` into ECX, advances `ap` by the argument's
-        slot size (rounded up to 4), then loads through ECX into EAX
-        with the target type's natural width.
+        Reads ap into ECX, advances ap by `(sizeof T + 3) & ~3`, then
+        loads through ECX with the target's width.
         """
-        ap_addr = self._va_arg_ap_addr(expr, ctx)
         target_ty = expr.target_type
-        target_size = self._size_of(target_ty)
-        advance = (target_size + 3) & ~3
-        out = [
-            f"        mov     ecx, {ap_addr}",
-            f"        add     dword {ap_addr}, {advance}",
-        ]
+        advance = (self._size_of(target_ty) + 3) & ~3
+        out = self._va_arg_read_and_advance(expr, advance, ctx)
         out += self._load_to_eax("[ecx]", target_ty)
         return out
 
@@ -3513,19 +3523,13 @@ class CodeGenerator:
         dest_addr_lines: list[str],
         ctx: _FuncCtx,
     ) -> list[str]:
-        """Copy the next variadic struct argument into `*dest`.
-
-        `dest_addr_lines` must leave the destination address in EAX.
-        We compute &source = current ap, advance ap by the struct's
-        padded size, then per-dword copy from source to dest.
-        """
-        ap_addr = self._va_arg_ap_addr(expr, ctx)
+        """Copy the next variadic struct argument into `*dest`."""
         target_size = self._size_of(expr.target_type)
         advance = (target_size + 3) & ~3
         out = list(dest_addr_lines)
         out.append("        mov     edx, eax")            # edx = dest
-        out.append(f"        mov     ecx, {ap_addr}")     # ecx = &src
-        out.append(f"        add     dword {ap_addr}, {advance}")
+        # Now compute the va_list pointer into ECX (preserving EDX).
+        out += self._va_arg_read_and_advance(expr, advance, ctx)
         # Copy in dword-sized chunks, then byte-tail.
         offset = 0
         while offset + 4 <= target_size:
@@ -3541,32 +3545,46 @@ class CodeGenerator:
 
     def _va_arg_float(self, expr: ast.VaArgExpr, ctx: _FuncCtx) -> list[str]:
         """Lower `va_arg(ap, T)` for `float`/`double` — leaves the
-        value on st(0). Note: in cdecl, float args are promoted to
-        double when passed through `...`, so `va_arg(ap, float)` is
-        usually a programmer error; we still handle it by reading 4
-        bytes if the user explicitly asks."""
-        ap_addr = self._va_arg_ap_addr(expr, ctx)
+        value on st(0)."""
         target_ty = expr.target_type
         target_size = self._size_of(target_ty)
         advance = (target_size + 3) & ~3
         width = "dword" if target_size == 4 else "qword"
-        return [
-            f"        mov     ecx, {ap_addr}",
-            f"        add     dword {ap_addr}, {advance}",
-            f"        fld     {width} [ecx]",
-        ]
+        out = self._va_arg_read_and_advance(expr, advance, ctx)
+        out.append(f"        fld     {width} [ecx]")
+        return out
 
-    def _va_arg_ap_addr(self, expr: ast.VaArgExpr, ctx: _FuncCtx) -> str:
-        """Resolve `expr.ap` to a memory operand (e.g. `[ebp - 4]`).
-
-        We need an addressable form (not just a value) because va_arg
-        must mutate the slot to advance past the argument.
+    def _va_arg_read_and_advance(
+        self, expr: ast.VaArgExpr, advance: int, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Emit code that puts the current va_list pointer into ECX
+        and advances the underlying ap slot by `advance`. Supports any
+        lvalue form for the ap operand (Identifier / `*p` / arr[i] /
+        struct.member / arr[i].member chains).
         """
-        if not isinstance(expr.ap, ast.Identifier):
+        if isinstance(expr.ap, ast.Identifier):
+            ap_addr = self._identifier_addr_text(expr.ap.name, ctx)
+            return [
+                f"        mov     ecx, {ap_addr}",
+                f"        add     dword {ap_addr}, {advance}",
+            ]
+        # General lvalue path: compute &ap into EBX, then load+advance.
+        if isinstance(expr.ap, ast.UnaryOp) and expr.ap.op == "*":
+            addr_lines = self._eval_expr_to_eax(expr.ap.operand, ctx)
+        elif isinstance(expr.ap, ast.Index):
+            addr_lines = self._index_address(expr.ap, ctx)
+        elif isinstance(expr.ap, ast.Member):
+            addr_lines = self._member_address(expr.ap, ctx)
+        else:
             raise CodegenError(
-                "va_arg: ap must be an identifier (lvalue)"
+                "va_arg: ap must be an lvalue "
+                f"(got {type(expr.ap).__name__})"
             )
-        return self._identifier_addr_text(expr.ap.name, ctx)
+        out = list(addr_lines)
+        out.append("        mov     ebx, eax")
+        out.append("        mov     ecx, [ebx]")
+        out.append(f"        add     dword [ebx], {advance}")
+        return out
 
     def _stripped_callee(self, call: ast.Call) -> ast.Expression:
         """Strip leading `*`s on a Call's callee (function-typed `*` is idempotent)."""
@@ -4204,13 +4222,10 @@ class CodeGenerator:
         if isinstance(expr, ast.VaArgExpr):
             target_ty = expr.target_type
             if self._is_long_long(target_ty):
-                ap_addr = self._va_arg_ap_addr(expr, ctx)
-                return [
-                    f"        mov     ecx, {ap_addr}",
-                    f"        add     dword {ap_addr}, 8",
-                    "        mov     eax, [ecx]",
-                    "        mov     edx, [ecx + 4]",
-                ]
+                out = self._va_arg_read_and_advance(expr, 8, ctx)
+                out.append("        mov     eax, [ecx]")
+                out.append("        mov     edx, [ecx + 4]")
+                return out
         # Fallback: eval as 32-bit, sign-extend.
         out = self._eval_expr_to_eax(expr, ctx)
         try:
