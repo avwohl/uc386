@@ -164,3 +164,8 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Compound + va_arg `*pap`/`arr[i]`/`s.m` ap forms had already landed earlier in the sweep; collected into the same totals.**
 
   **Result: 1229/1514 gcc-c-torture** (up from 1218). Combined with c-testsuite still 215/220, the run-mode pipeline now passes 1444 / 1734 (83.3%).
+- **2026-04-25 — torture cluster: __builtin_choose_expr / constant_p (1229 → 1230)**:
+  - **`__builtin_choose_expr(cond, a, b)` — compile-time pick.** Recognized in `_call` and routes to whichever branch matches the constant-folded condition (eval'd via `_const_eval`). The result type follows the chosen branch, so the lowering is just `_eval_expr_to_eax(chosen)`.
+  - **`__builtin_constant_p(x)` — answers via `_const_eval`.** If the operand reduces to an integer constant, returns 1; otherwise 0. Both paths are also wired into `_const_eval` so they work in global initializers (e.g. `int z = __builtin_choose_expr(!__builtin_constant_p(y), 3, 4);`).
+
+  **Result: 1230/1514 gcc-c-torture**.

@@ -1165,6 +1165,26 @@ class CodeGenerator:
             return expr.value
         if isinstance(expr, ast.CharLiteral):
             return expr.value
+        if (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Identifier)
+        ):
+            if (
+                expr.func.name == "__builtin_choose_expr"
+                and len(expr.args) == 3
+            ):
+                cond_val = self._const_eval(expr.args[0], name)
+                chosen = expr.args[1] if cond_val else expr.args[2]
+                return self._const_eval(chosen, name)
+            if (
+                expr.func.name == "__builtin_constant_p"
+                and len(expr.args) == 1
+            ):
+                try:
+                    self._const_eval(expr.args[0], name)
+                    return 1
+                except CodegenError:
+                    return 0
         if isinstance(expr, ast.SizeofType):
             return self._size_of(expr.target_type)
         if isinstance(expr, ast.SizeofExpr):
@@ -5003,6 +5023,30 @@ class CodeGenerator:
             # the first argument's value.
             if callee.name == "__builtin_expect" and len(expr.args) >= 1:
                 return self._eval_expr_to_eax(expr.args[0], ctx)
+            # `__builtin_choose_expr(cond, a, b)` selects a or b at
+            # compile time based on `cond`'s integer-constant value.
+            if (
+                callee.name == "__builtin_choose_expr"
+                and len(expr.args) == 3
+            ):
+                try:
+                    cond_val = self._const_eval(expr.args[0], "<choose>")
+                except CodegenError:
+                    cond_val = 0
+                chosen = expr.args[1] if cond_val else expr.args[2]
+                return self._eval_expr_to_eax(chosen, ctx)
+            # `__builtin_constant_p(x)` returns 1 if x is a compile-time
+            # constant integer expression, 0 otherwise. We can answer
+            # "yes" only when `_const_eval` succeeds without side effects.
+            if (
+                callee.name == "__builtin_constant_p"
+                and len(expr.args) == 1
+            ):
+                try:
+                    self._const_eval(expr.args[0], "<bcp>")
+                    return ["        mov     eax, 1"]
+                except CodegenError:
+                    return ["        xor     eax, eax"]
             # `__builtin_unreachable()` and `__builtin_trap()` are
             # diagnostic-only — emit a 0 in EAX so calls to them in
             # value position are at least defined.
