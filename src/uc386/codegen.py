@@ -8122,9 +8122,9 @@ class CodeGenerator:
         # call's value is defined when the user accidentally consumes
         # it. `va_arg` is handled at expression eval (see VaArgExpr).
         if isinstance(callee, ast.Identifier):
-            if callee.name == "va_start":
+            if callee.name in ("va_start", "__builtin_va_start"):
                 return self._va_start(expr.args, ctx)
-            if callee.name == "va_end":
+            if callee.name in ("va_end", "__builtin_va_end"):
                 return ["        xor     eax, eax"]
             # GCC branch-prediction hint: `__builtin_expect(expr, val)`
             # has the value of `expr`. We ignore the hint and just emit
