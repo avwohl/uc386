@@ -157,3 +157,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`va_start(arr[i], last)`**, `va_start(s.m, ...)`, `va_start(*pap, ...)`. Computes the destination's address and stores the variadic-args pointer at `[address]`. Generalizes from the previous Identifier-only path.
 
   **Result: 1218/1514 gcc-c-torture** (up from 1214).
+- **2026-04-25 — torture cluster: param attributes + string-init arithmetic (1218 → 1229)**:
+  - **uc_core: trailing `__attribute__` on parameter declarators.** `int x __attribute__((unused))` parses (skips noise after the declarator).
+  - **`StringLiteral + IntLiteral` as a global pointer init.** `static const char *p = "foo" + 1;` now emits `dd <strlabel> + 1` (or `- N` for negative offsets). Recognized in `_emit_global_init` for PointerType destinations.
+  - **`.data` section emit order: globals first, then strings.** A static-local global initialized from a string literal addr-arithmetic (`"foo" + 1`) interns a new string DURING the global emit; previously the strings were dumped first, so the new label was missing. Reordering — globals, compound globals, then strings, then float constants — fixes it.
+  - **Compound + va_arg `*pap`/`arr[i]`/`s.m` ap forms had already landed earlier in the sweep; collected into the same totals.**
+
+  **Result: 1229/1514 gcc-c-torture** (up from 1218). Combined with c-testsuite still 215/220, the run-mode pipeline now passes 1444 / 1734 (83.3%).

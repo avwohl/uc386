@@ -495,19 +495,9 @@ class CodeGenerator:
         ):
             return []
         out = ["        section .data"]
-        # Stable order for reproducible output.
-        for value, label in sorted(self._strings.items(), key=lambda kv: kv[1]):
-            out.append(f"{label}:")
-            out.append(f"        db      {self._render_string(value)}, 0")
-        for (value, size), label in sorted(
-            self._float_constants.items(), key=lambda kv: kv[1]
-        ):
-            # NASM accepts decimal float literals in `dd` (32-bit
-            # single) and `dq` (64-bit double); it converts to the
-            # appropriate IEEE-754 bit pattern at assemble time.
-            directive = "dd" if size == 4 else "dq"
-            out.append(f"{label}:")
-            out.append(f"        {directive}      {value!r}")
+        # Globals first — they may intern new strings (e.g. for a
+        # `static const char *p = "foo" + 1` init) which we still want
+        # to emit afterward.
         for name in initialized_globals:
             ty = self._globals[name]
             init = self._global_inits[name]
@@ -524,6 +514,20 @@ class CodeGenerator:
             out.append(f"{label}:")
             out += self._emit_global_init(target_type, init, label)
             emitted += 1
+        # Strings come last so any string interned during the global
+        # init walk above is included.
+        for value, label in sorted(self._strings.items(), key=lambda kv: kv[1]):
+            out.append(f"{label}:")
+            out.append(f"        db      {self._render_string(value)}, 0")
+        for (value, size), label in sorted(
+            self._float_constants.items(), key=lambda kv: kv[1]
+        ):
+            # NASM accepts decimal float literals in `dd` (32-bit
+            # single) and `dq` (64-bit double); it converts to the
+            # appropriate IEEE-754 bit pattern at assemble time.
+            directive = "dd" if size == 4 else "dq"
+            out.append(f"{label}:")
+            out.append(f"        {directive}      {value!r}")
         return out
 
     def _intern_float(self, value: float, size: int) -> str:
@@ -646,6 +650,21 @@ class CodeGenerator:
             if isinstance(init, ast.StringLiteral):
                 label = self._intern_string(init.value)
                 return [f"        dd      {label}"]
+            # `"foo" + 1` — string literal address arithmetic. Emit the
+            # interned string's label plus the integer offset.
+            if (
+                isinstance(init, ast.BinaryOp)
+                and init.op in ("+", "-")
+                and isinstance(init.left, ast.StringLiteral)
+            ):
+                label = self._intern_string(init.left.value)
+                offset = self._const_eval(init.right, name)
+                if init.op == "-":
+                    offset = -offset
+                if offset == 0:
+                    return [f"        dd      {label}"]
+                sign = "+" if offset > 0 else "-"
+                return [f"        dd      {label} {sign} {abs(offset)}"]
             value = self._const_eval(init, name)
             return [f"        dd      {value}"]
         if isinstance(ty, ast.ArrayType):
