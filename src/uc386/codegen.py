@@ -113,6 +113,9 @@ class CodegenError(NotImplementedError):
     """Raised when the AST contains a construct codegen can't handle yet."""
 
 
+_EXTERN_REDIRECT = -0x70000000  # sentinel disp meaning "look up in globals"
+
+
 def _ebp_addr(disp: int) -> str:
     """Render an EBP-relative address. Locals have negative disp, params positive."""
     if disp < 0:
@@ -1398,6 +1401,16 @@ class CodeGenerator:
                 return
             var_type = self._resolved_var_type(node)
             self._check_supported_type(var_type, node.name)
+            # `extern int x;` inside a function: no slot — references
+            # the global symbol of the same name. We just register the
+            # type in `_extern_vars` so any later identifier reference
+            # resolves; the actual scope-shadowing happens at emit time
+            # via `_var_init` (which sees the AST node and binds an
+            # EXTERN_REDIRECT marker in the current scope).
+            if node.storage_class == "extern":
+                if node.name not in self._globals and node.name not in self._extern_vars:
+                    self._extern_vars[node.name] = var_type
+                return
             # `static int x = ...;` inside a function: don't reserve a
             # frame slot. Instead register the variable as a global with
             # a function-mangled label so the value persists across
@@ -2184,6 +2197,13 @@ class CodeGenerator:
         # through the remapping table so callers don't need to know.
         name = ctx.local_static_labels.get(name, name)
         if ctx.has_local(name):
+            disp = ctx.lookup(name)
+            if disp == _EXTERN_REDIRECT:
+                # `extern int v;` inside a block — look up the global.
+                if name in self._globals:
+                    return self._globals[name]
+                if name in self._extern_vars:
+                    return self._extern_vars[name]
             return ctx.lookup_type(name)
         if name in self._globals:
             return self._globals[name]
@@ -2200,6 +2220,11 @@ class CodeGenerator:
             return ast.BasicType(name="int")
         raise CodegenError(f"unknown identifier `{name}`")
 
+    def _is_extern_redirect(self, name: str, ctx: _FuncCtx) -> bool:
+        if not ctx.has_local(name):
+            return False
+        return ctx.lookup(name) == _EXTERN_REDIRECT
+
     def _identifier_addr_text(self, name: str, ctx: _FuncCtx) -> str:
         """Return the `[...]` operand text used for in-place memory ops.
 
@@ -2208,7 +2233,7 @@ class CodeGenerator:
         `_load_to_eax` / `_store_from_eax` would be overkill.
         """
         name = ctx.local_static_labels.get(name, name)
-        if ctx.has_local(name):
+        if ctx.has_local(name) and not self._is_extern_redirect(name, ctx):
             return _ebp_addr(ctx.lookup(name))
         if name in self._globals or name in self._extern_vars:
             return f"[_{name}]"
@@ -2217,7 +2242,7 @@ class CodeGenerator:
     def _identifier_load(self, name: str, ctx: _FuncCtx) -> list[str]:
         """Lines that produce the value (or, for arrays/functions, the address) of `name` in eax."""
         name = ctx.local_static_labels.get(name, name)
-        if ctx.has_local(name):
+        if ctx.has_local(name) and not self._is_extern_redirect(name, ctx):
             ty = ctx.lookup_type(name)
             disp = ctx.lookup(name)
             if isinstance(ty, ast.ArrayType):
@@ -2243,7 +2268,7 @@ class CodeGenerator:
     def _identifier_address(self, name: str, ctx: _FuncCtx) -> list[str]:
         """Lines that compute &name into eax — for `&id` and as the base for indexing."""
         name = ctx.local_static_labels.get(name, name)
-        if ctx.has_local(name):
+        if ctx.has_local(name) and not self._is_extern_redirect(name, ctx):
             return [f"        lea     eax, {_ebp_addr(ctx.lookup(name))}"]
         if name in self._globals or name in self._extern_vars:
             return [f"        mov     eax, _{name}"]
@@ -2256,7 +2281,7 @@ class CodeGenerator:
         """Lines that store eax to the slot for `name`, with width per type."""
         name = ctx.local_static_labels.get(name, name)
         ty = self._identifier_type(name, ctx)
-        if ctx.has_local(name):
+        if ctx.has_local(name) and not self._is_extern_redirect(name, ctx):
             return self._store_from_eax(_ebp_addr(ctx.lookup(name)), ty)
         return self._store_from_eax(f"[_{name}]", ty)
 
@@ -2674,6 +2699,13 @@ class CodeGenerator:
         # `_collect_locals`; their initializer fires once at program
         # load via the `.data` emission, not on every call.
         if decl.storage_class == "static":
+            return []
+        # `extern int v;` inside a block: bind a sentinel in the
+        # current scope so identifier reads route through the global
+        # symbol instead of any outer local of the same name.
+        if decl.storage_class == "extern":
+            ctx.slots[-1][decl.name] = _EXTERN_REDIRECT
+            ctx.types[-1][decl.name] = self._resolved_var_type(decl)
             return []
         # Re-bind this VarDecl's name in the current scope using the disp
         # assigned during `_collect_locals`. The pre-pass walked the body
