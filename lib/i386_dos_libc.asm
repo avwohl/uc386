@@ -781,22 +781,45 @@ _snprintf:
         pop     ebp
         ret
 
-; fprintf(FILE *stream, const char *fmt, ...) — we ignore the stream
-; (everything goes to stdout) and reuse printf's format engine. The
-; stream arg sits at [ebp+8], fmt at [ebp+12], varargs at [ebp+16]+.
+; printf(const char *fmt, ...) — formats and writes to stdout.
+; Routed through the harness's INT 21h AH=5E hook so we get a real
+; Python-side printf with full %lld / %.Nf / %p / etc. support.
+_printf:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        mov     ecx, [ebp + 8]       ; fmt
+        lea     edx, [ebp + 12]      ; va_args
+        mov     ah, 0x5E
+        int     21h
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; fprintf(FILE *stream, const char *fmt, ...) — formats to the FILE.
+; The harness reads stream as fd (1=stdout, 2=stderr). Since our
+; libc declares stdin/stdout/stderr as 0/1/2 globals, the FILE *
+; arg evaluates to one of those small ints.
 _fprintf:
         push    ebp
         mov     ebp, esp
-        sub     esp, 8
         push    ebx
-        push    esi
-        push    edi
-        mov     esi, [ebp + 12]      ; fmt
-        lea     edi, [ebp + 16]      ; first vararg
-        xor     ebx, ebx
-        jmp     _printf.next         ; reuse the format-engine body
+        mov     ebx, [ebp + 8]       ; FILE *stream → fd
+        mov     ecx, [ebp + 12]      ; fmt
+        lea     edx, [ebp + 16]      ; va_args
+        mov     ah, 0x5F
+        int     21h
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
 
-_printf:
+; The legacy ASM format engine is kept below as `_printf_legacy` so any
+; user code that called it indirectly (via `&printf` taken to a function
+; pointer) finds the same behavior. New code goes through the INT 21h
+; harness path above.
+_printf_legacy:
         push    ebp
         mov     ebp, esp
         sub     esp, 8                ; [ebp-4] = zero_pad flag (per-spec)

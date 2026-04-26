@@ -162,8 +162,14 @@ def run(
                 while i < n and 0x30 <= fmt[i] <= 0x39:
                     precision = precision * 10 + (fmt[i] - 0x30)
                     i += 1
-            # length modifiers (ignored)
+            # length modifiers — track whether we saw `ll` so the
+            # integer specs read 8 bytes instead of 4.
+            length_long_long = False
             while i < n and fmt[i:i+1] in (b"l", b"h", b"L", b"z", b"j", b"t"):
+                if fmt[i:i+1] == b"l" and i + 1 < n and fmt[i+1:i+2] == b"l":
+                    length_long_long = True
+                    i += 2
+                    continue
                 i += 1
             if i >= n:
                 break
@@ -175,14 +181,24 @@ def run(
                 addr_ref[0] += 4
                 return int.from_bytes(bs, "little")
 
+            def read64_le(addr_ref):
+                bs = bytes(mu.mem_read(addr_ref[0], 8))
+                addr_ref[0] += 8
+                return int.from_bytes(bs, "little")
+
             ap_box = [ap]
             if conv == b"%":
                 out += b"%"
                 continue
             if conv == b"d" or conv == b"i":
-                val = read32_le(ap_box)
-                if val >= 0x80000000:
-                    val -= 0x100000000
+                if length_long_long:
+                    val = read64_le(ap_box)
+                    if val >= 0x8000000000000000:
+                        val -= 0x10000000000000000
+                else:
+                    val = read32_le(ap_box)
+                    if val >= 0x80000000:
+                        val -= 0x100000000
                 s = str(val).encode()
                 pad = b"0" if zero_pad else b" "
                 if width > len(s):
@@ -192,7 +208,10 @@ def run(
                         s = pad * (width - len(s)) + s
                 out += s
             elif conv in (b"u", b"x", b"X", b"o"):
-                val = read32_le(ap_box) & 0xFFFFFFFF
+                if length_long_long:
+                    val = read64_le(ap_box) & 0xFFFFFFFFFFFFFFFF
+                else:
+                    val = read32_le(ap_box) & 0xFFFFFFFF
                 if conv == b"u":
                     s = str(val).encode()
                 elif conv == b"x":
@@ -247,13 +266,52 @@ def run(
         return bytes(out)
 
     def on_int(uc, intno, user_data):
+        eax = uc.reg_read(UC_X86_REG_EAX)
+        ah = (eax >> 8) & 0xFF
+        al = eax & 0xFF
+        if intno == 0x80:
+            # Private uc386 trap: 64-bit divide / modulo.
+            #   EDX:EAX = numer (high:low)
+            #   EBX:ECX = denom (high:low)
+            #   ESI low byte = op (0=udiv, 1=sdiv, 2=umod, 3=smod)
+            # Result in EDX:EAX.
+            ecx = uc.reg_read(UC_X86_REG_ECX)
+            ebx = uc.reg_read(UC_X86_REG_EBX)
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            esi = uc.reg_read(UC_X86_REG_ESI)
+            op = esi & 0xFF
+            num = ((edx & 0xFFFFFFFF) << 32) | (eax & 0xFFFFFFFF)
+            den = ((ebx & 0xFFFFFFFF) << 32) | (ecx & 0xFFFFFFFF)
+            if op in (1, 3):
+                if num >= 0x8000000000000000:
+                    num -= 0x10000000000000000
+                if den >= 0x8000000000000000:
+                    den -= 0x10000000000000000
+            if den == 0:
+                res.error = "long-long divide by zero"
+                uc.emu_stop()
+                return
+            if op in (0, 1):
+                # Truncated division (matching C99 behavior).
+                if (num < 0) != (den < 0) and num % den != 0:
+                    quot = num // den + 1
+                else:
+                    quot = num // den
+                result = quot
+            else:
+                if (num < 0) != (den < 0) and num % den != 0:
+                    rem = num - (num // den + 1) * den
+                else:
+                    rem = num - (num // den) * den
+                result = rem
+            result_64 = result & 0xFFFFFFFFFFFFFFFF
+            uc.reg_write(UC_X86_REG_EAX, result_64 & 0xFFFFFFFF)
+            uc.reg_write(UC_X86_REG_EDX, (result_64 >> 32) & 0xFFFFFFFF)
+            return
         if intno != 0x21:
             res.error = f"unexpected interrupt {intno:#x}"
             uc.emu_stop()
             return
-        eax = uc.reg_read(UC_X86_REG_EAX)
-        ah = (eax >> 8) & 0xFF
-        al = eax & 0xFF
         if ah == 0x5C:
             # sprintf via harness: EBX=buf, ECX=fmt, EDX=va_ptr
             ebx = uc.reg_read(UC_X86_REG_EBX)
@@ -263,6 +321,31 @@ def run(
             formatted = _printf_format(fmt, edx)
             uc.mem_write(ebx, formatted + b"\x00")
             new_eax = (eax & ~0xFFFFFFFF) | len(formatted)
+            uc.reg_write(UC_X86_REG_EAX, new_eax)
+            return
+        if ah == 0x5E:
+            # printf via harness: ECX=fmt, EDX=va_ptr → format, write to stdout.
+            ecx = uc.reg_read(UC_X86_REG_ECX)
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            fmt = _read_cstr_local(ecx)
+            formatted = _printf_format(fmt, edx)
+            _write_stdout(formatted)
+            new_eax = (eax & ~0xFFFFFFFF) | (len(formatted) & 0xFFFFFFFF)
+            uc.reg_write(UC_X86_REG_EAX, new_eax)
+            return
+        if ah == 0x5F:
+            # fprintf via harness: EBX=stream(fd 1=stdout, 2=stderr),
+            # ECX=fmt, EDX=va_ptr.
+            ebx = uc.reg_read(UC_X86_REG_EBX)
+            ecx = uc.reg_read(UC_X86_REG_ECX)
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            fmt = _read_cstr_local(ecx)
+            formatted = _printf_format(fmt, edx)
+            if (ebx & 0xFFFF) == 2:
+                _write_stderr(formatted)
+            else:
+                _write_stdout(formatted)
+            new_eax = (eax & ~0xFFFFFFFF) | (len(formatted) & 0xFFFFFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
             return
         if ah == 0x5D:

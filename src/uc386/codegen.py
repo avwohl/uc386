@@ -1981,6 +1981,10 @@ class CodeGenerator:
         # `is_signed=None` is the language default — signed for char/short/int.
         return isinstance(t, ast.BasicType) and t.is_signed is False
 
+    @staticmethod
+    def _is_long_long(t: ast.TypeNode) -> bool:
+        return isinstance(t, ast.BasicType) and t.name == "long long"
+
     # ---- struct member lowering ---------------------------------------
 
     def _member_address(self, expr: ast.Member, ctx: _FuncCtx) -> list[str]:
@@ -2243,8 +2247,8 @@ class CodeGenerator:
         promotion rules.
 
         Size-8 loads (long long, double in scalar contexts) take only the
-        low 32 bits — full 64-bit support is not yet wired, so the high
-        half is simply ignored.
+        low 32 bits — used when the value is being narrowed to int. Real
+        64-bit lowering uses `_load_to_edx_eax`.
         """
         size = self._size_of(ty)
         if size == 4:
@@ -2258,6 +2262,27 @@ class CodeGenerator:
         if size == 8:
             return [f"        mov     eax, {addr}"]
         raise CodegenError(f"can't load size-{size} value into eax")
+
+    def _load_to_edx_eax(self, addr: str) -> list[str]:
+        """Load 8 bytes from `addr` into EDX:EAX (high:low).
+
+        `addr` is a NASM addressing form (e.g. `[ebp - 16]`, `[_g]`,
+        `[ecx]`); the helper takes the low 4 bytes from `addr` and the
+        high 4 bytes from `addr + 4`.
+        """
+        high_addr = self._bump_addr(addr, 4)
+        return [
+            f"        mov     eax, {addr}",
+            f"        mov     edx, {high_addr}",
+        ]
+
+    def _store_from_edx_eax(self, addr: str) -> list[str]:
+        """Store EDX:EAX (high:low) as 8 bytes at `addr`."""
+        high_addr = self._bump_addr(addr, 4)
+        return [
+            f"        mov     {addr}, eax",
+            f"        mov     {high_addr}, edx",
+        ]
 
     def _cast(self, expr: ast.Cast, ctx: _FuncCtx) -> list[str]:
         """Evaluate `expr.expr` then narrow/extend EAX to match `target_type`.
@@ -2674,6 +2699,12 @@ class CodeGenerator:
             return self._eval_float_to_st0(decl.init, ctx) + self._store_st0_to(
                 _ebp_addr(disp), var_type
             )
+        if self._is_long_long(var_type):
+            # 64-bit local: evaluate the rhs to EDX:EAX (sign- or
+            # zero-extending int rhs to long long), store both halves.
+            return self._eval_expr_to_edx_eax(
+                decl.init, ctx,
+            ) + self._store_from_edx_eax(_ebp_addr(disp))
         return self._eval_expr_to_eax(decl.init, ctx) + self._store_from_eax(
             _ebp_addr(disp), var_type
         )
@@ -2986,6 +3017,11 @@ class CodeGenerator:
             return self._copy_struct_to_retptr(
                 stmt.value, ret_ty, retptr_disp, ctx
             ) + ["        jmp     .epilogue"]
+        if self._is_long_long(ctx.return_type):
+            # cdecl returns 64-bit values in EDX:EAX (high:low).
+            return self._eval_expr_to_edx_eax(stmt.value, ctx) + [
+                "        jmp     .epilogue",
+            ]
         return self._eval_expr_to_eax(stmt.value, ctx) + [
             "        jmp     .epilogue",
         ]
@@ -3241,10 +3277,13 @@ class CodeGenerator:
             if expr.op in ("++", "--"):
                 # Mutation in place; the expression's type matches the operand.
                 return self._type_of(expr.operand, ctx)
-            # `+` and `-` propagate float through; `~ !` always produce int.
-            if expr.op in ("+", "-"):
+            # `+` and `-` and `~` propagate float / long long through;
+            # `!` always produces int.
+            if expr.op in ("+", "-", "~"):
                 inner = self._type_of(expr.operand, ctx)
                 if self._is_float_type(inner):
+                    return inner
+                if self._is_long_long(inner):
                     return inner
             return ast.BasicType(name="int")
         if isinstance(expr, ast.Index):
@@ -3311,6 +3350,18 @@ class CodeGenerator:
                             "`%` requires integer operands"
                         )
                     return self._float_promotion(lt, rt)
+                # Comparison/logical/etc. result is always int. Other
+                # int-result ops keep long-long promotion if either
+                # operand is long long.
+                if expr.op in ("==", "!=", "<", ">", "<=", ">=", "&&", "||"):
+                    return ast.BasicType(name="int")
+                if self._is_long_long(lt) or self._is_long_long(rt):
+                    return ast.BasicType(
+                        name="long long",
+                        is_signed=(False if (
+                            self._is_unsigned(lt) or self._is_unsigned(rt)
+                        ) else None),
+                    )
                 return ast.BasicType(name="int")
             # `+` and `-`: pointer ± int → pointer; pointer - pointer → int.
             # Arrays count as pointer-like via decay.
@@ -3326,6 +3377,15 @@ class CodeGenerator:
             # float (or double if either is double).
             if self._is_float_type(lt) or self._is_float_type(rt):
                 return self._float_promotion(lt, rt)
+            # Long-long promotion: if either operand is long long, the
+            # result is long long.
+            if self._is_long_long(lt) or self._is_long_long(rt):
+                return ast.BasicType(
+                    name="long long",
+                    is_signed=(False if (
+                        self._is_unsigned(lt) or self._is_unsigned(rt)
+                    ) else None),
+                )
             return ast.BasicType(name="int")
         if isinstance(expr, ast.TernaryOp):
             # Both arms should agree in well-formed C; pick the true arm.
@@ -3464,6 +3524,434 @@ class CodeGenerator:
         )
 
     # ---- float (x87) lowering ------------------------------------------
+
+    # ---- 64-bit (long long) lowering ------------------------------------
+
+    def _eval_expr_to_edx_eax(
+        self, expr: ast.Expression, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Lower a long-long-typed expression. Result lands in EDX:EAX
+        (high:low). Mirrors `_eval_expr_to_eax` but maintains the full
+        64-bit value through every node.
+        """
+        # Direct loads.
+        if isinstance(expr, ast.IntLiteral):
+            v = expr.value
+            if v < 0:
+                v = (1 << 64) + v
+            v &= 0xFFFFFFFFFFFFFFFF
+            low = v & 0xFFFFFFFF
+            high = (v >> 32) & 0xFFFFFFFF
+            return [
+                f"        mov     eax, 0x{low:08X}",
+                f"        mov     edx, 0x{high:08X}",
+            ]
+        if isinstance(expr, ast.CharLiteral):
+            return [f"        mov     eax, {expr.value}", "        xor     edx, edx"]
+        if isinstance(expr, ast.NullptrLiteral):
+            return ["        xor     eax, eax", "        xor     edx, edx"]
+        if isinstance(expr, ast.Identifier):
+            try:
+                addr = self._identifier_addr_text(expr.name, ctx)
+                return self._load_to_edx_eax(addr)
+            except CodegenError:
+                # Fall back to 32-bit load + sign extend (e.g. enum const).
+                out = self._eval_expr_to_eax(expr, ctx)
+                t = self._type_of(expr, ctx)
+                if self._is_unsigned(t):
+                    out.append("        xor     edx, edx")
+                else:
+                    out.append("        cdq")
+                return out
+        if isinstance(expr, ast.Index):
+            addr = self._index_address(expr, ctx)
+            # _index_address leaves &arr[i] in eax. Load 8 bytes through
+            # that, but be careful — load order matters because we
+            # clobber eax on the second mov. Use ecx as the addr.
+            out = list(addr)
+            return out + [
+                "        mov     ecx, eax",
+                "        mov     eax, [ecx]",
+                "        mov     edx, [ecx + 4]",
+            ]
+        if isinstance(expr, ast.Member):
+            out = self._member_address(expr, ctx)
+            return out + [
+                "        mov     ecx, eax",
+                "        mov     eax, [ecx]",
+                "        mov     edx, [ecx + 4]",
+            ]
+        if isinstance(expr, ast.Cast):
+            target = expr.target_type
+            src_ty = self._type_of(expr.expr, ctx)
+            if self._is_long_long(src_ty):
+                return self._eval_expr_to_edx_eax(expr.expr, ctx)
+            if self._is_float_type(src_ty):
+                # float → long long: fistp to a 64-bit slot, then load.
+                out = self._eval_float_to_st0(expr.expr, ctx)
+                out += [
+                    "        sub     esp, 8",
+                    "        fistp   qword [esp]",
+                    "        pop     eax",
+                    "        pop     edx",
+                ]
+                return out
+            # int → long long: sign- or zero-extend.
+            out = self._eval_expr_to_eax(expr.expr, ctx)
+            if self._is_unsigned(src_ty):
+                out.append("        xor     edx, edx")
+            else:
+                out.append("        cdq")
+            return out
+        if isinstance(expr, ast.UnaryOp):
+            if expr.op == "+":
+                return self._eval_expr_to_edx_eax(expr.operand, ctx)
+            if expr.op == "-":
+                out = self._eval_expr_to_edx_eax(expr.operand, ctx)
+                # 64-bit negate. `neg eax` sets CF=1 iff l != 0, then we
+                # add CF to h before negating it — matches two's
+                # complement on the 64-bit value.
+                out += [
+                    "        neg     eax",
+                    "        adc     edx, 0",
+                    "        neg     edx",
+                ]
+                return out
+            if expr.op == "~":
+                out = self._eval_expr_to_edx_eax(expr.operand, ctx)
+                return out + ["        not     eax", "        not     edx"]
+            if expr.op == "*":
+                # Dereferencing a long-long pointer.
+                out = self._eval_expr_to_eax(expr.operand, ctx)
+                return out + [
+                    "        mov     ecx, eax",
+                    "        mov     eax, [ecx]",
+                    "        mov     edx, [ecx + 4]",
+                ]
+            if expr.op in ("++", "--"):
+                # ++/-- on a long-long lvalue.
+                return self._inc_dec_ll(expr, ctx)
+        if isinstance(expr, ast.BinaryOp):
+            return self._binary_ll(expr, ctx)
+        if isinstance(expr, ast.TernaryOp):
+            cond_label = ctx.label("ll_ter_else")
+            end_label = ctx.label("ll_ter_end")
+            out = self._eval_to_bool_eax(expr.condition, ctx)
+            out += [
+                "        test    eax, eax",
+                f"        jz      {cond_label}",
+            ]
+            out += self._eval_expr_to_edx_eax(expr.true_expr, ctx)
+            out.append(f"        jmp     {end_label}")
+            out.append(f"{cond_label}:")
+            out += self._eval_expr_to_edx_eax(expr.false_expr, ctx)
+            out.append(f"{end_label}:")
+            return out
+        if isinstance(expr, ast.Call):
+            # cdecl returns 64-bit values in EDX:EAX. The standard call
+            # path leaves the low half in EAX; we need to make sure EDX
+            # is preserved as the high half.
+            return self._call(expr, ctx)
+        # Fallback: eval as 32-bit, sign-extend.
+        out = self._eval_expr_to_eax(expr, ctx)
+        try:
+            src_ty = self._type_of(expr, ctx)
+        except CodegenError:
+            src_ty = ast.BasicType(name="int")
+        if self._is_unsigned(src_ty):
+            out.append("        xor     edx, edx")
+        else:
+            out.append("        cdq")
+        return out
+
+    def _binary_ll(
+        self, expr: ast.BinaryOp, ctx: _FuncCtx,
+    ) -> list[str]:
+        """64-bit binary op. Result in EDX:EAX. Stack-machine eval:
+        right → push EDX:EAX, left → EDX:EAX, pop into ECX:EBX, op.
+        """
+        op = expr.op
+        if op == "=":
+            return self._assign_ll(expr, ctx)
+        # Right to EDX:EAX, push (high then low so low ends up on top).
+        right = self._eval_expr_to_edx_eax(expr.right, ctx)
+        out = list(right)
+        out += ["        push    edx", "        push    eax"]
+        # Left to EDX:EAX.
+        out += self._eval_expr_to_edx_eax(expr.left, ctx)
+        # Pop right into ECX:EBX (low then high).
+        out += [
+            "        pop     ecx",
+            "        pop     ebx",
+        ]
+        # Now: EDX:EAX = left, EBX:ECX = right.
+        if op == "+":
+            return out + ["        add     eax, ecx", "        adc     edx, ebx"]
+        if op == "-":
+            return out + ["        sub     eax, ecx", "        sbb     edx, ebx"]
+        if op == "&":
+            return out + ["        and     eax, ecx", "        and     edx, ebx"]
+        if op == "|":
+            return out + ["        or      eax, ecx", "        or      edx, ebx"]
+        if op == "^":
+            return out + ["        xor     eax, ecx", "        xor     edx, ebx"]
+        # Comparisons return int 0/1 in EAX, EDX clobbered.
+        if op in ("==", "!=", "<", ">", "<=", ">="):
+            return out + self._cmp_ll(op, ctx, signed=not (
+                self._is_unsigned(self._type_of(expr.left, ctx))
+                or self._is_unsigned(self._type_of(expr.right, ctx))
+            ))
+        if op == "<<":
+            big = ctx.label("ll_shl_big")
+            done = ctx.label("ll_shl_done")
+            return out + [
+                "        test    cl, 32",
+                f"        jnz     {big}",
+                "        shld    edx, eax, cl",
+                "        shl     eax, cl",
+                f"        jmp     {done}",
+                f"{big}:",
+                "        mov     edx, eax",
+                "        xor     eax, eax",
+                "        and     cl, 31",
+                "        shl     edx, cl",
+                f"{done}:",
+            ]
+        if op == ">>":
+            unsigned = self._is_unsigned(self._type_of(expr.left, ctx))
+            shift_high = "shr" if unsigned else "sar"
+            ext = "xor edx, edx" if unsigned else "sar edx, 31"
+            big = ctx.label("ll_shr_big")
+            done = ctx.label("ll_shr_done")
+            return out + [
+                "        test    cl, 32",
+                f"        jnz     {big}",
+                "        shrd    eax, edx, cl",
+                f"        {shift_high}    edx, cl",
+                f"        jmp     {done}",
+                f"{big}:",
+                "        mov     eax, edx",
+                f"        {ext}",
+                "        and     cl, 31",
+                f"        {shift_high}    eax, cl",
+                f"{done}:",
+            ]
+        if op == "*":
+            # 64x64 → 64 truncated multiply.
+            #   left  = LH:LL (EDX:EAX);  right = RH:RC (EBX:ECX)
+            #   low  32 = (LL*RC) low
+            #   high 32 = (LL*RC) high + (LL*RH) low + (LH*RC) low
+            return out + [
+                "        push    edx",          # [esp+8] = LH
+                "        push    eax",          # [esp+4] = LL (after one more push below)
+                "        mul     ecx",          # edx:eax = LL * RC
+                "        mov     esi, edx",     # esi = high 32 of LL*RC
+                "        push    eax",          # [esp]   = LL*RC low
+                "        mov     eax, [esp + 4]",   # LL
+                "        imul    eax, ebx",     # eax = LL * RH (low 32)
+                "        add     esi, eax",
+                "        mov     eax, [esp + 8]",   # LH
+                "        imul    eax, ecx",     # eax = LH * RC (low 32)
+                "        add     esi, eax",
+                "        pop     eax",          # eax = LL*RC low
+                "        mov     edx, esi",     # edx = high 32 of full product
+                "        add     esp, 8",       # discard LL and LH
+            ]
+        if op in ("/", "%"):
+            # Long-long div/mod: route through the harness via INT 0x80
+            # (a private trap vector — DOS doesn't use it, so our hook
+            # owns it). ESI selects the op (0=udiv, 1=sdiv, 2=umod,
+            # 3=smod). Inputs: EDX:EAX = numer, EBX:ECX = denom.
+            # Result in EDX:EAX. Using INT 0x80 (instead of INT 21h
+            # AH=...) avoids the AH-write clobbering EAX.
+            unsigned = self._is_unsigned(self._type_of(expr.left, ctx))
+            if op == "/":
+                code = 0 if unsigned else 1
+            else:
+                code = 2 if unsigned else 3
+            return out + [
+                f"        mov     esi, {code}",
+                "        int     0x80",
+            ]
+        if op == ",":
+            # Comma: discard left's value, keep right.
+            return self._eval_expr_to_edx_eax(expr.right, ctx) if not False else out
+        if op == "&&":
+            return self._logical_and_ll(expr, ctx)
+        if op == "||":
+            return self._logical_or_ll(expr, ctx)
+        raise CodegenError(f"long-long op `{op}` not implemented")
+
+    def _cmp_ll(self, op: str, ctx: _FuncCtx, *, signed: bool) -> list[str]:
+        """Lines comparing EDX:EAX vs EBX:ECX (left vs right). Result in
+        EAX (0 or 1). Sets EDX to 0 (clobber).
+        """
+        true_label = ctx.label("ll_cmp_true")
+        false_label = ctx.label("ll_cmp_false")
+        end_label = ctx.label("ll_cmp_end")
+        # Map to high/low compare branches.
+        if op == "==":
+            return [
+                "        cmp     edx, ebx",
+                f"        jne     {false_label}",
+                "        cmp     eax, ecx",
+                f"        jne     {false_label}",
+                f"{true_label}:",
+                "        mov     eax, 1",
+                f"        jmp     {end_label}",
+                f"{false_label}:",
+                "        xor     eax, eax",
+                f"{end_label}:",
+                "        xor     edx, edx",
+            ]
+        if op == "!=":
+            return [
+                "        cmp     edx, ebx",
+                f"        jne     {true_label}",
+                "        cmp     eax, ecx",
+                f"        jne     {true_label}",
+                f"{false_label}:",
+                "        xor     eax, eax",
+                f"        jmp     {end_label}",
+                f"{true_label}:",
+                "        mov     eax, 1",
+                f"{end_label}:",
+                "        xor     edx, edx",
+            ]
+        # < > <= >= — branch on high half first, then low half (unsigned).
+        if signed:
+            high_lt = "jl"
+            high_gt = "jg"
+        else:
+            high_lt = "jb"
+            high_gt = "ja"
+        # For all four: if high differs, decide; else compare low (unsigned).
+        if op == "<":
+            high_take = high_lt
+            high_drop = high_gt
+            low_take = "jb"
+        elif op == ">":
+            high_take = high_gt
+            high_drop = high_lt
+            low_take = "ja"
+        elif op == "<=":
+            high_take = high_lt
+            high_drop = high_gt
+            low_take = "jbe"
+        else:  # >=
+            high_take = high_gt
+            high_drop = high_lt
+            low_take = "jae"
+        return [
+            "        cmp     edx, ebx",
+            f"        {high_take}      {true_label}",
+            f"        {high_drop}      {false_label}",
+            "        cmp     eax, ecx",
+            f"        {low_take}     {true_label}",
+            f"{false_label}:",
+            "        xor     eax, eax",
+            f"        jmp     {end_label}",
+            f"{true_label}:",
+            "        mov     eax, 1",
+            f"{end_label}:",
+            "        xor     edx, edx",
+        ]
+
+    def _assign_ll(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
+        """Long-long assignment to a long-long lvalue."""
+        lhs = expr.left
+        if isinstance(lhs, ast.Identifier):
+            out = self._eval_expr_to_edx_eax(expr.right, ctx)
+            addr = self._identifier_addr_text(lhs.name, ctx)
+            out += self._store_from_edx_eax(addr)
+            return out
+        if isinstance(lhs, ast.UnaryOp) and lhs.op == "*":
+            # *p = rhs : eval p → eax push, eval rhs → edx:eax, pop ecx
+            out = self._eval_expr_to_eax(lhs.operand, ctx)
+            out.append("        push    eax")
+            out += self._eval_expr_to_edx_eax(expr.right, ctx)
+            out.append("        pop     ecx")
+            out.append("        mov     [ecx], eax")
+            out.append("        mov     [ecx + 4], edx")
+            return out
+        if isinstance(lhs, ast.Index):
+            out = self._index_address(lhs, ctx)
+            out.append("        push    eax")
+            out += self._eval_expr_to_edx_eax(expr.right, ctx)
+            out.append("        pop     ecx")
+            out.append("        mov     [ecx], eax")
+            out.append("        mov     [ecx + 4], edx")
+            return out
+        if isinstance(lhs, ast.Member):
+            out = self._member_address(lhs, ctx)
+            out.append("        push    eax")
+            out += self._eval_expr_to_edx_eax(expr.right, ctx)
+            out.append("        pop     ecx")
+            out.append("        mov     [ecx], eax")
+            out.append("        mov     [ecx + 4], edx")
+            return out
+        raise CodegenError(
+            f"long-long assignment to {type(lhs).__name__} not supported"
+        )
+
+    def _inc_dec_ll(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
+        """++/-- on a long-long Identifier lvalue."""
+        if not isinstance(expr.operand, ast.Identifier):
+            raise CodegenError("long-long ++/-- on non-Identifier not supported")
+        addr = self._identifier_addr_text(expr.operand.name, ctx)
+        high_addr = self._bump_addr(addr, 4)
+        # Read pre-value if postfix.
+        if expr.is_prefix:
+            out: list[str] = []
+            if expr.op == "++":
+                out.append(f"        add     dword {addr}, 1")
+                out.append(f"        adc     dword {high_addr}, 0")
+            else:
+                out.append(f"        sub     dword {addr}, 1")
+                out.append(f"        sbb     dword {high_addr}, 0")
+            out += self._load_to_edx_eax(addr)
+            return out
+        # Postfix: load first, then bump.
+        out = self._load_to_edx_eax(addr)
+        if expr.op == "++":
+            out.append(f"        add     dword {addr}, 1")
+            out.append(f"        adc     dword {high_addr}, 0")
+        else:
+            out.append(f"        sub     dword {addr}, 1")
+            out.append(f"        sbb     dword {high_addr}, 0")
+        return out
+
+    def _logical_and_ll(self, expr, ctx):
+        # Treat both sides as bool; result is 0 or 1 in EAX:EDX (high=0).
+        false_label = ctx.label("ll_and_false")
+        end_label = ctx.label("ll_and_end")
+        out = self._eval_to_bool_eax(expr.left, ctx)
+        out += ["        test    eax, eax", f"        jz      {false_label}"]
+        out += self._eval_to_bool_eax(expr.right, ctx)
+        out += ["        test    eax, eax", f"        jz      {false_label}"]
+        out += ["        mov     eax, 1", f"        jmp     {end_label}"]
+        out.append(f"{false_label}:")
+        out.append("        xor     eax, eax")
+        out.append(f"{end_label}:")
+        out.append("        xor     edx, edx")
+        return out
+
+    def _logical_or_ll(self, expr, ctx):
+        true_label = ctx.label("ll_or_true")
+        false_label = ctx.label("ll_or_false")
+        end_label = ctx.label("ll_or_end")
+        out = self._eval_to_bool_eax(expr.left, ctx)
+        out += ["        test    eax, eax", f"        jnz     {true_label}"]
+        out += self._eval_to_bool_eax(expr.right, ctx)
+        out += ["        test    eax, eax", f"        jz      {false_label}"]
+        out.append(f"{true_label}:")
+        out.append("        mov     eax, 1")
+        out.append(f"        jmp     {end_label}")
+        out.append(f"{false_label}:")
+        out.append("        xor     eax, eax")
+        out.append(f"{end_label}:")
+        out.append("        xor     edx, edx")
+        return out
 
     def _eval_float_to_st0(self, expr: ast.Expression, ctx: _FuncCtx) -> list[str]:
         """Lower a float-or-int expression so its value sits at st(0).
@@ -3986,9 +4474,20 @@ class CodeGenerator:
                 out.append(f"        fstp    {width} [esp]")
                 total_arg_bytes += size
             else:
-                out += self._eval_expr_to_eax(arg, ctx)
-                out.append("        push    eax")
-                total_arg_bytes += 4
+                # Long-long arg or long-long expected param: push 8 bytes
+                # (high then low so low ends up at the lower address).
+                want_ll = self._is_long_long(arg_ty) or (
+                    expected_ty is not None and self._is_long_long(expected_ty)
+                )
+                if want_ll:
+                    out += self._eval_expr_to_edx_eax(arg, ctx)
+                    out.append("        push    edx")
+                    out.append("        push    eax")
+                    total_arg_bytes += 8
+                else:
+                    out += self._eval_expr_to_eax(arg, ctx)
+                    out.append("        push    eax")
+                    total_arg_bytes += 4
         if retptr is not None:
             # Push retptr last so it's the leftmost arg (= [ebp+8] in callee).
             out += retptr
@@ -4230,6 +4729,18 @@ class CodeGenerator:
             return self._assign(expr, ctx)
         if expr.op in self._COMPOUND_OPS:
             return self._compound_assign(expr, ctx)
+        # Long-long short-circuit: any non-assignment binary op where at
+        # least one operand is long-long-typed routes through
+        # `_binary_ll` (the 64-bit ladder). Comparisons return bool in
+        # EAX; arithmetic leaves the 64-bit result in EDX:EAX, which
+        # the caller may truncate to EAX (taking the low 32 bits) when
+        # the surrounding context is 32-bit — that matches C's "narrow
+        # on assign".
+        if (
+            self._is_long_long(self._type_of(expr.left, ctx))
+            or self._is_long_long(self._type_of(expr.right, ctx))
+        ):
+            return self._binary_ll(expr, ctx)
         if expr.op == ",":
             # Comma operator: evaluate left for side effects, then right.
             # The result is the right-hand value.
@@ -4423,6 +4934,9 @@ class CodeGenerator:
                     ctx,
                 )
             return self._struct_copy_assign(expr, target_ty, ctx)
+        # Long-long lvalue: route through the 64-bit assignment helper.
+        if self._is_long_long(target_ty):
+            return self._assign_ll(expr, ctx)
 
         # `x = rhs` — direct slot store. Array names aren't lvalues in C.
         if isinstance(expr.left, ast.Identifier):
