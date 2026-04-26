@@ -732,6 +732,10 @@ class CodeGenerator:
             return self._emit_global_array_init(ty, init, name)
         if isinstance(ty, ast.StructType):
             return self._emit_global_struct_init(ty, init, name)
+        if isinstance(ty, ast.EnumType):
+            # An enum is int-sized; treat the init as an int literal.
+            value = self._const_eval(init, name)
+            return [f"        dd      {value}"]
         raise CodegenError(
             f"global `{name}`: unsupported type {type(ty).__name__}"
         )
@@ -2150,6 +2154,11 @@ class CodeGenerator:
         t = decl.var_type
         if not isinstance(t, ast.ArrayType) or t.size is not None:
             return t
+        # `extern T arr[];` — size lives in another translation unit,
+        # not knowable here. Return as-is; we never need to allocate a
+        # frame slot for an extern, just emit a NASM extern label.
+        if getattr(decl, "storage_class", None) == "extern":
+            return t
         if isinstance(decl.init, ast.InitializerList):
             try:
                 leaves = self._leaf_slot_count(t.base_type)
@@ -2807,6 +2816,12 @@ class CodeGenerator:
     # ---- identifier resolution (local vs global) ----------------------
 
     def _identifier_type(self, name: str, ctx: _FuncCtx) -> ast.TypeNode:
+        # `__func__` / `__FUNCTION__` (C99 / GCC) — a const char*
+        # pointing to the current function's name.
+        if name in ("__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"):
+            return ast.PointerType(
+                base_type=ast.BasicType(name="char", is_const=True),
+            )
         # A `static` local lives as a global under a mangled name; route
         # through the remapping table so callers don't need to know.
         name = ctx.local_static_labels.get(name, name)
@@ -2859,6 +2874,9 @@ class CodeGenerator:
 
     def _identifier_load(self, name: str, ctx: _FuncCtx) -> list[str]:
         """Lines that produce the value (or, for arrays/functions, the address) of `name` in eax."""
+        if name in ("__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"):
+            label = self._intern_string(ctx.func_name)
+            return [f"        mov     eax, {label}"]
         name = ctx.local_static_labels.get(name, name)
         name = ctx.local_captures.get(name, name)
         name = ctx.nested_fn_names.get(name, name)
@@ -2887,6 +2905,9 @@ class CodeGenerator:
 
     def _identifier_address(self, name: str, ctx: _FuncCtx) -> list[str]:
         """Lines that compute &name into eax — for `&id` and as the base for indexing."""
+        if name in ("__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"):
+            label = self._intern_string(ctx.func_name)
+            return [f"        mov     eax, {label}"]
         name = ctx.local_static_labels.get(name, name)
         name = ctx.local_captures.get(name, name)
         name = ctx.nested_fn_names.get(name, name)
