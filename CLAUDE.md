@@ -137,3 +137,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Top-level stray `;` tolerance.** `static inline ... };` (semicolon after function body, common from C++ habits) no longer trips the parser.
 
   **Result: 1160/1514 gcc-c-torture** (up from 1134). Combined with c-testsuite's 215/220, the run-mode pipeline now passes 1375 / 1734 (79.3%).
+- **2026-04-25 — torture cluster: anon bit-fields, hex floats, asm volatile (1160 → 1194)**:
+  - **`asm volatile` / `asm __volatile__` / `asm inline`.** The asm-statement parser previously didn't eat the volatile/inline qualifiers between `asm` and `(`. Also added `__volatile` / `__volatile__` as keyword aliases.
+  - **Anonymous bit-fields (`unsigned : 12;`).** `_register_struct` now recognizes them as padding bits and consumes width without registering a member. `_emit_global_bitfield_struct_init` packs init values into 4-byte storage units honoring the bit-offset / bit-width metadata so file-scope `struct { int a:4; int :4; int b:4; } x = {2, 3};` lays down the right dword.
+  - **Hex float literals.** `0x1.0p-500L` was failing because the fractional `.` was only handled for base-10 literals. Added a base-16 branch that consumes hex digits between the `.` and the mandatory `p`.
+
+  **Result: 1194/1514 gcc-c-torture** (up from 1160). Combined with c-testsuite, 1409 / 1734 (81.3%).

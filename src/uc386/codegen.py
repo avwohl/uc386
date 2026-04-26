@@ -670,6 +670,11 @@ class CodeGenerator:
         members = self._structs[sname]
         total = self._struct_sizes[sname]
         member_index = {mn: i for i, (mn, _, _) in enumerate(members)}
+        bitfields = self._struct_bitfields.get(sname, {})
+        if bitfields:
+            return self._emit_global_bitfield_struct_init(
+                sname, members, bitfields, total, init, name,
+            )
 
         # Walk source values, honouring `.field = value` designators.
         # `slot_values[i]` is the expr to emit for member i, or absent
@@ -758,6 +763,56 @@ class CodeGenerator:
             span = max(self._size_of(members[k][1]) for k in range(i, j))
             emit_cursor = cm_off + span
             i = j
+        if total > emit_cursor:
+            out.append(f"        times {total - emit_cursor} db 0")
+        return out
+
+    def _emit_global_bitfield_struct_init(
+        self,
+        sname: str,
+        members: list,
+        bitfields: dict,
+        total: int,
+        init: ast.InitializerList,
+        name: str,
+    ) -> list[str]:
+        """Pack bit-field init values into 4-byte storage units and emit.
+
+        Walks the InitializerList and members in parallel. For each
+        bit-field member, OR its value (masked to bit_width and shifted
+        to bit_offset) into the value at unit_offset. Non-bit-field
+        members are not currently supported in the same struct as bit
+        fields at global scope.
+        """
+        # Map storage_unit_offset → packed dword value.
+        units: dict[int, int] = {}
+        # Walk values in declaration order. Designators not supported here.
+        cursor = 0
+        for value in init.values:
+            if cursor >= len(members):
+                raise CodegenError(
+                    f"global `{name}`: too many initializers"
+                )
+            m_name_i, m_ty_i, m_off = members[cursor]
+            cursor += 1
+            if m_name_i not in bitfields:
+                raise CodegenError(
+                    f"global `{name}`: mixed bit-field and regular "
+                    f"members not supported in bit-field struct init"
+                )
+            bit_offset, bit_width = bitfields[m_name_i]
+            v = self._const_eval(value, f"{name}.{m_name_i}")
+            mask = (1 << bit_width) - 1
+            v_masked = (v & mask) << bit_offset
+            units[m_off] = units.get(m_off, 0) | v_masked
+        out: list[str] = []
+        emit_cursor = 0
+        for off in sorted(units.keys()):
+            if off > emit_cursor:
+                out.append(f"        times {off - emit_cursor} db 0")
+                emit_cursor = off
+            out.append(f"        dd      0x{units[off] & 0xFFFFFFFF:08X}")
+            emit_cursor = off + 4
         if total > emit_cursor:
             out.append(f"        times {total - emit_cursor} db 0")
         return out
@@ -1890,8 +1945,17 @@ class CodeGenerator:
         max_align = 1
         for m in decl.members:
             if m.name is None:
-                # Anonymous nested struct/union — accept iff the type has
-                # inline members so we know the inner layout.
+                # Two unnamed cases:
+                #   - Anonymous bit-field: `unsigned : 12;` — pure padding.
+                #   - Anonymous nested struct/union: `struct { ... };`.
+                if m.bit_width is not None:
+                    self._check_supported_type(
+                        m.member_type, f"{decl.name}.<anon-bf>",
+                    )
+                    align = self._alignment_of(m.member_type)
+                    if align > max_align:
+                        max_align = align
+                    continue
                 if not (
                     isinstance(m.member_type, ast.StructType)
                     and m.member_type.members
@@ -1967,6 +2031,11 @@ class CodeGenerator:
                 if unit_used + width > 32:
                     unit_offset += 4
                     unit_used = 0
+                # Anonymous bit-field (`unsigned : N`): just consume bits
+                # without registering a member. Used as inline padding.
+                if m.name is None:
+                    unit_used += width
+                    continue
                 members.append((m.name, m.member_type, unit_offset))
                 bitfields[m.name] = (unit_used, width)
                 unit_used += width
