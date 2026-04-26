@@ -2467,14 +2467,14 @@ def test_global_array_underspecified_zero_filled():
 def test_global_string_array_inferred_size():
     asm = _compile('char s[] = "hi"; int main(void) { return 0; }')
     assert "_s:" in asm
-    # String stored inline: 'h', 'i', 0.
-    assert "db      'hi', 0" in asm
+    # String stored as byte values + null terminator.
+    assert "db      104, 105, 0" in asm
 
 
 def test_global_string_array_with_padding():
     asm = _compile('char s[5] = "hi"; int main(void) { return 0; }')
     # 'h', 'i', null, then 2 zero-pad bytes to fill out to 5.
-    assert "db      'hi', 0, 0, 0" in asm
+    assert "db      104, 105, 0, 0, 0" in asm
 
 
 def test_global_char_uses_db():

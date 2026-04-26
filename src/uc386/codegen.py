@@ -793,16 +793,24 @@ class CodeGenerator:
             first_value = init.values[0]
             if isinstance(first_value, ast.DesignatedInit):
                 # `.field = value` — find the named member.
-                if (
-                    len(first_value.designators) != 1
-                    or not isinstance(first_value.designators[0], str)
-                ):
+                first = first_value.designators[0]
+                if not isinstance(first, str):
                     raise CodegenError(
-                        f"global `{name}`: only single-level `.field` "
-                        f"designators supported"
+                        f"global `{name}`: array designator on struct "
+                        f"init not supported"
                     )
-                target_name = first_value.designators[0]
-                value = first_value.value
+                target_name = first
+                # Multi-level designator like `.a.b = expr` —
+                # synthesize a nested InitializerList so the outer
+                # struct emit only sees `.a = {...}`.
+                if len(first_value.designators) > 1:
+                    inner = ast.DesignatedInit(
+                        designators=first_value.designators[1:],
+                        value=first_value.value,
+                    )
+                    value = ast.InitializerList(values=[inner])
+                else:
+                    value = first_value.value
             else:
                 target_name = members[0][0]
                 value = first_value
@@ -811,13 +819,24 @@ class CodeGenerator:
             )
             if target_name in bitfields:
                 # Single bit-field init: pack into the storage unit.
-                bit_offset, bit_width = bitfields[target_name]
+                info = bitfields[target_name]
+                if len(info) == 2:
+                    bit_offset, bit_width = info
+                    unit_size = 4
+                else:
+                    bit_offset, bit_width, unit_size = info
                 v = self._const_eval(value, f"{name}.{target_name}")
                 mask = (1 << bit_width) - 1
                 packed = (v & mask) << bit_offset
-                out = [f"        dd      0x{packed & 0xFFFFFFFF:08X}"]
-                if total > 4:
-                    out.append(f"        times {total - 4} db 0")
+                if unit_size == 8:
+                    out = [
+                        f"        dd      0x{packed & 0xFFFFFFFF:08X}, "
+                        f"0x{(packed >> 32) & 0xFFFFFFFF:08X}"
+                    ]
+                else:
+                    out = [f"        dd      0x{packed & 0xFFFFFFFF:08X}"]
+                if total > unit_size:
+                    out.append(f"        times {total - unit_size} db 0")
                 return out
             out = self._emit_global_init(target_ty, value, f"{name}.{target_name}")
             written = self._size_of(target_ty)
@@ -1282,18 +1301,17 @@ class CodeGenerator:
             raw_bytes = list(self._string_to_bytes(init.value))
             # C: a string literal initializing a char array of the exact
             # length drops the trailing null. If the array is larger,
-            # the null is included and remaining slots zero-fill.
+            # the null is included and remaining slots zero-fill. If the
+            # string is *longer* than the array, gcc truncates as a QoI
+            # matter (the excess is undefined behavior); mirror that.
             if len(raw_bytes) > length:
-                raise CodegenError(
-                    f"global `{name}`: string init exceeds array size {length}"
-                )
+                raw_bytes = raw_bytes[:length]
             if len(raw_bytes) == length:
                 # No room for the null terminator — emit just the bytes.
-                return [f"        db      {self._render_string(init.value)}"]
-            # Render the printable run + explicit null + zero-pad.
-            chars_with_null = raw_bytes + [0]
-            parts = [self._render_string(init.value), "0"]
-            parts.extend(["0"] * (length - len(chars_with_null)))
+                parts = [str(b) for b in raw_bytes]
+                return [f"        db      {', '.join(parts)}"]
+            # Append the null terminator + zero-pad the rest.
+            parts = [str(b) for b in raw_bytes] + ["0"] * (length - len(raw_bytes))
             return [f"        db      {', '.join(parts)}"]
 
         if isinstance(init, ast.InitializerList):
@@ -4566,23 +4584,65 @@ class CodeGenerator:
                 # against an auto-keyed Identifier whose type/address come
                 # from a one-shot synthesized lookup. Easiest: emit the
                 # store inline using the stored bit_offset/width.
-                bit_offset, bit_width = bitfields[m_name_i]
+                info = bitfields[m_name_i]
+                if len(info) == 2:
+                    bit_offset, bit_width = info
+                    unit_size = 4
+                else:
+                    bit_offset, bit_width, unit_size = info
                 mask = (1 << bit_width) - 1
-                clear_mask = (~(mask << bit_offset)) & 0xFFFFFFFF
-                store = self._eval_expr_to_eax(actual, ctx)
-                store.append(f"        and     eax, {mask}")
-                if bit_offset > 0:
-                    store.append(f"        shl     eax, {bit_offset}")
-                # m_disp is the storage unit (offset already equals the
-                # unit_offset). RMW the unit at [ebp + m_disp].
-                unit_addr = _ebp_addr(m_disp)
-                store.append("        push    eax")
-                store.append(f"        mov     ecx, {unit_addr}")
-                store.append(f"        and     ecx, {clear_mask}")
-                store.append("        pop     edx")
-                store.append("        or      ecx, edx")
-                store.append(f"        mov     {unit_addr}, ecx")
-                out += store
+                positioned_mask = (mask << bit_offset) & ((1 << (unit_size * 8)) - 1)
+                clear_low = (~positioned_mask) & 0xFFFFFFFF
+                clear_high = ((~positioned_mask) >> 32) & 0xFFFFFFFF
+                if unit_size == 8:
+                    # Long-long bit-field: pack rhs (eval as 64-bit)
+                    # then RMW the 8-byte unit.
+                    store = self._eval_expr_to_edx_eax(actual, ctx)
+                    if bit_width <= 32:
+                        store.append(f"        and     eax, {mask}")
+                        store.append("        xor     edx, edx")
+                    else:
+                        high_m = (mask >> 32) & 0xFFFFFFFF
+                        store.append(f"        and     edx, {high_m}")
+                    if bit_offset >= 32:
+                        shift = bit_offset - 32
+                        store.append("        mov     edx, eax")
+                        store.append("        xor     eax, eax")
+                        if shift:
+                            store.append(f"        shl     edx, {shift}")
+                    elif bit_offset > 0:
+                        store.append(f"        shld    edx, eax, {bit_offset}")
+                        store.append(f"        shl     eax, {bit_offset}")
+                    addr_lo = _ebp_addr(m_disp)
+                    addr_hi = _ebp_addr(m_disp + 4)
+                    store.append("        push    edx")
+                    store.append("        push    eax")
+                    store.append(f"        mov     ecx, {addr_lo}")
+                    store.append(f"        and     ecx, {clear_low}")
+                    store.append("        pop     edx")
+                    store.append("        or      ecx, edx")
+                    store.append(f"        mov     {addr_lo}, ecx")
+                    store.append(f"        mov     ecx, {addr_hi}")
+                    store.append(f"        and     ecx, {clear_high}")
+                    store.append("        pop     edx")
+                    store.append("        or      ecx, edx")
+                    store.append(f"        mov     {addr_hi}, ecx")
+                    out += store
+                else:
+                    store = self._eval_expr_to_eax(actual, ctx)
+                    store.append(f"        and     eax, {mask}")
+                    if bit_offset > 0:
+                        store.append(f"        shl     eax, {bit_offset}")
+                    # m_disp is the storage unit (offset already equals the
+                    # unit_offset). RMW the unit at [ebp + m_disp].
+                    unit_addr = _ebp_addr(m_disp)
+                    store.append("        push    eax")
+                    store.append(f"        mov     ecx, {unit_addr}")
+                    store.append(f"        and     ecx, {clear_low}")
+                    store.append("        pop     edx")
+                    store.append("        or      ecx, edx")
+                    store.append(f"        mov     {unit_addr}, ecx")
+                    out += store
             else:
                 out += self._eval_expr_to_eax(actual, ctx)
                 out += self._store_from_eax(_ebp_addr(m_disp), m_ty)
