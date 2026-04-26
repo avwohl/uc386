@@ -1978,8 +1978,15 @@ class CodeGenerator:
 
     @staticmethod
     def _is_unsigned(t: ast.TypeNode) -> bool:
-        # `is_signed=None` is the language default — signed for char/short/int.
-        return isinstance(t, ast.BasicType) and t.is_signed is False
+        # `is_signed=None` is the language default — signed for
+        # char/short/int. EnumType is treated as unsigned for bit-field
+        # purposes (matches GCC's choice for enums of non-negative
+        # values, which is the common case).
+        if isinstance(t, ast.BasicType):
+            return t.is_signed is False
+        if isinstance(t, ast.EnumType):
+            return True
+        return False
 
     @staticmethod
     def _is_long_long(t: ast.TypeNode) -> bool:
@@ -2131,7 +2138,7 @@ class CodeGenerator:
         ctx: _FuncCtx,
     ) -> list[str]:
         """Write a bit-field: position the rhs, mask the storage, OR them in."""
-        bit_offset, bit_width, _ = bf
+        bit_offset, bit_width, member_ty = bf
         mask = (1 << bit_width) - 1
         clear_mask = (~(mask << bit_offset)) & 0xFFFFFFFF
         out = self._eval_expr_to_eax(rhs, ctx)        # eax = rhs
@@ -2145,15 +2152,19 @@ class CodeGenerator:
         out.append("        pop     edx")             # edx = positioned rhs
         out.append("        or      ecx, edx")        # combine
         out.append("        mov     [eax], ecx")     # store back
-        # Result of the assignment expression is the new value (rhs as
-        # narrowed to the field's width). Recompute it cheaply: edx
-        # already has the positioned form, but we want the unpositioned
-        # value — for simplicity, leave EAX = the rhs as-positioned in
-        # EDX. This is a fudge; chained `(f.x = v).y` isn't really
-        # meaningful for bit-fields.
+        # Result of the assignment expression is the new value (rhs
+        # narrowed to the bit-field's width). Reconstruct it: undo the
+        # left-shift by bit_offset from EDX. For SIGNED bit-fields,
+        # also sign-extend the resulting `bit_width`-wide value to the
+        # full 32-bit register, so subsequent `==` etc. compares with
+        # the right semantics.
         out.append("        mov     eax, edx")
         if bit_offset > 0:
             out.append(f"        shr     eax, {bit_offset}")
+        if not self._is_unsigned(member_ty) and bit_width < 32:
+            shift = 32 - bit_width
+            out.append(f"        shl     eax, {shift}")
+            out.append(f"        sar     eax, {shift}")
         return out
 
     # ---- identifier resolution (local vs global) ----------------------
@@ -4413,6 +4424,23 @@ class CodeGenerator:
         param_types: list[ast.TypeNode] | None = None
         if direct is not None and direct in self._func_param_types:
             param_types = self._func_param_types[direct]
+        elif indirect_callee is not None:
+            # Indirect call: extract param types from the callee's
+            # function-pointer type if known.
+            try:
+                callee_ty = self._type_of(indirect_callee, ctx)
+            except CodegenError:
+                callee_ty = None
+            ft: ast.FunctionType | None = None
+            if isinstance(callee_ty, ast.FunctionType):
+                ft = callee_ty
+            elif (
+                isinstance(callee_ty, ast.PointerType)
+                and isinstance(callee_ty.base_type, ast.FunctionType)
+            ):
+                ft = callee_ty.base_type
+            if ft is not None:
+                param_types = list(ft.param_types)
         out: list[str] = []
         total_arg_bytes = 0
         for arg_idx, arg in enumerate(reversed(args)):
