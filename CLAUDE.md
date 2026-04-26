@@ -212,3 +212,12 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Trailing `__attribute__` on typedef name.** `typedef struct S {...} T __attribute__((aligned(N)));` parses now.
 
   **Result: 1301/1514 gcc-c-torture** (up from 1297).
+- **2026-04-25 — torture cluster: small wins + minimal _Complex (1301 → 1308)**:
+  - **Bit-field compound assign in lvalue position.** `s.bf op= rhs` now goes through `_compound_assign_bitfield` which RMW's the storage unit at the right bit_offset/width with sign-extend; previously the regular path read the whole storage unit and smashed adjacent bit-fields.
+  - **Bit-field local init: don't skip across shared offsets.** Bit-fields share storage units but each gets its own init value; the union-style "advance past shared offset" logic was eating cursor positions.
+  - **`__builtin_classify_type` stub** in libc returning 1 (integer_type) — gcc-style tests use constant-folded equality.
+  - **Inline asm operand expressions evaluated for side effects.** Parser now captures the `(expr)` part of each `[name] "constraint" (expr)` operand; codegen evaluates each in sequence so `asm("" : "+r"(*bar()))` actually invokes bar(). Also handles `::` (COLONCOLON) as two consecutive group separators.
+  - **Outer pointer modifiers in `( declarator )` grouping.** `int *(p[25])` is "p as array of pointers" and `T * (*fty)()` is "fty as pointer-to-function-returning-pointer-to-T". Pre-applies pointer_stack to base_type before suffix-parsing so the substitute lands the * at the suffix's leaf base.
+  - **Minimal `_Complex T`.** Layout is 2*sizeof(base) (real then imag). `__real__`/`__imag__` on a Complex Identifier/Index/Member/`*p` lvalue compute the half address and load via fld. Assignment `__real__ x = rhs` writes back. Pass-by-value treats Complex like a struct (size-rounded byte copy onto the call stack). Arithmetic on complex values, returning complex by value, and complex compound assign are still TODO.
+
+  **Result: 1308/1514 gcc-c-torture** (up from 1301). Combined with c-testsuite still 215/220, the pipeline now passes 1523 / 1734 (87.8%).
