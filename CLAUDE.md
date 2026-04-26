@@ -130,3 +130,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **uc_core: `_nested_const_fold` preserves `is_unsigned` and `is_long_long`.** `(my_int * 2 + 4) - 8U` was folding the constants but losing the unsigned-ness, causing the residue to be treated as long long once the value exceeded INT_MAX. Now the fold helper carries flags through.
 
   **Result: 1134/1514 gcc-c-torture** (up from 1125); c-testsuite still 215/220; uc386's own suite still 310/310.
+- **2026-04-25 — torture cluster: setjmp + inline asm (1134 → 1160)**:
+  - **Real `setjmp`/`longjmp` (and `__builtin_setjmp`/`__builtin_longjmp`).** Previously stub-aborted on longjmp, breaking pr64242, built-in-setjmp.c, pr60003.c. Now save EBX/ESI/EDI/EBP/ESP/return-EIP into `jmp_buf[0..5]` and restore on longjmp. The long jump treats `val == 0` as 1 (per C — keeps setjmp's "0 means direct call" sentinel meaningful).
+  - **Inline asm parsed as a no-op statement.** Added `asm` / `__asm` / `__asm__` keywords, an `AsmStmt` AST node, and a parser that swallows the `("template" : outputs : inputs : clobbers)` operand groups without honoring them. uc386 lowers it to nothing. Unlocks ~20 tests that use `asm("")` purely as a compiler barrier.
+  - **`__restrict` and `__restrict__` keywords.** Mapped to RESTRICT, so `extern int baz(struct a *__restrict x);`-style declarations parse.
+  - **Top-level stray `;` tolerance.** `static inline ... };` (semicolon after function body, common from C++ habits) no longer trips the parser.
+
+  **Result: 1160/1514 gcc-c-torture** (up from 1134). Combined with c-testsuite's 215/220, the run-mode pipeline now passes 1375 / 1734 (79.3%).

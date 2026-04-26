@@ -2573,6 +2573,13 @@ class CodeGenerator:
             if not ctx.continue_targets:
                 raise CodegenError("`continue` outside of a loop")
             return [f"        jmp     {ctx.continue_targets[-1]}"]
+        if isinstance(item, ast.AsmStmt):
+            # Inline asm is treated as a no-op; we don't honor the
+            # template, constraints, or clobbers. Tests that use it
+            # purely as an optimization barrier (most of them) work
+            # because uc386 doesn't aggressively optimize across the
+            # statement boundary.
+            return []
         if isinstance(item, ast.DeclarationList):
             # `int x, *p, **pp;` parses as DeclarationList of one VarDecl
             # per declarator. Lower each one in order.
