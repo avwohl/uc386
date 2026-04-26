@@ -206,3 +206,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`__signed`/`__signed__` keywords; gcc builtin types like `__INT_LEAST*_TYPE__`, `__builtin_va_list`.**
 
   **Result: 1297/1514 gcc-c-torture** (up from 1278). Combined with c-testsuite still 215/220, the pipeline now passes 1512 / 1734 (87.2%).
+- **2026-04-25 — torture cluster: parser polish (1297 → 1301)**:
+  - **`__extension__` keyword** is consumed and discarded (it just suppresses pedantic warnings around non-standard expressions/decls).
+  - **K&R parameter declarations with `register` / `auto`.** `_parse_kr_declarations` consumes the storage-class keyword before reading the type specifier.
+  - **Trailing `__attribute__` on typedef name.** `typedef struct S {...} T __attribute__((aligned(N)));` parses now.
+
+  **Result: 1301/1514 gcc-c-torture** (up from 1297).
