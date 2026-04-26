@@ -3268,13 +3268,25 @@ class CodeGenerator:
             return self._identifier_type(expr.name, ctx)
         if isinstance(expr, ast.IntLiteral):
             # Honor the L/U suffixes per C: 17L → long, 17U → unsigned int,
-            # 17LL → long long. Used by `_Generic` matching, mostly.
+            # 17LL → long long. uc_core's parser sets is_long=True for
+            # both L and LL, so we additionally check if the literal's
+            # value overflows 32 bits — that forces it to long long.
             name = "int"
-            if getattr(expr, "is_long", False):
+            v = expr.value
+            unsigned = getattr(expr, "is_unsigned", False)
+            is_long = getattr(expr, "is_long", False)
+            limit = 0xFFFFFFFF if unsigned else 0x7FFFFFFF
+            if (
+                (is_long and v > limit)
+                or v > 0xFFFFFFFF
+                or v < -0x80000000
+            ):
+                name = "long long"
+            elif is_long:
                 name = "long"
             return ast.BasicType(
                 name=name,
-                is_signed=(False if getattr(expr, "is_unsigned", False) else None),
+                is_signed=(False if unsigned else None),
             )
         if isinstance(expr, ast.CharLiteral):
             # Per C, a character constant has type `int`, not `char`.
@@ -3591,18 +3603,18 @@ class CodeGenerator:
         if isinstance(expr, ast.NullptrLiteral):
             return ["        xor     eax, eax", "        xor     edx, edx"]
         if isinstance(expr, ast.Identifier):
-            try:
+            t = self._type_of(expr, ctx)
+            if self._is_long_long(t):
                 addr = self._identifier_addr_text(expr.name, ctx)
                 return self._load_to_edx_eax(addr)
-            except CodegenError:
-                # Fall back to 32-bit load + sign extend (e.g. enum const).
-                out = self._eval_expr_to_eax(expr, ctx)
-                t = self._type_of(expr, ctx)
-                if self._is_unsigned(t):
-                    out.append("        xor     edx, edx")
-                else:
-                    out.append("        cdq")
-                return out
+            # Smaller-than-long-long Identifier in long-long context:
+            # load as 32-bit value, then sign- or zero-extend to fill EDX.
+            out = self._eval_expr_to_eax(expr, ctx)
+            if self._is_unsigned(t):
+                out.append("        xor     edx, edx")
+            else:
+                out.append("        cdq")
+            return out
         if isinstance(expr, ast.Index):
             addr = self._index_address(expr, ctx)
             # _index_address leaves &arr[i] in eax. Load 8 bytes through
@@ -3626,8 +3638,28 @@ class CodeGenerator:
             src_ty = self._type_of(expr.expr, ctx)
             if self._is_long_long(src_ty):
                 return self._eval_expr_to_edx_eax(expr.expr, ctx)
+            if self._is_long_long(target):
+                # int → long long: extend per the SOURCE's signedness
+                # (since the value's bit pattern comes from the source).
+                if self._is_float_type(src_ty):
+                    out = self._eval_float_to_st0(expr.expr, ctx)
+                    out += [
+                        "        sub     esp, 8",
+                        "        fistp   qword [esp]",
+                        "        pop     eax",
+                        "        pop     edx",
+                    ]
+                    return out
+                out = self._eval_expr_to_eax(expr.expr, ctx)
+                if self._is_unsigned(src_ty):
+                    out.append("        xor     edx, edx")
+                else:
+                    out.append("        cdq")
+                return out
+            # Widening a smaller type via cast to int/unsigned int and
+            # then needing to fill EDX:EAX. Use the TARGET type's
+            # signedness — `(unsigned int)(-1)` should zero-extend.
             if self._is_float_type(src_ty):
-                # float → long long: fistp to a 64-bit slot, then load.
                 out = self._eval_float_to_st0(expr.expr, ctx)
                 out += [
                     "        sub     esp, 8",
@@ -3636,9 +3668,8 @@ class CodeGenerator:
                     "        pop     edx",
                 ]
                 return out
-            # int → long long: sign- or zero-extend.
-            out = self._eval_expr_to_eax(expr.expr, ctx)
-            if self._is_unsigned(src_ty):
+            out = self._eval_expr_to_eax(expr, ctx)
+            if self._is_unsigned(target):
                 out.append("        xor     edx, edx")
             else:
                 out.append("        cdq")
