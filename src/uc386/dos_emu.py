@@ -486,13 +486,68 @@ def _libc_provided_symbols() -> set[str]:
     return syms
 
 
+def _user_defined_symbols(asm_text: str) -> set[str]:
+    """Names defined in `asm_text` (top-level labels of the form
+    `_name:`). Used to decide which libc routines to drop when the
+    user code provides its own version (the test program's own
+    `sin`/`cos` etc. shadow ours).
+    """
+    out: set[str] = set()
+    for line in asm_text.splitlines():
+        s = line.strip()
+        if s.startswith(";") or not s:
+            continue
+        if s.startswith("_") and ":" in s:
+            label = s.split(":", 1)[0].strip()
+            if label.startswith("_") and "." not in label[1:]:
+                # Top-level globals — keep `_name`. Skip `.local` labels.
+                if label[1:].replace("_", "").isalnum():
+                    out.add(label[1:])
+    return out
+
+
+def _strip_libc_function(libc_text: str, name: str) -> str:
+    """Remove the function body labeled `_name:` from libc.asm so the
+    user's definition wins. The body extends from `_name:` up to the
+    next top-level label.
+    """
+    lines = libc_text.splitlines()
+    out: list[str] = []
+    skip = False
+    target = f"_{name}:"
+    target_alias_pre = f"_{name} "  # tolerate weird formatting
+    for line in lines:
+        s = line.strip()
+        if not skip and (s == target or s.startswith(target_alias_pre)):
+            skip = True
+            continue
+        if skip:
+            # Stop skipping when we hit the next top-level label.
+            if s.startswith("_") and ":" in s and not s.startswith("."):
+                skip = False
+        if not skip:
+            out.append(line)
+    return "\n".join(out)
+
+
 def bundle_user_asm(asm_path: Path) -> Path:
     """Strip `extern _name` lines for libc-provided symbols and append
     `lib/i386_dos_libc.asm`. Writes the merged asm next to `asm_path`
     with a `.bundled.asm` suffix and returns its path.
+
+    User code may define its own version of a libc symbol (e.g., a
+    test that ships its own `sin`). When that happens, we strip the
+    matching definition from libc.asm so nasm doesn't see a
+    duplicate.
     """
     libc_syms = _libc_provided_symbols()
-    user_lines = asm_path.read_text().splitlines()
+    user_text = asm_path.read_text()
+    user_syms = _user_defined_symbols(user_text)
+    libc_text = LIBC_ASM_PATH.read_text()
+    # Drop libc definitions that the user provides.
+    for name in libc_syms & user_syms:
+        libc_text = _strip_libc_function(libc_text, name)
+    user_lines = user_text.splitlines()
     out_lines: list[str] = []
     for line in user_lines:
         s = line.strip()
@@ -505,7 +560,7 @@ def bundle_user_asm(asm_path: Path) -> Path:
     bundled = asm_path.with_suffix(".bundled.asm")
     bundled.write_text(
         "\n".join(out_lines) + "\n\n; ==== bundled libc ====\n"
-        + LIBC_ASM_PATH.read_text()
+        + libc_text
     )
     return bundled
 

@@ -642,6 +642,90 @@ ___builtin_bswap32:
         mov     esp, ebp
         pop     ebp
         ret
+___builtin_prefetch:
+        ret                          ; no-op
+___builtin_signbit:
+        ; signbit(double): low half at [esp+4..7], high at [esp+8..11].
+        ; Bit 31 of high half is the sign bit. Return 0 or 1.
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 12]      ; high 32 of double
+        shr     eax, 31
+        mov     esp, ebp
+        pop     ebp
+        ret
+___builtin_signbitf:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]       ; float bits
+        shr     eax, 31
+        mov     esp, ebp
+        pop     ebp
+        ret
+___builtin_signbitl:
+        jmp     ___builtin_signbit
+___builtin_sprintf:
+        jmp     _sprintf
+___builtin_snprintf:
+        jmp     _snprintf
+___builtin_longjmp:
+        ; Real longjmp restores a saved jmp_buf. We don't really
+        ; support setjmp/longjmp, so just exit non-zero so any test
+        ; that depends on them fails visibly.
+        mov     ax, 0x4C7F
+        int     21h
+___builtin_setjmp:
+        ; setjmp returns 0 on direct call (no longjmp). Return 0.
+        xor     eax, eax
+        ret
+_setjmp:
+        xor     eax, eax
+        ret
+_longjmp:
+        mov     ax, 0x4C7F
+        int     21h
+___builtin_mul_overflow:
+        ; Three pointer args: (a, b, *result). Returns int (0=ok, 1=overflow).
+        ; We approximate without overflow detection: *result = a * b; return 0.
+        push    ebp
+        mov     ebp, esp
+        push    edi
+        mov     eax, [ebp + 8]
+        imul    eax, [ebp + 12]
+        mov     edi, [ebp + 16]
+        mov     [edi], eax
+        xor     eax, eax
+        pop     edi
+        mov     esp, ebp
+        pop     ebp
+        ret
+___builtin_add_overflow:
+        push    ebp
+        mov     ebp, esp
+        push    edi
+        mov     eax, [ebp + 8]
+        add     eax, [ebp + 12]
+        mov     edi, [ebp + 16]
+        mov     [edi], eax
+        xor     eax, eax
+        pop     edi
+        mov     esp, ebp
+        pop     ebp
+        ret
+___builtin_sub_overflow:
+        push    ebp
+        mov     ebp, esp
+        push    edi
+        mov     eax, [ebp + 8]
+        sub     eax, [ebp + 12]
+        mov     edi, [ebp + 16]
+        mov     [edi], eax
+        xor     eax, eax
+        pop     edi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
 ___builtin_bswap16:
         push    ebp
         mov     ebp, esp
