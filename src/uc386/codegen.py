@@ -2107,6 +2107,14 @@ class CodeGenerator:
                 ret_ty = self._func_return_types[self._call_target(sub)]
                 size = (self._size_of(ret_ty) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
+            elif isinstance(sub, ast.Call) and self._is_complex_returning_call(sub, None):
+                # Complex-returning calls need a per-call-site temp
+                # so consumers like `__real foo()` can address the
+                # halves via a stable slot.
+                target = self._call_target(sub)
+                ret_ty = self._func_return_types[target]
+                size = (self._size_of(ret_ty) + 3) & ~3
+                ctx.alloc_call_temp(sub, size)
             elif isinstance(sub, ast.Compound):
                 size = self._compound_temp_size(sub)
                 ctx.alloc_call_temp(sub, size)
@@ -2351,6 +2359,16 @@ class CodeGenerator:
             out = self._member_address(operand, ctx)
         elif isinstance(operand, ast.Index):
             out = self._index_address(operand, ctx)
+        elif (
+            isinstance(operand, ast.Call)
+            and self._is_complex_returning_call(operand, ctx)
+        ):
+            # Route the call into its per-call-site temp slot, then
+            # use the temp's address.
+            disp = ctx.call_temps[id(operand)]
+            retptr_lines = [f"        lea     eax, {_ebp_addr(disp)}"]
+            out = self._call_into_address(operand, retptr_lines, ctx)
+            out.append(f"        lea     eax, {_ebp_addr(disp)}")
         else:
             raise CodegenError(
                 f"`{expr.op}` operand must be a simple lvalue "
