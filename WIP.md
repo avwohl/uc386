@@ -26,27 +26,30 @@ link → run → diff pipeline is not yet wired. Headers in
 Latest tally — `python run_ctests.py --full` and
 `python run_gcc_torture.py --full`:
 
-    c-testsuite     214 / 220   (97.3%)  — running for real
-    gcc-c-torture   989 / 1514  (65.3%)  — running for real
+    c-testsuite     215 / 220   (97.7%)  — running for real
+    gcc-c-torture  1063 / 1514  (70.2%)  — running for real
 
 The full run-mode pipeline is wired:
 uc386 → .asm → bundle libc.asm → nasm -f bin → unicorn-engine →
 diff stdout against the test's `.expected` (or check exit code).
 INT 21h is intercepted by `src/uc386/dos_emu.py` so DOS-style
-syscalls reach a Python-side handler.
+syscalls reach a Python-side handler. Long-long divide / modulo
+goes through INT 0x80 to avoid clobbering EAX with a dispatch byte.
 
 Remaining c-testsuite gaps: 00216 (init-list torture), 00187
 (real file I/O), 00200 (shift-type subtleties), 00204 (struct
-va_arg in detail), 00218 (8-bit unsigned-enum bit-field), and
-the const-qualifier edge of `_Generic` (00219).
+va_arg in detail), 00219 (const-qualifier edge of `_Generic`).
 
 Remaining torture gaps cluster around features that each warrant
-their own day-long slice:
-  - long long arithmetic (real 64-bit ops; ~110 tests)
+their own slice:
+  - __complex__ types (~150 tests)
   - inline asm (`asm("...")`)
-  - __complex__ types
   - nested function definitions (gcc extension)
   - VaArgExpr address-of and struct va_arg edges
+  - aligned-attribute / packed-struct
+  - VLA in struct/param-list with side effects
+  - GCC label-values (`&&label`, computed goto)
+  - file I/O
 
 To finish the pipeline:
 1. NASM assembly (`-f bin` works; for `-f obj`/`-f elf` we'd need a linker).
