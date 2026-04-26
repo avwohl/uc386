@@ -3882,15 +3882,20 @@ class CodeGenerator:
 
     @staticmethod
     def _string_to_bytes(s: str) -> bytes:
-        """Encode a Python str (possibly with `surrogateescape` lone
-        bytes from a Latin-1 source file) back to a bytes object.
-        High-bit-set characters round-trip through Latin-1 except for
-        surrogates, which we extract from their UTF-16 surrogate
-        encoding."""
+        """Encode a Python str (a C string literal) to bytes.
+
+        C string literals in 8-bit char arrays target one byte per
+        character. Octal escapes like `"\\377"` produce a U+00FF
+        codepoint which we want as a single 0xFF byte. Latin-1
+        encoding gives that round-trip for codepoints 0-255;
+        surrogate-escaped raw bytes (from a Latin-1 source file)
+        decode the same way. We fall back to UTF-8 only for higher
+        codepoints which have no single-byte representation.
+        """
         try:
-            return s.encode("utf-8", errors="surrogateescape")
+            return s.encode("latin-1", errors="surrogateescape")
         except UnicodeEncodeError:
-            return s.encode("latin-1", errors="replace")
+            return s.encode("utf-8", errors="surrogateescape")
 
     def _resolve_static_init_name(self, name: str) -> str:
         """While emitting a static-local global init, an Identifier
@@ -5377,11 +5382,7 @@ class CodeGenerator:
         out = self._complex_value_address(expr, ctx)
         out.append("        mov     edx, eax")
         out.append("        mov     ecx, [esp]")
-        offset = 0
-        while size - offset >= 4:
-            out.append(f"        mov     eax, [edx + {offset}]")
-            out.append(f"        mov     [ecx + {offset}], eax")
-            offset += 4
+        self._emit_memcpy_inline(out, "edx", "ecx", size)
         return out
 
     def _cast_to_complex_into_top(
@@ -5470,6 +5471,29 @@ class CodeGenerator:
             out.append("        fchs")
             out.append(f"        fstp    {width} [ecx + {half_size}]")
         return out
+
+    def _emit_memcpy_inline(
+        self, out: list[str], src_reg: str, dst_reg: str, size: int,
+        src_off: int = 0, dst_off: int = 0,
+    ) -> None:
+        """Emit unrolled byte-wise memcpy from `[src_reg+src_off]` to
+        `[dst_reg+dst_off]` for `size` bytes. Uses 4-byte loads/stores
+        through EAX, falling back to 2-byte (AX) and 1-byte (AL) for
+        odd tails. Required for `_Complex char` / `_Complex short`
+        whose total size isn't a multiple of 4.
+        """
+        offset = 0
+        while size - offset >= 4:
+            out.append(f"        mov     eax, [{src_reg} + {src_off + offset}]")
+            out.append(f"        mov     [{dst_reg} + {dst_off + offset}], eax")
+            offset += 4
+        if size - offset >= 2:
+            out.append(f"        mov     ax, [{src_reg} + {src_off + offset}]")
+            out.append(f"        mov     [{dst_reg} + {dst_off + offset}], ax")
+            offset += 2
+        if size - offset >= 1:
+            out.append(f"        mov     al, [{src_reg} + {src_off + offset}]")
+            out.append(f"        mov     [{dst_reg} + {dst_off + offset}], al")
 
     def _complex_int_neg_half(
         self, out: list, addr_reg: str, off: int, half_size: int,
@@ -5730,11 +5754,7 @@ class CodeGenerator:
         out.append("        mov     edx, eax")
         out.append("        mov     ecx, [esp]")
         size = self._size_of(ty)
-        offset = 0
-        while size - offset >= 4:
-            out.append(f"        mov     eax, [edx + {offset}]")
-            out.append(f"        mov     [ecx + {offset}], eax")
-            offset += 4
+        self._emit_memcpy_inline(out, "edx", "ecx", size)
         return out
 
     def _complex_assign_from_scalar(
@@ -5812,11 +5832,7 @@ class CodeGenerator:
         out += self._complex_value_address(rhs, ctx)
         out.append("        mov     edx, eax")
         out.append("        pop     ecx")
-        offset = 0
-        while size - offset >= 4:
-            out.append(f"        mov     eax, [edx + {offset}]")
-            out.append(f"        mov     [ecx + {offset}], eax")
-            offset += 4
+        self._emit_memcpy_inline(out, "edx", "ecx", size)
         out.append("        mov     eax, ecx")
         return out
 
@@ -5839,11 +5855,7 @@ class CodeGenerator:
         out += self._complex_value_address(src_expr, ctx)
         out.append("        mov     edx, eax")
         out.append("        pop     ecx")
-        offset = 0
-        while size - offset >= 4:
-            out.append(f"        mov     eax, [edx + {offset}]")
-            out.append(f"        mov     [ecx + {offset}], eax")
-            offset += 4
+        self._emit_memcpy_inline(out, "edx", "ecx", size)
         out.append(f"        mov     eax, {_ebp_addr(retptr_disp)}")
         return out
 
@@ -8444,6 +8456,14 @@ class CodeGenerator:
             operand_ty = self._type_of(expr.left.operand, ctx)
             if isinstance(operand_ty, ast.ComplexType):
                 addr_lines, half_ty = self._complex_part_address(expr.left, ctx)
+                if operand_ty.base_type in self._COMPLEX_INT_BASES:
+                    # Integer half: store via the regular int store.
+                    out = list(addr_lines)
+                    out.append("        push    eax")
+                    out += self._eval_expr_to_eax(expr.right, ctx)
+                    out.append("        pop     ecx")
+                    out += self._store_from_eax("[ecx]", half_ty)
+                    return out
                 size = self._size_of(half_ty)
                 width = "dword" if size == 4 else "qword"
                 out = list(addr_lines)
