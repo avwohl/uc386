@@ -886,7 +886,16 @@ ___builtin_return_address:
         xor     eax, eax
         ret
 ___builtin_frame_address:
-        xor     eax, eax
+        ; Return the caller's frame pointer. With our prologue, the
+        ; caller's saved EBP is at [esp+0] before we set up our frame —
+        ; but we already have a return address at [esp+0] when entered
+        ; via call. Read the caller's EBP from there. We don't honor
+        ; the level argument — only level 0 is supported.
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp]              ; saved EBP of caller
+        mov     esp, ebp
+        pop     ebp
         ret
 ___builtin_expect_with_probability:
         ; First arg is the value, ignore the rest.
