@@ -1322,12 +1322,15 @@ class CodeGenerator:
                     break
                 group.append(vj)
                 j += 1
-            if len(group) == leaf_count:
+            if len(group) > 0:
+                # Wrap whatever we collected. Partial groups (fewer
+                # than leaf_count) zero-fill the unwritten slots in
+                # the struct/array.
                 out.append(ast.InitializerList(values=group))
                 i = j
             else:
-                # Couldn't form a complete group — pass through, let
-                # the downstream type-check raise a clearer error.
+                # Empty group (caused by a leading designator we
+                # already passed through) — defensive bail-out.
                 out.append(v)
                 i += 1
         return out
@@ -2205,10 +2208,14 @@ class CodeGenerator:
                 # Complex-valued sub-expression: needs a temp slot
                 # to hold the (real, imag) result. One per node so
                 # `(a+b) + (c+d)` allocates distinct buffers.
+                # `_type_of` may fail because the temp-collection
+                # pass runs after the local-scope chain has been
+                # exited; fall back to the structural complex
+                # detector for those cases.
                 try:
                     ty = self._type_of(sub, ctx)
                 except CodegenError:
-                    continue
+                    ty = self._type_of_complex_expr(sub)
                 if isinstance(ty, ast.ComplexType):
                     size = (self._size_of(ty) + 3) & ~3
                     ctx.alloc_call_temp(sub, size)
