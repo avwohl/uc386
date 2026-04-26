@@ -1312,8 +1312,10 @@ class CodeGenerator:
                 out.append(v)
                 i += 1
                 continue
-            # A StringLiteral is a complete initializer for a char
-            # array — don't elision-wrap it.
+            # When elem_type is a `char[]` directly, a StringLiteral is
+            # a complete initializer; don't elision-wrap it. (`{"str"}`
+            # initializing struct{char[N]} still gets wrapped below
+            # because the elem there is the struct, not char[].)
             if (
                 isinstance(v, ast.StringLiteral)
                 and isinstance(elem_type, ast.ArrayType)
@@ -1324,22 +1326,20 @@ class CodeGenerator:
                 i += 1
                 continue
             # Flat value — gather up to leaf_count consecutive flat
-            # values into an InitializerList for one element.
+            # values into an InitializerList for one element. Stop
+            # the group after a StringLiteral (which can fill a whole
+            # nested char array all by itself, so subsequent flat
+            # values belong to the next element).
             group = []
             j = i
             while j < len(values) and j - i < leaf_count:
                 vj = values[j]
                 if isinstance(vj, (ast.DesignatedInit, ast.InitializerList)):
                     break
-                if (
-                    isinstance(vj, ast.StringLiteral)
-                    and isinstance(elem_type, ast.ArrayType)
-                    and isinstance(elem_type.base_type, ast.BasicType)
-                    and elem_type.base_type.name == "char"
-                ):
-                    break
                 group.append(vj)
                 j += 1
+                if isinstance(vj, ast.StringLiteral):
+                    break
             if len(group) > 0:
                 # Wrap whatever we collected. Partial groups (fewer
                 # than leaf_count) zero-fill the unwritten slots in
@@ -2237,6 +2237,14 @@ class CodeGenerator:
                 if isinstance(ty, ast.ComplexType):
                     size = (self._size_of(ty) + 3) & ~3
                     ctx.alloc_call_temp(sub, size)
+            elif (
+                isinstance(sub, ast.FloatLiteral) and sub.is_imaginary
+            ):
+                # `1.0i` as a complex value — needs a temp slot.
+                ty = self._type_of_complex_expr(sub)
+                if isinstance(ty, ast.ComplexType):
+                    size = (self._size_of(ty) + 3) & ~3
+                    ctx.alloc_call_temp(sub, size)
 
     def _compound_temp_size(self, node: ast.Compound) -> int:
         """Size of the per-call-site temp slot for a compound literal.
@@ -2453,9 +2461,9 @@ class CodeGenerator:
             out = self._call_into_address(expr, retptr_lines, ctx)
             out.append(f"        lea     eax, {_ebp_addr(disp)}")
             return out
-        # Complex-valued sub-expression (BinaryOp / UnaryOp / Cast):
-        # evaluate into the pre-allocated temp slot reserved by
-        # `_collect_call_temps`, then return its address.
+        # Complex-valued sub-expression (BinaryOp / UnaryOp / Cast)
+        # or imaginary FloatLiteral: evaluate into the pre-allocated
+        # temp slot reserved by `_collect_call_temps`.
         if (
             isinstance(expr, (ast.BinaryOp, ast.UnaryOp, ast.Cast))
             and id(expr) in ctx.call_temps
@@ -2465,6 +2473,24 @@ class CodeGenerator:
             out = self._eval_complex_to(expr, dest, ctx)
             out.append(f"        lea     eax, {_ebp_addr(disp)}")
             return out
+        if (
+            isinstance(expr, ast.FloatLiteral)
+            and expr.is_imaginary
+            and id(expr) in ctx.call_temps
+        ):
+            disp = ctx.call_temps[id(expr)]
+            ty = self._type_of_complex_expr(expr)
+            half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
+            width = "dword" if half_size == 4 else "qword"
+            r_label = self._intern_float(0.0, half_size)
+            i_label = self._intern_float(float(expr.value), half_size)
+            return [
+                f"        fld     {width} [{r_label}]",
+                f"        fstp    {width} {_ebp_addr(disp)}",
+                f"        fld     {width} [{i_label}]",
+                f"        fstp    {width} {_ebp_addr(disp + half_size)}",
+                f"        lea     eax, {_ebp_addr(disp)}",
+            ]
         raise CodegenError(
             f"can't take address of complex `{type(expr).__name__}`"
         )
