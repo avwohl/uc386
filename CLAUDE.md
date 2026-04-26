@@ -193,3 +193,16 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **GCC builtin types: `__INT_LEAST{8,16,32,64}_TYPE__`, `__INT_FAST*_TYPE__`, `__INTMAX_TYPE__`, `__builtin_va_list`.** Added as preprocessor predefines so type-introducing typedefs resolve.
 
   **Result: 1278/1514 gcc-c-torture** (up from 1265).
+- **2026-04-25 — torture cluster: more globals + bit-field polish (1278 → 1297)**:
+  - **`__func__` / `__FUNCTION__` / `__PRETTY_FUNCTION__`.** Identifier helpers intern the current function's name as a string and load its address.
+  - **EnumType globals.** `static volatile enum X test = 0;` now lays down a `dd <const>` like a regular int.
+  - **`extern T arr[];` (unsized arrays).** `_resolved_var_type` lets extern arrays keep `size = None` since we just need the linker label.
+  - **`__builtin_expect` evaluates the second arg for side effects.** Per gcc semantics, the "expected value" arg is a runtime expression. We eval it (drop the result) before yielding the first arg.
+  - **Bit-field designated init in globals.** `static struct { int :1; int s:1; } s = { .s = 1 };` now packs into the storage unit at the right offset.
+  - **Mixed bit-field + regular member globals.** Restructured `_emit_global_bitfield_struct_init` to emit each member's init at its declared offset (one packed dword for bit-fields, normal init for regulars, zero-fill for unwritten gaps).
+  - **Bit-field local init: don't skip across shared offsets.** Bit-fields share storage units but each gets its own init value; the union-style "advance past shared offset" logic was eating cursor positions for bit-fields.
+  - **Inline struct/union members of pointers.** `struct outer { struct inner { ... } *p; };` now registers `struct inner` so a sibling `struct inner *` (without inline body) resolves.
+  - **Implicit int (pre-C99).** `static foo[10];` and `f(args) { ... }` default the type to `int` when no specifier is present and the next token starts a declarator.
+  - **`__signed`/`__signed__` keywords; gcc builtin types like `__INT_LEAST*_TYPE__`, `__builtin_va_list`.**
+
+  **Result: 1297/1514 gcc-c-torture** (up from 1278). Combined with c-testsuite still 215/220, the pipeline now passes 1512 / 1734 (87.2%).

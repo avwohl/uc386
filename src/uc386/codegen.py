@@ -2139,6 +2139,17 @@ class CodeGenerator:
         # without an init) are caught by `_resolved_var_type` before they
         # reach this check.
         if isinstance(t, ast.PointerType):
+            # If the pointee is an inline-defined struct/union, register
+            # it under its tag so a sibling `struct foo *` (without a
+            # body) can resolve later. We don't need its layout for
+            # the pointer itself.
+            base = t.base_type
+            if (
+                isinstance(base, ast.StructType)
+                and base.name
+                and base.members
+            ):
+                self._resolve_struct_name(base)
             return
         if isinstance(t, ast.BasicType) and t.name in self._SLOT_BASIC_NAMES:
             return
@@ -3776,15 +3787,17 @@ class CodeGenerator:
                 actual = value
                 # Advance past members that share the same offset
                 # (anonymous-union alternatives get one slot of init
-                # between them: the value goes to members[idx], and
-                # the rest at this offset are not separately consumed).
+                # between them). Bit-fields can also share an offset
+                # (same storage unit, different bit_offsets) but each
+                # gets its own init value, so we don't skip over them.
                 next_cursor = cursor + 1
                 _, _, this_off = members[idx]
-                while (
-                    next_cursor < len(members)
-                    and members[next_cursor][2] == this_off
-                ):
-                    next_cursor += 1
+                if not bitfields:
+                    while (
+                        next_cursor < len(members)
+                        and members[next_cursor][2] == this_off
+                    ):
+                        next_cursor += 1
                 cursor = next_cursor
             filled.add(idx)
             m_name_i, m_ty, m_off = members[idx]
