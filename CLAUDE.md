@@ -221,3 +221,33 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Minimal `_Complex T`.** Layout is 2*sizeof(base) (real then imag). `__real__`/`__imag__` on a Complex Identifier/Index/Member/`*p` lvalue compute the half address and load via fld. Assignment `__real__ x = rhs` writes back. Pass-by-value treats Complex like a struct (size-rounded byte copy onto the call stack). Arithmetic on complex values, returning complex by value, and complex compound assign are still TODO.
 
   **Result: 1308/1514 gcc-c-torture** (up from 1301). Combined with c-testsuite still 215/220, the pipeline now passes 1523 / 1734 (87.8%).
+- **2026-04-26 — torture sweep: computed goto, offsetof, long-long bit-fields, +Q (1308 → 1445)**: a long sweep through the torture failures. Lots of independent root causes; collecting the wins here.
+  - **GCC computed goto (`&&label` and `goto *expr`).** uc_core gets a `LabelAddr` AST node for `&&label` and a `target` field on `GotoStmt` for the indirect form. uc386 saves each function's user-label table after `_collect_labels` so static-local globals (emitted later from `.data`) can resolve `&&label` as `_funcname.LN_user_<x>`. Static-local globals (which can have initializers like `static const void *j[] = {&&l1, &&l2};`) now know which function they came from via a new `_static_local_owner` map; `_emit_global_init` uses that to consult the right user-label table.
+  - **`__builtin_offsetof(T, designator)`.** Parser walks the `.field`/`[idx]` chain into a Member/Index tree rooted at a synthetic Identifier of T; new `OffsetofExpr` AST node. Codegen recurses through the chain, accumulating member offsets and `idx*sizeof(elem)` to a single integer constant.
+  - **`__builtin_types_compatible_p(T1, T2)`.** New AST node + codegen folder; checks BasicType match (with `signed int` ↔ `int`), pointer-pointee compat, array-element compat (size differences allowed), struct-tag compat, enum-tag compat.
+  - **Long-long bit-fields (33–64 bits).** Storage unit width follows the bit-field's declared type — 4 bytes for `int`/`unsigned`, 8 bytes for `long long`/`unsigned long long`. The `(bit_offset, bit_width)` tuple in `_struct_bitfields` grew a `unit_size` field. Loads via `_bitfield_load_ll`: read EDX:EAX from the unit, `shrd` across the 32-bit boundary, mask to width, sign-extend if signed. Stores via `_bitfield_store_ll_simple`: address-once, eval rhs to EDX:EAX, mask + `shld` to position, RMW the 8-byte unit through ESI/EDI. Compound assignment desugars through `_bitfield_store_ll_simple`. Globals get `dd low, dd high` pairs in `_emit_global_bitfield_struct_init`. Mixing 4-byte and 8-byte bit-fields in the same struct finishes the current unit at the type change and re-aligns to the larger natural alignment.
+  - **`__label__` declarations** parse and discard at the start of any compound statement.
+  - **`__alignof__` / `__alignof` keyword aliases** to ALIGNOF.
+  - **`__builtin_va_arg`** alias for `va_arg`.
+  - **`__extension__` before declarations.** `_is_declaration_start` peeks past leading `_DOS_IGNORED_IDENTS` so `__extension__ union { ... } u = ...;` is recognized as a local decl.
+  - **Compound literal postfix chaining.** `(int []){0,1,2}[1]` now parses as `Index(Compound, 1)` — the cast/compound-literal branch in `_parse_cast` continues into `_parse_postfix_continue` so `[i]`/`.field`/`(args)`/`++` chain off the compound literal. Unsized array compound literals (`(int []){0, f(), 2}`) infer length from the initializer.
+  - **GNU `name : value` designator** (`{ c: {1,2,3} }`) parses alongside the C99 `.name = value` form.
+  - **Multi-level designators.** `.a.b = expr` synthesizes a nested InitializerList so the standard struct-init dispatch handles it. Works in both local and global init.
+  - **StmtExpr returning a struct.** `({ ...; expr; }).field` now lowers via `_struct_address` of the trailing expression rather than trying to load the whole struct into EAX. The body's items emit in scope, then `_struct_address` runs in the same scope so locals declared in the body are visible.
+  - **`_struct_address(BinaryOp("="))` for struct-typed assignments.** Chained struct assignment in expression position (like `a = ({ ...; p[3] = b; });`) now works via `_struct_copy_assign`.
+  - **`&__real__ x` and `&__imag__ x`.** Address-of a `_Complex` half via the existing `_complex_part_address` machinery.
+  - **Wide-char globals.** `wchar_t arr[N] = L"foo"` now lays out 2-byte per-codepoint elements with a trailing null.
+  - **`wchar_t`** typedef in our `<stddef.h>` stub via `__WCHAR_TYPE__`.
+  - **Latin-1 source files.** Sources containing literal high bytes (`"\377"` meaning 0xFF) round-trip through `surrogateescape`.
+  - **String init that doesn't fit drops the null** (per C). String init that's *longer* than the array truncates silently (gcc QoI).
+  - **Float global init can be a constant arithmetic expression** (e.g. `1024.0 - 1.0/32768.0`).
+  - **Bit-field width** can be a non-literal compile-time integer expression (e.g. `sizeof(int)*8 - 2`); `_const_eval` runs over the width when it's not an `IntLiteral`.
+  - **Builtin macros galore.** `__CHAR_BIT__`, `__INT_MAX__`/`__INT_MIN__` and similar for short/long/long-long, `__FLT_MAX__`/`__DBL_MAX__`/`__LDBL_MAX__`, `__FLT_DIG__`/`__DBL_MANT_DIG__`, `__SIZEOF_*__` family.
+  - **Static-local globals can reference each other** in their inits (`static int *hx = gx;` where `gx` is also a static local). `_function_local_static` tracks per-function static-local-name → mangled-key so `_emit_global_init` can rewrite the Identifier's name when emitting in static-local context.
+  - **Empty struct/union with `{}`.** `union T {} v;` registers a zero-byte tag. Bare `struct T v;` (incomplete) still rejects.
+  - **Long-long compound assignment.** `<<=`, `>>=`, `+=` etc. on long-long lvalues desugar to `lvalue = lvalue OP rhs` and route through the long-long path.
+  - **Preprocessor: char literals in `#if`** (`'x'`, `L'x'`, `'\400'`, `'\xff'`) decode to integer values before the Python eval.
+  - **Multi-level designator in global struct init** (`{ .f.f9 = 0 }`).
+  - **Long-long bit-field `++`/`--`** raises a clear error rather than crashing on tuple unpack.
+
+  **Result: 1445/1514 gcc-c-torture** (up from 1308). Combined with c-testsuite at 215/220, the pipeline now passes 1660 / 1734 (95.7%).
