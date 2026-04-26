@@ -1131,6 +1131,144 @@ ___builtin_signbitf:
         ret
 ___builtin_signbitl:
         jmp     ___builtin_signbit
+
+; isinf(x): 1 if +inf, -1 if -inf, 0 otherwise.
+; For double: exponent bits (bits 52-62) all 1, mantissa bits (0-51) zero.
+___builtin_isinf:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 12]      ; high half of double
+        mov     edx, [ebp + 8]       ; low half
+        and     eax, 0x7fffffff      ; clear sign bit
+        cmp     eax, 0x7ff00000
+        jne     .isinf_no
+        test    edx, edx
+        jne     .isinf_no
+        mov     eax, [ebp + 12]
+        shr     eax, 31
+        test    eax, eax
+        jnz     .isinf_neg
+        mov     eax, 1
+        jmp     .isinf_done
+.isinf_neg:
+        mov     eax, -1
+        jmp     .isinf_done
+.isinf_no:
+        xor     eax, eax
+.isinf_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+___builtin_isinff:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]       ; float bits
+        mov     edx, eax
+        and     eax, 0x7fffffff
+        cmp     eax, 0x7f800000
+        jne     .isinff_no
+        shr     edx, 31
+        test    edx, edx
+        jnz     .isinff_neg
+        mov     eax, 1
+        jmp     .isinff_done
+.isinff_neg:
+        mov     eax, -1
+        jmp     .isinff_done
+.isinff_no:
+        xor     eax, eax
+.isinff_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+___builtin_isinfl:
+        jmp     ___builtin_isinf
+
+; isnan(x): 1 if NaN, 0 otherwise.
+___builtin_isnan:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 12]
+        mov     edx, [ebp + 8]
+        and     eax, 0x7fffffff
+        cmp     eax, 0x7ff00000
+        ja      .isnan_yes
+        jb      .isnan_no
+        ; exp == max, check mantissa nonzero
+        test    edx, edx
+        jnz     .isnan_yes
+        cmp     eax, 0x7ff00000
+        jne     .isnan_no
+        ; high mantissa bits 0..19 (in eax low 20 bits after &= 7ff00000 — those are 0; check
+        ; whether ORIG high had non-zero mantissa low). If high & 0xfffff != 0, NaN.
+        mov     eax, [ebp + 12]
+        and     eax, 0xfffff
+        test    eax, eax
+        jnz     .isnan_yes
+.isnan_no:
+        xor     eax, eax
+        jmp     .isnan_done
+.isnan_yes:
+        mov     eax, 1
+.isnan_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+___builtin_isnanf:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        and     eax, 0x7fffffff
+        cmp     eax, 0x7f800000
+        jbe     .isnanf_no
+        mov     eax, 1
+        mov     esp, ebp
+        pop     ebp
+        ret
+.isnanf_no:
+        xor     eax, eax
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+___builtin_isnanl:
+        jmp     ___builtin_isnan
+
+; isfinite(x): 1 if finite, 0 if NaN or infinity.
+___builtin_isfinite:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 12]
+        and     eax, 0x7fffffff
+        cmp     eax, 0x7ff00000
+        jge     .isfin_no
+        mov     eax, 1
+        jmp     .isfin_done
+.isfin_no:
+        xor     eax, eax
+.isfin_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+___builtin_isfinitef:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        and     eax, 0x7fffffff
+        cmp     eax, 0x7f800000
+        jge     .isfinf_no
+        mov     eax, 1
+        jmp     .isfinf_done
+.isfinf_no:
+        xor     eax, eax
+.isfinf_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
 ___builtin_sprintf:
         jmp     _sprintf
 ___builtin_snprintf:
