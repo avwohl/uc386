@@ -1438,20 +1438,24 @@ class CodeGenerator:
                 ctx.user_labels[sub.label] = ctx.label(f"user_{sub.label}")
 
     def _collect_call_temps(self, node, ctx: _FuncCtx) -> None:
-        """Pre-allocate a frame slot for every struct-returning Call in `node`.
+        """Pre-allocate a frame slot for every struct-returning Call and
+        every Compound literal in `node`.
 
-        We allocate one buffer per Call expression (keyed by `id(call)`)
-        so two struct-returning calls in the same expression — e.g.
-        `make(1).x + make(2).x` — get distinct buffers and don't clobber
-        each other. Some call sites later turn out to have a known
-        destination (var init, struct assignment, return chain) and
-        won't read from the temp, but allocating them anyway keeps this
-        pass context-free.
+        We allocate one buffer per node (keyed by `id`) so two
+        struct-returning calls or compound literals in the same
+        expression — e.g. `make(1).x + make(2).x` — get distinct
+        buffers and don't clobber each other. Some call sites later
+        turn out to have a known destination (var init, struct
+        assignment, return chain) and won't read from the temp, but
+        allocating them anyway keeps this pass context-free.
         """
         for sub in self._walk_ast(node):
             if isinstance(sub, ast.Call) and self._is_struct_returning_call(sub, None):
                 ret_ty = self._func_return_types[self._call_target(sub)]
                 size = (self._size_of(ret_ty) + 3) & ~3
+                ctx.alloc_call_temp(sub, size)
+            elif isinstance(sub, ast.Compound):
+                size = (self._size_of(sub.target_type) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
 
     @staticmethod
@@ -2192,6 +2196,10 @@ class CodeGenerator:
             # For struct-returning calls, evaluating the call leaves EAX
             # holding the temp's address (the callee returns the retptr
             # we passed in) — that's exactly the address `.member` wants.
+            return self._eval_expr_to_eax(expr, ctx)
+        if isinstance(expr, ast.Compound):
+            # Compound literal: evaluating it leaves EAX holding the
+            # temp's address (for struct/array types).
             return self._eval_expr_to_eax(expr, ctx)
         raise CodegenError(
             f"can't take address of {type(expr).__name__} for `.member`"
@@ -3840,6 +3848,8 @@ class CodeGenerator:
             return expr.target_type
         if isinstance(expr, ast.Cast):
             return expr.target_type
+        if isinstance(expr, ast.Compound):
+            return expr.target_type
         if isinstance(expr, ast.Call):
             if isinstance(expr.func, ast.Identifier):
                 rt = self._func_return_types.get(expr.func.name)
@@ -3949,6 +3959,36 @@ class CodeGenerator:
             return self._ternary(expr, ctx)
         if isinstance(expr, ast.Cast):
             return self._cast(expr, ctx)
+        if isinstance(expr, ast.Compound):
+            # `(T){init}` — evaluate the init into a pre-reserved temp
+            # slot, then return the address (for compound types) or
+            # load the value (for scalars).
+            disp = ctx.call_temps[id(expr)]
+            target_ty = expr.target_type
+            out: list[str] = []
+            if isinstance(target_ty, ast.StructType):
+                out += self._struct_init(
+                    target_ty, expr.init, disp, ctx, "<compound>",
+                )
+                out.append(f"        lea     eax, {_ebp_addr(disp)}")
+                return out
+            if isinstance(target_ty, ast.ArrayType):
+                out += self._array_init(
+                    target_ty, expr.init, disp, ctx, "<compound>",
+                )
+                out.append(f"        lea     eax, {_ebp_addr(disp)}")
+                return out
+            # Scalar: emit init then read the slot back.
+            if (
+                isinstance(expr.init, ast.InitializerList)
+                and len(expr.init.values) == 1
+            ):
+                inner = expr.init.values[0]
+            else:
+                inner = expr.init
+            out += self._eval_expr_to_eax(inner, ctx)
+            out += self._store_from_eax(_ebp_addr(disp), target_ty)
+            return out
         if isinstance(expr, ast.VaArgExpr):
             return self._va_arg_int(expr, ctx)
         if isinstance(expr, ast.SizeofType):
@@ -5166,6 +5206,13 @@ class CodeGenerator:
         if isinstance(expr.operand, ast.Member):
             # &s.m or &p->m — member-address lowering, no deref.
             return self._member_address(expr.operand, ctx)
+        if isinstance(expr.operand, ast.Compound):
+            # &(T){init}: evaluating the compound leaves EAX holding
+            # the temp's address (per `_eval_expr_to_eax`).
+            return self._eval_expr_to_eax(expr.operand, ctx)
+        if isinstance(expr.operand, ast.UnaryOp) and expr.operand.op == "*":
+            # &*p is a no-op — just produce p.
+            return self._eval_expr_to_eax(expr.operand.operand, ctx)
         raise CodegenError(
             f"`&` operand must be an identifier, `arr[i]`, or `s.m` "
             f"(got {type(expr.operand).__name__})"

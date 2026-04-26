@@ -143,11 +143,20 @@ def run(
             # flags
             zero_pad = False
             left_align = False
+            hash_flag = False
+            plus_flag = False
+            space_flag = False
             while i < n and fmt[i:i+1] in (b"0", b"-", b"+", b" ", b"#"):
                 if fmt[i:i+1] == b"0":
                     zero_pad = True
                 elif fmt[i:i+1] == b"-":
                     left_align = True
+                elif fmt[i:i+1] == b"#":
+                    hash_flag = True
+                elif fmt[i:i+1] == b"+":
+                    plus_flag = True
+                elif fmt[i:i+1] == b" ":
+                    space_flag = True
                 i += 1
             # width
             width = 0
@@ -162,14 +171,21 @@ def run(
                 while i < n and 0x30 <= fmt[i] <= 0x39:
                     precision = precision * 10 + (fmt[i] - 0x30)
                     i += 1
-            # length modifiers — track whether we saw `ll` so the
-            # integer specs read 8 bytes instead of 4.
+            # length modifiers
             length_long_long = False
+            length_short = False        # h
+            length_char = False         # hh
             while i < n and fmt[i:i+1] in (b"l", b"h", b"L", b"z", b"j", b"t"):
                 if fmt[i:i+1] == b"l" and i + 1 < n and fmt[i+1:i+2] == b"l":
                     length_long_long = True
                     i += 2
                     continue
+                if fmt[i:i+1] == b"h" and i + 1 < n and fmt[i+1:i+2] == b"h":
+                    length_char = True
+                    i += 2
+                    continue
+                if fmt[i:i+1] == b"h":
+                    length_short = True
                 i += 1
             if i >= n:
                 break
@@ -197,9 +213,25 @@ def run(
                         val -= 0x10000000000000000
                 else:
                     val = read32_le(ap_box)
-                    if val >= 0x80000000:
+                    if length_char:
+                        val &= 0xFF
+                        if val >= 0x80:
+                            val -= 0x100
+                    elif length_short:
+                        val &= 0xFFFF
+                        if val >= 0x8000:
+                            val -= 0x10000
+                    elif val >= 0x80000000:
                         val -= 0x100000000
-                s = str(val).encode()
+                if val >= 0:
+                    if plus_flag:
+                        s = b"+" + str(val).encode()
+                    elif space_flag:
+                        s = b" " + str(val).encode()
+                    else:
+                        s = str(val).encode()
+                else:
+                    s = str(val).encode()
                 pad = b"0" if zero_pad else b" "
                 if width > len(s):
                     if left_align:
@@ -212,14 +244,24 @@ def run(
                     val = read64_le(ap_box) & 0xFFFFFFFFFFFFFFFF
                 else:
                     val = read32_le(ap_box) & 0xFFFFFFFF
+                    if length_char:
+                        val &= 0xFF
+                    elif length_short:
+                        val &= 0xFFFF
                 if conv == b"u":
                     s = str(val).encode()
                 elif conv == b"x":
                     s = f"{val:x}".encode()
+                    if hash_flag and val != 0:
+                        s = b"0x" + s
                 elif conv == b"X":
                     s = f"{val:X}".encode()
-                else:
+                    if hash_flag and val != 0:
+                        s = b"0X" + s
+                else:  # o
                     s = f"{val:o}".encode()
+                    if hash_flag and not s.startswith(b"0"):
+                        s = b"0" + s
                 pad = b"0" if zero_pad else b" "
                 if width > len(s):
                     if left_align:

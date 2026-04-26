@@ -143,3 +143,8 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Hex float literals.** `0x1.0p-500L` was failing because the fractional `.` was only handled for base-10 literals. Added a base-16 branch that consumes hex digits between the `.` and the mandatory `p`.
 
   **Result: 1194/1514 gcc-c-torture** (up from 1160). Combined with c-testsuite, 1409 / 1734 (81.3%).
+- **2026-04-25 — torture cluster: compound literals + printf flags (1194 → 1212)**:
+  - **Compound literals `(T){init}`.** New per-call-temp slot (the existing `call_temps` mechanism extended to `Compound` nodes via `_collect_call_temps`). `_eval_expr_to_eax(Compound)` runs the init through `_struct_init` / `_array_init` / scalar store and returns the temp's address (struct/array) or loaded value (scalar). `_struct_address(Compound)` and `_address_of(Compound)` chain through the same path. `_type_of(Compound)` → `target_type`. Also added `&*p` no-op to `_address_of`.
+  - **printf format extras: `#`, `+`, `space`, and `hh`/`h` length.** Honors the `#` flag (`0` for `o`, `0x`/`0X` for `x`/`X`), `+` and ` ` flags for signed `d`/`i`, and `hh` (narrow to char) / `h` (narrow to short) length modifiers across `d/i/u/x/X/o`. Fixes `__builtin_sprintf("%#hho", x)`-style tests.
+
+  **Result: 1212/1514 gcc-c-torture** (up from 1194). Combined with c-testsuite still 215/220, the run-mode pipeline now passes 1427 / 1734 (82.3%).
