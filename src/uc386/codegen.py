@@ -7563,6 +7563,18 @@ class CodeGenerator:
             out.append("        mov     [ecx + 4], edx")
             return out
         if isinstance(lhs, ast.Member):
+            # Bit-field LL member: route through the LL bit-field
+            # store so we don't smash neighboring fields in the
+            # 8-byte storage unit.
+            bf = self._bitfield_info(lhs, ctx)
+            if bf is not None and len(bf) == 4 and bf[3] == 8:
+                return self._bitfield_store_ll_simple(
+                    lhs, bf, expr.right, ctx,
+                )
+            # Bit-field with 4-byte storage: route through the
+            # 32-bit bit-field store, narrowing the rhs.
+            if bf is not None:
+                return self._bitfield_store(lhs, bf, expr.right, ctx)
             out = self._member_address(lhs, ctx)
             out.append("        push    eax")
             out += self._eval_expr_to_edx_eax(expr.right, ctx)
