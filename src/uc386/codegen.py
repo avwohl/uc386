@@ -6046,6 +6046,67 @@ class CodeGenerator:
             out.append("        pop     eax")
         return out
 
+    def _compound_assign_bitfield(
+        self,
+        expr: ast.BinaryOp,
+        bf: tuple[int, int, ast.TypeNode],
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """`s.bf op= rhs` on a bit-field member: address-once, read,
+        op, mask, store back."""
+        bit_offset, bit_width, member_ty = bf
+        op = self._COMPOUND_OPS[expr.op]
+        mask = (1 << bit_width) - 1
+        clear_mask = (~(mask << bit_offset)) & 0xFFFFFFFF
+        is_unsigned = self._is_unsigned(member_ty)
+        # Compute &storage_unit, save in EBX.
+        out = self._member_address(expr.left, ctx)
+        out.append("        push    eax")
+        # Evaluate rhs after the address — per C99 6.5.16.2.
+        out += self._eval_expr_to_eax(expr.right, ctx)
+        out.append("        push    eax")          # save rhs
+        out.append("        mov     ebx, [esp + 4]")  # ebx = &unit
+        # Load current bit-field value into EAX (sign-extended if signed).
+        out.append("        mov     eax, [ebx]")
+        if bit_offset > 0:
+            out.append(f"        shr     eax, {bit_offset}")
+        out.append(f"        and     eax, {mask}")
+        if not is_unsigned and bit_width < 32:
+            shift = 32 - bit_width
+            out.append(f"        shl     eax, {shift}")
+            out.append(f"        sar     eax, {shift}")
+        # Pop rhs into ECX, apply op (lvalue OP rhs in eax).
+        out.append("        pop     ecx")  # ecx = rhs
+        # The remaining stack top is the saved address, but we have it in ebx.
+        out.append("        add     esp, 4")  # discard
+        # Stack-machine for `op`: we have lhs in EAX, rhs in ECX.
+        # Push lhs, then move rhs to ECX (already there), pop lhs into EAX,
+        # then run `_apply_binop_post_eval` which expects [esp+0]=lhs, EAX=rhs.
+        # Easier: just synthesize the op directly.
+        out.append("        push    eax")
+        out.append("        mov     eax, ecx")
+        out += self._apply_binop_post_eval(op, member_ty, member_ty)
+        # eax = new value. Mask to bit_width and shift into position.
+        out.append(f"        and     eax, {mask}")
+        if bit_offset > 0:
+            out.append(f"        shl     eax, {bit_offset}")
+        # Read storage unit, clear field bits, OR in new positioned val.
+        out.append("        mov     edx, [ebx]")
+        out.append(f"        and     edx, {clear_mask}")
+        out.append("        or      edx, eax")
+        out.append("        mov     [ebx], edx")
+        # Result of the assignment expression is the new bit-field value
+        # (sign-extended, masked).
+        out.append("        mov     eax, edx")
+        if bit_offset > 0:
+            out.append(f"        shr     eax, {bit_offset}")
+        out.append(f"        and     eax, {mask}")
+        if not is_unsigned and bit_width < 32:
+            shift = 32 - bit_width
+            out.append(f"        shl     eax, {shift}")
+            out.append(f"        sar     eax, {shift}")
+        return out
+
     @staticmethod
     def _scale_reg(reg: str, size: int) -> list[str]:
         """Multiply `reg` by `size` (unsigned). Used for pointer-arithmetic scaling."""
@@ -6541,6 +6602,11 @@ class CodeGenerator:
             # address we'll read from and write back to.
             addr_lines = self._eval_expr_to_eax(expr.left.operand, ctx)
         elif isinstance(expr.left, ast.Member):
+            # Bit-field compound assign goes through the bit-field
+            # RMW path so we don't smash the other fields in the unit.
+            bf = self._bitfield_info(expr.left, ctx)
+            if bf is not None:
+                return self._compound_assign_bitfield(expr, bf, ctx)
             addr_lines = self._member_address(expr.left, ctx)
         else:
             raise CodegenError(

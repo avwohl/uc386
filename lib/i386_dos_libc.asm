@@ -533,6 +533,13 @@ ___builtin_strcat:        jmp _strcat
 ___builtin_abs:           jmp _abs
 ___builtin_labs:          jmp _abs
 ___builtin_alloca:        jmp _alloca
+___builtin_classify_type:
+        ; gcc returns an integer indicating the type class of an
+        ; unevaluated expression. We always return 1 (integer_type)
+        ; since callers that test for specific types check via
+        ; constant-folded equality, which fails-closed safely.
+        mov     eax, 1
+        ret
 ___builtin_abort:         jmp _abort
 ___builtin_exit:          jmp _exit
 ___builtin_putchar:       jmp _putchar
