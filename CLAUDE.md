@@ -280,3 +280,46 @@ See `README.md` for the public roadmap (Phase 0–6).
   **Result: 1464/1514 gcc-c-torture** (up from 1453). Combined with c-testsuite at 215/220, the pipeline now passes 1679 / 1734 (96.8%).
 
   **Remaining 50 torture failures** cluster around: vector types via `__attribute__((vector_size))` (~17 tests), VLA / typedef VLA (~4), nested functions referencing outer labels (~7), `_Complex int` / `_Complex long int` (1), `__int128` (1), `_Decimal64` (1), full `typeof` in type contexts (2), GCC range case labels (`case L ... U:`) (1), anonymous struct/union member init (1), header-comment parsing edges, and a couple of preprocessor edge cases.
+- **2026-04-26 — torture sweep cont'd: full _Complex arithmetic + libc gaps (--full mode actually)**:
+
+  Discovery first: my earlier "1466/1514" tally was actually compile-only — `run_gcc_torture.py` defaults to `--compile-only`, so my big numbers reflected only how many tests *compiled*, not how many actually ran correctly. Real --full pass count was 1304/1514. After all the recent slices the real number is 1384/1514 (91.4%), with ~80 runtime failures and ~40 compile failures still.
+
+  Slices in this batch:
+
+  - **`_Complex T` floating arithmetic** (`+ - * / ~ - ==`/`!=`). Eval engine `_eval_complex_into_top` writes a complex result into a stack-top destination via component-wise FPU code. Real-valued operands auto-promote to (val, 0). Imaginary FloatLiteral writes (0, value) into a per-literal temp slot. Cross-precision destinations narrow per half (`fld dword`/`fstp qword` etc.).
+
+  - **`_Complex int` / `long int`** support. Storage extends `_COMPLEX_BASE_SIZES` to include the integer family (1-, 2-, 4-, 8-byte halves). Conjugate `~x` and unary minus `-x` use integer `neg` instead of FPU `fchs`. `__real__ x = rhs` / `__imag__ x = rhs` for integer halves go through `_eval_expr_to_eax` + `_store_from_eax`. Scalar-to-complex-int promotion converts via `fistp` (when rhs is float) or direct int store.
+
+  - **`typeof(expr)`** as a type-name. New `TypeofType(operand)` AST node; codegen pre-walks the function body building a flat name→type map (since `_collect_locals` exited the scope chain by the time we resolve), then mutates each `TypeofType` to its concrete type in place. Lets `va_arg(ap, typeof(x))` and similar idioms work.
+
+  - **`__builtin_types_compatible_p`** now compares pointee/array-element qualifiers per C; top-level `const`/`volatile` are still ignored. Anonymous enums are no longer universally compatible (only equal to themselves).
+
+  - **`cond ?: alt`** GCC ternary shorthand.
+
+  - **`__extension__ expr`** in expression position.
+
+  - **`__attribute__((vector_size(N)))`** recognized at the parser. The base type is wrapped as `ArrayType(N/elem_size)`, giving us init / indexing / storage. Vector arithmetic still falls through to scalar paths so heavy SIMD tests remain failing on `v + w`.
+
+  - **Per-half `_Complex` copy with non-multiple-of-4 sizes** (`_Complex char`, `_Complex short`). The unrolled-memcpy pattern moved into a `_emit_memcpy_inline` helper that handles 2-byte and 1-byte tails and replaced the per-dword inline copies in the complex paths.
+
+  - **Cross-precision `_Complex` from a Call.** `_var_init` and `_assign` no longer route the call directly into `&dst` when the precision differs; they go through `_complex_copy_assign` which emits per-half conversion via `_convert_complex_into_top`.
+
+  - **String init via Latin-1.** `_string_to_bytes` encodes Latin-1 first (UTF-8 fallback). `"\377"` now lays down a single 0xFF byte instead of UTF-8 `0xC3 0xBF`.
+
+  - **`_Bool` is unsigned per C99.** Fixes bit-field load sign-extension on `bool b:1` reading as -1 instead of 1. Lets 20030714-1 (style flags via bool bit-fields) pass.
+
+  - **`__builtin_conjf`/`__builtin_conj`/`__builtin_conjl`** stubs in the libc that return the conjugate via the retptr ABI. Pre-registered as `_Complex T` returning so calls without a declaration know the ABI.
+
+  - **`link_error` stub.** Many tests use `extern void link_error(void); ... if (cond_compile_time_false) link_error();` as a marker for DCE. Without DCE the call survives but never runs; the stub lets the binary assemble. +6 tests.
+
+  - **`__assert_fail` / `__assert` / `__assert_perror_fail` stubs.**
+
+  - **`mempcpy(dst, src, n)`** in libc — like memcpy but returns `dst+n`.
+
+  - **More bit-manipulation builtins**: `__builtin_clzll`, `__builtin_ctzll`, `__builtin_popcountll`, `__builtin_ffs`/`ffsl`/`ffsll`, `__builtin_parity`/`parityl`/`parityll`, `__builtin_clrsb`/`clrsbl`, `__builtin_bswap64`. Long variants alias the int form on i386 (long is 32-bit); long-long variants explicitly handle the (low, high) layout.
+
+  - **Global complex init** via a new `_const_eval_complex` that folds compile-time complex arithmetic.
+
+  **Result: 1384/1514 gcc-c-torture at runtime** (up from a real baseline of 1304). Combined with c-testsuite 215/220, the actual pipeline pass rate is 1599/1734 = 92.2%.
+
+  **Remaining ~130 torture failures** still cluster around: vector arithmetic (~17 tests, need full componentwise vector add/sub/mul/etc.), VLA (~10 tests, need real runtime-sized stack allocation), nested functions referencing outer labels (~7 tests, need trampolines), heavy bit-field tests with multi-struct random init (~5), 40-bit-precision shift on long-long bit-fields (~4 tests, gcc-specific narrowing semantics), inline asm with constraints (~12 tests, need real operand binding), `qsort` and a few other libc functions, alignment attribute (`__attribute__((aligned(N)))`) honoring (~3 tests), and a handful of preprocessor / parser edges.
