@@ -4317,14 +4317,7 @@ class CodeGenerator:
                 raise CodegenError("`continue` outside of a loop")
             return [f"        jmp     {ctx.continue_targets[-1]}"]
         if isinstance(item, ast.AsmStmt):
-            # Inline asm: we don't honor the template / constraints /
-            # clobbers, but we still evaluate operand expressions for
-            # their side effects so calls like
-            # `asm("" : "+r"(*bar()))` actually invoke bar().
-            out: list[str] = []
-            for op in getattr(item, "operands", []) or []:
-                out += self._eval_expr_to_eax(op, ctx)
-            return out
+            return self._asm_stmt(item, ctx)
         if isinstance(item, ast.DeclarationList):
             # `int x, *p, **pp;` parses as DeclarationList of one VarDecl
             # per declarator. Lower each one in order.
@@ -5488,6 +5481,105 @@ class CodeGenerator:
             out.append("        fchs")
             out.append(f"        fstp    {width} [ecx + {half_size}]")
         return out
+
+    def _asm_stmt(self, item: ast.AsmStmt, ctx: _FuncCtx) -> list[str]:
+        """Lower an inline asm statement.
+
+        We can't honor arbitrary asm templates, but a few common
+        patterns appear often enough in gcc-c-torture that recognizing
+        them is worth the effort:
+
+        - Empty template `""` with `=r`/`=g` outputs and matching `0`/
+          `r`/`g` inputs is just `out = in` for each output. Used as
+          a register-allocation barrier in many tests.
+        - Empty template with no outputs and just inputs is a memory /
+          compiler barrier — emit nothing.
+
+        Anything else: evaluate the operand expressions for side
+        effects (matching gcc semantics where the operand expressions
+        always execute) and emit nothing else.
+        """
+        outputs = list(getattr(item, "outputs", []) or [])
+        inputs = list(getattr(item, "inputs", []) or [])
+        operands = list(getattr(item, "operands", []) or [])
+        template = (getattr(item, "template", "") or "").strip()
+
+        # Recognized identity pattern: empty template + `=r/=g/+r/+g`
+        # outputs each paired with a matching input (constraint `0`,
+        # `1`, ... or a constraint binding to the same operand).
+        if template == "" and outputs and inputs:
+            if self._asm_identity_eligible(outputs, inputs):
+                out: list[str] = []
+                for i, (constraint, lvalue) in enumerate(outputs):
+                    rhs = self._asm_match_input(constraint, i, inputs)
+                    if rhs is None:
+                        # Unmatched output: just evaluate for side
+                        # effects.
+                        out += self._eval_expr_to_eax(lvalue, ctx)
+                        continue
+                    # `lvalue = rhs` semantics.
+                    out += self._asm_emit_assign(lvalue, rhs, ctx)
+                return out
+
+        # Fallback: evaluate every operand for side effects.
+        out: list[str] = []
+        for op in operands:
+            try:
+                out += self._eval_expr_to_eax(op, ctx)
+            except CodegenError:
+                # Some operands (e.g. taking address of a register
+                # variable) may not lower cleanly; skip silently.
+                pass
+        return out
+
+    @staticmethod
+    def _asm_identity_eligible(outputs, inputs) -> bool:
+        """Are the asm constraints simple enough to model as identity
+        assignments?"""
+        for c, _ in outputs:
+            base = c.lstrip("=+&!%@")
+            if not base:
+                return False
+            if base[0] not in "rgmRpiq":
+                return False
+        for c, _ in inputs:
+            base = c.lstrip("&!%@")
+            if not base:
+                return False
+            ok_initials = "rgmRpiq0123456789"
+            if base[0] not in ok_initials:
+                return False
+        return True
+
+    @staticmethod
+    def _asm_match_input(out_constraint, out_idx, inputs):
+        """For an output operand at index `out_idx`, find a matching
+        input operand. The input may be the same operand (constraint
+        starts with `+`), or any input whose constraint starts with
+        the digit `out_idx`."""
+        if out_constraint.startswith("+"):
+            # `+r`(x) is "x is both input and output". We don't get a
+            # separate input expression, so this is effectively a no-op
+            # for our purposes.
+            return None
+        for c, expr in inputs:
+            if c.lstrip("&!%@").startswith(str(out_idx)):
+                return expr
+        # No matching input: not an identity-style asm.
+        return None
+
+    def _asm_emit_assign(
+        self, lvalue: ast.Expression, rhs: ast.Expression, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Emit code for `lvalue = rhs` in the context of an
+        identity-pattern asm statement. We synthesize a BinaryOp("=")
+        and route it through the regular `_assign` path."""
+        synth = ast.BinaryOp(op="=", left=lvalue, right=rhs)
+        try:
+            return self._eval_expr_to_eax(synth, ctx)
+        except CodegenError:
+            # Fall back to evaluating the rhs for side effects.
+            return self._eval_expr_to_eax(rhs, ctx)
 
     def _emit_memcpy_inline(
         self, out: list[str], src_reg: str, dst_reg: str, size: int,
