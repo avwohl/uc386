@@ -323,3 +323,12 @@ See `README.md` for the public roadmap (Phase 0–6).
   **Result: 1384/1514 gcc-c-torture at runtime** (up from a real baseline of 1304). Combined with c-testsuite 215/220, the actual pipeline pass rate is 1599/1734 = 92.2%.
 
   **Remaining ~130 torture failures** still cluster around: vector arithmetic (~17 tests, need full componentwise vector add/sub/mul/etc.), VLA (~10 tests, need real runtime-sized stack allocation), nested functions referencing outer labels (~7 tests, need trampolines), heavy bit-field tests with multi-struct random init (~5), 40-bit-precision shift on long-long bit-fields (~4 tests, gcc-specific narrowing semantics), inline asm with constraints (~12 tests, need real operand binding), `qsort` and a few other libc functions, alignment attribute (`__attribute__((aligned(N)))`) honoring (~3 tests), and a handful of preprocessor / parser edges.
+- **2026-04-26 — torture sweep more (1384 → 1386)**: small additional wins:
+  - **`_Bool` is unsigned per C99.** `_is_unsigned(BasicType('bool'))` was returning False because `is_signed=None` is the default. Fixes bit-field load sign-extension on `bool b:1` reading as -1 instead of 1. Lets 20030714-1 pass.
+  - **Long-long bit-field local init** was overwriting the storage unit because `_struct_init`'s `_is_long_long` branch matched first. Reordered to check `bitfields` first.
+  - **`_eval_expr_to_edx_eax(Member)` for long-long bit-field** was loading the raw 64-bit storage unit instead of using `_bitfield_load_ll` (shrd + mask + extend). Routes through the proper load. Lets 20081117-1 pass.
+  - **Dead-store eliminator: aliasing-prone second RHS bail-out.** `b = a; b = *p;` was eliminating the first store because the second RHS doesn't textually mention `b`. Added `_expr_has_pointer_or_call(expr)` and gated dead-store elimination on it: don't drop the first assignment if the second RHS contains a `*`-deref, an `->` member, or a function call. Lets 20071219-1 pass.
+  - **`__builtin_isinf*`, `__builtin_isnan*`, `__builtin_isfinite*`** stubs in libc.
+  - **ctype.h family** in libc: `isprint`, `isupper`, `islower`, `isalpha`, `isdigit`, `isalnum`, `isspace`, `isxdigit`, `iscntrl`, `ispunct`, `toupper`, `tolower`. Lets 991112-1 pass.
+
+  **Result: 1386/1514 gcc-c-torture at runtime** (up from 1384). Combined with c-testsuite 215/220, the actual pipeline pass rate is 1601/1734 = 92.3%.
