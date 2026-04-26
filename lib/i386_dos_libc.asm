@@ -540,6 +540,13 @@ ___builtin_classify_type:
         ; constant-folded equality, which fails-closed safely.
         mov     eax, 1
         ret
+
+; Tests use `link_error()` as a marker for "this code path should
+; have been DCE'd". Without DCE we'd link-fail; provide a no-op so
+; the binary assembles and the call is harmless at runtime
+; (callers always gate it on a compile-time-false condition).
+_link_error:
+        ret
 ___builtin_abort:         jmp _abort
 ___builtin_exit:          jmp _exit
 ___builtin_putchar:       jmp _putchar
