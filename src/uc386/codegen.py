@@ -2977,10 +2977,16 @@ class CodeGenerator:
                 out += self._array_init(
                     m_ty, actual, m_disp, ctx, f"{name}.{m_name_i}"
                 )
+            elif (
+                isinstance(m_ty, ast.StructType)
+                and isinstance(self._type_of(actual, ctx), ast.StructType)
+            ):
+                # Struct-typed value (an Identifier, a *p, a member, etc.)
+                # being assigned to a struct member: per-dword copy.
+                out += self._struct_copy_from_expr(
+                    actual, m_disp, m_ty, ctx,
+                )
             else:
-                if self._size_of(m_ty) > 4:
-                    import sys as _s
-                    print(f"DBG struct_init big member {name}.{m_name_i} m_ty={m_ty!r} actual={type(actual).__name__}", file=_s.stderr)
                 out += self._eval_expr_to_eax(actual, ctx)
                 out += self._store_from_eax(_ebp_addr(m_disp), m_ty)
         # Zero-fill any unfilled members in declaration order.
