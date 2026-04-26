@@ -2116,6 +2116,11 @@ class CodeGenerator:
         # struct assignment rhs, return chain) and don't actually use the
         # temp — wasting a few bytes of frame is simpler than tracking
         # parent context here.
+        # Resolve `typeof(expr)` references in the body. Replaces
+        # `TypeofType(operand=X)` with the result of `_type_of(X,
+        # ctx)`. Done before `_collect_call_temps` so size queries
+        # see concrete types.
+        self._resolve_typeof_in_body(fn.body, ctx)
         self._collect_call_temps(fn.body, ctx)
         # Third pass: assign a NASM label to every user `label:`. Done
         # ahead of body emission so a forward `goto` can resolve.
@@ -2186,6 +2191,56 @@ class CodeGenerator:
                         f"duplicate label `{sub.label}` in function"
                     )
                 ctx.user_labels[sub.label] = ctx.label(f"user_{sub.label}")
+
+    def _resolve_typeof_in_body(self, node, ctx: _FuncCtx) -> None:
+        """Walk `node` recursively and replace any `TypeofType` field
+        with the concrete type.
+
+        `_collect_locals` already exited its scope chain by the time
+        we run, so `_type_of(Identifier)` would fail for body locals.
+        Pre-build a flat name→type map by re-walking the body for
+        VarDecls / ParamDecls and consult that here. Mutates the
+        AST in place.
+        """
+        flat_types: dict[str, ast.TypeNode] = {}
+        # Function params live on ctx via alloc_param.
+        for scope in ctx.types:
+            flat_types.update(scope)
+        # Walk the body for VarDecls — their decl_types entry is the
+        # resolved type from `_collect_locals`.
+        for sub in self._walk_ast(node):
+            if isinstance(sub, ast.VarDecl):
+                t = ctx.decl_types.get(id(sub))
+                if t is not None:
+                    flat_types[sub.name] = t
+
+        def resolve_inner(operand: ast.Expression) -> ast.TypeNode | None:
+            # For an Identifier, look in flat_types first.
+            if isinstance(operand, ast.Identifier):
+                t = flat_types.get(operand.name)
+                if t is not None:
+                    return t
+            # Fall back to live _type_of (may fail).
+            try:
+                return self._type_of(operand, ctx)
+            except CodegenError:
+                return None
+
+        for sub in self._walk_ast(node):
+            if not dataclasses.is_dataclass(sub):
+                continue
+            for f in dataclasses.fields(sub):
+                v = getattr(sub, f.name, None)
+                if isinstance(v, ast.TypeofType):
+                    resolved = resolve_inner(v.operand)
+                    if resolved is not None:
+                        setattr(sub, f.name, resolved)
+                elif isinstance(v, list):
+                    for i, item in enumerate(v):
+                        if isinstance(item, ast.TypeofType):
+                            r = resolve_inner(item.operand)
+                            if r is not None:
+                                v[i] = r
 
     def _collect_call_temps(self, node, ctx: _FuncCtx) -> None:
         """Pre-allocate a frame slot for every struct-returning Call and
@@ -3685,17 +3740,27 @@ class CodeGenerator:
 
     def _types_compatible(
         self, a: ast.TypeNode, b: ast.TypeNode,
+        check_quals: bool = False,
     ) -> bool:
         """C type compatibility for `__builtin_types_compatible_p`.
 
-        Per C: types are compatible if they're the same. Two pointer
-        types are compatible if their pointees are. Two array types
-        are compatible if their element types are compatible (size
-        difference is allowed). Two struct/union/enum types must
-        share a tag. Qualifiers are ignored.
+        Top-level qualifiers (const/volatile) are ignored per GCC
+        docs. Pointee / array-element qualifiers DO matter — `char *`
+        and `const char *` are NOT compatible. The recursive call
+        sets `check_quals=True` for the nested case.
         """
-        # Resolve typedef-style synonyms by canonical-form comparison
-        # at the leaf.
+        # Compare top-level qualifiers when nested.
+        if check_quals:
+            qa = (
+                getattr(a, "is_const", False),
+                getattr(a, "is_volatile", False),
+            )
+            qb = (
+                getattr(b, "is_const", False),
+                getattr(b, "is_volatile", False),
+            )
+            if qa != qb:
+                return False
         if isinstance(a, ast.BasicType) and isinstance(b, ast.BasicType):
             # `int` and `signed int` are compatible. `signed` is the
             # default for int but not for char — and that distinction
@@ -3707,9 +3772,13 @@ class CodeGenerator:
             sb = b.is_signed if b.is_signed is not None else (b.name != "char")
             return sa == sb
         if isinstance(a, ast.PointerType) and isinstance(b, ast.PointerType):
-            return self._types_compatible(a.base_type, b.base_type)
+            return self._types_compatible(
+                a.base_type, b.base_type, check_quals=True,
+            )
         if isinstance(a, ast.ArrayType) and isinstance(b, ast.ArrayType):
-            return self._types_compatible(a.base_type, b.base_type)
+            return self._types_compatible(
+                a.base_type, b.base_type, check_quals=True,
+            )
         if isinstance(a, ast.StructType) and isinstance(b, ast.StructType):
             try:
                 ka = self._resolve_struct_name(a)
@@ -3718,7 +3787,11 @@ class CodeGenerator:
             except CodegenError:
                 return False
         if isinstance(a, ast.EnumType) and isinstance(b, ast.EnumType):
-            return (a.name or "") == (b.name or "")
+            # Named enums compare by tag; anonymous enums are only
+            # compatible with themselves (same node).
+            if a.name and b.name:
+                return a.name == b.name
+            return a is b
         # Enum is compatible with its underlying integer type.
         if isinstance(a, ast.EnumType) and isinstance(b, ast.BasicType):
             return b.name in ("int", "long")
