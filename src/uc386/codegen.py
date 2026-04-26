@@ -2332,6 +2332,15 @@ class CodeGenerator:
             return self._member_address(expr, ctx)
         if isinstance(expr, ast.Index):
             return self._index_address(expr, ctx)
+        if (
+            isinstance(expr, ast.Call)
+            and self._is_complex_returning_call(expr, ctx)
+        ):
+            disp = ctx.call_temps[id(expr)]
+            retptr_lines = [f"        lea     eax, {_ebp_addr(disp)}"]
+            out = self._call_into_address(expr, retptr_lines, ctx)
+            out.append(f"        lea     eax, {_ebp_addr(disp)}")
+            return out
         raise CodegenError(
             f"can't take address of complex `{type(expr).__name__}`"
         )
