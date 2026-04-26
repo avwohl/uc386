@@ -3422,9 +3422,19 @@ class CodeGenerator:
                 rt = self._func_return_types.get(expr.func.name)
                 if rt is not None:
                     return rt
-                # Unknown identifier (e.g. va_start, builtins, undeclared
-                # call) — fall through to int default rather than letting
-                # `_identifier_type` raise.
+                # Identifier that's a known variable (e.g. function
+                # pointer): follow its type to find the return type.
+                try:
+                    var_ty = self._identifier_type(expr.func.name, ctx)
+                except CodegenError:
+                    var_ty = None
+                if isinstance(var_ty, ast.PointerType) and isinstance(
+                    var_ty.base_type, ast.FunctionType
+                ):
+                    return var_ty.base_type.return_type
+                if isinstance(var_ty, ast.FunctionType):
+                    return var_ty.return_type
+                # Unknown identifier — default to int.
                 return ast.BasicType(name="int")
             # Indirect call: the callee evaluates to a function pointer
             # (or a function — same shape after decay). Recover the
@@ -4244,12 +4254,13 @@ class CodeGenerator:
 
         For float-typed expressions, tests against 0.0 on the FPU rather
         than truncating to int — `if (0.5)` should branch true, not
-        false (which would happen with `_eval_expr_to_eax`'s fistp path).
-        For int-typed expressions, just defers to `_eval_expr_to_eax`;
-        callers that follow with `test eax, eax` get the right behavior
-        because any non-zero int is truthy.
+        false. For long-long expressions, OR the two halves so a value
+        with non-zero high bits but zero low bits is still truthy. For
+        plain int expressions, just defer to `_eval_expr_to_eax`; the
+        following `test eax, eax` handles non-zero-is-true.
         """
-        if self._is_float_type(self._type_of(expr, ctx)):
+        ty = self._type_of(expr, ctx)
+        if self._is_float_type(ty):
             out = self._eval_float_to_st0(expr, ctx)
             out.append("        fldz")
             out.append("        fucompp")
@@ -4257,6 +4268,10 @@ class CodeGenerator:
             out.append("        sahf")
             out.append("        setne   al")
             out.append("        movzx   eax, al")
+            return out
+        if self._is_long_long(ty):
+            out = self._eval_expr_to_edx_eax(expr, ctx)
+            out.append("        or      eax, edx")
             return out
         return self._eval_expr_to_eax(expr, ctx)
 
