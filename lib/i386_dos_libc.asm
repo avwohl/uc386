@@ -560,6 +560,44 @@ ___assert:
         jmp     _abort
 ___assert_perror_fail:
         jmp     _abort
+
+; __builtin_conj{f,l,} — complex conjugate (real, -imag).
+; Complex-returning ABI: hidden retptr is the first arg, then the
+; complex value's halves.
+___builtin_conjf:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]     ; retptr
+        mov     edx, [ebp + 12]    ; real (float)
+        mov     [eax], edx
+        mov     edx, [ebp + 16]    ; imag (float)
+        xor     edx, 0x80000000    ; flip sign bit
+        mov     [eax + 4], edx
+        mov     eax, [ebp + 8]
+        pop     ebp
+        ret
+
+___builtin_conj:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]     ; retptr
+        ; real (double, 8 bytes)
+        mov     edx, [ebp + 12]
+        mov     [eax], edx
+        mov     edx, [ebp + 16]
+        mov     [eax + 4], edx
+        ; imag (double, 8 bytes) with flipped sign bit on high dword
+        mov     edx, [ebp + 20]
+        mov     [eax + 8], edx
+        mov     edx, [ebp + 24]
+        xor     edx, 0x80000000
+        mov     [eax + 12], edx
+        mov     eax, [ebp + 8]
+        pop     ebp
+        ret
+
+___builtin_conjl:
+        jmp     ___builtin_conj   ; long double = double on i386 here
 ___builtin_abort:         jmp _abort
 ___builtin_exit:          jmp _exit
 ___builtin_putchar:       jmp _putchar

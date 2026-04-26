@@ -404,6 +404,16 @@ class CodeGenerator:
         # `_emit_call` only fires when the param types are known.
         self._func_return_types = {}
         self._func_param_types = {}
+        # Pre-register a few GCC builtins so calls without an explicit
+        # declaration know the right (complex) ABI.
+        for name, base in (
+            ("__builtin_conjf", "float"),
+            ("__builtin_conj", "double"),
+            ("__builtin_conjl", "long double"),
+        ):
+            ct = ast.ComplexType(base_type=base)
+            self._func_return_types[name] = ct
+            self._func_param_types[name] = [ct]
         for d in top_decls:
             if isinstance(d, ast.FunctionDecl):
                 self._func_return_types[d.name] = d.return_type
@@ -4623,14 +4633,18 @@ class CodeGenerator:
             # the complex-eval engine, which writes (real, imag) into
             # the slot directly.
             dest = [f"        lea     eax, {_ebp_addr(disp)}"]
-            # If rhs is a complex-returning call, route into the slot.
+            init_ty = self._type_of(decl.init, ctx)
+            # If rhs is a same-precision complex-returning call,
+            # route into the slot. Cross-precision must go through
+            # _complex_copy_assign which converts.
             if (
                 isinstance(decl.init, ast.Call)
                 and self._is_complex_returning_call(decl.init, ctx)
+                and isinstance(init_ty, ast.ComplexType)
+                and init_ty.base_type == var_type.base_type
             ):
                 return self._call_into_address(decl.init, dest, ctx)
             # If rhs is itself a complex expression, eval directly.
-            init_ty = self._type_of(decl.init, ctx)
             if isinstance(init_ty, ast.ComplexType):
                 synth = ast.BinaryOp(op="=", left=ast.Identifier(name=decl.name), right=decl.init)
                 return self._complex_copy_assign(synth, var_type, ctx)
@@ -5828,7 +5842,18 @@ class CodeGenerator:
             out.append("        pop     ecx")
             out.append("        mov     eax, ecx")
             return out
-        # Lvalue / Call / FloatLiteral source: get &src, per-dword copy.
+        # Lvalue / Call / FloatLiteral source.
+        rhs_ty = self._type_of(rhs, ctx)
+        if (
+            isinstance(rhs_ty, ast.ComplexType)
+            and rhs_ty.base_type != ty.base_type
+        ):
+            # Cross-precision: per-half conversion.
+            out += self._convert_complex_into_top(rhs, rhs_ty, ty, ctx)
+            out.append("        pop     ecx")
+            out.append("        mov     eax, ecx")
+            return out
+        # Same-precision: memcpy.
         out += self._complex_value_address(rhs, ctx)
         out.append("        mov     edx, eax")
         out.append("        pop     ecx")
@@ -8505,9 +8530,12 @@ class CodeGenerator:
             # returning call (handled like struct-returning).
             rhs_ty = self._type_of(expr.right, ctx)
             if isinstance(rhs_ty, ast.ComplexType):
+                # Same-precision complex-returning call: route the
+                # call directly into &lhs (no temp).
                 if (
                     isinstance(expr.right, ast.Call)
                     and self._is_complex_returning_call(expr.right, ctx)
+                    and rhs_ty.base_type == target_ty.base_type
                 ):
                     return self._call_into_address(
                         expr.right,
