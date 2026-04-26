@@ -6885,7 +6885,14 @@ class CodeGenerator:
         rewrite the storage unit. EAX holds the value the postfix /
         prefix form should yield.
         """
-        bit_offset, bit_width, member_ty = bf
+        # Unpack bit-field info, defaulting unit_size to 4 for the
+        # 2-tuple form.
+        bit_offset, bit_width, member_ty = bf[:3]
+        unit_size = bf[3] if len(bf) == 4 else 4
+        if unit_size == 8:
+            raise CodegenError(
+                "long-long bit-field ++/-- not yet supported"
+            )
         mask = (1 << bit_width) - 1
         clear_mask = (~(mask << bit_offset)) & 0xFFFFFFFF
         is_unsigned = self._is_unsigned(member_ty)
