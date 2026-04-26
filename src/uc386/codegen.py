@@ -4310,6 +4310,27 @@ class CodeGenerator:
             out.append("        pop     eax")
             out.append(f"{label_done}:")
             return out
+        # Vector → integer cast in scalar context. The vector's bytes
+        # are type-punned: for size==4 we read the low dword; for
+        # size==8 (long long) we'd need EDX:EAX, but the caller of
+        # `_cast` only takes EAX, so we just load the low dword. (The
+        # `_eval_expr_to_edx_eax(Cast)` path handles the full LL load
+        # for callers that want both halves.)
+        if (
+            isinstance(src_ty, ast.ArrayType)
+            and isinstance(target, ast.BasicType)
+            and self._size_of(src_ty) >= self._size_of(target)
+        ):
+            out = self._vector_value_address(expr.expr, ctx)
+            out.append("        mov     eax, [eax]")
+            tsize = self._size_of(target)
+            if tsize == 1:
+                mnem = "movzx" if target.is_signed is False else "movsx"
+                out.append(f"        {mnem}   eax, al")
+            elif tsize == 2:
+                mnem = "movzx" if target.is_signed is False else "movsx"
+                out.append(f"        {mnem}   eax, ax")
+            return out
         out = self._eval_expr_to_eax(expr.expr, ctx)
         target = expr.target_type
         if isinstance(target, ast.PointerType):
