@@ -2134,6 +2134,55 @@ class CodeGenerator:
 
     _COMPLEX_BASE_SIZES = {"float": 4, "double": 8, "long double": 8}
 
+    def _complex_value_address(
+        self, expr: ast.Expression, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Compute the address of a `_Complex T` value lvalue."""
+        if isinstance(expr, ast.Identifier):
+            return self._identifier_address(expr.name, ctx)
+        if isinstance(expr, ast.UnaryOp) and expr.op == "*":
+            return self._eval_expr_to_eax(expr.operand, ctx)
+        if isinstance(expr, ast.Member):
+            return self._member_address(expr, ctx)
+        if isinstance(expr, ast.Index):
+            return self._index_address(expr, ctx)
+        raise CodegenError(
+            f"can't take address of complex `{type(expr).__name__}`"
+        )
+
+    def _complex_part_address(
+        self, expr: ast.UnaryOp, ctx: _FuncCtx,
+    ) -> tuple[list[str], ast.TypeNode]:
+        """Compute the address of a `__real__ x` or `__imag__ x`
+        expression: returns asm lines that leave EAX = address of the
+        half, plus the half's type (a base BasicType)."""
+        operand = expr.operand
+        operand_ty = self._type_of(operand, ctx)
+        if not isinstance(operand_ty, ast.ComplexType):
+            raise CodegenError(
+                f"`{expr.op}` requires a _Complex operand "
+                f"(got {type(operand_ty).__name__})"
+            )
+        half_size = self._COMPLEX_BASE_SIZES[operand_ty.base_type]
+        # Compute &operand.
+        if isinstance(operand, ast.Identifier):
+            out = self._identifier_address(operand.name, ctx)
+        elif isinstance(operand, ast.UnaryOp) and operand.op == "*":
+            out = self._eval_expr_to_eax(operand.operand, ctx)
+        elif isinstance(operand, ast.Member):
+            out = self._member_address(operand, ctx)
+        elif isinstance(operand, ast.Index):
+            out = self._index_address(operand, ctx)
+        else:
+            raise CodegenError(
+                f"`{expr.op}` operand must be a simple lvalue "
+                f"(got {type(operand).__name__})"
+            )
+        offset = 0 if expr.op == "__real__" else half_size
+        if offset:
+            out.append(f"        add     eax, {offset}")
+        return out, ast.BasicType(name=operand_ty.base_type)
+
     def _complex_struct_name(self, t: ast.ComplexType) -> str:
         """Return (and lazily register) the synthetic struct name we
         use to lay out `_Complex T`. The struct has members `_real`
@@ -4378,6 +4427,13 @@ class CodeGenerator:
             if expr.op in ("++", "--"):
                 # Mutation in place; the expression's type matches the operand.
                 return self._type_of(expr.operand, ctx)
+            if expr.op in ("__real__", "__imag__"):
+                inner = self._type_of(expr.operand, ctx)
+                if isinstance(inner, ast.ComplexType):
+                    return ast.BasicType(name=inner.base_type)
+                # On a non-complex operand, __real__ is identity and
+                # __imag__ is zero (per gcc semantics).
+                return inner
             # `+` and `-` and `~` propagate float / long long / unsigned
             # through; `!` always produces int.
             if expr.op in ("+", "-", "~"):
@@ -5258,11 +5314,31 @@ class CodeGenerator:
                 out = self._eval_expr_to_eax(expr.operand, ctx)
                 out.append(f"        fld     {width} [eax]")
                 return out
+            if expr.op in ("__real__", "__imag__"):
+                operand_ty = self._type_of(expr.operand, ctx)
+                if isinstance(operand_ty, ast.ComplexType):
+                    out, _ = self._complex_part_address(expr, ctx)
+                    size = self._COMPLEX_BASE_SIZES[operand_ty.base_type]
+                    width = "dword" if size == 4 else "qword"
+                    out.append(f"        fld     {width} [eax]")
+                    return out
+                # Non-complex: __real__ is identity, __imag__ is 0.
+                if expr.op == "__real__":
+                    return self._eval_float_to_st0(expr.operand, ctx)
+                return ["        fldz"]
             raise CodegenError(
                 f"unary `{expr.op}` not supported on float operand"
             )
         if isinstance(expr, ast.BinaryOp):
             if expr.op == "=":
+                # `__real__/__imag__ x = rhs` writes to a half of a
+                # complex value; route through _assign so the half-
+                # address path runs.
+                if (
+                    isinstance(expr.left, ast.UnaryOp)
+                    and expr.left.op in ("__real__", "__imag__")
+                ):
+                    return self._assign(expr, ctx)
                 return self._float_assign(expr, ctx)
             if expr.op in self._COMPOUND_OPS:
                 return self._float_compound_assign(expr, ctx)
@@ -5778,11 +5854,14 @@ class CodeGenerator:
             if param_types is not None and real_idx < len(param_types):
                 expected_ty = param_types[real_idx]
             arg_ty = self._type_of(arg, ctx)
-            if isinstance(arg_ty, ast.StructType):
+            if isinstance(arg_ty, (ast.StructType, ast.ComplexType)):
                 size = self._size_of(arg_ty)
                 padded = (size + 3) & ~3
                 # Compute &arg first; once it's in EDX we can reserve and copy.
-                out += self._struct_address(arg, ctx)
+                if isinstance(arg_ty, ast.ComplexType):
+                    out += self._complex_value_address(arg, ctx)
+                else:
+                    out += self._struct_address(arg, ctx)
                 out.append("        mov     edx, eax")
                 out.append(f"        sub     esp, {padded}")
                 offset = 0
@@ -6435,6 +6514,24 @@ class CodeGenerator:
         return out
 
     def _assign(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
+        # `__real__ x = rhs` / `__imag__ x = rhs` — store rhs into
+        # the real or imag half of x.
+        if (
+            isinstance(expr.left, ast.UnaryOp)
+            and expr.left.op in ("__real__", "__imag__")
+        ):
+            operand_ty = self._type_of(expr.left.operand, ctx)
+            if isinstance(operand_ty, ast.ComplexType):
+                addr_lines, half_ty = self._complex_part_address(expr.left, ctx)
+                size = self._size_of(half_ty)
+                width = "dword" if size == 4 else "qword"
+                out = list(addr_lines)
+                out.append("        push    eax")
+                out += self._eval_float_to_st0(expr.right, ctx)
+                out.append("        pop     ecx")
+                out.append(f"        fst     {width} [ecx]")
+                # Leave value on st(0) — rhs is the assignment's value.
+                return out
         # Struct-to-struct assignment `dst = src` short-circuits to a
         # struct-copy regardless of the lvalue shape. Without this, the
         # rhs's `_eval_expr_to_eax` would try to load the whole struct
