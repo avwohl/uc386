@@ -2132,6 +2132,23 @@ class CodeGenerator:
          "float", "double", "long double"}
     )
 
+    _COMPLEX_BASE_SIZES = {"float": 4, "double": 8, "long double": 8}
+
+    def _complex_struct_name(self, t: ast.ComplexType) -> str:
+        """Return (and lazily register) the synthetic struct name we
+        use to lay out `_Complex T`. The struct has members `_real`
+        and `_imag` of type `T`."""
+        key = f"__complex_{t.base_type.replace(' ', '_')}"
+        if key not in self._structs:
+            base = ast.BasicType(name=t.base_type)
+            size = self._COMPLEX_BASE_SIZES[t.base_type]
+            self._structs[key] = [
+                ("_real", base, 0),
+                ("_imag", base, size),
+            ]
+            self._struct_sizes[key] = 2 * size
+        return key
+
     def _check_supported_type(self, t: ast.TypeNode, name: str) -> None:
         # Pointers, and arrays / scalars / structs / enums of supported
         # base types. Slot sizes are rounded up to 4 in `_collect_locals`
@@ -2184,6 +2201,16 @@ class CodeGenerator:
             # otherwise-inline-defined structs and raises if neither a
             # registered name nor inline members are available.
             self._resolve_struct_name(t)
+            return
+        if isinstance(t, ast.ComplexType):
+            # `_Complex T` is laid out as two T's (real, imag). We
+            # accept it as a struct-like type; arithmetic ops (+, *,
+            # etc.) on complex values are not yet implemented, but
+            # storage / __real__ / __imag__ / pass-by-value all work.
+            if t.base_type not in self._COMPLEX_BASE_SIZES:
+                raise CodegenError(
+                    f"`{name}`: _Complex base type `{t.base_type}` not supported"
+                )
             return
         raise CodegenError(
             f"`{name}`: only `int`/`short`/`char`, pointer, array, and "
@@ -2321,6 +2348,9 @@ class CodeGenerator:
             return self._struct_sizes[self._resolve_struct_name(t)]
         if isinstance(t, ast.EnumType):
             return 4
+        if isinstance(t, ast.ComplexType):
+            # `_Complex T` is laid out as two T's (real, imag).
+            return 2 * self._COMPLEX_BASE_SIZES.get(t.base_type, 8)
         raise CodegenError(f"sizeof not supported for {type(t).__name__}")
 
     def _resolve_struct_name(self, t: ast.StructType) -> str:
@@ -2659,6 +2689,8 @@ class CodeGenerator:
             return max(self._alignment_of(mt) for _, mt, _ in members)
         if isinstance(t, ast.EnumType):
             return 4
+        if isinstance(t, ast.ComplexType):
+            return self._COMPLEX_BASE_SIZES.get(t.base_type, 8)
         return 1
 
     @staticmethod

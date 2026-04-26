@@ -90,10 +90,12 @@ def test_unknown_identifier_rejected():
         _compile("int main(void) { return x; }")
 
 
-def test_complex_type_local_rejected():
-    # `_Complex` isn't a supported slot type. (`float` and `double` are.)
-    with pytest.raises(CodegenError, match="not supported|only"):
-        _compile("int main(void) { _Complex float c; return 0; }")
+def test_complex_type_basic_layout():
+    # `_Complex T` is laid out as two T's (real, imag), 16 bytes for
+    # `_Complex double`. Just declaring one shouldn't error; arithmetic
+    # / __real__ / __imag__ on them is still incomplete.
+    asm = _compile("int main(void) { _Complex double c; return 0; }")
+    assert "sub     esp, 16" in asm
 
 
 @pytest.mark.parametrize(
