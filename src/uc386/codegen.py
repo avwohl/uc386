@@ -769,6 +769,20 @@ class CodeGenerator:
             value = self._const_eval(init, name)
             return [f"        dd      {value}"]
         if isinstance(ty, ast.ArrayType):
+            # Compound literal init: `((vec_t){a, b, ...})` — strip
+            # the wrapper and use the inner InitializerList directly.
+            if (
+                isinstance(init, ast.Compound)
+                and isinstance(init.init, ast.InitializerList)
+            ):
+                init = init.init
+            # Strip leading Casts that pun a same-shape value.
+            while isinstance(init, ast.Cast) and isinstance(
+                init.expr, (ast.Compound, ast.InitializerList)
+            ):
+                init = init.expr
+                if isinstance(init, ast.Compound):
+                    init = init.init
             return self._emit_global_array_init(ty, init, name)
         if isinstance(ty, ast.StructType):
             return self._emit_global_struct_init(ty, init, name)
@@ -1319,6 +1333,12 @@ class CodeGenerator:
                 i += 1
                 continue
             if isinstance(v, ast.InitializerList):
+                out.append(v)
+                i += 1
+                continue
+            # A Compound literal `(T){...}` is already a complete
+            # element initializer — don't elide.
+            if isinstance(v, ast.Compound):
                 out.append(v)
                 i += 1
                 continue
@@ -2781,10 +2801,11 @@ class CodeGenerator:
                         max_idx = cursor
                     cursor += 1
                     continue
-                # A positional value already wrapped in `{}` consumes one
-                # element regardless of leaf_count. A flat value in a
+                # A positional value already wrapped in `{}` (or as
+                # a Compound literal `(T){...}`) consumes one element
+                # regardless of leaf_count. A flat value in a
                 # leaves > 1 array consumes 1/leaves of an element.
-                if isinstance(value, ast.InitializerList):
+                if isinstance(value, (ast.InitializerList, ast.Compound)):
                     if cursor > max_idx:
                         max_idx = cursor
                     cursor += 1
@@ -2802,7 +2823,9 @@ class CodeGenerator:
             # If all values were flat (no IL/Designators), the value
             # count divided by leaves gives the right element count.
             all_flat = all(
-                not isinstance(v, (ast.DesignatedInit, ast.InitializerList))
+                not isinstance(
+                    v, (ast.DesignatedInit, ast.InitializerList, ast.Compound)
+                )
                 for v in decl.init.values
             )
             if all_flat and leaves > 1:
@@ -7457,7 +7480,12 @@ class CodeGenerator:
         )
 
     def _inc_dec_ll(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
-        """++/-- on a long-long Identifier lvalue."""
+        """++/-- on a long-long Identifier or bit-field lvalue."""
+        # Long-long bit-field: route through the bit-field-aware path.
+        if isinstance(expr.operand, ast.Member):
+            bf = self._bitfield_info(expr.operand, ctx)
+            if bf is not None and len(bf) == 4 and bf[3] == 8:
+                return self._inc_dec_bitfield_ll(expr, bf, ctx)
         if not isinstance(expr.operand, ast.Identifier):
             raise CodegenError("long-long ++/-- on non-Identifier not supported")
         addr = self._identifier_addr_text(expr.operand.name, ctx)
@@ -8469,6 +8497,51 @@ class CodeGenerator:
                 out.append(f"        sar     eax, {shift}")
         else:
             out.append("        pop     eax")
+        return out
+
+    def _inc_dec_bitfield_ll(
+        self,
+        expr: ast.UnaryOp,
+        bf: tuple[int, int, ast.TypeNode, int],
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """`++` / `--` on a long-long bit-field. Lowers to
+        `lhs = lhs +/- 1` via the existing LL bitfield store, with
+        the right pre/postfix value semantics."""
+        # Delta as an IntLiteral; the synthesized BinaryOp takes the
+        # bit-field value and adds/subtracts 1.
+        synth_one = ast.IntLiteral(
+            value=1, is_long=False, is_long_long=True, is_unsigned=False,
+        )
+        op = "+" if expr.op == "++" else "-"
+        # For prefix, the result is the new value; for postfix, the
+        # old value. We use _bitfield_load_ll + _bitfield_store_ll_simple
+        # to avoid re-evaluating the bitfield address and the increment.
+        # Postfix: load old, then bump.
+        if not expr.is_prefix:
+            out = self._bitfield_load_ll(expr.operand, bf, ctx)
+            # Save old.
+            out.append("        push    edx")
+            out.append("        push    eax")
+            # Compute new = old + delta. The bit-field address still
+            # needs to be re-evaluated (we lost it). Build a synthetic
+            # `lhs op= 1`.
+            new_rhs = ast.BinaryOp(op=op, left=expr.operand, right=synth_one)
+            out += self._bitfield_store_ll_simple(
+                expr.operand, bf, new_rhs, ctx,
+            )
+            out.append("        pop     eax")
+            out.append("        pop     edx")
+            return out
+        # Prefix: store first, then load the new value.
+        new_rhs = ast.BinaryOp(op=op, left=expr.operand, right=synth_one)
+        out = self._bitfield_store_ll_simple(
+            expr.operand, bf, new_rhs, ctx,
+        )
+        # _bitfield_store_ll_simple leaves a positioned-then-shifted-
+        # back value in EAX (low 32 bits) without sign extension.
+        # Reload via _bitfield_load_ll for correct semantics.
+        out += self._bitfield_load_ll(expr.operand, bf, ctx)
         return out
 
     def _compound_assign_bitfield(
