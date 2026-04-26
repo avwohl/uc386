@@ -484,6 +484,130 @@ _memcmp:
         pop     ebp
         ret
 
+; ---- qsort -----------------------------------------------------------------
+; void qsort(void *base, size_t nmemb, size_t size,
+;            int (*cmp)(const void *, const void *));
+; Simple insertion sort (good enough for typical test cases). Allocates
+; `size` bytes of scratch on the stack for the per-iteration save slot.
+_qsort:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        push    edi
+        push    ebx
+        ; base   = [ebp + 8]
+        ; nmemb  = [ebp + 12]
+        ; size   = [ebp + 16]
+        ; cmp    = [ebp + 20]
+        ; Allocate `size` bytes of scratch storage; round up to 4.
+        mov     eax, [ebp + 16]
+        add     eax, 3
+        and     eax, ~3
+        sub     esp, eax
+        mov     edi, esp                ; edi = scratch ptr
+        ; if (nmemb <= 1) return
+        mov     ecx, [ebp + 12]
+        cmp     ecx, 1
+        jbe     .qs_done
+        ; for (i = 1; i < nmemb; i++)
+        mov     ebx, 1                  ; ebx = i
+.qs_outer:
+        cmp     ebx, [ebp + 12]
+        jge     .qs_done
+        ; Save base[i] to scratch via memcpy
+        mov     eax, ebx
+        imul    eax, [ebp + 16]
+        add     eax, [ebp + 8]          ; eax = &base[i]
+        mov     esi, eax
+        mov     ecx, [ebp + 16]
+.qs_save:
+        test    ecx, ecx
+        jz      .qs_save_done
+        mov     al, [esi]
+        mov     [edi + ecx - 1 + 0], al
+        ; Iterate forward direction:
+.qs_save_done:
+        ; Actually rewrite: simple byte copy esi -> edi, ecx bytes
+        mov     ecx, [ebp + 16]
+        mov     eax, ebx
+        imul    eax, ecx
+        add     eax, [ebp + 8]
+        mov     esi, eax
+        push    ecx
+        push    edi
+.qs_save2:
+        mov     al, [esi]
+        mov     [edi], al
+        inc     esi
+        inc     edi
+        dec     ecx
+        jnz     .qs_save2
+        pop     edi
+        pop     ecx
+        ; Now find insertion point: j = i; while (j>0 && cmp(&base[j-1], scratch) > 0): shift down; j--;
+        mov     edx, ebx                ; edx = j
+.qs_inner:
+        test    edx, edx
+        jz      .qs_insert
+        ; Compute &base[j-1] in eax
+        lea     eax, [edx - 1]
+        imul    eax, [ebp + 16]
+        add     eax, [ebp + 8]
+        ; Call cmp(&base[j-1], scratch)
+        push    edi                     ; arg2 = scratch
+        push    eax                     ; arg1 = &base[j-1]
+        call    [ebp + 20]
+        add     esp, 8
+        cmp     eax, 0
+        jle     .qs_insert
+        ; Shift base[j-1] down to base[j]: memcpy(&base[j], &base[j-1], size)
+        mov     eax, edx
+        imul    eax, [ebp + 16]
+        add     eax, [ebp + 8]          ; eax = &base[j]
+        lea     ecx, [edx - 1]
+        imul    ecx, [ebp + 16]
+        add     ecx, [ebp + 8]          ; ecx = &base[j-1]
+        mov     esi, ecx
+        push    edi
+        mov     edi, eax
+        mov     ecx, [ebp + 16]
+.qs_shift:
+        mov     al, [esi]
+        mov     [edi], al
+        inc     esi
+        inc     edi
+        dec     ecx
+        jnz     .qs_shift
+        pop     edi
+        dec     edx
+        jmp     .qs_inner
+.qs_insert:
+        ; Place scratch into base[j]
+        mov     eax, edx
+        imul    eax, [ebp + 16]
+        add     eax, [ebp + 8]          ; eax = &base[j]
+        mov     ecx, [ebp + 16]
+        push    edi
+        mov     esi, edi
+        mov     edi, eax
+.qs_insert2:
+        mov     al, [esi]
+        mov     [edi], al
+        inc     esi
+        inc     edi
+        dec     ecx
+        jnz     .qs_insert2
+        pop     edi
+        inc     ebx
+        jmp     .qs_outer
+.qs_done:
+        pop     ebx
+        pop     edi
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
 ; ---- memchr ---------------------------------------------------------------
 ; void *memchr(const void *s, int c, size_t n);
 ; Returns pointer to first byte equal to c (as unsigned char) within
