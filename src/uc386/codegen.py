@@ -4963,10 +4963,10 @@ class CodeGenerator:
                 out += self._struct_copy_from_expr(
                     actual, m_disp, m_ty, ctx,
                 )
-            elif self._is_float_type(m_ty):
+            elif self._is_float_type(m_ty) and m_name_i not in bitfields:
                 out += self._eval_float_to_st0(actual, ctx)
                 out += self._store_st0_to(_ebp_addr(m_disp), m_ty)
-            elif self._is_long_long(m_ty):
+            elif self._is_long_long(m_ty) and m_name_i not in bitfields:
                 value_ty = self._type_of(actual, ctx)
                 if self._is_long_long(value_ty):
                     out += self._eval_expr_to_edx_eax(actual, ctx)
@@ -6692,6 +6692,21 @@ class CodeGenerator:
             return out
         if isinstance(expr, ast.Member):
             mem_ty = self._type_of(expr, ctx)
+            # Bit-field member needs the proper load (shrd + mask)
+            # rather than a raw 64-bit memcpy. The 32-bit-storage
+            # case still falls through to `_eval_expr_to_eax` which
+            # routes through `_bitfield_load`.
+            bf = self._bitfield_info(expr, ctx)
+            if bf is not None and len(bf) == 4 and bf[3] == 8:
+                # Long-long-storage bit-field: emit the LL load then
+                # zero-extend (or sign-extend for signed types) to
+                # ensure EDX:EAX holds the full 64-bit value.
+                out = self._bitfield_load_ll(expr, bf, ctx)
+                if self._is_unsigned(mem_ty):
+                    out.append("        xor     edx, edx")
+                else:
+                    out.append("        cdq")
+                return out
             if self._is_long_long(mem_ty):
                 out = self._member_address(expr, ctx)
                 return out + [
