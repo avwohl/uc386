@@ -1312,6 +1312,17 @@ class CodeGenerator:
                 out.append(v)
                 i += 1
                 continue
+            # A StringLiteral is a complete initializer for a char
+            # array — don't elision-wrap it.
+            if (
+                isinstance(v, ast.StringLiteral)
+                and isinstance(elem_type, ast.ArrayType)
+                and isinstance(elem_type.base_type, ast.BasicType)
+                and elem_type.base_type.name == "char"
+            ):
+                out.append(v)
+                i += 1
+                continue
             # Flat value — gather up to leaf_count consecutive flat
             # values into an InitializerList for one element.
             group = []
@@ -1319,6 +1330,13 @@ class CodeGenerator:
             while j < len(values) and j - i < leaf_count:
                 vj = values[j]
                 if isinstance(vj, (ast.DesignatedInit, ast.InitializerList)):
+                    break
+                if (
+                    isinstance(vj, ast.StringLiteral)
+                    and isinstance(elem_type, ast.ArrayType)
+                    and isinstance(elem_type.base_type, ast.BasicType)
+                    and elem_type.base_type.name == "char"
+                ):
                     break
                 group.append(vj)
                 j += 1
