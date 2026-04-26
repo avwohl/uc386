@@ -177,3 +177,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Doesn't support: nested fn returning a struct (struct return ABI tangles with the lift), or nested fns called via function pointer when they capture outer-locals (real GCC uses runtime trampolines that load a static-link register; we don't generate those). Nested fns called directly with captures work; nested fns called as fn-pointers without captures work; the combination doesn't.**
 
   **Result: 1245/1514 gcc-c-torture** (up from 1230). Combined with c-testsuite still 215/220, the pipeline now passes 1460 / 1734 (84.2%).
+- **2026-04-25 — torture cluster: globals + struct/union polish (1245 → 1265)**:
+  - **Empty struct definition `struct foo {};`.** uc_core's parser was returning an empty DeclarationList because `if base_type.members:` skipped over zero-member braces. Added `_had_inline_brace` flag on StructType so `struct foo {};` registers as a real (zero-size) StructDecl distinct from the forward-decl `struct foo;`.
+  - **`typedef struct foo { ... } bar;` registers the struct under the tag too.** The typedef alone wasn't calling `_register_struct`, so a later `struct foo *p` failed to find the layout. Wiring the typedef path through `_resolve_struct_name` registers the layout the first time we see the inline definition.
+  - **Comma-separated bit-field declarators (`unsigned int i:6, j:11, k:15`).** Bit-width was being parsed via `_parse_expression()` which eats commas; switched to `_parse_assignment_expression()` so each declarator is parsed separately.
+  - **Bit-fields in unions.** `_register_struct(union)` now allows bit-fields — each gets its own 32-bit storage unit at offset 0. `_emit_global_struct_init` for unions takes a separate path that initializes only the first (or designated) member.
+  - **Static address resolution for global initializers.** New `_resolve_static_addr` walks any `&<lvalue>` chain (`Member`/`Index`/`*`/`Cast`) and resolves it to `(label, offset)`, so `int *p = &v.d.b;` and `void *foo[] = {(void *)&("X"[0])};` and `int *q = &arr[N];` all emit `dd <label> [+ N]` at link time. Pointer-init also strips leading casts and handles `&(string)[N]` directly.
+
+  **Result: 1265/1514 gcc-c-torture** (up from 1245). Combined with c-testsuite still 215/220, the pipeline now passes 1480 / 1734 (85.4%).

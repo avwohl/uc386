@@ -419,6 +419,16 @@ class CodeGenerator:
                     and d.target_type.values
                 ):
                     self._register_enum_values(d.target_type.values)
+                # `typedef struct foo { ... } bar;` defines `struct foo`
+                # too — register its layout under the tag so later
+                # references via `struct foo *` (e.g. through a forward
+                # decl) can resolve the layout for member access.
+                if (
+                    isinstance(d.target_type, ast.StructType)
+                    and d.target_type.name
+                    and d.target_type.members
+                ):
+                    self._resolve_struct_name(d.target_type)
         # `StructType` references inside a containing decl (e.g.,
         # `struct point origin;` at top level) carry an empty members
         # list; the layout is owned by `_structs[name]`. Inline struct
@@ -631,6 +641,10 @@ class CodeGenerator:
             directive = self._DATA_DIRECTIVE[self._size_of(ty)]
             return [f"        {directive}      {value}"]
         if isinstance(ty, ast.PointerType):
+            # Strip any leading casts: pointer init `(char *)&x` is the
+            # same address as `&x` for layout purposes.
+            while isinstance(init, ast.Cast):
+                init = init.expr
             # Allow `int *p = 0` (null pointer literal) and
             # `int *p = &other_global` / `char *s = "literal"` — both
             # become `dd <label>` so the linker resolves the address.
@@ -644,6 +658,20 @@ class CodeGenerator:
                 )
             ):
                 return [f"        dd      _{init.operand.name}"]
+            # `&<static-lvalue>` — address of any static lvalue. Walk
+            # the chain of `.field` / `->field` / `[i]` / `*` to compute
+            # `<base_label> + <constant_offset>` at link time.
+            if (
+                isinstance(init, ast.UnaryOp)
+                and init.op == "&"
+            ):
+                resolved = self._resolve_static_addr(init.operand, name)
+                if resolved is not None:
+                    base_label, offset = resolved
+                    if offset == 0:
+                        return [f"        dd      {base_label}"]
+                    sign = "+" if offset > 0 else "-"
+                    return [f"        dd      {base_label} {sign} {abs(offset)}"]
             # `struct S *s = &(struct S){...};` — the compound literal
             # gets a private global, and the pointer global stores its
             # address.
@@ -712,10 +740,52 @@ class CodeGenerator:
         total = self._struct_sizes[sname]
         member_index = {mn: i for i, (mn, _, _) in enumerate(members)}
         bitfields = self._struct_bitfields.get(sname, {})
-        if bitfields:
+        is_union = sname in self._struct_unions
+        if bitfields and not is_union:
             return self._emit_global_bitfield_struct_init(
                 sname, members, bitfields, total, init, name,
             )
+        if is_union:
+            # Union init targets the first member by C99 default
+            # (unless designated). The init value is laid out at
+            # offset 0; the rest of the union is zero-padded to its
+            # total size.
+            if not init.values:
+                return [f"        times {total} db 0"]
+            first_value = init.values[0]
+            if isinstance(first_value, ast.DesignatedInit):
+                # `.field = value` — find the named member.
+                if (
+                    len(first_value.designators) != 1
+                    or not isinstance(first_value.designators[0], str)
+                ):
+                    raise CodegenError(
+                        f"global `{name}`: only single-level `.field` "
+                        f"designators supported"
+                    )
+                target_name = first_value.designators[0]
+                value = first_value.value
+            else:
+                target_name = members[0][0]
+                value = first_value
+            target_ty = next(
+                ty for n, ty, _ in members if n == target_name
+            )
+            if target_name in bitfields:
+                # Single bit-field init: pack into the storage unit.
+                bit_offset, bit_width = bitfields[target_name]
+                v = self._const_eval(value, f"{name}.{target_name}")
+                mask = (1 << bit_width) - 1
+                packed = (v & mask) << bit_offset
+                out = [f"        dd      0x{packed & 0xFFFFFFFF:08X}"]
+                if total > 4:
+                    out.append(f"        times {total - 4} db 0")
+                return out
+            out = self._emit_global_init(target_ty, value, f"{name}.{target_name}")
+            written = self._size_of(target_ty)
+            if total > written:
+                out.append(f"        times {total - written} db 0")
+            return out
 
         # Walk source values, honouring `.field = value` designators.
         # `slot_values[i]` is the expr to emit for member i, or absent
@@ -1174,6 +1244,120 @@ class CodeGenerator:
     _DATA_DIRECTIVE_NAMES = frozenset({
         "bool", "char", "short", "int", "long",
     })
+
+    def _resolve_static_addr(
+        self, expr: ast.Expression, name: str,
+    ) -> tuple[str, int] | None:
+        """Resolve `expr` to `(label, offset)` for a global-init address.
+
+        Walks `.field` / `->field` / `[i]` / `*` chains rooted at a
+        static lvalue (a global identifier or string literal) and
+        accumulates a compile-time integer offset. Returns None if
+        the chain isn't statically resolvable.
+        """
+        # Strip casts.
+        while isinstance(expr, ast.Cast):
+            expr = expr.expr
+        if isinstance(expr, ast.StringLiteral):
+            return self._intern_string(expr.value), 0
+        if isinstance(expr, ast.Identifier):
+            if expr.name in self._globals or expr.name in self._extern_vars:
+                return f"_{expr.name}", 0
+            if expr.name in self._func_return_types:
+                return f"_{expr.name}", 0
+            return None
+        if isinstance(expr, ast.UnaryOp) and expr.op == "*":
+            # `*p` where p is a pointer-arithmetic expression. Lower as
+            # equivalent indexing — only resolves if p is a known
+            # global+offset.
+            inner = self._resolve_static_addr(expr.operand, name)
+            return inner
+        if isinstance(expr, ast.Member):
+            # `obj.field` — resolve obj's address, then add field offset.
+            try:
+                obj_ty = self._type_of(
+                    expr.obj, _FuncCtx(),
+                )
+            except CodegenError:
+                return None
+            if expr.is_arrow:
+                # `p->m`: the base address comes from evaluating p (a
+                # pointer), then plus member offset.
+                if isinstance(obj_ty, ast.PointerType):
+                    obj_ty = obj_ty.base_type
+                inner = self._resolve_static_addr(expr.obj, name)
+            else:
+                inner = self._resolve_static_addr(expr.obj, name)
+            if inner is None:
+                return None
+            if isinstance(obj_ty, (ast.ArrayType, ast.PointerType)):
+                obj_ty = obj_ty.base_type
+            if not isinstance(obj_ty, ast.StructType):
+                return None
+            sname = self._resolve_struct_name(obj_ty)
+            try:
+                _, m_off = self._member_layout(sname, expr.member)
+            except CodegenError:
+                return None
+            base_label, base_off = inner
+            return base_label, base_off + m_off
+        if isinstance(expr, ast.Index):
+            # `arr[i]` — resolve arr's address, then add i*sizeof(elem).
+            inner = self._resolve_static_addr(expr.array, name)
+            if inner is None:
+                return None
+            try:
+                arr_ty = self._type_of(expr.array, _FuncCtx())
+            except CodegenError:
+                return None
+            if isinstance(arr_ty, ast.PointerType):
+                elem_ty = arr_ty.base_type
+            elif isinstance(arr_ty, ast.ArrayType):
+                elem_ty = arr_ty.base_type
+            else:
+                return None
+            try:
+                idx = self._const_eval(expr.index, name)
+            except CodegenError:
+                return None
+            base_label, base_off = inner
+            return base_label, base_off + idx * self._size_of(elem_ty)
+        if isinstance(expr, ast.BinaryOp) and expr.op in ("+", "-"):
+            # `arr + N` or `arr - N` — pointer arithmetic.
+            inner = self._resolve_static_addr(expr.left, name)
+            if inner is None:
+                # Try the other side for `N + arr`.
+                inner = self._resolve_static_addr(expr.right, name)
+                if inner is None:
+                    return None
+                try:
+                    offset = self._const_eval(expr.left, name)
+                except CodegenError:
+                    return None
+            else:
+                try:
+                    offset = self._const_eval(expr.right, name)
+                except CodegenError:
+                    return None
+                if expr.op == "-":
+                    offset = -offset
+            try:
+                arr_ty = self._type_of(
+                    expr.left if inner == self._resolve_static_addr(expr.left, name)
+                    else expr.right,
+                    _FuncCtx(),
+                )
+            except CodegenError:
+                return None
+            if isinstance(arr_ty, ast.PointerType):
+                elem_ty = arr_ty.base_type
+            elif isinstance(arr_ty, ast.ArrayType):
+                elem_ty = arr_ty.base_type
+            else:
+                elem_ty = ast.BasicType(name="char")  # byte arithmetic
+            base_label, base_off = inner
+            return base_label, base_off + offset * self._size_of(elem_ty)
+        return None
 
     def _const_eval(self, expr: ast.Expression, name: str) -> int:
         """Evaluate a compile-time integer constant for a global initializer.
@@ -2261,14 +2445,30 @@ class CodeGenerator:
 
         if decl.is_union:
             # All members share offset 0; total size = max member size,
-            # rounded up to the union's alignment. (Bitfields in unions
-            # are unusual; we don't try to support them here.)
+            # rounded up to the union's alignment. Bit-fields each get
+            # their own 32-bit storage unit at offset 0 (no packing
+            # across bit-fields like in a struct, since they all
+            # alias).
             total = 0
             for m in decl.members:
                 if m.bit_width is not None:
-                    raise CodegenError(
-                        f"`{decl.name}`: bit-fields in unions not supported"
-                    )
+                    if not isinstance(m.bit_width, ast.IntLiteral):
+                        raise CodegenError(
+                            f"`{decl.name}.{m.name}`: bit-field width "
+                            f"must be an integer literal"
+                        )
+                    width = m.bit_width.value
+                    if width <= 0 or width > 32:
+                        raise CodegenError(
+                            f"`{decl.name}.{m.name}`: bit-field width "
+                            f"{width} out of range (1..32)"
+                        )
+                    if m.name is not None:
+                        members.append((m.name, m.member_type, 0))
+                        bitfields[m.name] = (0, width)
+                    if 4 > total:
+                        total = 4
+                    continue
                 if m.name is None:
                     # Anonymous nested member: promote each of its inner
                     # members at offset 0 (union scope).
@@ -2284,6 +2484,8 @@ class CodeGenerator:
             self._structs[decl_name] = members
             self._struct_sizes[decl_name] = total
             self._struct_unions.add(decl_name)
+            if bitfields:
+                self._struct_bitfields[decl_name] = bitfields
             return
 
         # Struct layout. Two cursors run in parallel: a byte cursor for
