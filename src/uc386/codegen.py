@@ -2350,6 +2350,22 @@ class CodeGenerator:
                 # via a per-cast temp slot.
                 size = (self._size_of(sub.target_type) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
+            elif (
+                isinstance(sub, ast.Cast)
+                and isinstance(sub.target_type, ast.ArrayType)
+                and getattr(sub.target_type, "is_vector", False)
+            ):
+                # `(vec_t) scalar` — type-pun a scalar value into a
+                # vector slot. The codegen needs an address to hand
+                # back to consumers, so allocate a temp.
+                src_ty_check = None
+                try:
+                    src_ty_check = self._type_of(sub.expr, ctx)
+                except CodegenError:
+                    pass
+                if not isinstance(src_ty_check, ast.ArrayType):
+                    size = (self._size_of(sub.target_type) + 3) & ~3
+                    ctx.alloc_call_temp(sub, size)
             elif isinstance(sub, (ast.BinaryOp, ast.UnaryOp, ast.Cast)):
                 # Complex-valued sub-expression: needs a temp slot
                 # to hold the (real, imag) result. One per node so
@@ -4352,6 +4368,11 @@ class CodeGenerator:
                 )
             out.append(f"        {mnem}   eax, {half}")
             return out
+        if isinstance(target, ast.ArrayType):
+            # `(vec_t) value` in EAX-scalar context: produce the
+            # vector's address (consumers reading EAX get a pointer
+            # to the temp). Allocated in `_collect_call_temps`.
+            return self._vector_value_address(expr, ctx)
         raise CodegenError(
             f"cast to {type(target).__name__} not supported"
         )
@@ -9271,9 +9292,36 @@ class CodeGenerator:
             # `*p` of pointer-to-vector: just evaluate the pointer.
             return self._eval_expr_to_eax(expr.operand, ctx)
         if isinstance(expr, ast.Cast):
-            # Vector type-pun: take the source's address (assumes the
-            # source is an lvalue with the same size; for true type-pun
-            # via union or memcpy this is fine).
+            # Vector type-pun: if the source is itself a vector / lvalue,
+            # take its address. If the source is a scalar (e.g.
+            # `(V2SI) 0LL`), evaluate it into the cast's temp slot
+            # (allocated by `_collect_call_temps` for ArrayType targets)
+            # so we can hand back a stable address.
+            src_ty = self._type_of(expr.expr, ctx)
+            if isinstance(src_ty, ast.ArrayType):
+                return self._vector_value_address(expr.expr, ctx)
+            if id(expr) in ctx.call_temps:
+                disp = ctx.call_temps[id(expr)]
+                out: list[str] = []
+                if self._is_long_long(src_ty):
+                    out += self._eval_expr_to_edx_eax(expr.expr, ctx)
+                    out.append(f"        mov     {_ebp_addr(disp)}, eax")
+                    out.append(f"        mov     {_ebp_addr(disp + 4)}, edx")
+                else:
+                    out += self._eval_expr_to_eax(expr.expr, ctx)
+                    out.append(f"        mov     {_ebp_addr(disp)}, eax")
+                    # Zero-fill the rest of the vector slot.
+                    target_size = self._size_of(expr.target_type)
+                    src_size = self._size_of(src_ty) if not isinstance(
+                        src_ty, (ast.PointerType, ast.ArrayType)
+                    ) else 4
+                    if src_size < target_size:
+                        out += self._zero_fill_at(
+                            disp + src_size, target_size - src_size
+                        )
+                out.append(f"        lea     eax, {_ebp_addr(disp)}")
+                return out
+            # Fallback: peel and try the source.
             return self._vector_value_address(expr.expr, ctx)
         if isinstance(expr, ast.Compound):
             # Compound literal — use its temp slot, run init into it,
