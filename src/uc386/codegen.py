@@ -2383,6 +2383,50 @@ class CodeGenerator:
         (`al`/`ax`) and re-extends per the target's signedness, so a
         subsequent use of the value sees the right C semantics.
         """
+        target = expr.target_type
+        src_ty = self._type_of(expr.expr, ctx)
+        # Float → unsigned int: fistp only does signed conversion, so
+        # for values >= 2^31 we need a bias subtract / re-add. Detect
+        # the case here so `_eval_expr_to_eax(expr.expr)` (which would
+        # otherwise produce a wrong signed value for big floats) is
+        # bypassed.
+        if (
+            self._is_float_type(src_ty)
+            and isinstance(target, ast.BasicType)
+            and self._size_of(target) == 4
+            and self._is_unsigned(target)
+        ):
+            out = self._eval_float_to_st0(expr.expr, ctx)
+            # Compare st(0) against 2^31 (the boundary).
+            bias_label = self._intern_float(2147483648.0, 4)
+            label_below = ctx.label("f2u_below")
+            label_done = ctx.label("f2u_done")
+            out.append(f"        fld     dword [{bias_label}]")
+            out.append("        fucompp")
+            out.append("        fnstsw  ax")
+            out.append("        sahf")
+            # If st(0) (the value) < bias, take the small path.
+            # FPU ZF/PF/CF semantics: for `fucompp st(0)` vs ST(1),
+            # ST(0)=bias, ST(1)=value (we loaded value first, then bias).
+            # Compare returns: ST(0) < ST(1) → CF=0 ZF=0; equal → CF=0 ZF=1; greater → CF=1.
+            # We want value < bias, i.e. ST(1) < ST(0), which means ST(0) > ST(1) → CF=0 (ja).
+            out.append(f"        ja      {label_below}")
+            # value >= bias: re-eval, subtract bias, fistp, add 0x80000000.
+            out += self._eval_float_to_st0(expr.expr, ctx)
+            out.append(f"        fld     dword [{bias_label}]")
+            out.append("        fsubp   st1, st0")
+            out.append("        sub     esp, 4")
+            out.append("        fistp   dword [esp]")
+            out.append("        pop     eax")
+            out.append("        add     eax, 0x80000000")
+            out.append(f"        jmp     {label_done}")
+            out.append(f"{label_below}:")
+            out += self._eval_float_to_st0(expr.expr, ctx)
+            out.append("        sub     esp, 4")
+            out.append("        fistp   dword [esp]")
+            out.append("        pop     eax")
+            out.append(f"{label_done}:")
+            return out
         out = self._eval_expr_to_eax(expr.expr, ctx)
         target = expr.target_type
         if isinstance(target, ast.PointerType):
@@ -3281,7 +3325,14 @@ class CodeGenerator:
         """
         a_ty = self._type_of(args[0], ctx)
         b_ty = self._type_of(args[1], ctx)
-        unsigned = self._is_unsigned(a_ty) or self._is_unsigned(b_ty)
+        # Per GCC docs, __builtin_*_overflow checks whether the
+        # mathematically-precise result fits in the type pointed to by
+        # the third argument. Use that type's signedness to pick the
+        # right flag (CF for unsigned, OF for signed).
+        dest_ty = self._type_of(args[2], ctx)
+        if isinstance(dest_ty, ast.PointerType):
+            dest_ty = dest_ty.base_type
+        unsigned = self._is_unsigned(dest_ty)
         if self._is_long_long(a_ty) or self._is_long_long(b_ty):
             raise CodegenError(
                 f"{name}: long-long operand not supported"
@@ -4369,7 +4420,36 @@ class CodeGenerator:
         """
         ty = self._type_of(expr, ctx)
         if not self._is_float_type(ty):
-            # Promote int → float via stack scratch.
+            # Promote int → float via stack scratch. fild reads the
+            # value as SIGNED, so for unsigned int we zero-extend into
+            # an 8-byte qword scratch and `fild qword` from there.
+            if self._is_long_long(ty):
+                out = self._eval_expr_to_edx_eax(expr, ctx)
+                out.append("        push    edx")
+                out.append("        push    eax")
+                out.append("        fild    qword [esp]")
+                out.append("        add     esp, 8")
+                # For unsigned long long: if the high bit is set, fild
+                # treated it as negative — add 2^64 to correct.
+                if self._is_unsigned(ty):
+                    out.append("        test    edx, edx")
+                    label_ok = ctx.label("ull_to_float_ok")
+                    out.append(f"        jns     {label_ok}")
+                    # 2^64 as a float constant. Intern it.
+                    bias_label = self._intern_float(
+                        18446744073709551616.0, 8,
+                    )
+                    out.append(f"        fld     qword [{bias_label}]")
+                    out.append("        faddp   st1, st0")
+                    out.append(f"{label_ok}:")
+                return out
+            if self._is_unsigned(ty):
+                out = self._eval_expr_to_eax(expr, ctx)
+                out.append("        push    0")           # high half = 0
+                out.append("        push    eax")
+                out.append("        fild    qword [esp]")
+                out.append("        add     esp, 8")
+                return out
             out = self._eval_expr_to_eax(expr, ctx)
             out.append("        push    eax")
             out.append("        fild    dword [esp]")
