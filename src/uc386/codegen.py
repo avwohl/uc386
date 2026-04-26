@@ -904,41 +904,86 @@ class CodeGenerator:
     ) -> list[str]:
         """Pack bit-field init values into 4-byte storage units and emit.
 
-        Walks the InitializerList and members in parallel. For each
-        bit-field member, OR its value (masked to bit_width and shifted
-        to bit_offset) into the value at unit_offset. Non-bit-field
-        members are not currently supported in the same struct as bit
-        fields at global scope.
+        Walks the InitializerList and members in parallel. Bit-field
+        members get OR'd into the value at their storage unit's offset;
+        regular members get a per-member init value at their own
+        offset. Mixed bit-field and regular members in the same struct
+        are supported (bit-fields share storage units, regulars don't).
         """
-        # Map storage_unit_offset → packed dword value.
+        member_index = {mn: i for i, (mn, _, _) in enumerate(members)}
+        # storage_unit_offset → packed dword value (for bit-field members).
         units: dict[int, int] = {}
-        # Walk values in declaration order. Designators not supported here.
+        # member_index → init expr (for non-bit-field members).
+        regular_inits: dict[int, ast.Expression] = {}
+        # Walk values in declaration order. `.field = value` jumps the
+        # cursor; subsequent positional values continue from there.
         cursor = 0
         for value in init.values:
+            if isinstance(value, ast.DesignatedInit):
+                if (
+                    len(value.designators) != 1
+                    or not isinstance(value.designators[0], str)
+                ):
+                    raise CodegenError(
+                        f"global `{name}`: only single-level `.field` "
+                        f"designators supported in bit-field init"
+                    )
+                m_name_des = value.designators[0]
+                if m_name_des not in member_index:
+                    raise CodegenError(
+                        f"global `{name}`: unknown member "
+                        f"`{m_name_des}`"
+                    )
+                cursor = member_index[m_name_des]
+                actual = value.value
+            else:
+                actual = value
             if cursor >= len(members):
                 raise CodegenError(
                     f"global `{name}`: too many initializers"
                 )
             m_name_i, m_ty_i, m_off = members[cursor]
+            idx = cursor
             cursor += 1
-            if m_name_i not in bitfields:
-                raise CodegenError(
-                    f"global `{name}`: mixed bit-field and regular "
-                    f"members not supported in bit-field struct init"
-                )
-            bit_offset, bit_width = bitfields[m_name_i]
-            v = self._const_eval(value, f"{name}.{m_name_i}")
-            mask = (1 << bit_width) - 1
-            v_masked = (v & mask) << bit_offset
-            units[m_off] = units.get(m_off, 0) | v_masked
+            if m_name_i in bitfields:
+                bit_offset, bit_width = bitfields[m_name_i]
+                v = self._const_eval(actual, f"{name}.{m_name_i}")
+                mask = (1 << bit_width) - 1
+                v_masked = (v & mask) << bit_offset
+                units[m_off] = units.get(m_off, 0) | v_masked
+            else:
+                regular_inits[idx] = actual
+        # Now emit in declaration order. For each member:
+        #  - bit-field: emit the packed unit at its offset (only once
+        #    per unit_offset).
+        #  - regular: emit its init expr (or zero) at its offset.
         out: list[str] = []
         emit_cursor = 0
-        for off in sorted(units.keys()):
-            if off > emit_cursor:
-                out.append(f"        times {off - emit_cursor} db 0")
-                emit_cursor = off
-            out.append(f"        dd      0x{units[off] & 0xFFFFFFFF:08X}")
-            emit_cursor = off + 4
+        emitted_unit_offsets: set[int] = set()
+        for idx, (m_name_i, m_ty_i, m_off) in enumerate(members):
+            if m_name_i in bitfields:
+                if m_off in emitted_unit_offsets:
+                    continue
+                if m_off > emit_cursor:
+                    out.append(f"        times {m_off - emit_cursor} db 0")
+                out.append(
+                    f"        dd      0x{units.get(m_off, 0) & 0xFFFFFFFF:08X}"
+                )
+                emit_cursor = m_off + 4
+                emitted_unit_offsets.add(m_off)
+            else:
+                if m_off > emit_cursor:
+                    out.append(f"        times {m_off - emit_cursor} db 0")
+                    emit_cursor = m_off
+                if idx in regular_inits:
+                    out += self._emit_global_init(
+                        m_ty_i, regular_inits[idx], f"{name}.{m_name_i}",
+                    )
+                else:
+                    out.append(
+                        f"        times {self._size_of(m_ty_i)} db 0"
+                    )
+                emit_cursor = m_off + self._size_of(m_ty_i)
         if total > emit_cursor:
             out.append(f"        times {total - emit_cursor} db 0")
         return out
@@ -5557,7 +5602,15 @@ class CodeGenerator:
             # has the value of `expr`. We ignore the hint and just emit
             # the first argument's value.
             if callee.name == "__builtin_expect" and len(expr.args) >= 1:
-                return self._eval_expr_to_eax(expr.args[0], ctx)
+                # The second arg is "expected value" — gcc treats it as
+                # a runtime expression (not a static hint), so we eval
+                # it for any side effects, drop the result, then yield
+                # the first arg.
+                out: list[str] = []
+                for extra in expr.args[1:]:
+                    out += self._eval_expr_to_eax(extra, ctx)
+                out += self._eval_expr_to_eax(expr.args[0], ctx)
+                return out
             # `__builtin_choose_expr(cond, a, b)` selects a or b at
             # compile time based on `cond`'s integer-constant value.
             if (
