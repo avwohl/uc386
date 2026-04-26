@@ -664,6 +664,8 @@ def test_dynamic_index():
 
 
 def test_array_assignment_rejected():
+    # Regular C arrays aren't lvalues. Only vector_size-tagged
+    # ArrayTypes get the memcpy-style assignment.
     with pytest.raises(CodegenError, match="array"):
         _compile("int main(void) { int a[3]; int b[3]; a = b; return 0; }")
 

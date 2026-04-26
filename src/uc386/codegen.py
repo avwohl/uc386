@@ -2097,7 +2097,17 @@ class CodeGenerator:
         # — a pointer to the caller's destination buffer. Real params
         # shift up by 4 in that case.
         disp = 8
-        if isinstance(fn.return_type, (ast.StructType, ast.ComplexType)):
+        # Vectors return via the same caller-buffer ABI as structs;
+        # regular C arrays can't be returned by value (so don't reserve
+        # a retptr for them).
+        ret_is_vector = (
+            isinstance(fn.return_type, ast.ArrayType)
+            and getattr(fn.return_type, "is_vector", False)
+        )
+        if (
+            isinstance(fn.return_type, (ast.StructType, ast.ComplexType))
+            or ret_is_vector
+        ):
             ctx.alloc_param(
                 "__retptr__", disp,
                 ast.PointerType(base_type=fn.return_type),
@@ -2264,8 +2274,31 @@ class CodeGenerator:
         assignment, return chain) and won't read from the temp, but
         allocating them anyway keeps this pass context-free.
         """
+        # `_collect_locals` already exited its scope stack by the time we
+        # run, so `_type_of(Identifier)` for body locals would fail. Push
+        # a flat scope with all body VarDecls' resolved types so vector-
+        # arithmetic detection (`_type_of(BinaryOp)` → ArrayType) sees
+        # the right types for k0/k1/etc. The dummy slot disp doesn't
+        # matter — `_type_of` only reads `ctx.types`.
+        ctx.enter_scope()
+        for sub in self._walk_ast(node):
+            if isinstance(sub, ast.VarDecl):
+                t = ctx.decl_types.get(id(sub))
+                if t is not None and sub.name not in ctx.slots[-1]:
+                    ctx.slots[-1][sub.name] = 0
+                    ctx.types[-1][sub.name] = t
+        try:
+            self._collect_call_temps_inner(node, ctx)
+        finally:
+            ctx.exit_scope()
+
+    def _collect_call_temps_inner(self, node, ctx: _FuncCtx) -> None:
         for sub in self._walk_ast(node):
             if isinstance(sub, ast.Call) and self._is_struct_returning_call(sub, None):
+                ret_ty = self._func_return_types[self._call_target(sub)]
+                size = (self._size_of(ret_ty) + 3) & ~3
+                ctx.alloc_call_temp(sub, size)
+            elif isinstance(sub, ast.Call) and self._is_vector_returning_call(sub, None):
                 ret_ty = self._func_return_types[self._call_target(sub)]
                 size = (self._size_of(ret_ty) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
@@ -2300,6 +2333,17 @@ class CodeGenerator:
                 except CodegenError:
                     ty = self._type_of_complex_expr(sub)
                 if isinstance(ty, ast.ComplexType):
+                    size = (self._size_of(ty) + 3) & ~3
+                    ctx.alloc_call_temp(sub, size)
+                elif (
+                    isinstance(ty, ast.ArrayType)
+                    and self._is_vector_op_node(sub)
+                    and self._is_genuine_vector_op(sub, ctx)
+                ):
+                    # Vector arithmetic / unary: needs a temp to hold
+                    # the componentwise result. Distinguish from
+                    # pointer arithmetic (`arr + i`) which also has
+                    # ArrayType-flavored result type.
                     size = (self._size_of(ty) + 3) & ~3
                     ctx.alloc_call_temp(sub, size)
             elif (
@@ -2786,6 +2830,46 @@ class CodeGenerator:
         the same as pointers anywhere we look at element-step semantics.
         """
         return isinstance(t, (ast.PointerType, ast.ArrayType))
+
+    @staticmethod
+    def _is_vector_op_node(node) -> bool:
+        """True for BinaryOp / UnaryOp shapes that should be lowered as
+        componentwise vector arithmetic when their type is ArrayType.
+        Distinguishes vector arithmetic from incidental ArrayType results
+        (e.g. an Identifier of array type used in arithmetic context)."""
+        if isinstance(node, ast.BinaryOp):
+            return node.op in ("+", "-", "*", "/", "%", "&", "|", "^")
+        if isinstance(node, ast.UnaryOp):
+            return node.op in ("-", "+", "~")
+        return False
+
+    def _is_genuine_vector_op(self, node, ctx) -> bool:
+        """Distinguish vector componentwise arithmetic from pointer
+        arithmetic. For BinaryOp, both sides must be ArrayType of the
+        same shape, with at least one tagged as a vector. For UnaryOp,
+        the operand must be a vector ArrayType."""
+        try:
+            if isinstance(node, ast.BinaryOp):
+                lt = self._type_of(node.left, ctx)
+                rt = self._type_of(node.right, ctx)
+                return (
+                    isinstance(lt, ast.ArrayType)
+                    and isinstance(rt, ast.ArrayType)
+                    and self._size_of(lt) == self._size_of(rt)
+                    and (
+                        getattr(lt, "is_vector", False)
+                        or getattr(rt, "is_vector", False)
+                    )
+                )
+            if isinstance(node, ast.UnaryOp):
+                opt = self._type_of(node.operand, ctx)
+                return (
+                    isinstance(opt, ast.ArrayType)
+                    and getattr(opt, "is_vector", False)
+                )
+        except CodegenError:
+            return False
+        return False
 
     # Sizes used for pointer-arithmetic scaling. We can compute these for
     # any pointee type the parser produces, even ones we don't yet support
@@ -4458,7 +4542,9 @@ class CodeGenerator:
         the switch escapes to the enclosing loop (as C requires).
         """
         end_label = ctx.label("switch_end")
-        case_specs: list[tuple[str, int | None, str]] = []
+        # case_specs entries: (kind, value, value_end, label).
+        # `kind` is "case" (single value), "range" (V..VE), or "default".
+        case_specs: list[tuple[str, int | None, int | None, str]] = []
         case_label_map: dict[int, str] = {}
         default_label: str | None = None
 
@@ -4473,12 +4559,18 @@ class CodeGenerator:
                             "multiple `default` labels in switch"
                         )
                     default_label = ctx.label("default")
-                    case_specs.append(("default", None, default_label))
+                    case_specs.append(
+                        ("default", None, None, default_label)
+                    )
                     case_label_map[id(node)] = default_label
                 else:
                     value = self._const_eval(node.value, "case")
                     lbl = ctx.label("case")
-                    case_specs.append(("case", value, lbl))
+                    if getattr(node, "value_end", None) is not None:
+                        value_end = self._const_eval(node.value_end, "case")
+                        case_specs.append(("range", value, value_end, lbl))
+                    else:
+                        case_specs.append(("case", value, None, lbl))
                     case_label_map[id(node)] = lbl
                 walk(node.stmt)
                 return
@@ -4500,12 +4592,27 @@ class CodeGenerator:
 
         walk(stmt.body)
 
-        # Eval the controlling expression once.
+        # Eval the controlling expression once. For LL switches we'd
+        # need a different dispatch (EDX:EAX); not yet implemented.
+        # Single-value LL cases still pass through here as 32-bit
+        # comparisons (truncating the high half), which is wrong for
+        # very-large values but works for typical small-value LL
+        # switches.
         out = self._eval_expr_to_eax(stmt.expr, ctx)
-        for kind, value, target in case_specs:
+        for kind, value, value_end, target in case_specs:
             if kind == "case":
                 out.append(f"        cmp     eax, {value}")
                 out.append(f"        je      {target}")
+            elif kind == "range":
+                skip = ctx.label("rskip")
+                # Use signed comparison since case values may be
+                # negative. Unsigned ranges still work as long as
+                # both endpoints are < 2^31.
+                out.append(f"        cmp     eax, {value}")
+                out.append(f"        jl      {skip}")
+                out.append(f"        cmp     eax, {value_end}")
+                out.append(f"        jle     {target}")
+                out.append(f"{skip}:")
         out.append(f"        jmp     {default_label or end_label}")
 
         # Body emission. `_item`'s CaseStmt branch consults
@@ -4582,6 +4689,49 @@ class CodeGenerator:
         # `_array_init` and `_store_from_eax` see a concrete shape.
         var_type = ctx.lookup_type(decl.name)
         if isinstance(var_type, ast.ArrayType):
+            # Vector types accept a same-shape vector value (Identifier,
+            # BinaryOp, UnaryOp, Call, etc.) as their initializer — copy
+            # the bytes from the rhs's address into the local's slot.
+            # Regular C arrays only accept InitializerList/StringLiteral.
+            if (
+                getattr(var_type, "is_vector", False)
+                and not isinstance(
+                    decl.init, (ast.InitializerList, ast.StringLiteral)
+                )
+            ):
+                init_ty = self._type_of(decl.init, ctx)
+                if (
+                    isinstance(init_ty, ast.ArrayType)
+                    and self._size_of(init_ty) == self._size_of(var_type)
+                ):
+                    # Vector-returning call: use the local's address as
+                    # the retptr to skip the temp.
+                    if (
+                        isinstance(decl.init, ast.Call)
+                        and self._is_vector_returning_call(decl.init, ctx)
+                    ):
+                        return self._call_into_address(
+                            decl.init,
+                            [f"        lea     eax, {_ebp_addr(disp)}"],
+                            ctx,
+                        )
+                    out = self._vector_value_address(decl.init, ctx)
+                    out.append("        mov     edx, eax")
+                    out.append(f"        lea     ecx, {_ebp_addr(disp)}")
+                    size = self._size_of(var_type)
+                    offset = 0
+                    while size - offset >= 4:
+                        out.append(f"        mov     eax, [edx + {offset}]")
+                        out.append(f"        mov     [ecx + {offset}], eax")
+                        offset += 4
+                    if size - offset >= 2:
+                        out.append(f"        mov     ax, [edx + {offset}]")
+                        out.append(f"        mov     [ecx + {offset}], ax")
+                        offset += 2
+                    if size - offset >= 1:
+                        out.append(f"        mov     al, [edx + {offset}]")
+                        out.append(f"        mov     [ecx + {offset}], al")
+                    return out
             return self._array_init(var_type, decl.init, disp, ctx, decl.name)
         if isinstance(var_type, ast.StructType):
             # `struct T s = make(...)` — call `make` with &s as the hidden
@@ -5106,6 +5256,16 @@ class CodeGenerator:
             # address helper.
             if isinstance(ret_ty, ast.ComplexType):
                 return self._copy_complex_to_retptr(
+                    stmt.value, ret_ty, retptr_disp, ctx
+                ) + ["        jmp     .epilogue"]
+            # Vector return: same retptr ABI as structs, but the source
+            # address comes from `_vector_value_address` since vector
+            # ops don't dispatch through `_struct_address`.
+            if (
+                isinstance(ret_ty, ast.ArrayType)
+                and getattr(ret_ty, "is_vector", False)
+            ):
+                return self._copy_vector_to_retptr(
                     stmt.value, ret_ty, retptr_disp, ctx
                 ) + ["        jmp     .epilogue"]
             return self._copy_struct_to_retptr(
@@ -5979,6 +6139,39 @@ class CodeGenerator:
         out.append(f"        mov     eax, {_ebp_addr(retptr_disp)}")
         return out
 
+    def _copy_vector_to_retptr(
+        self,
+        src_expr: ast.Expression,
+        ret_ty: ast.ArrayType,
+        retptr_disp: int,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Copy a vector value into the function's `__retptr__` buffer.
+
+        Same byte-for-byte layout as `_copy_struct_to_retptr`; differs
+        only in how the source address is computed.
+        """
+        size = self._size_of(ret_ty)
+        out = [f"        mov     eax, {_ebp_addr(retptr_disp)}"]
+        out.append("        push    eax")
+        out += self._vector_value_address(src_expr, ctx)  # eax = &src
+        out.append("        mov     edx, eax")
+        out.append("        pop     ecx")
+        offset = 0
+        while size - offset >= 4:
+            out.append(f"        mov     eax, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], eax")
+            offset += 4
+        if size - offset >= 2:
+            out.append(f"        mov     ax, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], ax")
+            offset += 2
+        if size - offset >= 1:
+            out.append(f"        mov     al, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], al")
+        out.append("        mov     eax, ecx")
+        return out
+
     def _copy_struct_to_retptr(
         self,
         src_expr: ast.Expression,
@@ -6264,6 +6457,15 @@ class CodeGenerator:
             return False
         return isinstance(self._func_return_types[target], ast.StructType)
 
+    def _is_vector_returning_call(self, call: ast.Call, ctx) -> bool:
+        """True iff `call` invokes a known function that returns a vector
+        (modeled as ArrayType in our AST). Vectors use the same caller-
+        provided buffer ABI as structs."""
+        target = self._call_target(call)
+        if target is None:
+            return False
+        return isinstance(self._func_return_types[target], ast.ArrayType)
+
     # ---- expressions ----------------------------------------------------
 
     # Operators whose result is always plain int regardless of operand types
@@ -6380,10 +6582,13 @@ class CodeGenerator:
                 # __imag__ is zero (per gcc semantics).
                 return inner
             # `+` and `-` and `~` propagate float / long long / unsigned
-            # / complex through; `!` always produces int.
+            # / complex / vector through; `!` always produces int.
             if expr.op in ("+", "-", "~"):
                 inner = self._type_of(expr.operand, ctx)
                 if isinstance(inner, ast.ComplexType):
+                    return inner
+                if isinstance(inner, ast.ArrayType):
+                    # Vector componentwise unary.
                     return inner
                 if self._is_float_type(inner):
                     return inner
@@ -6449,6 +6654,17 @@ class CodeGenerator:
                 isinstance(lt, ast.ComplexType) or isinstance(rt, ast.ComplexType)
             ):
                 return self._complex_promotion(lt, rt)
+            # Vector arithmetic: two ArrayTypes of the same shape combine
+            # componentwise and return the array type. Comparison ops
+            # still return int (since GCC vector compares fold to a mask
+            # that's int-typed at the C level for our subset).
+            if (
+                expr.op in ("+", "-", "*", "/", "%", "&", "|", "^")
+                and isinstance(lt, ast.ArrayType)
+                and isinstance(rt, ast.ArrayType)
+                and self._size_of(lt) == self._size_of(rt)
+            ):
+                return lt
             if expr.op in self._INT_RESULT_BINOPS:
                 # Pointer-arithmetic promotion above doesn't apply here,
                 # but float promotion does for `*` and `/`.
@@ -6482,7 +6698,8 @@ class CodeGenerator:
                     return ast.BasicType(name="int", is_signed=False)
                 return ast.BasicType(name="int")
             # `+` and `-`: pointer ± int → pointer; pointer - pointer → int.
-            # Arrays count as pointer-like via decay.
+            # Arrays count as pointer-like via decay. (Vector componentwise
+            # arithmetic on two ArrayType operands is handled above.)
             l_ptr = self._is_pointer_like(lt)
             r_ptr = self._is_pointer_like(rt)
             if l_ptr and r_ptr:
@@ -6615,8 +6832,22 @@ class CodeGenerator:
         if isinstance(expr, ast.Member):
             return self._member_load(expr, ctx)
         if isinstance(expr, ast.UnaryOp):
+            # Vector unary: returns a temp address.
+            if (
+                self._is_vector_op_node(expr)
+                and id(expr) in ctx.call_temps
+                and self._is_genuine_vector_op(expr, ctx)
+            ):
+                return self._eval_vector_into_temp(expr, ctx)
             return self._unary(expr, ctx)
         if isinstance(expr, ast.BinaryOp):
+            # Vector arithmetic: both sides ArrayType of same shape.
+            if (
+                self._is_vector_op_node(expr)
+                and id(expr) in ctx.call_temps
+                and self._is_genuine_vector_op(expr, ctx)
+            ):
+                return self._eval_vector_into_temp(expr, ctx)
             return self._binary(expr, ctx)
         if isinstance(expr, ast.Call):
             if self._is_struct_returning_call(expr, ctx):
@@ -6839,6 +7070,19 @@ class CodeGenerator:
                         "        fistp   qword [esp]",
                         "        pop     eax",
                         "        pop     edx",
+                    ]
+                    return out
+                # 8-byte vector (ArrayType) → long long: type-pun by
+                # loading both halves of the vector's storage.
+                if (
+                    isinstance(src_ty, ast.ArrayType)
+                    and self._size_of(src_ty) == 8
+                ):
+                    out = self._vector_value_address(expr.expr, ctx)
+                    out += [
+                        "        mov     ecx, eax",
+                        "        mov     eax, [ecx]",
+                        "        mov     edx, [ecx + 4]",
                     ]
                     return out
                 out = self._eval_expr_to_eax(expr.expr, ctx)
@@ -7883,12 +8127,24 @@ class CodeGenerator:
             if param_types is not None and real_idx < len(param_types):
                 expected_ty = param_types[real_idx]
             arg_ty = self._type_of(arg, ctx)
-            if isinstance(arg_ty, (ast.StructType, ast.ComplexType)):
+            # Pass-by-value applies to: structs, complex, and *vectors*.
+            # Regular arrays decay to a pointer at the call site (just
+            # push the address).
+            arg_is_vector = (
+                isinstance(arg_ty, ast.ArrayType)
+                and getattr(arg_ty, "is_vector", False)
+            )
+            if (
+                isinstance(arg_ty, (ast.StructType, ast.ComplexType))
+                or arg_is_vector
+            ):
                 size = self._size_of(arg_ty)
                 padded = (size + 3) & ~3
                 # Compute &arg first; once it's in EDX we can reserve and copy.
                 if isinstance(arg_ty, ast.ComplexType):
                     out += self._complex_value_address(arg, ctx)
+                elif arg_is_vector:
+                    out += self._vector_value_address(arg, ctx)
                 else:
                     out += self._struct_address(arg, ctx)
                 out.append("        mov     edx, eax")
@@ -8661,6 +8917,35 @@ class CodeGenerator:
         if self._is_long_long(target_ty):
             return self._assign_ll(expr, ctx)
 
+        # Vector-typed lvalue (gcc vector_size types are ArrayType in
+        # our AST). Copy via memcpy of `sizeof(vector)` bytes from the
+        # rhs's address. Catches any l-value shape (Identifier, Member,
+        # Index, *p) — they all flow through `_vector_value_address`.
+        # Only vector-tagged ArrayTypes are assignable; regular C arrays
+        # are not lvalues. (rhs ArrayType need not be vector-tagged —
+        # casts and `(vec){...}` compounds may strip the flag.)
+        if (
+            isinstance(target_ty, ast.ArrayType)
+            and getattr(target_ty, "is_vector", False)
+        ):
+            rhs_ty = self._type_of(expr.right, ctx)
+            if (
+                isinstance(rhs_ty, ast.ArrayType)
+                and self._size_of(rhs_ty) == self._size_of(target_ty)
+            ):
+                # Vector-returning call: route the call directly into
+                # &lhs without an intermediate copy.
+                if (
+                    isinstance(expr.right, ast.Call)
+                    and self._is_vector_returning_call(expr.right, ctx)
+                ):
+                    return self._call_into_address(
+                        expr.right,
+                        self._vector_value_address(expr.left, ctx),
+                        ctx,
+                    )
+                return self._vector_copy_assign(expr, target_ty, ctx)
+
         # `x = rhs` — direct slot store. Array names aren't lvalues in C.
         if isinstance(expr.left, ast.Identifier):
             ty = self._identifier_type(expr.left.name, ctx)
@@ -8802,6 +9087,225 @@ class CodeGenerator:
         # Leave EAX = &dst as the assignment-expression result. Real
         # struct-value semantics would copy the struct again, but our
         # codegen never reads a struct as a value.
+        out.append("        mov     eax, ecx")
+        return out
+
+    # ------------------------------------------------------------
+    # Vector arithmetic (gcc __attribute__((vector_size(N))) types).
+    # We model vectors as ArrayType. Componentwise arithmetic is
+    # lowered as a per-element load / op / store loop over the
+    # element type. The result lands in a per-node temp slot
+    # allocated by `_collect_call_temps`.
+    # ------------------------------------------------------------
+
+    def _vector_element_type(self, vec_ty: ast.ArrayType) -> ast.TypeNode:
+        """Element type of a vector (potentially nested ArrayType)."""
+        elem = vec_ty.base_type
+        # We use the leaf scalar; nested arrays are not vectors here.
+        return elem
+
+    def _vector_value_address(
+        self, expr: ast.Expression, ctx: _FuncCtx
+    ) -> list[str]:
+        """Compute the address of a vector-typed expression in EAX.
+
+        For lvalue forms (Identifier / Index / Member / *p) we use the
+        existing addressing machinery. For BinaryOp / UnaryOp / Cast,
+        the value lives in a per-node temp slot — we emit the
+        evaluation that fills the temp and leave its address in EAX.
+        """
+        if isinstance(expr, ast.Identifier):
+            return self._identifier_address(expr.name, ctx)
+        if isinstance(expr, ast.Index):
+            return self._index_address(expr, ctx)
+        if isinstance(expr, ast.Member):
+            return self._member_address(expr, ctx)
+        if isinstance(expr, ast.UnaryOp) and expr.op == "*":
+            # `*p` of pointer-to-vector: just evaluate the pointer.
+            return self._eval_expr_to_eax(expr.operand, ctx)
+        if isinstance(expr, ast.Cast):
+            # Vector type-pun: take the source's address (assumes the
+            # source is an lvalue with the same size; for true type-pun
+            # via union or memcpy this is fine).
+            return self._vector_value_address(expr.expr, ctx)
+        if isinstance(expr, ast.Compound):
+            # Compound literal — use its temp slot, run init into it,
+            # then return the address.
+            disp = ctx.call_temps[id(expr)]
+            out: list[str] = []
+            target_ty = expr.target_type
+            if isinstance(target_ty, ast.ArrayType):
+                out += self._array_init(
+                    target_ty, expr.init, disp, ctx, "<vector-compound>",
+                )
+            elif isinstance(target_ty, ast.StructType):
+                out += self._struct_init(
+                    target_ty, expr.init, disp, ctx, "<vector-compound>",
+                )
+            out.append(f"        lea     eax, {_ebp_addr(disp)}")
+            return out
+        if isinstance(expr, (ast.BinaryOp, ast.UnaryOp)):
+            return self._eval_vector_into_temp(expr, ctx)
+        if isinstance(expr, ast.Call) and self._is_vector_returning_call(expr, ctx):
+            disp = ctx.call_temps[id(expr)]
+            retptr_lines = [f"        lea     eax, {_ebp_addr(disp)}"]
+            out = self._call_into_address(expr, retptr_lines, ctx)
+            # Callee leaves &temp in EAX; that's already the address.
+            return out
+        raise CodegenError(
+            f"vector value: unsupported expression {type(expr).__name__}"
+        )
+
+    def _eval_vector_into_temp(
+        self, expr: ast.Expression, ctx: _FuncCtx
+    ) -> list[str]:
+        """Evaluate a vector-typed BinaryOp / UnaryOp into the per-node
+        temp slot. Returns asm; EAX = address of the temp."""
+        vec_ty = self._type_of(expr, ctx)
+        if not isinstance(vec_ty, ast.ArrayType):
+            raise CodegenError("vector eval: expected ArrayType")
+        disp = ctx.call_temps[id(expr)]
+        elem_ty = self._vector_element_type(vec_ty)
+        elem_size = self._size_of(elem_ty)
+        count = self._size_of(vec_ty) // elem_size
+        out: list[str] = []
+        if isinstance(expr, ast.BinaryOp):
+            # Compute &right, &left; keep them across the per-element
+            # body. Use [esp + 4]/[esp] as anchors so per-element loads
+            # can re-fetch (we don't keep them in fixed regs because
+            # the per-element op may want to use the regs).
+            out += self._vector_value_address(expr.right, ctx)
+            out.append("        push    eax")              # [esp] = &right
+            out += self._vector_value_address(expr.left, ctx)
+            out.append("        push    eax")              # [esp] = &left
+            for i in range(count):
+                offset = i * elem_size
+                # Load left[i] into EAX.
+                out.append("        mov     edx, [esp]")
+                out += self._load_to_eax(
+                    f"[edx + {offset}]" if offset else "[edx]",
+                    elem_ty,
+                )
+                # Apply op against right[i].
+                out.append("        mov     edx, [esp + 4]")
+                if self._is_float_type(elem_ty):
+                    raise CodegenError(
+                        "float vectors not yet supported"
+                    )
+                # Integer per-element op.
+                # Load right[i] into ECX.
+                out.append("        push    eax")
+                rhs_load = self._load_to_eax(
+                    f"[edx + {offset}]" if offset else "[edx]",
+                    elem_ty,
+                )
+                out += rhs_load
+                out.append("        mov     ecx, eax")
+                out.append("        pop     eax")
+                # eax op ecx → eax
+                out += self._vector_int_binop(expr.op, elem_ty)
+                # Store to temp[disp + offset].
+                addr = _ebp_addr(disp + offset)
+                out += self._store_from_eax(addr, elem_ty)
+            out.append("        add     esp, 8")
+            out.append(f"        lea     eax, {_ebp_addr(disp)}")
+            return out
+        # UnaryOp.
+        if isinstance(expr, ast.UnaryOp):
+            out += self._vector_value_address(expr.operand, ctx)
+            out.append("        push    eax")              # [esp] = &operand
+            for i in range(count):
+                offset = i * elem_size
+                out.append("        mov     edx, [esp]")
+                out += self._load_to_eax(
+                    f"[edx + {offset}]" if offset else "[edx]",
+                    elem_ty,
+                )
+                if self._is_float_type(elem_ty):
+                    raise CodegenError(
+                        "float vectors not yet supported"
+                    )
+                out += self._vector_int_unop(expr.op, elem_ty)
+                addr = _ebp_addr(disp + offset)
+                out += self._store_from_eax(addr, elem_ty)
+            out.append("        add     esp, 4")
+            out.append(f"        lea     eax, {_ebp_addr(disp)}")
+            return out
+        raise CodegenError(
+            f"vector eval: unexpected node {type(expr).__name__}"
+        )
+
+    def _vector_int_binop(
+        self, op: str, elem_ty: ast.TypeNode
+    ) -> list[str]:
+        """Emit eax := eax OP ecx for integer vector elements."""
+        out: list[str] = []
+        if op == "+":
+            out.append("        add     eax, ecx")
+        elif op == "-":
+            out.append("        sub     eax, ecx")
+        elif op == "*":
+            out.append("        imul    eax, ecx")
+        elif op == "&":
+            out.append("        and     eax, ecx")
+        elif op == "|":
+            out.append("        or      eax, ecx")
+        elif op == "^":
+            out.append("        xor     eax, ecx")
+        elif op == "/":
+            if self._is_unsigned(elem_ty):
+                out.append("        xor     edx, edx")
+                out.append("        div     ecx")
+            else:
+                out.append("        cdq")
+                out.append("        idiv    ecx")
+        elif op == "%":
+            if self._is_unsigned(elem_ty):
+                out.append("        xor     edx, edx")
+                out.append("        div     ecx")
+            else:
+                out.append("        cdq")
+                out.append("        idiv    ecx")
+            out.append("        mov     eax, edx")
+        else:
+            raise CodegenError(f"vector op `{op}` not supported")
+        return out
+
+    def _vector_int_unop(
+        self, op: str, elem_ty: ast.TypeNode
+    ) -> list[str]:
+        """Emit eax := OP eax for integer vector elements."""
+        if op == "-":
+            return ["        neg     eax"]
+        if op == "+":
+            return []
+        if op == "~":
+            return ["        not     eax"]
+        raise CodegenError(f"vector unary `{op}` not supported")
+
+    def _vector_copy_assign(
+        self, expr: ast.BinaryOp, vec_ty: ast.ArrayType, ctx: _FuncCtx
+    ) -> list[str]:
+        """Copy a vector value to a vector lvalue (memcpy of sizeof bytes)."""
+        size = self._size_of(vec_ty)
+        # &src first, push, then &dst.
+        out = self._vector_value_address(expr.right, ctx)
+        out.append("        push    eax")
+        out += self._vector_value_address(expr.left, ctx)
+        out.append("        mov     ecx, eax")
+        out.append("        pop     edx")
+        offset = 0
+        while size - offset >= 4:
+            out.append(f"        mov     eax, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], eax")
+            offset += 4
+        if size - offset >= 2:
+            out.append(f"        mov     ax, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], ax")
+            offset += 2
+        if size - offset >= 1:
+            out.append(f"        mov     al, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], al")
         out.append("        mov     eax, ecx")
         return out
 
