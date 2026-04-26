@@ -7139,15 +7139,12 @@ class CodeGenerator:
             # routes through `_bitfield_load`.
             bf = self._bitfield_info(expr, ctx)
             if bf is not None and len(bf) == 4 and bf[3] == 8:
-                # Long-long-storage bit-field: emit the LL load then
-                # zero-extend (or sign-extend for signed types) to
-                # ensure EDX:EAX holds the full 64-bit value.
-                out = self._bitfield_load_ll(expr, bf, ctx)
-                if self._is_unsigned(mem_ty):
-                    out.append("        xor     edx, edx")
-                else:
-                    out.append("        cdq")
-                return out
+                # Long-long-storage bit-field: `_bitfield_load_ll`
+                # already produces the fully sign- or zero-extended
+                # 64-bit value in EDX:EAX. Don't `cdq` on top — that
+                # would clobber EDX with the sign of EAX and lose the
+                # bit-field's high bits.
+                return self._bitfield_load_ll(expr, bf, ctx)
             if self._is_long_long(mem_ty):
                 out = self._member_address(expr, ctx)
                 return out + [
