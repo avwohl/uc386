@@ -4851,6 +4851,39 @@ class CodeGenerator:
         out.append("        jmp     .epilogue")
         return out
 
+    def _complex_assign_from_scalar(
+        self,
+        lhs: ast.Expression,
+        rhs: ast.Expression,
+        ty: ast.ComplexType,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """`c = scalar` for `_Complex T c` — store scalar as the real
+        part, zero the imag part. Per C, an integer or float assigned
+        to a complex extends with imag=0.
+        """
+        half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
+        # Compute &c, hold in a register.
+        out = self._complex_value_address(lhs, ctx)
+        out.append("        push    eax")
+        # Evaluate the scalar as a float (handles both int rhs and
+        # float rhs through the existing _eval_float_to_st0 path with
+        # int-promotion).
+        out += self._eval_float_to_st0(rhs, ctx)
+        out.append("        pop     ecx")
+        # Store real part.
+        width = "dword" if half_size == 4 else "qword"
+        out.append(f"        fstp    {width} [ecx]")
+        # Zero-fill the imag half.
+        if half_size == 4:
+            out.append(f"        mov     dword [ecx + {half_size}], 0")
+        else:
+            out.append(f"        mov     dword [ecx + {half_size}], 0")
+            out.append(f"        mov     dword [ecx + {half_size + 4}], 0")
+        # Leave EAX = address (matching struct-copy convention).
+        out.append("        mov     eax, ecx")
+        return out
+
     def _is_complex_returning_call(
         self, call: ast.Call, ctx: _FuncCtx,
     ) -> bool:
@@ -7515,16 +7548,22 @@ class CodeGenerator:
             # `c = c2` — complex-to-complex copy. Same per-dword
             # mechanism as struct copy. The rhs may be a complex-
             # returning call (handled like struct-returning).
-            if (
-                isinstance(expr.right, ast.Call)
-                and self._is_complex_returning_call(expr.right, ctx)
-            ):
-                return self._call_into_address(
-                    expr.right,
-                    self._complex_value_address(expr.left, ctx),
-                    ctx,
-                )
-            return self._complex_copy_assign(expr, target_ty, ctx)
+            rhs_ty = self._type_of(expr.right, ctx)
+            if isinstance(rhs_ty, ast.ComplexType):
+                if (
+                    isinstance(expr.right, ast.Call)
+                    and self._is_complex_returning_call(expr.right, ctx)
+                ):
+                    return self._call_into_address(
+                        expr.right,
+                        self._complex_value_address(expr.left, ctx),
+                        ctx,
+                    )
+                return self._complex_copy_assign(expr, target_ty, ctx)
+            # Scalar → complex: rhs becomes the real part, imag is 0.
+            return self._complex_assign_from_scalar(
+                expr.left, expr.right, target_ty, ctx,
+            )
         # Long-long lvalue: route through the 64-bit assignment helper.
         if self._is_long_long(target_ty):
             return self._assign_ll(expr, ctx)
