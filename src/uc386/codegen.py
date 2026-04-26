@@ -3362,6 +3362,12 @@ class CodeGenerator:
                             self._is_unsigned(lt) or self._is_unsigned(rt)
                         ) else None),
                     )
+                # C usual arithmetic conversions: if either operand is
+                # unsigned, the result is unsigned. Drives the
+                # signed-vs-unsigned dispatch in `_binary` for div / mod
+                # / shr / comparisons.
+                if self._is_unsigned(lt) or self._is_unsigned(rt):
+                    return ast.BasicType(name="int", is_signed=False)
                 return ast.BasicType(name="int")
             # `+` and `-`: pointer ± int → pointer; pointer - pointer → int.
             # Arrays count as pointer-like via decay.
@@ -3386,6 +3392,9 @@ class CodeGenerator:
                         self._is_unsigned(lt) or self._is_unsigned(rt)
                     ) else None),
                 )
+            # Unsigned propagation for `+`/`-`.
+            if self._is_unsigned(lt) or self._is_unsigned(rt):
+                return ast.BasicType(name="int", is_signed=False)
             return ast.BasicType(name="int")
         if isinstance(expr, ast.TernaryOp):
             # Both arms should agree in well-formed C; pick the true arm.
