@@ -3220,8 +3220,11 @@ class CodeGenerator:
         # `is_signed=None` is the language default — signed for
         # char/short/int. EnumType is treated as unsigned for bit-field
         # purposes (matches GCC's choice for enums of non-negative
-        # values, which is the common case).
+        # values, which is the common case). `_Bool` is always
+        # unsigned per C99 6.2.5.
         if isinstance(t, ast.BasicType):
+            if t.name == "bool":
+                return True
             return t.is_signed is False
         if isinstance(t, ast.EnumType):
             return True
