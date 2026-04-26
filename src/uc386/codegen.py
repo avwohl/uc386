@@ -1988,6 +1988,16 @@ class CodeGenerator:
             return True
         return False
 
+    def _is_unsigned_after_promotion(self, t: ast.TypeNode) -> bool:
+        """C usual arithmetic conversions: unsigned char/short are
+        promoted to int (signed), so they don't make the surrounding
+        comparison or division unsigned. Only unsigned types that are
+        at least as wide as int retain unsigned-ness.
+        """
+        if isinstance(t, ast.BasicType) and t.is_signed is False:
+            return t.name in ("int", "long", "long long")
+        return False
+
     @staticmethod
     def _is_long_long(t: ast.TypeNode) -> bool:
         return isinstance(t, ast.BasicType) and t.name == "long long"
@@ -4826,7 +4836,11 @@ class CodeGenerator:
             return out
         if expr.op == "/":
             lt = self._type_of(expr.left, ctx)
-            if self._is_unsigned(lt) or self._is_unsigned(self._type_of(expr.right, ctx)):
+            rt = self._type_of(expr.right, ctx)
+            if (
+                self._is_unsigned_after_promotion(lt)
+                or self._is_unsigned_after_promotion(rt)
+            ):
                 return out + [
                     "        xor     edx, edx",
                     "        div     ecx",
@@ -4837,7 +4851,11 @@ class CodeGenerator:
             ]
         if expr.op == "%":
             lt = self._type_of(expr.left, ctx)
-            if self._is_unsigned(lt) or self._is_unsigned(self._type_of(expr.right, ctx)):
+            rt = self._type_of(expr.right, ctx)
+            if (
+                self._is_unsigned_after_promotion(lt)
+                or self._is_unsigned_after_promotion(rt)
+            ):
                 return out + [
                     "        xor     edx, edx",
                     "        div     ecx",
@@ -4855,13 +4873,18 @@ class CodeGenerator:
         if expr.op == ">>":
             # Unsigned operand → logical shift; otherwise arithmetic.
             lt = self._type_of(expr.left, ctx)
-            if self._is_unsigned(lt):
+            if self._is_unsigned_after_promotion(lt):
                 return out + ["        shr     eax, cl"]
             return out + ["        sar     eax, cl"]
         if expr.op in self._CMP_SETCC:
             lt = self._type_of(expr.left, ctx)
             rt = self._type_of(expr.right, ctx)
-            unsigned = self._is_unsigned(lt) or self._is_unsigned(rt)
+            # Per C, only types as wide as int retain unsigned-ness;
+            # unsigned char / unsigned short promote to signed int.
+            unsigned = (
+                self._is_unsigned_after_promotion(lt)
+                or self._is_unsigned_after_promotion(rt)
+            )
             table = (
                 self._CMP_SETCC_UNSIGNED if unsigned else self._CMP_SETCC
             )
