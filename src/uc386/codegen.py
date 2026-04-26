@@ -9492,7 +9492,10 @@ class CodeGenerator:
             out.append(f"        lea     eax, {_ebp_addr(disp)}")
             return out
         if r_vec and not l_vec:
-            # float-scalar op vec.
+            # float-scalar op vec. After loading scalar then vec[i],
+            # the FPU stack has st0=vec[i], st1=scalar. The two-arg
+            # popping form `fop st1, st0` does `st1 = st1 OP st0`,
+            # which is `scalar OP vec[i]` — exactly what we want.
             out += self._eval_float_to_st0(expr.left, ctx)
             scalar_size = self._size_of(lt) if isinstance(lt, ast.BasicType) else 8
             scalar_w = "dword" if scalar_size == 4 else "qword"
@@ -9502,18 +9505,15 @@ class CodeGenerator:
             out.append("        push    eax")
             for i in range(count):
                 offset = i * elem_size
-                # st0 = scalar; st1 = vec[i] — but op order matters.
-                # Load scalar first (becomes st1 after vec[i] load).
+                # Load scalar (st0=scalar), then vec[i] on top
+                # (st0=vec[i], st1=scalar).
                 out.append(f"        fld     {scalar_w} [esp + 4]")
                 out.append("        mov     edx, [esp]")
                 if offset:
                     out.append(f"        fld     {width} [edx + {offset}]")
                 else:
                     out.append(f"        fld     {width} [edx]")
-                # st0 = vec[i], st1 = scalar; we want scalar op vec[i]
-                # i.e. st1 OP st0 → result in st1, pop. fop's two-
-                # arg form already does st1 = st1 OP st0, then pop.
-                out.append("        fxch    st1")  # now st0=scalar, st1=vec[i]
+                # st1 = st1 OP st0 = scalar OP vec[i], then pop.
                 out.append(f"        {fop}   st1, st0")
                 addr = _ebp_addr(disp + offset)
                 out.append(f"        fstp    {width} {addr}")
