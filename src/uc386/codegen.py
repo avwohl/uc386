@@ -5243,12 +5243,20 @@ class CodeGenerator:
         target_ty = self._type_of(expr.left, ctx)
         rhs_ty = self._type_of(expr.right, ctx)
 
+        # C99 §6.5.16.2: in `E1 op= E2`, the lvalue's address is
+        # computed once, then E2 is evaluated, then the read-op-store
+        # sequence runs. So if E2 has side effects on E1, the read
+        # must happen AFTER E2.
         out = addr_lines                                       # eax = lvalue address
-        out.append("        push    eax")                       # save addr for the store
+        out.append("        push    eax")                       # save addr
+        out += self._eval_expr_to_eax(expr.right, ctx)          # eax = rhs (may mutate *addr)
+        out.append("        push    eax")                       # save rhs
+        out.append("        mov     eax, [esp + 4]")            # eax = saved addr
         out += self._load_to_eax("[eax]", target_ty)            # eax = current value
         out.append("        push    eax")                       # left operand on stack
-        out += self._eval_expr_to_eax(expr.right, ctx)          # eax = rhs
+        out.append("        mov     eax, [esp + 4]")            # eax = saved rhs
         out += self._apply_binop_post_eval(op, target_ty, rhs_ty)  # eax = new value
+        out.append("        add     esp, 4")                    # discard saved rhs
         out.append("        pop     ecx")                       # ecx = saved addr
         out += self._store_from_eax("[ecx]", target_ty)         # *addr = new value
         return out
