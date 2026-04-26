@@ -173,6 +173,16 @@ class _FuncCtx:
         # `_f__x` in `.data`/`.bss` instead of a frame slot, so the
         # value persists across calls.
         self.local_static_labels: dict[str, str] = {}
+        # Nested-function name → mangled top-level name. GCC nested
+        # function definitions inside a function body get lifted to
+        # file-scope functions with mangled names; references in the
+        # outer body resolve through this map.
+        self.nested_fn_names: dict[str, str] = {}
+        # Outer-local name → mangled global label for variables that
+        # are captured (referenced) by a nested function. Outer's
+        # reads/writes route through the global so the nested fn,
+        # also reading the same global, sees a coherent value.
+        self.local_captures: dict[str, str] = {}
         # The current function's name. Used to mangle static-local
         # labels so two functions with the same `static int x` don't
         # collide.
@@ -448,7 +458,19 @@ class CodeGenerator:
         lines += self._header(extern_list)
         lines += self._start_stub()
         function_blocks: list[list[str]] = []
-        for fn in functions:
+        # Use a pending queue so nested function definitions discovered
+        # while compiling outer functions get appended and drained too.
+        self._pending_functions = list(functions)
+        # Lifted nested functions remember their outer's capture
+        # remapping so their bodies' references to outer-locals
+        # resolve to the right mangled global at compile time.
+        self._lifted_captures: dict[str, dict[str, str]] = {}
+        # Sibling nested-fn name → mangled. A lifted nested function
+        # may call sibling nested fns that share the same outer; this
+        # maps `t0` → `_outer__t0` etc.
+        self._lifted_nested_fn_names: dict[str, dict[str, str]] = {}
+        while self._pending_functions:
+            fn = self._pending_functions.pop(0)
             function_blocks.append(self._function(fn))
         for block in function_blocks:
             lines.append("")
@@ -1400,6 +1422,176 @@ class CodeGenerator:
         ctx.return_type = fn.return_type
         ctx.func_name = fn.name
         ctx._codegen_ref = self
+        # If this is a lifted nested function, inherit the outer's
+        # capture remapping so references in our body to outer locals
+        # resolve to the right mangled globals. Also inherit sibling
+        # nested-fn names so we can call each other.
+        if fn.name in getattr(self, "_lifted_captures", {}):
+            ctx.local_captures = dict(self._lifted_captures[fn.name])
+        if fn.name in getattr(self, "_lifted_nested_fn_names", {}):
+            ctx.nested_fn_names = dict(
+                self._lifted_nested_fn_names[fn.name]
+            )
+        # Lift nested function definitions to file scope. Each gets a
+        # mangled name (`<outer>__<inner>`); calls / address-takes in
+        # the outer body resolve through `ctx.nested_fn_names`.
+        #
+        # Nested functions can reference outer's locals. We don't
+        # implement full GCC static-link / trampoline semantics, but
+        # we handle the common case by lifting the *captured* outer
+        # locals to file-scope globals: any name referenced from inside
+        # a nested fn (and not bound there as a param/local) gets a
+        # mangled global. The outer fn's reads/writes route through
+        # the same global via `local_captures`. This is correct for
+        # non-reentrant outer fns (the typical torture-test shape).
+        # Find nested fns at this lexical level (this function body
+        # plus any nested blocks). Deeper nested fns inside other
+        # nested fn bodies are NOT collected here — they'll be
+        # discovered when their parent (a lifted fn) runs its own
+        # _function pre-pass.
+        nested_decls: list[ast.FunctionDecl] = []
+        def _collect_nested_decls(node):
+            if node is None:
+                return
+            if isinstance(node, ast.FunctionDecl) and node.body is not None:
+                nested_decls.append(node)
+                return  # Don't recurse into the nested fn's body.
+            if isinstance(node, ast.CompoundStmt):
+                for it in node.items:
+                    _collect_nested_decls(it)
+                return
+            if isinstance(node, (ast.IfStmt,)):
+                _collect_nested_decls(node.then_branch)
+                _collect_nested_decls(node.else_branch)
+                return
+            if isinstance(node, (ast.WhileStmt, ast.DoWhileStmt)):
+                _collect_nested_decls(node.body)
+                return
+            if isinstance(node, ast.ForStmt):
+                _collect_nested_decls(node.body)
+                return
+            if isinstance(node, ast.SwitchStmt):
+                _collect_nested_decls(node.body)
+                return
+            if isinstance(node, ast.CaseStmt):
+                _collect_nested_decls(node.stmt)
+                return
+            if isinstance(node, ast.LabelStmt):
+                _collect_nested_decls(node.stmt)
+                return
+            if isinstance(node, ast.DeclarationList):
+                for d in node.declarations:
+                    _collect_nested_decls(d)
+                return
+        _collect_nested_decls(fn.body)
+        # Build the capture set: names referenced in any nested body
+        # that aren't bound as the nested fn's own params or locals,
+        # and aren't sibling nested fn names (which resolve via the
+        # outer's lift chain, not as outer-locals).
+        sibling_nested_names = {n.name for n in nested_decls}
+        captured: set[str] = set()
+        outer_param_names = {p.name for p in fn.params if p.name}
+        for nested in nested_decls:
+            inner_bound = {p.name for p in nested.params if p.name}
+            inner_nested_names: set[str] = set()
+            for sub in self._walk_ast(nested.body):
+                if isinstance(sub, ast.VarDecl):
+                    inner_bound.add(sub.name)
+                if (
+                    isinstance(sub, ast.FunctionDecl)
+                    and sub.body is not None
+                ):
+                    inner_nested_names.add(sub.name)
+            for sub in self._walk_ast(nested.body):
+                if isinstance(sub, ast.Identifier):
+                    n = sub.name
+                    if n in inner_bound:
+                        continue
+                    if n in inner_nested_names:
+                        continue
+                    if n in sibling_nested_names:
+                        continue
+                    if n in self._globals or n in self._extern_vars:
+                        continue
+                    if n in self._func_return_types:
+                        continue
+                    if n in self._enum_constants:
+                        continue
+                    captured.add(n)
+        # Promote captures to globals. Outer params are allocated
+        # normally (they live on the call stack); if a param is
+        # captured we copy its value into the global at function entry
+        # and route subsequent outer reads/writes through the global.
+        captured_param_copies: list[tuple[str, str, ast.TypeNode]] = []
+        # Don't reset ctx.local_captures here — a lifted nested fn
+        # already inherited remappings from its outer.
+        for name in captured:
+            mangled_key = f"{fn.name}__{name}"
+            if name in outer_param_names:
+                # Find param type; allocate a global, plan a runtime
+                # copy from param to global at function entry.
+                ptype = next(p.param_type for p in fn.params if p.name == name)
+                if mangled_key not in self._globals:
+                    self._globals[mangled_key] = ptype
+                captured_param_copies.append((name, mangled_key, ptype))
+                ctx.local_captures[name] = mangled_key
+        # Now lift the nested function definitions.
+        for sub in nested_decls:
+            if sub.name in ctx.nested_fn_names:
+                continue
+            mangled = f"{fn.name}__{sub.name}"
+            # Avoid collisions if multiple sibling outer functions
+            # both have a nested fn with the same name.
+            base_mangled = mangled
+            suffix = 0
+            while mangled in self._func_return_types:
+                suffix += 1
+                mangled = f"{base_mangled}_{suffix}"
+            ctx.nested_fn_names[sub.name] = mangled
+            self._func_return_types[mangled] = sub.return_type
+            self._func_param_types[mangled] = [
+                p.param_type for p in sub.params
+            ]
+            # Build a renamed copy of the inner FunctionDecl so the
+            # emitted label uses the mangled name. Reusing the AST
+            # node would otherwise emit `_<inner>` and collide with
+            # any other inner of the same name.
+            lifted = ast.FunctionDecl(
+                name=mangled,
+                return_type=sub.return_type,
+                params=sub.params,
+                body=sub.body,
+                is_variadic=sub.is_variadic,
+                storage_class=sub.storage_class,
+                is_inline=sub.is_inline,
+                location=sub.location,
+            )
+            self._pending_functions.append(lifted)
+        # Stash for later (used after locals are collected).
+        self._capture_set = captured
+        self._captured_param_copies = captured_param_copies
+        # Record per-nested-fn capture remapping so when each lifted
+        # function later compiles, its body's references to outer
+        # locals resolve to the right mangled global. For names that
+        # are themselves outer-of-outer captures (already remapped via
+        # `ctx.local_captures`), reuse the existing remapping so we
+        # don't create double-mangled aliases at each nesting level.
+        capture_remap: dict[str, str] = {}
+        for n in captured:
+            if n in ctx.local_captures:
+                capture_remap[n] = ctx.local_captures[n]
+            else:
+                capture_remap[n] = f"{fn.name}__{n}"
+        # Sibling nested fns resolve via the lift chain. Each lifted
+        # nested needs to inherit BOTH our outer's `nested_fn_names`
+        # (for outer-of-outer references) AND our siblings' lifts (so
+        # nested t1 can call sibling nested t0).
+        sibling_lifts = dict(ctx.nested_fn_names)
+        for sub in nested_decls:
+            mangled = ctx.nested_fn_names.get(sub.name)
+            if mangled:
+                self._lifted_captures[mangled] = capture_remap
+                self._lifted_nested_fn_names[mangled] = sibling_lifts
         # Parameters live above EBP at cdecl offsets; the first sits at
         # [ebp + 8], and each subsequent param is offset by its predecessor's
         # padded size. For scalars/pointers/floats that's `(size + 3) & ~3`
@@ -1451,6 +1643,33 @@ class CodeGenerator:
         out.append("        mov     ebp, esp")
         if ctx.frame_size:
             out.append(f"        sub     esp, {ctx.frame_size}")
+        # If any of our params are captured by a nested function, copy
+        # the param's incoming value into its mangled global so the
+        # nested fn (compiled separately) sees the right initial value.
+        # `local_captures` already routes outer's reads/writes through
+        # the global; we just need to seed it from the param slot.
+        for pname, mangled, ptype in self._captured_param_copies:
+            param_disp = ctx.lookup(pname)
+            if self._is_long_long(ptype):
+                out.append(f"        mov     eax, {_ebp_addr(param_disp)}")
+                out.append(f"        mov     [_{mangled}], eax")
+                out.append(f"        mov     eax, {_ebp_addr(param_disp + 4)}")
+                out.append(f"        mov     [_{mangled} + 4], eax")
+            elif self._is_float_type(ptype):
+                size = self._size_of(ptype)
+                width = "dword" if size == 4 else "qword"
+                out.append(f"        fld     {width} {_ebp_addr(param_disp)}")
+                out.append(f"        fstp    {width} [_{mangled}]")
+            else:
+                size = self._size_of(ptype)
+                if size == 8:
+                    out.append(f"        mov     eax, {_ebp_addr(param_disp)}")
+                    out.append(f"        mov     [_{mangled}], eax")
+                    out.append(f"        mov     eax, {_ebp_addr(param_disp + 4)}")
+                    out.append(f"        mov     [_{mangled} + 4], eax")
+                else:
+                    out += self._load_to_eax(_ebp_addr(param_disp), ptype)
+                    out += self._store_from_eax(f"[_{mangled}]", ptype)
         out += body
         # C99: falling off the end of main returns 0. For other functions
         # this is technically undefined, but a deterministic zero beats
@@ -1539,6 +1758,23 @@ class CodeGenerator:
                 return
             var_type = self._resolved_var_type(node)
             self._check_supported_type(var_type, node.name)
+            # Captured-by-nested-fn local: promote to a file-scope
+            # global with a mangled name so the nested fn (compiled as
+            # a separate top-level function) can reference the same
+            # storage. Initializers are emitted via the regular
+            # _var_init path with the lvalue address resolved through
+            # `local_captures` → globals.
+            if (
+                node.storage_class != "extern"
+                and node.storage_class != "static"
+                and getattr(self, "_capture_set", None)
+                and node.name in self._capture_set
+            ):
+                mangled_key = f"{ctx.func_name}__{node.name}"
+                if mangled_key not in self._globals:
+                    self._globals[mangled_key] = var_type
+                ctx.local_captures[node.name] = mangled_key
+                return
             # `extern int x;` inside a function: no slot — references
             # the global symbol of the same name. We just register the
             # type in `_extern_vars` so any later identifier reference
@@ -1615,6 +1851,11 @@ class CodeGenerator:
             # might be a real local that needs a slot.
             for decl in node.declarations:
                 self._collect_locals(decl, ctx)
+            return
+        if isinstance(node, ast.FunctionDecl):
+            # Nested function definition (gcc extension): no frame slot.
+            # The pre-pass at the top of `_function` lifts these to
+            # top-level functions with mangled names.
             return
         if isinstance(node, (ast.StructDecl, ast.EnumDecl, ast.TypedefDecl)):
             # In-function type-only declarations (no storage). Register
@@ -2356,6 +2597,8 @@ class CodeGenerator:
         # A `static` local lives as a global under a mangled name; route
         # through the remapping table so callers don't need to know.
         name = ctx.local_static_labels.get(name, name)
+        name = ctx.local_captures.get(name, name)
+        name = ctx.nested_fn_names.get(name, name)
         if ctx.has_local(name):
             disp = ctx.lookup(name)
             if disp == _EXTERN_REDIRECT:
@@ -2393,6 +2636,8 @@ class CodeGenerator:
         `_load_to_eax` / `_store_from_eax` would be overkill.
         """
         name = ctx.local_static_labels.get(name, name)
+        name = ctx.local_captures.get(name, name)
+        name = ctx.nested_fn_names.get(name, name)
         if ctx.has_local(name) and not self._is_extern_redirect(name, ctx):
             return _ebp_addr(ctx.lookup(name))
         if name in self._globals or name in self._extern_vars:
@@ -2402,6 +2647,8 @@ class CodeGenerator:
     def _identifier_load(self, name: str, ctx: _FuncCtx) -> list[str]:
         """Lines that produce the value (or, for arrays/functions, the address) of `name` in eax."""
         name = ctx.local_static_labels.get(name, name)
+        name = ctx.local_captures.get(name, name)
+        name = ctx.nested_fn_names.get(name, name)
         if ctx.has_local(name) and not self._is_extern_redirect(name, ctx):
             ty = ctx.lookup_type(name)
             disp = ctx.lookup(name)
@@ -2428,6 +2675,8 @@ class CodeGenerator:
     def _identifier_address(self, name: str, ctx: _FuncCtx) -> list[str]:
         """Lines that compute &name into eax — for `&id` and as the base for indexing."""
         name = ctx.local_static_labels.get(name, name)
+        name = ctx.local_captures.get(name, name)
+        name = ctx.nested_fn_names.get(name, name)
         if ctx.has_local(name) and not self._is_extern_redirect(name, ctx):
             return [f"        lea     eax, {_ebp_addr(ctx.lookup(name))}"]
         if name in self._globals or name in self._extern_vars:
@@ -2440,6 +2689,8 @@ class CodeGenerator:
     def _identifier_store(self, name: str, ctx: _FuncCtx) -> list[str]:
         """Lines that store eax to the slot for `name`, with width per type."""
         name = ctx.local_static_labels.get(name, name)
+        name = ctx.local_captures.get(name, name)
+        name = ctx.nested_fn_names.get(name, name)
         ty = self._identifier_type(name, ctx)
         if ctx.has_local(name) and not self._is_extern_redirect(name, ctx):
             return self._store_from_eax(_ebp_addr(ctx.lookup(name)), ty)
@@ -2722,6 +2973,11 @@ class CodeGenerator:
             # `_resolve_struct_name` already handles inline-member
             # StructTypes lazily, so there's nothing more to do here.
             return []
+        if isinstance(item, ast.FunctionDecl):
+            # Nested function definition — already lifted in the
+            # top-of-`_function` pre-pass. Emit no code at this point;
+            # the lifted function compiles separately at file scope.
+            return []
         raise CodegenError(
             f"{type(item).__name__} not implemented yet"
         )
@@ -2918,6 +3174,28 @@ class CodeGenerator:
             ctx.slots[-1][decl.name] = _EXTERN_REDIRECT
             ctx.types[-1][decl.name] = self._resolved_var_type(decl)
             return []
+        # Captured-by-nested-fn local: `_collect_locals` registered the
+        # name as a global with a mangled label. Emit the initializer
+        # as a store to the global on every entry to this function.
+        if decl.name in ctx.local_captures:
+            if decl.init is None:
+                return []
+            mangled = ctx.local_captures[decl.name]
+            var_type = self._resolved_var_type(decl)
+            if self._is_float_type(var_type):
+                size = self._size_of(var_type)
+                width = "dword" if size == 4 else "qword"
+                out = self._eval_float_to_st0(decl.init, ctx)
+                out.append(f"        fstp    {width} [_{mangled}]")
+                return out
+            if self._is_long_long(var_type):
+                out = self._eval_expr_to_edx_eax(decl.init, ctx)
+                out.append(f"        mov     [_{mangled}], eax")
+                out.append(f"        mov     [_{mangled} + 4], edx")
+                return out
+            out = self._eval_expr_to_eax(decl.init, ctx)
+            out += self._store_from_eax(f"[_{mangled}]", var_type)
+            return out
         # Re-bind this VarDecl's name in the current scope using the disp
         # assigned during `_collect_locals`. The pre-pass walked the body
         # under the same enter_scope/exit_scope pattern, so we know an
@@ -3909,7 +4187,10 @@ class CodeGenerator:
             return expr.target_type
         if isinstance(expr, ast.Call):
             if isinstance(expr.func, ast.Identifier):
-                rt = self._func_return_types.get(expr.func.name)
+                fname = ctx.nested_fn_names.get(
+                    expr.func.name, expr.func.name,
+                )
+                rt = self._func_return_types.get(fname)
                 if rt is not None:
                     return rt
                 # Identifier that's a known variable (e.g. function
@@ -5007,6 +5288,26 @@ class CodeGenerator:
         # Struct-returning calls are handled in `_eval_expr_to_eax` (via
         # the per-call temp) before reaching here.
         callee = self._stripped_callee(expr)
+        # Rebind nested-fn names to their lifted top-level mangled name
+        # so the rest of the path treats them as regular file-scope
+        # functions. The pre-pass at the top of `_function` registers
+        # the mangled name in `_func_return_types` / `_func_param_types`.
+        if (
+            isinstance(callee, ast.Identifier)
+            and callee.name in ctx.nested_fn_names
+        ):
+            callee = ast.Identifier(
+                name=ctx.nested_fn_names[callee.name],
+                location=callee.location,
+            )
+            # Build a fresh Call node so downstream code (param-type
+            # lookups, struct-return retptr handling) keys on the new
+            # name. Args are pass-by-reference; reusing them is fine.
+            expr = ast.Call(
+                func=callee,
+                args=expr.args,
+                location=expr.location,
+            )
 
         # Variadic builtins. `va_start(ap, last)` writes the address
         # past `last` into `ap`; `va_end(ap)` is a no-op (cdecl needs
