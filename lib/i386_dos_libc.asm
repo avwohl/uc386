@@ -548,6 +548,239 @@ ___builtin_classify_type:
 _link_error:
         ret
 
+; ctype.h functions — single-arg int → int, returning nonzero if
+; the predicate matches.
+_isprint:
+        push    ebp
+        mov     ebp, esp
+        movzx   eax, byte [ebp + 8]
+        cmp     al, 0x20
+        jb      .ctype_false
+        cmp     al, 0x7e
+        ja      .ctype_false
+        mov     eax, 1
+        mov     esp, ebp
+        pop     ebp
+        ret
+.ctype_false:
+        xor     eax, eax
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+_isupper:
+        push    ebp
+        mov     ebp, esp
+        movzx   eax, byte [ebp + 8]
+        cmp     al, 0x41
+        jb      .iu_false
+        cmp     al, 0x5a
+        ja      .iu_false
+        mov     eax, 1
+        jmp     .iu_done
+.iu_false:
+        xor     eax, eax
+.iu_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+_islower:
+        push    ebp
+        mov     ebp, esp
+        movzx   eax, byte [ebp + 8]
+        cmp     al, 0x61
+        jb      .il_false
+        cmp     al, 0x7a
+        ja      .il_false
+        mov     eax, 1
+        jmp     .il_done
+.il_false:
+        xor     eax, eax
+.il_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+_isalpha:
+        push    ebp
+        mov     ebp, esp
+        movzx   eax, byte [ebp + 8]
+        cmp     al, 0x41
+        jb      .ialp_low
+        cmp     al, 0x5a
+        jbe     .ialp_yes
+.ialp_low:
+        cmp     al, 0x61
+        jb      .ialp_no
+        cmp     al, 0x7a
+        ja      .ialp_no
+.ialp_yes:
+        mov     eax, 1
+        mov     esp, ebp
+        pop     ebp
+        ret
+.ialp_no:
+        xor     eax, eax
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+_isdigit:
+        push    ebp
+        mov     ebp, esp
+        movzx   eax, byte [ebp + 8]
+        cmp     al, 0x30
+        jb      .id_no
+        cmp     al, 0x39
+        ja      .id_no
+        mov     eax, 1
+        jmp     .id_done
+.id_no:
+        xor     eax, eax
+.id_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+_isalnum:
+        push    ebp
+        mov     ebp, esp
+        push    dword [ebp + 8]
+        call    _isalpha
+        add     esp, 4
+        test    eax, eax
+        jnz     .ian_yes
+        push    dword [ebp + 8]
+        call    _isdigit
+        add     esp, 4
+.ian_yes:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+_isspace:
+        push    ebp
+        mov     ebp, esp
+        movzx   eax, byte [ebp + 8]
+        cmp     al, 0x20
+        je      .isp_yes
+        cmp     al, 0x09
+        je      .isp_yes
+        cmp     al, 0x0a
+        je      .isp_yes
+        cmp     al, 0x0b
+        je      .isp_yes
+        cmp     al, 0x0c
+        je      .isp_yes
+        cmp     al, 0x0d
+        je      .isp_yes
+        xor     eax, eax
+        jmp     .isp_done
+.isp_yes:
+        mov     eax, 1
+.isp_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+_isxdigit:
+        push    ebp
+        mov     ebp, esp
+        movzx   eax, byte [ebp + 8]
+        cmp     al, 0x30
+        jb      .ixd_no
+        cmp     al, 0x39
+        jbe     .ixd_yes
+        cmp     al, 0x41
+        jb      .ixd_no
+        cmp     al, 0x46
+        jbe     .ixd_yes
+        cmp     al, 0x61
+        jb      .ixd_no
+        cmp     al, 0x66
+        ja      .ixd_no
+.ixd_yes:
+        mov     eax, 1
+        jmp     .ixd_done
+.ixd_no:
+        xor     eax, eax
+.ixd_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+_iscntrl:
+        push    ebp
+        mov     ebp, esp
+        movzx   eax, byte [ebp + 8]
+        cmp     al, 0x20
+        jb      .ic_yes
+        cmp     al, 0x7f
+        je      .ic_yes
+        xor     eax, eax
+        jmp     .ic_done
+.ic_yes:
+        mov     eax, 1
+.ic_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+_ispunct:
+        push    ebp
+        mov     ebp, esp
+        push    dword [ebp + 8]
+        call    _isprint
+        add     esp, 4
+        test    eax, eax
+        jz      .ip_no
+        push    dword [ebp + 8]
+        call    _isalnum
+        add     esp, 4
+        test    eax, eax
+        jnz     .ip_no
+        movzx   eax, byte [ebp + 8]
+        cmp     al, 0x20
+        je      .ip_no
+        mov     eax, 1
+        mov     esp, ebp
+        pop     ebp
+        ret
+.ip_no:
+        xor     eax, eax
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+_toupper:
+        push    ebp
+        mov     ebp, esp
+        movzx   eax, byte [ebp + 8]
+        cmp     al, 0x61
+        jb      .tu_done
+        cmp     al, 0x7a
+        ja      .tu_done
+        sub     al, 0x20
+.tu_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+_tolower:
+        push    ebp
+        mov     ebp, esp
+        movzx   eax, byte [ebp + 8]
+        cmp     al, 0x41
+        jb      .tl_done
+        cmp     al, 0x5a
+        ja      .tl_done
+        add     al, 0x20
+.tl_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
 ; assert() failure handlers — abort on a failing condition. The C
 ; symbol is `_assert_fail` (per our assert.h) which lowers to the
 ; NASM label `__assert_fail`. We also stub the gcc __builtin form
