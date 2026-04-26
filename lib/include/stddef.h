@@ -26,6 +26,13 @@ typedef short ptrdiff_t;
 #define NULL ((void *)0)
 #endif
 
+/* wchar_t — wide character type. Use the compiler's predefined
+ * `__WCHAR_TYPE__` so the in-band `L'x'` lexer width matches. */
+#ifndef _WCHAR_T_DEFINED
+#define _WCHAR_T_DEFINED
+typedef __WCHAR_TYPE__ wchar_t;
+#endif
+
 /* Maximum alignment type (on Z80, alignment is always 1) */
 typedef long double max_align_t;
 

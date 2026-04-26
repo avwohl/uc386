@@ -2673,9 +2673,11 @@ def test_too_many_initializers_rejected():
 
 
 def test_string_init_too_long_rejected():
-    # "hi" + null = 3 bytes, but only 2 slots available.
+    # `char s[N] = "<string>"` requires N >= len("<string>"); the
+    # null terminator is dropped if N == len. Three chars into a
+    # two-slot array is a real overflow.
     with pytest.raises(CodegenError, match="exceeds"):
-        _compile('int main(void) { char s[2] = "hi"; return 0; }')
+        _compile('int main(void) { char s[2] = "hii"; return 0; }')
 
 
 def test_string_init_for_int_array_rejected():

@@ -1234,6 +1234,29 @@ class CodeGenerator:
             length = arr_ty.size.value
 
         if isinstance(init, ast.StringLiteral):
+            is_wide = getattr(init, "is_wide", False) or elem_size > 1
+            if is_wide:
+                # `wchar_t arr[N] = L"..."`: each codepoint is one
+                # `elem_size`-byte slot. Append a null terminator if
+                # there's room.
+                codepoints = [ord(c) for c in init.value]
+                if len(codepoints) > length:
+                    raise CodegenError(
+                        f"global `{name}`: wide string init exceeds "
+                        f"array size {length}"
+                    )
+                if len(codepoints) < length:
+                    codepoints = codepoints + [0]
+                directive = self._DATA_DIRECTIVE.get(elem_size)
+                if directive is None:
+                    raise CodegenError(
+                        f"global `{name}`: wide-char element size "
+                        f"{elem_size} unsupported"
+                    )
+                values = [str(cp) for cp in codepoints] + ["0"] * (
+                    length - len(codepoints)
+                )
+                return [f"        {directive}      {', '.join(values)}"]
             if not (
                 isinstance(elem_type, ast.BasicType) and elem_type.name == "char"
             ):
@@ -2763,12 +2786,21 @@ class CodeGenerator:
         unit_used = 0       # bits used in the current unit (0..32)
         for m in decl.members:
             if m.bit_width is not None:
-                if not isinstance(m.bit_width, ast.IntLiteral):
-                    raise CodegenError(
-                        f"`{decl.name}.{m.name}`: bit-field width must "
-                        f"be an integer literal"
-                    )
-                width = m.bit_width.value
+                # Common case: integer literal. Otherwise reduce
+                # through `_const_eval` so things like
+                # `int : sizeof(int) * 8 - 2` work.
+                if isinstance(m.bit_width, ast.IntLiteral):
+                    width = m.bit_width.value
+                else:
+                    try:
+                        width = self._const_eval(
+                            m.bit_width, f"{decl.name}.{m.name or '<anon>'}"
+                        )
+                    except CodegenError as e:
+                        raise CodegenError(
+                            f"`{decl.name}.{m.name}`: bit-field width must "
+                            f"reduce to an integer constant ({e})"
+                        )
                 if width < 0 or width > 32:
                     raise CodegenError(
                         f"`{decl.name}.{m.name}`: bit-field width "
@@ -4020,14 +4052,20 @@ class CodeGenerator:
                 raise CodegenError(
                     f"`{name}`: string initializer requires a char array"
                 )
-            # Lay out the bytes, append a null. ASCII string literals only
-            # for now — escape handling lives in `_render_string` for the
-            # `.data` path; for inline init we just pull byte values.
-            bytes_to_store = list(self._string_to_bytes(init.value)) + [0]
-            if len(bytes_to_store) > length:
+            # Lay out the bytes, append a null when there's room.
+            # C semantics: `char a[3] = "abc"` lays out exactly the
+            # 3 bytes (no null terminator), `char a[4] = "abc"` lays
+            # out the 3 bytes plus the null. Arrays smaller than the
+            # raw string content are an error.
+            raw_bytes = list(self._string_to_bytes(init.value))
+            if len(raw_bytes) > length:
                 raise CodegenError(
                     f"`{name}`: string initializer exceeds array size {length}"
                 )
+            if len(raw_bytes) < length:
+                bytes_to_store = raw_bytes + [0]
+            else:
+                bytes_to_store = raw_bytes
             out: list[str] = []
             for i, byte in enumerate(bytes_to_store):
                 addr = _ebp_addr(base_disp + i * elem_size)
@@ -6405,6 +6443,16 @@ class CodeGenerator:
         if isinstance(expr.operand, ast.UnaryOp) and expr.operand.op == "*":
             # &*p is a no-op — just produce p.
             return self._eval_expr_to_eax(expr.operand.operand, ctx)
+        if (
+            isinstance(expr.operand, ast.UnaryOp)
+            and expr.operand.op in ("__real__", "__imag__")
+        ):
+            # &__real__ x / &__imag__ x — address of the corresponding
+            # half of the _Complex value.
+            addr_lines, _half_ty = self._complex_part_address(
+                expr.operand, ctx,
+            )
+            return addr_lines
         raise CodegenError(
             f"`&` operand must be an identifier, `arr[i]`, or `s.m` "
             f"(got {type(expr.operand).__name__})"
