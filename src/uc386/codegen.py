@@ -3231,12 +3231,14 @@ class CodeGenerator:
                 raise CodegenError("`continue` outside of a loop")
             return [f"        jmp     {ctx.continue_targets[-1]}"]
         if isinstance(item, ast.AsmStmt):
-            # Inline asm is treated as a no-op; we don't honor the
-            # template, constraints, or clobbers. Tests that use it
-            # purely as an optimization barrier (most of them) work
-            # because uc386 doesn't aggressively optimize across the
-            # statement boundary.
-            return []
+            # Inline asm: we don't honor the template / constraints /
+            # clobbers, but we still evaluate operand expressions for
+            # their side effects so calls like
+            # `asm("" : "+r"(*bar()))` actually invoke bar().
+            out: list[str] = []
+            for op in getattr(item, "operands", []) or []:
+                out += self._eval_expr_to_eax(op, ctx)
+            return out
         if isinstance(item, ast.DeclarationList):
             # `int x, *p, **pp;` parses as DeclarationList of one VarDecl
             # per declarator. Lower each one in order.
