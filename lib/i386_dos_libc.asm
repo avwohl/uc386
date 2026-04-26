@@ -547,6 +547,19 @@ ___builtin_classify_type:
 ; (callers always gate it on a compile-time-false condition).
 _link_error:
         ret
+
+; assert() failure handlers — abort on a failing condition. The C
+; symbol is `_assert_fail` (per our assert.h) which lowers to the
+; NASM label `__assert_fail`. We also stub the gcc __builtin form
+; (`___assert_fail`).
+__assert_fail:
+        jmp     _abort
+___assert_fail:
+        jmp     _abort
+___assert:
+        jmp     _abort
+___assert_perror_fail:
+        jmp     _abort
 ___builtin_abort:         jmp _abort
 ___builtin_exit:          jmp _exit
 ___builtin_putchar:       jmp _putchar
@@ -818,6 +831,25 @@ _memcpy:
         cld
         rep movsb
         mov     eax, [ebp + 8]
+        pop     edi
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; mempcpy: like memcpy but returns dest + n (one past the last byte).
+_mempcpy:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        push    edi
+        mov     edi, [ebp + 8]
+        mov     esi, [ebp + 12]
+        mov     ecx, [ebp + 16]
+        cld
+        rep movsb
+        ; edi already points past the last byte we wrote.
+        mov     eax, edi
         pop     edi
         pop     esi
         mov     esp, ebp
