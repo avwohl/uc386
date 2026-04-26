@@ -972,7 +972,17 @@ class CodeGenerator:
     ) -> list[str]:
         elem_type = arr_ty.base_type
         elem_size = self._size_of(elem_type)
-        length = arr_ty.size.value
+        # Flexible array member or `int arr[] = {...};` — derive length
+        # from the initializer.
+        if arr_ty.size is None:
+            if isinstance(init, ast.StringLiteral):
+                length = len(init.value) + 1  # include null terminator
+            elif isinstance(init, ast.InitializerList):
+                length = len(init.values)
+            else:
+                length = 1
+        else:
+            length = arr_ty.size.value
 
         if isinstance(init, ast.StringLiteral):
             if not (
@@ -1092,11 +1102,28 @@ class CodeGenerator:
             ty = self._type_of(expr.expr, _FuncCtx())
             return self._size_of(ty)
         if isinstance(expr, ast.Cast):
-            # `(myint)1` etc. — the cast is a no-op for integer types
-            # at compile time. We don't honor narrowing here; if the
-            # source value doesn't fit the target type, the assembler
-            # will catch it.
-            return self._const_eval(expr.expr, name)
+            # Recurse on the operand, then narrow per the target type.
+            # `(unsigned short)-4` must produce 65532, not -4. Truncate
+            # to the target width and re-extend per signedness so a
+            # subsequent widen (to long, etc.) sees the right bit
+            # pattern.
+            inner = self._const_eval(expr.expr, name)
+            ty = expr.target_type
+            if isinstance(ty, ast.BasicType):
+                size = self._size_of(ty)
+                if size == 1:
+                    inner &= 0xFF
+                    if not self._is_unsigned(ty) and inner & 0x80:
+                        inner -= 0x100
+                elif size == 2:
+                    inner &= 0xFFFF
+                    if not self._is_unsigned(ty) and inner & 0x8000:
+                        inner -= 0x10000
+                elif size == 4:
+                    inner &= 0xFFFFFFFF
+                    if not self._is_unsigned(ty) and inner & 0x80000000:
+                        inner -= 0x100000000
+            return inner
         if isinstance(expr, ast.Identifier):
             # Allow enum constants in global initializers — they're
             # already integer constants by the time codegen runs.
@@ -3238,6 +3265,65 @@ class CodeGenerator:
 
     # ---- variadic builtins (va_start / va_arg / va_end) -----------------
 
+    def _builtin_overflow(
+        self,
+        name: str,
+        args: list[ast.Expression],
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """`__builtin_{add,sub,mul}_overflow(a, b, &result)`.
+
+        Returns 1 if the operation overflows when interpreting the
+        operands per their static types (C overflow semantics depend on
+        signedness — CF for unsigned add/sub, OF for signed add/sub,
+        EDX-nonzero for unsigned mul, OF for signed mul). The libc
+        stub couldn't know the type so we inline here.
+        """
+        a_ty = self._type_of(args[0], ctx)
+        b_ty = self._type_of(args[1], ctx)
+        unsigned = self._is_unsigned(a_ty) or self._is_unsigned(b_ty)
+        if self._is_long_long(a_ty) or self._is_long_long(b_ty):
+            raise CodegenError(
+                f"{name}: long-long operand not supported"
+            )
+        # Eval b → push, eval a → eax, eval result_ptr → ebx (after).
+        out = self._eval_expr_to_eax(args[1], ctx)
+        out.append("        push    eax")
+        out += self._eval_expr_to_eax(args[0], ctx)
+        out.append("        pop     ecx")
+        # Stash addr of result for after the op (it can clobber EDX).
+        out += self._eval_expr_to_eax(args[2], ctx)
+        out.append("        mov     ebx, eax")
+        # Reload the operands; we need EAX to hold a, ECX to hold b.
+        # We just clobbered EAX with &result; redo the eval. Cheaper
+        # alternative: shuffle, but the operand expressions are usually
+        # leaf identifiers so re-eval is fine.
+        out += self._eval_expr_to_eax(args[1], ctx)
+        out.append("        mov     ecx, eax")
+        out += self._eval_expr_to_eax(args[0], ctx)
+        if name == "__builtin_add_overflow":
+            out.append("        add     eax, ecx")
+            flag = "setc" if unsigned else "seto"
+        elif name == "__builtin_sub_overflow":
+            out.append("        sub     eax, ecx")
+            flag = "setc" if unsigned else "seto"
+        else:  # mul
+            if unsigned:
+                # `mul ecx` → EDX:EAX = unsigned product. Overflow iff
+                # EDX != 0. Capture before EDX is clobbered.
+                out.append("        mul     ecx")
+                out.append("        test    edx, edx")
+                out.append("        setnz   dl")
+                out.append("        mov     [ebx], eax")
+                out.append("        movzx   eax, dl")
+                return out
+            out.append("        imul    ecx")
+            flag = "seto"
+        out.append(f"        {flag}    dl")
+        out.append("        mov     [ebx], eax")
+        out.append("        movzx   eax, dl")
+        return out
+
     def _va_start(self, args: list[ast.Expression], ctx: _FuncCtx) -> list[str]:
         """Lower `va_start(ap, last)`: ap = (char *)&last + sizeof_padded(last).
 
@@ -3419,25 +3505,57 @@ class CodeGenerator:
         if isinstance(expr, ast.Identifier):
             return self._identifier_type(expr.name, ctx)
         if isinstance(expr, ast.IntLiteral):
-            # Honor the L/U suffixes per C: 17L → long, 17U → unsigned int,
-            # 17LL → long long. The parser sets is_long_long=True for `LL`
-            # specifically; we also promote to long long when the value
-            # overflows 32 bits.
+            # Honor the L/U suffixes per C 6.4.4.1: walk int → unsigned int
+            # → long → unsigned long → long long → unsigned long long,
+            # taking the first that fits per the suffix's lower bound.
+            # On i386 long is 32-bit, so the long step is interchangeable
+            # with int width-wise; we set the BasicType name based on the
+            # ranks the value/suffix imply.
             name = "int"
             v = expr.value
             unsigned = getattr(expr, "is_unsigned", False)
             is_long = getattr(expr, "is_long", False)
             is_long_long = getattr(expr, "is_long_long", False)
-            limit = 0xFFFFFFFF if unsigned else 0x7FFFFFFF
-            if (
-                is_long_long
-                or (is_long and v > limit)
-                or v > 0xFFFFFFFF
-                or v < -0x80000000
-            ):
+            is_hex = getattr(expr, "is_hex", False)
+            if is_long_long:
                 name = "long long"
+                # Hex/octal can promote to unsigned ll if value > LL_MAX.
+                if is_hex and v > 0x7FFFFFFFFFFFFFFF:
+                    unsigned = True
             elif is_long:
-                name = "long"
+                # `L` suffix: walk (signed) long → (unsigned) long → ll → ull.
+                if v > 0xFFFFFFFFFFFFFFFF:
+                    name = "long long"   # shouldn't happen, but be safe
+                elif v > 0xFFFFFFFF:
+                    name = "long long"
+                    if is_hex:
+                        unsigned = unsigned or v > 0x7FFFFFFFFFFFFFFF
+                elif v > 0x7FFFFFFF:
+                    # On i386 long is 32-bit, so this is unsigned long
+                    # (which is just unsigned int, same width).
+                    if not unsigned and is_hex:
+                        unsigned = True
+                    elif not unsigned and not is_hex:
+                        # decimal with `L` suffix: skip unsigned long,
+                        # promote directly to long long.
+                        name = "long long"
+                # name stays "int" / "long" otherwise; we treat them as
+                # the same width here.
+            else:
+                # No L suffix: walk int → unsigned int → long → unsigned
+                # long → long long → unsigned long long.
+                if v > 0xFFFFFFFF:
+                    name = "long long"
+                    if is_hex:
+                        unsigned = unsigned or v > 0x7FFFFFFFFFFFFFFF
+                elif v > 0x7FFFFFFF:
+                    if not unsigned and is_hex:
+                        unsigned = True
+                    elif not unsigned:
+                        # decimal that overflows int: long long (signed).
+                        name = "long long"
+                elif v < -0x80000000:
+                    name = "long long"
             return ast.BasicType(
                 name=name,
                 is_signed=(False if unsigned else None),
@@ -4274,6 +4392,15 @@ class CodeGenerator:
                 ]
             if expr.op in ("++", "--"):
                 return self._float_inc_dec(expr, ctx)
+            if expr.op == "*":
+                # Dereferencing a float pointer in a float context:
+                # eval pointer to eax, then `fld` from there. Width
+                # follows the pointee (float vs double).
+                size = 4 if ty.name == "float" else 8
+                width = "dword" if size == 4 else "qword"
+                out = self._eval_expr_to_eax(expr.operand, ctx)
+                out.append(f"        fld     {width} [eax]")
+                return out
             raise CodegenError(
                 f"unary `{expr.op}` not supported on float operand"
             )
@@ -4344,6 +4471,17 @@ class CodeGenerator:
             "*": "fmulp",
             "/": "fdivp",
         }
+        if expr.op == ",":
+            # Comma operator: eval lhs for side effects, then yield rhs.
+            # Lhs may be int or float; we need to drop its value.
+            lhs_ty = self._type_of(expr.left, ctx)
+            if self._is_float_type(lhs_ty):
+                out = self._eval_float_to_st0(expr.left, ctx)
+                out.append("        fstp    st0")
+            else:
+                out = self._eval_expr_to_eax(expr.left, ctx)
+            out += self._eval_float_to_st0(expr.right, ctx)
+            return out
         if expr.op not in op_to_mnem:
             raise CodegenError(
                 f"binary `{expr.op}` not supported on float operands"
@@ -4640,6 +4778,14 @@ class CodeGenerator:
             # value position are at least defined.
             if callee.name in ("__builtin_unreachable", "__builtin_trap"):
                 return ["        xor     eax, eax"]
+            if callee.name in (
+                "__builtin_add_overflow",
+                "__builtin_sub_overflow",
+                "__builtin_mul_overflow",
+            ) and len(expr.args) == 3:
+                return self._builtin_overflow(
+                    callee.name, expr.args, ctx,
+                )
 
         # Direct call: callee names a function declared in this unit
         # (defined or extern). Emit a `call _name` linker reference.
@@ -5325,6 +5471,14 @@ class CodeGenerator:
                 and self._is_struct_returning_call(expr.right, ctx)
             ):
                 return self._call_into_address(
+                    expr.right,
+                    self._struct_address(expr.left, ctx),
+                    ctx,
+                )
+            if isinstance(expr.right, ast.VaArgExpr):
+                # `s = va_arg(ap, struct T)` — the value lives at the
+                # current ap; copy from there into &s and advance ap.
+                return self._va_arg_struct_copy(
                     expr.right,
                     self._struct_address(expr.left, ctx),
                     ctx,

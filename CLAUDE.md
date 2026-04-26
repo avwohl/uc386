@@ -108,3 +108,18 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`__builtin_mul_overflow` actually detects overflow.** The libc stub used to do `imul reg, mem` (truncating, no flag). Now uses one-operand `imul mem32` followed by `seto cl`, returning `cl` zero-extended. Same shape for `__builtin_add_overflow` / `__builtin_sub_overflow`. (Removed the duplicate sub_overflow definition that was masking the new one.)
 
   **Result: 1093/1514 gcc-c-torture passing in run mode** (up from 1064); `c-testsuite` 215/220 holds; uc386's own suite still 310 / 310.
+- **2026-04-25 — torture cluster: more wins (1093 → 1125)**: another sweep through the smallest failures.
+  - **`__builtin_{add,sub,mul}_overflow` is type-aware.** Inline lowering in `_call` (when the callee Identifier matches the builtin) reads the argument types and dispatches to `setc` (unsigned add/sub overflow) or `seto` (signed) and uses `mul`+`test edx` for unsigned multiply overflow.
+  - **`s = va_arg(ap, struct T)` for struct-typed targets.** `_assign` recognizes a VaArgExpr rhs and routes through `_va_arg_struct_copy` with the lhs's address as the destination.
+  - **Float dereference `*p` in float context.** `_eval_float_to_st0` for `UnaryOp("*")` now emits `fld dword/qword [eax]` based on the pointee's width.
+  - **Comma operator `(a, b)` for float result.** Eval lhs (drop the value if float) for side effects, then eval rhs as the float result.
+  - **Flexible array members and unsized global arrays.** `_emit_global_array_init` derives the length from a string-literal or initializer-list when `arr_ty.size is None` instead of crashing.
+  - **`_const_eval(Cast)` narrows.** Previously a no-op pass-through, now truncates the inner value per the target type's width and re-extends per signedness so `volatile unsigned long l2 = (unsigned short)-4` lays down `dd 65532` instead of `dd -4`.
+  - **`_type_of(IntLiteral)` honors the C 6.4.4.1 walk.** Hex-with-L on a value > LONG_MAX promotes to `unsigned long` (32-bit on i386), not `long long`. Decimal-with-L jumps directly to `long long` past LONG_MAX. The previous code always bumped to long long, breaking 32-bit comparisons of `0xdeadbeefL`-style literals.
+  - **`_struct_init` dispatches by member type.** Float members use `_eval_float_to_st0`+`_store_st0_to`; long-long members widen to EDX:EAX. Previously fell through to the int store path, truncating `2.0` to int.
+  - **`_struct_unions` set + zero-fill.** Tracks union types so `_struct_init` zero-fills the whole struct upfront (members share offset 0 with bit-fields and unions, so per-member end-zero-fill is destructive).
+  - **`_inc_dec_bitfield`.** Handles `++`/`--` on bit-field Member operands by RMW'ing the storage unit at the right bit offset/width with sign-extend semantics.
+  - **`_bitfield_info` accepts ArrayType obj.** `s->c` where `s` is `struct T s[1]` now resolves correctly.
+  - **uc_core parser: trailing `__attribute__` on struct members.** `int x __attribute__((packed));` parses now (skips noise before the SEMICOLON in the member loop). Unlocks the strct-pack-* tests.
+
+  **Result: 1125/1514 gcc-c-torture** (up from 1093); c-testsuite still 215/220; uc386's own suite still 310/310.
