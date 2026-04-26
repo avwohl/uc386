@@ -668,8 +668,18 @@ class CodeGenerator:
                 # Float globals can initialize from a float or int literal.
                 # NASM accepts the decimal form in `dd` / `dq` and converts
                 # to IEEE-754; a plain integer like `100` becomes `100.0`.
+                # For inf / nan we emit the IEEE-754 bit pattern as a
+                # hex int (NASM's repr-form rejects 'inf' / 'nan').
                 directive = "dd" if ty.name == "float" else "dq"
                 value = self._const_eval_float(init, name)
+                import math
+                if math.isinf(value) or math.isnan(value):
+                    import struct
+                    if ty.name == "float":
+                        bits = struct.unpack(">I", struct.pack(">f", value))[0]
+                        return [f"        dd      0x{bits:08X}"]
+                    bits = struct.unpack(">Q", struct.pack(">d", value))[0]
+                    return [f"        dq      0x{bits:016X}"]
                 return [f"        {directive}      {value!r}"]
             # `&&l1 - &&l2` — label-difference constant. NASM resolves
             # the difference at assemble time. Common in static jump
