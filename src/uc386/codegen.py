@@ -2861,29 +2861,56 @@ class CodeGenerator:
         Distinguishes vector arithmetic from incidental ArrayType results
         (e.g. an Identifier of array type used in arithmetic context)."""
         if isinstance(node, ast.BinaryOp):
-            return node.op in ("+", "-", "*", "/", "%", "&", "|", "^")
+            return node.op in (
+                "+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>",
+            )
         if isinstance(node, ast.UnaryOp):
             return node.op in ("-", "+", "~")
         return False
 
     def _is_genuine_vector_op(self, node, ctx) -> bool:
         """Distinguish vector componentwise arithmetic from pointer
-        arithmetic. For BinaryOp, both sides must be ArrayType of the
-        same shape, with at least one tagged as a vector. For UnaryOp,
-        the operand must be a vector ArrayType."""
+        arithmetic.
+
+        For BinaryOp:
+        - Both sides ArrayType same shape with at least one tagged
+          as a vector → componentwise vector arithmetic.
+        - One side a vector ArrayType and the other a scalar (int)
+          → scalar broadcast against each element.
+
+        For UnaryOp, the operand must be a vector ArrayType."""
         try:
             if isinstance(node, ast.BinaryOp):
                 lt = self._type_of(node.left, ctx)
                 rt = self._type_of(node.right, ctx)
-                return (
+                l_vec = (
+                    isinstance(lt, ast.ArrayType)
+                    and getattr(lt, "is_vector", False)
+                )
+                r_vec = (
+                    isinstance(rt, ast.ArrayType)
+                    and getattr(rt, "is_vector", False)
+                )
+                # Two-sided vector op (same size).
+                if (
                     isinstance(lt, ast.ArrayType)
                     and isinstance(rt, ast.ArrayType)
                     and self._size_of(lt) == self._size_of(rt)
-                    and (
-                        getattr(lt, "is_vector", False)
-                        or getattr(rt, "is_vector", False)
+                    and (l_vec or r_vec)
+                ):
+                    return True
+                # Scalar broadcast: vector op int.
+                def _is_scalar_int(t):
+                    return (
+                        isinstance(t, ast.BasicType)
+                        and t.name in (
+                            "int", "char", "short", "long",
+                        )
                     )
-                )
+                if l_vec and _is_scalar_int(rt):
+                    return True
+                if r_vec and _is_scalar_int(lt):
+                    return True
             if isinstance(node, ast.UnaryOp):
                 opt = self._type_of(node.operand, ctx)
                 return (
@@ -6680,14 +6707,28 @@ class CodeGenerator:
             # Vector arithmetic: two ArrayTypes of the same shape combine
             # componentwise and return the array type. Comparison ops
             # still return int (since GCC vector compares fold to a mask
-            # that's int-typed at the C level for our subset).
-            if (
-                expr.op in ("+", "-", "*", "/", "%", "&", "|", "^")
-                and isinstance(lt, ast.ArrayType)
-                and isinstance(rt, ast.ArrayType)
-                and self._size_of(lt) == self._size_of(rt)
-            ):
-                return lt
+            # that's int-typed at the C level for our subset). Also
+            # supports scalar-broadcast `vec op int` / `int op vec` where
+            # the scalar is replicated to every element.
+            if expr.op in ("+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>"):
+                l_vec = (
+                    isinstance(lt, ast.ArrayType)
+                    and getattr(lt, "is_vector", False)
+                )
+                r_vec = (
+                    isinstance(rt, ast.ArrayType)
+                    and getattr(rt, "is_vector", False)
+                )
+                if (
+                    isinstance(lt, ast.ArrayType)
+                    and isinstance(rt, ast.ArrayType)
+                    and self._size_of(lt) == self._size_of(rt)
+                ):
+                    return lt
+                if l_vec and isinstance(rt, ast.BasicType):
+                    return lt
+                if r_vec and isinstance(lt, ast.BasicType):
+                    return rt
             if expr.op in self._INT_RESULT_BINOPS:
                 # Pointer-arithmetic promotion above doesn't apply here,
                 # but float promotion does for `*` and `/`.
@@ -9243,6 +9284,59 @@ class CodeGenerator:
         count = self._size_of(vec_ty) // elem_size
         out: list[str] = []
         if isinstance(expr, ast.BinaryOp):
+            lt = self._type_of(expr.left, ctx)
+            rt = self._type_of(expr.right, ctx)
+            l_vec = (
+                isinstance(lt, ast.ArrayType)
+                and getattr(lt, "is_vector", False)
+            )
+            r_vec = (
+                isinstance(rt, ast.ArrayType)
+                and getattr(rt, "is_vector", False)
+            )
+            # Scalar broadcast — vec op scalar / scalar op vec.
+            if l_vec and not r_vec:
+                # eval scalar to ECX once (push), then loop over vec.
+                out += self._eval_expr_to_eax(expr.right, ctx)
+                out.append("        push    eax")          # [esp] = scalar
+                out += self._vector_value_address(expr.left, ctx)
+                out.append("        push    eax")          # [esp] = &vec
+                for i in range(count):
+                    offset = i * elem_size
+                    out.append("        mov     edx, [esp]")
+                    out += self._load_to_eax(
+                        f"[edx + {offset}]" if offset else "[edx]",
+                        elem_ty,
+                    )
+                    out.append("        mov     ecx, [esp + 4]")
+                    out += self._vector_int_binop(expr.op, elem_ty)
+                    addr = _ebp_addr(disp + offset)
+                    out += self._store_from_eax(addr, elem_ty)
+                out.append("        add     esp, 8")
+                out.append(f"        lea     eax, {_ebp_addr(disp)}")
+                return out
+            if r_vec and not l_vec:
+                out += self._eval_expr_to_eax(expr.left, ctx)
+                out.append("        push    eax")          # [esp] = scalar
+                out += self._vector_value_address(expr.right, ctx)
+                out.append("        push    eax")          # [esp] = &vec
+                for i in range(count):
+                    offset = i * elem_size
+                    # eax = vec[i]; ecx = scalar — but we want
+                    # `scalar op vec[i]`. So move things around.
+                    out.append("        mov     edx, [esp]")
+                    out += self._load_to_eax(
+                        f"[edx + {offset}]" if offset else "[edx]",
+                        elem_ty,
+                    )
+                    out.append("        mov     ecx, eax")    # ecx = vec[i]
+                    out.append("        mov     eax, [esp + 4]")  # eax = scalar
+                    out += self._vector_int_binop(expr.op, elem_ty)
+                    addr = _ebp_addr(disp + offset)
+                    out += self._store_from_eax(addr, elem_ty)
+                out.append("        add     esp, 8")
+                out.append(f"        lea     eax, {_ebp_addr(disp)}")
+                return out
             # Compute &right, &left; keep them across the per-element
             # body. Use [esp + 4]/[esp] as anchors so per-element loads
             # can re-fetch (we don't keep them in fixed regs because
@@ -9340,6 +9434,14 @@ class CodeGenerator:
                 out.append("        cdq")
                 out.append("        idiv    ecx")
             out.append("        mov     eax, edx")
+        elif op == "<<":
+            # `shl/sal eax, cl` — only CL is meaningful for shifts on x86.
+            out.append("        shl     eax, cl")
+        elif op == ">>":
+            if self._is_unsigned(elem_ty):
+                out.append("        shr     eax, cl")
+            else:
+                out.append("        sar     eax, cl")
         else:
             raise CodegenError(f"vector op `{op}` not supported")
         return out
