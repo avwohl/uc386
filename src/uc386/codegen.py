@@ -2340,28 +2340,34 @@ class CodeGenerator:
         )
 
     def _store_from_eax(self, addr: str, ty: ast.TypeNode) -> list[str]:
-        """Lines that store EAX (treated as `ty`) to `addr`.
+        """Lines that store EAX (treated as `ty`) to `addr`, then leave
+        EAX = the stored-and-reread value (narrowed to `ty`'s width and
+        re-extended per `ty`'s signedness). This makes chained
+        assignments like `ul = us = -1` see the same conversion the
+        lvalue would have seen on a plain read.
 
-        For sub-word types we narrow via the low half of EAX (`ax`/`al`),
-        leaving the higher bytes of the slot untouched — the load helper
-        above only reads the meaningful bytes anyway.
-
-        For size-8 types (long long, double) we store only the low 32 bits
-        in EAX and sign-extend into the high half. This is a known
-        approximation — full 64-bit arithmetic is not yet implemented, so
-        these stores match what 32-bit-truncated reads see.
+        For size-8 types (long long, double) we store only the low 32
+        bits in EAX and sign-extend into the high half. Real long long
+        goes through `_store_from_edx_eax`; this path is the
+        narrow-on-store fallback when callers happen to be in 32-bit
+        eval mode.
         """
         size = self._size_of(ty)
         if size == 4:
             return [f"        mov     {addr}, eax"]
         if size == 2:
-            return [f"        mov     word {addr}, ax"]
+            mnem = "movzx" if self._is_unsigned(ty) else "movsx"
+            return [
+                f"        mov     word {addr}, ax",
+                f"        {mnem}   eax, ax",
+            ]
         if size == 1:
-            return [f"        mov     byte {addr}, al"]
+            mnem = "movzx" if self._is_unsigned(ty) else "movsx"
+            return [
+                f"        mov     byte {addr}, al",
+                f"        {mnem}   eax, al",
+            ]
         if size == 8:
-            # Emit `mov [addr], eax; mov [addr+4], <sign-ext of eax>`.
-            # NASM addr forms like `[ebp - 16]` need surgery to bump the
-            # offset; do it textually for the common cases.
             high_addr = self._bump_addr(addr, 4)
             return [
                 f"        mov     {addr}, eax",
