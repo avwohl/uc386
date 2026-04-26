@@ -1990,7 +1990,7 @@ class CodeGenerator:
         # — a pointer to the caller's destination buffer. Real params
         # shift up by 4 in that case.
         disp = 8
-        if isinstance(fn.return_type, ast.StructType):
+        if isinstance(fn.return_type, (ast.StructType, ast.ComplexType)):
             ctx.alloc_param(
                 "__retptr__", disp,
                 ast.PointerType(base_type=fn.return_type),
@@ -4809,6 +4809,13 @@ class CodeGenerator:
                 return self._call_into_address(
                     stmt.value, retptr_load, ctx,
                 ) + ["        jmp     .epilogue"]
+            # `_Complex T` value uses the same retptr / struct-copy
+            # mechanism with a per-half load via the existing complex
+            # address helper.
+            if isinstance(ret_ty, ast.ComplexType):
+                return self._copy_complex_to_retptr(
+                    stmt.value, ret_ty, retptr_disp, ctx
+                ) + ["        jmp     .epilogue"]
             return self._copy_struct_to_retptr(
                 stmt.value, ret_ty, retptr_disp, ctx
             ) + ["        jmp     .epilogue"]
@@ -4842,6 +4849,62 @@ class CodeGenerator:
                 mnem = "movzx" if self._is_unsigned(rt) else "movsx"
                 out.append(f"        {mnem}   eax, ax")
         out.append("        jmp     .epilogue")
+        return out
+
+    def _is_complex_returning_call(
+        self, call: ast.Call, ctx: _FuncCtx,
+    ) -> bool:
+        """Does `call` invoke a function whose declared return type is
+        `_Complex T`?"""
+        target = self._call_target(call)
+        if target is None:
+            return False
+        ret_ty = self._func_return_types.get(target)
+        return isinstance(ret_ty, ast.ComplexType)
+
+    def _complex_copy_assign(
+        self, expr: ast.BinaryOp, ty: ast.ComplexType, ctx: _FuncCtx,
+    ) -> list[str]:
+        """`dst = src` where both are `_Complex T`. Per-dword copy."""
+        size = self._size_of(ty)
+        out = self._complex_value_address(expr.right, ctx)
+        out.append("        push    eax")
+        out += self._complex_value_address(expr.left, ctx)
+        out.append("        mov     ecx, eax")
+        out.append("        pop     edx")
+        offset = 0
+        while size - offset >= 4:
+            out.append(f"        mov     eax, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], eax")
+            offset += 4
+        out.append("        mov     eax, ecx")
+        return out
+
+    def _copy_complex_to_retptr(
+        self,
+        src_expr: ast.Expression,
+        ret_ty: ast.ComplexType,
+        retptr_disp: int,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Copy a `_Complex T` lvalue into the `__retptr__` buffer.
+
+        Uses the same per-dword copy as `_copy_struct_to_retptr` —
+        complex values are laid out as `{real, imag}` and live in a
+        slot like a 2-member struct.
+        """
+        size = self._size_of(ret_ty)
+        out = [f"        mov     eax, {_ebp_addr(retptr_disp)}"]
+        out.append("        push    eax")
+        out += self._complex_value_address(src_expr, ctx)
+        out.append("        mov     edx, eax")
+        out.append("        pop     ecx")
+        offset = 0
+        while size - offset >= 4:
+            out.append(f"        mov     eax, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], eax")
+            offset += 4
+        out.append(f"        mov     eax, {_ebp_addr(retptr_disp)}")
         return out
 
     def _copy_struct_to_retptr(
@@ -7448,6 +7511,20 @@ class CodeGenerator:
                     ctx,
                 )
             return self._struct_copy_assign(expr, target_ty, ctx)
+        if isinstance(target_ty, ast.ComplexType):
+            # `c = c2` — complex-to-complex copy. Same per-dword
+            # mechanism as struct copy. The rhs may be a complex-
+            # returning call (handled like struct-returning).
+            if (
+                isinstance(expr.right, ast.Call)
+                and self._is_complex_returning_call(expr.right, ctx)
+            ):
+                return self._call_into_address(
+                    expr.right,
+                    self._complex_value_address(expr.left, ctx),
+                    ctx,
+                )
+            return self._complex_copy_assign(expr, target_ty, ctx)
         # Long-long lvalue: route through the 64-bit assignment helper.
         if self._is_long_long(target_ty):
             return self._assign_ll(expr, ctx)
