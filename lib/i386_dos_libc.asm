@@ -484,6 +484,38 @@ _memcmp:
         pop     ebp
         ret
 
+; ---- memchr ---------------------------------------------------------------
+; void *memchr(const void *s, int c, size_t n);
+; Returns pointer to first byte equal to c (as unsigned char) within
+; the first n bytes, or NULL if not found.
+_memchr:
+        push    ebp
+        mov     ebp, esp
+        push    edi
+        mov     edi, [ebp + 8]      ; ptr
+        mov     eax, [ebp + 12]     ; c (only low byte matters)
+        mov     ecx, [ebp + 16]     ; n
+        movzx   eax, al             ; mask to byte
+.l:
+        test    ecx, ecx
+        jz      .nf
+        movzx   edx, byte [edi]
+        cmp     eax, edx
+        je      .found
+        inc     edi
+        dec     ecx
+        jmp     .l
+.found:
+        mov     eax, edi
+        jmp     .d
+.nf:
+        xor     eax, eax
+.d:
+        pop     edi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
 ; ---- memmove ---------------------------------------------------------------
 _memmove:
         push    ebp
@@ -1169,6 +1201,49 @@ ___builtin_signbitf:
         ret
 ___builtin_signbitl:
         jmp     ___builtin_signbit
+
+; double __builtin_copysign(double x, double y);
+; Returns x with the sign of y. Result on st(0) per cdecl.
+; cdecl arg layout: x_low [ebp+8], x_high [ebp+12],
+;                   y_low [ebp+16], y_high [ebp+20].
+___builtin_copysign:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 12]         ; high half of x
+        and     eax, 0x7FFFFFFF         ; clear sign
+        mov     edx, [ebp + 20]         ; high half of y
+        and     edx, 0x80000000         ; isolate sign of y
+        or      eax, edx                ; combine
+        mov     [ebp + 12], eax
+        fld     qword [ebp + 8]
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; float __builtin_copysignf(float x, float y);
+___builtin_copysignf:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]          ; bits of x
+        and     eax, 0x7FFFFFFF
+        mov     edx, [ebp + 12]         ; bits of y
+        and     edx, 0x80000000
+        or      eax, edx
+        mov     [ebp + 8], eax
+        fld     dword [ebp + 8]
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; long double __builtin_copysignl: i386 long double is 8-byte for our
+; ABI, alias to copysign.
+___builtin_copysignl:
+        jmp     ___builtin_copysign
+
+; Library-name aliases (no leading __builtin).
+_copysign:      jmp ___builtin_copysign
+_copysignf:     jmp ___builtin_copysignf
+_copysignl:     jmp ___builtin_copysign
 
 ; isinf(x): 1 if +inf, -1 if -inf, 0 otherwise.
 ; For double: exponent bits (bits 52-62) all 1, mantissa bits (0-51) zero.
