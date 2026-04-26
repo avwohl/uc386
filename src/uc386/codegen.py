@@ -3049,9 +3049,21 @@ class CodeGenerator:
             return self._eval_expr_to_edx_eax(stmt.value, ctx) + [
                 "        jmp     .epilogue",
             ]
-        return self._eval_expr_to_eax(stmt.value, ctx) + [
-            "        jmp     .epilogue",
-        ]
+        # For sub-word return types (char / short), narrow EAX to the
+        # type's width and re-extend per signedness — matches C's
+        # "value narrows to the return type on return".
+        out = self._eval_expr_to_eax(stmt.value, ctx)
+        rt = ctx.return_type
+        if isinstance(rt, ast.BasicType):
+            size = self._size_of(rt)
+            if size == 1:
+                mnem = "movzx" if self._is_unsigned(rt) else "movsx"
+                out.append(f"        {mnem}   eax, al")
+            elif size == 2:
+                mnem = "movzx" if self._is_unsigned(rt) else "movsx"
+                out.append(f"        {mnem}   eax, ax")
+        out.append("        jmp     .epilogue")
+        return out
 
     def _copy_struct_to_retptr(
         self,
