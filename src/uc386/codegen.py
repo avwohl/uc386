@@ -2438,7 +2438,13 @@ class CodeGenerator:
          "float", "double", "long double"}
     )
 
-    _COMPLEX_BASE_SIZES = {"float": 4, "double": 8, "long double": 8}
+    # Half-element sizes for `_Complex T`. Includes int family for
+    # GCC's `_Complex int` / `_Complex long` extension.
+    _COMPLEX_BASE_SIZES = {
+        "float": 4, "double": 8, "long double": 8,
+        "char": 1, "short": 2, "int": 4, "long": 4, "long long": 8,
+    }
+    _COMPLEX_INT_BASES = {"char", "short", "int", "long", "long long"}
 
     def _complex_value_address(
         self, expr: ast.Expression, ctx: _FuncCtx,
@@ -4534,6 +4540,27 @@ class CodeGenerator:
             return self._eval_expr_to_edx_eax(
                 decl.init, ctx,
             ) + self._store_from_edx_eax(_ebp_addr(disp))
+        if isinstance(var_type, ast.ComplexType):
+            # Complex local init — `__complex__ T r = expr` lowers via
+            # the complex-eval engine, which writes (real, imag) into
+            # the slot directly.
+            dest = [f"        lea     eax, {_ebp_addr(disp)}"]
+            # If rhs is a complex-returning call, route into the slot.
+            if (
+                isinstance(decl.init, ast.Call)
+                and self._is_complex_returning_call(decl.init, ctx)
+            ):
+                return self._call_into_address(decl.init, dest, ctx)
+            # If rhs is itself a complex expression, eval directly.
+            init_ty = self._type_of(decl.init, ctx)
+            if isinstance(init_ty, ast.ComplexType):
+                synth = ast.BinaryOp(op="=", left=ast.Identifier(name=decl.name), right=decl.init)
+                return self._complex_copy_assign(synth, var_type, ctx)
+            # Scalar init — promote to (val, 0).
+            synth = ast.Identifier(name=decl.name)
+            return self._complex_assign_from_scalar(
+                synth, decl.init, var_type, ctx,
+            )
         return self._eval_expr_to_eax(decl.init, ctx) + self._store_from_eax(
             _ebp_addr(disp), var_type
         )
@@ -5113,62 +5140,157 @@ class CodeGenerator:
 
     def _eval_complex_into_top(
         self, expr: ast.Expression, ctx: _FuncCtx,
+        dest_ty: ast.ComplexType | None = None,
     ) -> list[str]:
         """Helper: store a complex value into `[esp]`'s pointed-to
         slot (the top of stack is the destination address; we leave
         it there so callers can pop it).
+
+        `dest_ty` is the complex type of the destination slot.
+        Operands are converted to that type so component-wise math
+        always uses the destination's half width. When the caller
+        doesn't know the dest type (e.g. eval_complex_to where the
+        slot's address is opaque), we fall back to the expression's
+        own type.
         """
         ty = self._type_of(expr, ctx)
+        if dest_ty is None and isinstance(ty, ast.ComplexType):
+            dest_ty = ty
         # `(_Complex T) scalar` cast — store scalar as real, 0 as imag.
         if isinstance(expr, ast.Cast) and isinstance(
             expr.target_type, ast.ComplexType
         ):
-            return self._cast_to_complex_into_top(expr, ctx)
+            return self._cast_to_complex_into_top(expr, ctx, dest_ty)
         if not isinstance(ty, ast.ComplexType):
             # Real-valued expression in complex context: promote to
-            # (real, 0). Use a synthetic ComplexType matching the
-            # value's float width for the imag-zero fill.
-            promoted = ast.ComplexType(
-                base_type=(
-                    "double"
-                    if isinstance(ty, ast.BasicType) and ty.name == "double"
-                    else "float"
-                ),
-            )
-            return self._scalar_to_complex_into_top(expr, promoted, ctx)
-        half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
+            # (real, 0) using the destination's complex type if known.
+            if dest_ty is None:
+                dest_ty = ast.ComplexType(
+                    base_type=(
+                        "double"
+                        if isinstance(ty, ast.BasicType) and ty.name == "double"
+                        else "float"
+                    ),
+                )
+            return self._scalar_to_complex_into_top(expr, dest_ty, ctx)
+        # Use the destination's complex type for the dispatch when
+        # provided — this drives narrowing for cross-precision cases
+        # (e.g. complex_double rhs → complex_float dest).
+        eff_ty = dest_ty if dest_ty is not None else ty
         # If expr is an lvalue / Call / __real__ wrapper, we already
         # have an addressing helper that gives us &expr; copy from there.
+        # When dest_ty differs from the lvalue's own type we need to
+        # convert per-half rather than memcpy; route through the
+        # complex-conversion helper.
         if isinstance(expr, (ast.Identifier, ast.Member, ast.Index)) or (
             isinstance(expr, ast.UnaryOp) and expr.op == "*"
         ) or (
             isinstance(expr, ast.Call)
             and self._is_complex_returning_call(expr, ctx)
         ):
-            return self._copy_complex_lvalue_into_top(expr, ty, ctx)
+            if (
+                dest_ty is not None
+                and isinstance(ty, ast.ComplexType)
+                and dest_ty.base_type != ty.base_type
+            ):
+                return self._convert_complex_into_top(expr, ty, dest_ty, ctx)
+            return self._copy_complex_lvalue_into_top(expr, eff_ty, ctx)
         if isinstance(expr, ast.UnaryOp):
             if expr.op == "+":
-                return self._eval_complex_into_top(expr.operand, ctx)
+                return self._eval_complex_into_top(expr.operand, ctx, dest_ty)
             if expr.op == "-":
-                return self._complex_neg_into_top(expr, ty, ctx)
+                return self._complex_neg_into_top(expr, eff_ty, ctx)
             if expr.op == "~":
-                return self._complex_conj_into_top(expr, ty, ctx)
+                return self._complex_conj_into_top(expr, eff_ty, ctx)
         if isinstance(expr, ast.BinaryOp):
             if expr.op == "=":
-                return self._complex_assign_into_top(expr, ty, ctx)
+                return self._complex_assign_into_top(expr, eff_ty, ctx)
             if expr.op in ("+", "-"):
-                return self._complex_addsub_into_top(expr, ty, ctx)
+                return self._complex_addsub_into_top(expr, eff_ty, ctx)
             if expr.op == "*":
-                return self._complex_mul_into_top(expr, ty, ctx)
+                return self._complex_mul_into_top(expr, eff_ty, ctx)
             if expr.op == "/":
-                return self._complex_div_into_top(expr, ty, ctx)
+                return self._complex_div_into_top(expr, eff_ty, ctx)
         # Imaginary FloatLiteral or scalar-typed sub-expression that
         # got promoted to complex (rare). Treat as (0, value) or
         # (value, 0) depending on whether it's imaginary.
         if isinstance(expr, ast.FloatLiteral) and expr.is_imaginary:
-            return self._complex_const_into_top(0.0, expr.value, ty)
+            return self._complex_const_into_top(0.0, expr.value, eff_ty)
         # Fallback: evaluate as a scalar (real part), zero the imag.
-        return self._scalar_to_complex_into_top(expr, ty, ctx)
+        return self._scalar_to_complex_into_top(expr, eff_ty, ctx)
+
+    def _convert_complex_into_top(
+        self,
+        src_expr: ast.Expression,
+        src_ty: ast.ComplexType,
+        dest_ty: ast.ComplexType,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Copy `src_expr` (a complex lvalue or call) into the
+        top-of-stack destination, converting per-half from `src_ty`
+        to `dest_ty`. Each half is loaded as the source width and
+        stored as the destination width.
+
+        Float-to-int via `fistp`, int-to-float via `fild`, same-kind
+        narrowing/widening via `fld`/`fstp`. Int-to-int truncates.
+        """
+        src_half = self._COMPLEX_BASE_SIZES[src_ty.base_type]
+        dst_half = self._COMPLEX_BASE_SIZES[dest_ty.base_type]
+        src_is_int = src_ty.base_type in self._COMPLEX_INT_BASES
+        dst_is_int = dest_ty.base_type in self._COMPLEX_INT_BASES
+        # &src in EAX.
+        out = self._complex_value_address(src_expr, ctx)
+        out.append("        mov     edx, eax")
+        out.append("        mov     ecx, [esp]")
+        for i in range(2):
+            src_off = i * src_half
+            dst_off = i * dst_half
+            self._complex_half_convert(
+                out, src_ty, dest_ty, "edx", src_off, "ecx", dst_off,
+            )
+        return out
+
+    def _complex_half_convert(
+        self, out, src_ty, dest_ty, src_reg, src_off, dst_reg, dst_off,
+    ) -> None:
+        """Convert one half of a complex value from `src_ty.base_type`
+        to `dest_ty.base_type` and store at `[dst_reg + dst_off]`.
+        Generates FPU code for float-side conversions and integer
+        loads/stores for the int family.
+        """
+        src_int = src_ty.base_type in self._COMPLEX_INT_BASES
+        dst_int = dest_ty.base_type in self._COMPLEX_INT_BASES
+        src_half = self._COMPLEX_BASE_SIZES[src_ty.base_type]
+        dst_half = self._COMPLEX_BASE_SIZES[dest_ty.base_type]
+        if src_int and dst_int:
+            # Integer → integer. Load with sign-extend, store narrow.
+            src_basic = ast.BasicType(name=src_ty.base_type)
+            dst_basic = ast.BasicType(name=dest_ty.base_type)
+            out += self._load_to_eax(f"[{src_reg} + {src_off}]", src_basic)
+            out += self._store_from_eax(f"[{dst_reg} + {dst_off}]", dst_basic)
+            return
+        # FPU-mediated: load src half, store dst half.
+        if src_int:
+            # Integer source: fild from a stack scratch.
+            src_basic = ast.BasicType(name=src_ty.base_type)
+            out += self._load_to_eax(f"[{src_reg} + {src_off}]", src_basic)
+            out.append("        sub     esp, 4")
+            out.append("        mov     [esp], eax")
+            out.append("        fild    dword [esp]")
+            out.append("        add     esp, 4")
+        else:
+            width = "dword" if src_half == 4 else "qword"
+            out.append(f"        fld     {width} [{src_reg} + {src_off}]")
+        if dst_int:
+            # Float → int: fistp.
+            out.append("        sub     esp, 4")
+            out.append("        fistp   dword [esp]")
+            out.append("        pop     eax")
+            dst_basic = ast.BasicType(name=dest_ty.base_type)
+            out += self._store_from_eax(f"[{dst_reg} + {dst_off}]", dst_basic)
+        else:
+            width = "dword" if dst_half == 4 else "qword"
+            out.append(f"        fstp    {width} [{dst_reg} + {dst_off}]")
 
     def _copy_complex_lvalue_into_top(
         self,
@@ -5191,9 +5313,10 @@ class CodeGenerator:
 
     def _cast_to_complex_into_top(
         self, expr: ast.Cast, ctx: _FuncCtx,
+        dest_ty: ast.ComplexType | None = None,
     ) -> list[str]:
         """`(_Complex T) scalar` — store scalar as real part, 0 as imag."""
-        ty = expr.target_type
+        ty = dest_ty if dest_ty is not None else expr.target_type
         return self._scalar_to_complex_into_top(expr.expr, ty, ctx)
 
     def _scalar_to_complex_into_top(
@@ -5204,6 +5327,29 @@ class CodeGenerator:
     ) -> list[str]:
         """Promote a real-typed expression to (real, 0)."""
         half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
+        if ty.base_type in self._COMPLEX_INT_BASES:
+            # Integer destination: evaluate via the regular int eval
+            # path (or via float→int fistp if the rhs is float-typed).
+            half_basic = ast.BasicType(name=ty.base_type)
+            scalar_ty = self._type_of(scalar_expr, ctx)
+            out: list[str] = []
+            if self._is_float_type(scalar_ty):
+                out += self._eval_float_to_st0(scalar_expr, ctx)
+                out.append("        sub     esp, 4")
+                out.append("        fistp   dword [esp]")
+                out.append("        pop     eax")
+            else:
+                out += self._eval_expr_to_eax(scalar_expr, ctx)
+            out.append("        mov     ecx, [esp]")
+            out += self._store_from_eax("[ecx]", half_basic)
+            # Zero the imag half.
+            for off in range(half_size, half_size * 2, 4):
+                out.append(f"        mov     dword [ecx + {off}], 0")
+            if half_size == 1:
+                out.append(f"        mov     byte [ecx + {half_size}], 0")
+            elif half_size == 2:
+                out.append(f"        mov     word [ecx + {half_size}], 0")
+            return out
         width = "dword" if half_size == 4 else "qword"
         out = self._eval_float_to_st0(scalar_expr, ctx)
         out.append("        mov     ecx, [esp]")
@@ -5220,16 +5366,20 @@ class CodeGenerator:
     ) -> list[str]:
         """`-x` for complex x: (-real, -imag)."""
         half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
-        width = "dword" if half_size == 4 else "qword"
         # Eval operand into our temp first.
-        out = self._eval_complex_into_top(expr.operand, ctx)
+        out = self._eval_complex_into_top(expr.operand, ctx, ty)
         out.append("        mov     ecx, [esp]")
-        out.append(f"        fld     {width} [ecx]")
-        out.append("        fchs")
-        out.append(f"        fstp    {width} [ecx]")
-        out.append(f"        fld     {width} [ecx + {half_size}]")
-        out.append("        fchs")
-        out.append(f"        fstp    {width} [ecx + {half_size}]")
+        if ty.base_type in self._COMPLEX_INT_BASES:
+            self._complex_int_neg_half(out, "ecx", 0, half_size)
+            self._complex_int_neg_half(out, "ecx", half_size, half_size)
+        else:
+            width = "dword" if half_size == 4 else "qword"
+            out.append(f"        fld     {width} [ecx]")
+            out.append("        fchs")
+            out.append(f"        fstp    {width} [ecx]")
+            out.append(f"        fld     {width} [ecx + {half_size}]")
+            out.append("        fchs")
+            out.append(f"        fstp    {width} [ecx + {half_size}]")
         return out
 
     def _complex_conj_into_top(
@@ -5237,13 +5387,37 @@ class CodeGenerator:
     ) -> list[str]:
         """`~x` for complex x: (real, -imag) — complex conjugate."""
         half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
-        width = "dword" if half_size == 4 else "qword"
-        out = self._eval_complex_into_top(expr.operand, ctx)
+        out = self._eval_complex_into_top(expr.operand, ctx, ty)
         out.append("        mov     ecx, [esp]")
-        out.append(f"        fld     {width} [ecx + {half_size}]")
-        out.append("        fchs")
-        out.append(f"        fstp    {width} [ecx + {half_size}]")
+        if ty.base_type in self._COMPLEX_INT_BASES:
+            self._complex_int_neg_half(out, "ecx", half_size, half_size)
+        else:
+            width = "dword" if half_size == 4 else "qword"
+            out.append(f"        fld     {width} [ecx + {half_size}]")
+            out.append("        fchs")
+            out.append(f"        fstp    {width} [ecx + {half_size}]")
         return out
+
+    def _complex_int_neg_half(
+        self, out: list, addr_reg: str, off: int, half_size: int,
+    ) -> None:
+        """Negate the integer half at `[addr_reg + off]` of width
+        `half_size`. Long-long halves use eax/edx; smaller halves
+        use the appropriately-narrow load + neg + store."""
+        if half_size == 8:
+            out.append(f"        mov     eax, [{addr_reg} + {off}]")
+            out.append(f"        mov     edx, [{addr_reg} + {off + 4}]")
+            out.append("        neg     eax")
+            out.append("        adc     edx, 0")
+            out.append("        neg     edx")
+            out.append(f"        mov     [{addr_reg} + {off}], eax")
+            out.append(f"        mov     [{addr_reg} + {off + 4}], edx")
+        elif half_size == 4:
+            out.append(f"        neg     dword [{addr_reg} + {off}]")
+        elif half_size == 2:
+            out.append(f"        neg     word [{addr_reg} + {off}]")
+        elif half_size == 1:
+            out.append(f"        neg     byte [{addr_reg} + {off}]")
 
     def _complex_const_into_top(
         self, real: float, imag: float, ty: ast.ComplexType,
@@ -5285,12 +5459,12 @@ class CodeGenerator:
         out.append("        mov     eax, esp")
         out.append("        push    eax")
         # Eval left into scratch.
-        out += self._eval_complex_into_top(expr.left, ctx)
+        out += self._eval_complex_into_top(expr.left, ctx, ty)
         out.append("        add     esp, 4")  # discard scratch ptr
         # Eval right into the original destination ([esp + size] now).
         out.append(f"        mov     eax, [esp + {size}]")
         out.append("        push    eax")
-        out += self._eval_complex_into_top(expr.right, ctx)
+        out += self._eval_complex_into_top(expr.right, ctx, ty)
         out.append("        add     esp, 4")
         # ECX = original destination, EDX = scratch base (esp).
         out.append(f"        mov     ecx, [esp + {size}]")
@@ -5326,12 +5500,12 @@ class CodeGenerator:
         # Eval left into scratch lo.
         out.append("        mov     eax, esp")
         out.append("        push    eax")
-        out += self._eval_complex_into_top(expr.left, ctx)
+        out += self._eval_complex_into_top(expr.left, ctx, ty)
         out.append("        add     esp, 4")
         # Eval right into scratch mid.
         out.append(f"        lea     eax, [esp + {size}]")
         out.append("        push    eax")
-        out += self._eval_complex_into_top(expr.right, ctx)
+        out += self._eval_complex_into_top(expr.right, ctx, ty)
         out.append("        add     esp, 4")
         # ECX = original dest (at [esp + 2*size]).
         out.append(f"        mov     ecx, [esp + {2 * size}]")
@@ -5371,11 +5545,11 @@ class CodeGenerator:
         out = [f"        sub     esp, {2 * size}"]
         out.append("        mov     eax, esp")
         out.append("        push    eax")
-        out += self._eval_complex_into_top(expr.left, ctx)
+        out += self._eval_complex_into_top(expr.left, ctx, ty)
         out.append("        add     esp, 4")
         out.append(f"        lea     eax, [esp + {size}]")
         out.append("        push    eax")
-        out += self._eval_complex_into_top(expr.right, ctx)
+        out += self._eval_complex_into_top(expr.right, ctx, ty)
         out.append("        add     esp, 4")
         out.append(f"        mov     ecx, [esp + {2 * size}]")
         out.append("        mov     edx, esp")
@@ -5436,7 +5610,7 @@ class CodeGenerator:
         out += self._eval_complex_into_top(
             expr.left if isinstance(lt, ast.ComplexType)
             else ast.Cast(target_type=cty, expr=expr.left),
-            ctx,
+            ctx, cty,
         )
         out.append("        add     esp, 4")
         # Eval right into [esp] (slot 0).
@@ -5445,7 +5619,7 @@ class CodeGenerator:
         out += self._eval_complex_into_top(
             expr.right if isinstance(rt, ast.ComplexType)
             else ast.Cast(target_type=cty, expr=expr.right),
-            ctx,
+            ctx, cty,
         )
         out.append("        add     esp, 4")
         # Compare reals: fld both, fucompp → ax via fnstsw.
@@ -5554,8 +5728,10 @@ class CodeGenerator:
                 and isinstance(rhs.target_type, ast.ComplexType) is False
             )
         ):
-            # Evaluate rhs into &dst directly.
-            out += self._eval_complex_into_top(rhs, ctx)
+            # Evaluate rhs into &dst directly. Pass the destination's
+            # complex type so component-wise math uses the dest's
+            # half width (narrowing where necessary).
+            out += self._eval_complex_into_top(rhs, ctx, ty)
             out.append("        pop     ecx")
             out.append("        mov     eax, ecx")
             return out
@@ -5999,9 +6175,11 @@ class CodeGenerator:
                 # __imag__ is zero (per gcc semantics).
                 return inner
             # `+` and `-` and `~` propagate float / long long / unsigned
-            # through; `!` always produces int.
+            # / complex through; `!` always produces int.
             if expr.op in ("+", "-", "~"):
                 inner = self._type_of(expr.operand, ctx)
+                if isinstance(inner, ast.ComplexType):
+                    return inner
                 if self._is_float_type(inner):
                     return inner
                 if self._is_long_long(inner):
@@ -7583,6 +7761,16 @@ class CodeGenerator:
             return self._inc_dec(expr, ctx)
         if expr.op == "&":
             return self._address_of(expr, ctx)
+        if expr.op in ("__real__", "__imag__"):
+            operand_ty = self._type_of(expr.operand, ctx)
+            if isinstance(operand_ty, ast.ComplexType):
+                # Complex int half: load the integer half from the
+                # appropriate offset and sign- or zero-extend to EAX.
+                if operand_ty.base_type in self._COMPLEX_INT_BASES:
+                    addr_lines, half_ty = self._complex_part_address(
+                        expr, ctx,
+                    )
+                    return addr_lines + self._load_to_eax("[eax]", half_ty)
         if expr.op == "*":
             # Dereference: load the pointer value into EAX, then read from
             # the address it holds. The load width follows the pointee
