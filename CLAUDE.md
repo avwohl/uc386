@@ -251,3 +251,14 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Long-long bit-field `++`/`--`** raises a clear error rather than crashing on tuple unpack.
 
   **Result: 1445/1514 gcc-c-torture** (up from 1308). Combined with c-testsuite at 215/220, the pipeline now passes 1660 / 1734 (95.7%).
+- **2026-04-26 — torture sweep continued: cast-to-struct, complex returns (1445 → 1453)**:
+  - **Cast to struct/union from int/long-long/float.** `(t_be) 0x100000000ULL` type-puns the source into a per-cast temp slot (allocated by `_collect_call_temps` for any Cast whose target is a StructType) and returns the slot's address.
+  - **Static array of `&&label - &&label` differences.** NASM resolves the difference at assemble time. `_emit_global_array_init` detects when any element needs the recursive emit path (LabelAddr or address arithmetic) via a new `_needs_recursive_init` predicate.
+  - **Brace-elision for global struct init.** `struct vc cs[63] = { &a }` (where the struct has a single pointer member) now wraps the non-list value in a synthetic InitializerList rather than rejecting.
+  - **`_Complex T` value return.** Functions returning `_Complex T` use the same retptr ABI as struct-returning functions: caller pushes a hidden buffer pointer as the leftmost arg; callee copies the value into `*__retptr__`. New `_copy_complex_to_retptr` parallels the struct copy.
+  - **`_Complex T` assignment.** `c = c2` for two complex values lowers via a new `_complex_copy_assign` that copies real+imag halves through a per-dword loop. `c = scalar` (int or float) stores the scalar as the real part with imag=0.
+  - **`__real__ foo()` / `__imag__ foo()`** for a complex-returning call. `_collect_call_temps` reserves a per-call-site temp slot for every complex-returning call; `_complex_part_address` and `_complex_value_address` route Call operands through the temp slot.
+
+  **Result: 1453/1514 gcc-c-torture** (up from 1445 in the same session). Combined with c-testsuite at 215/220, the pipeline now passes 1668 / 1734 (96.2%).
+
+  **Remaining ~61 torture failures** cluster around heavyweight features that warrant their own slices: vector types via `__attribute__((vector_size))` (~16 tests), full _Complex arithmetic (`+`/`-`/`*`/`/`/`==` on _Complex values; ~8 tests), variable-length arrays (~4 tests), GCC nested functions with `__label__` cross-function gotos (~9 tests; needs trampolines), long-long bit-field `++`/`--`, _Decimal64, `__int128`, `typeof` in type contexts, anonymous struct/union members in initializers, GCC `cond ?: alt` shorthand, and a few preprocessor edge cases (e.g. `L'1'` inside a macro body).
