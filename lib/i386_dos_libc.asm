@@ -1099,6 +1099,44 @@ ___builtin_clrsb:
         ret
 ___builtin_clrsbl:      jmp ___builtin_clrsb
 
+; __builtin_clrsbll(long long): count leading redundant sign bits
+; in a 64-bit value, minus the sign bit itself. ARG at [ebp+8]:[ebp+12]
+; (low:high). Returns 0..63 in EAX.
+___builtin_clrsbll:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]      ; low half
+        mov     edx, [ebp + 12]     ; high half
+        ; If high bit of EDX is set, invert the whole value so we
+        ; count leading zeros in either case.
+        test    edx, edx
+        jns     .clrsbll_pos
+        not     edx
+        not     eax
+.clrsbll_pos:
+        ; Now we want leading-zero count of EDX:EAX, minus 1 for the
+        ; sign bit. If EDX is non-zero, scan high half. If zero,
+        ; scan low half and add 32.
+        test    edx, edx
+        jz      .clrsbll_low
+        bsr     ecx, edx
+        mov     eax, 30
+        sub     eax, ecx        ; 31 - bsr - 1
+        jmp     .clrsbll_done
+.clrsbll_low:
+        test    eax, eax
+        jz      .clrsbll_zero
+        bsr     ecx, eax
+        mov     eax, 62
+        sub     eax, ecx        ; 32 + 31 - bsr - 1
+        jmp     .clrsbll_done
+.clrsbll_zero:
+        mov     eax, 63
+.clrsbll_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
 ___builtin_bswap64:
         push    ebp
         mov     ebp, esp
