@@ -148,3 +148,7 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **printf format extras: `#`, `+`, `space`, and `hh`/`h` length.** Honors the `#` flag (`0` for `o`, `0x`/`0X` for `x`/`X`), `+` and ` ` flags for signed `d`/`i`, and `hh` (narrow to char) / `h` (narrow to short) length modifiers across `d/i/u/x/X/o`. Fixes `__builtin_sprintf("%#hho", x)`-style tests.
 
   **Result: 1212/1514 gcc-c-torture** (up from 1194). Combined with c-testsuite still 215/220, the run-mode pipeline now passes 1427 / 1734 (82.3%).
+- **2026-04-25 — torture cluster: optimizer width on 32-bit-int targets (1212 → 1214)**:
+  - **uc_core: `_optimize_binary` is_long/is_long_long uses `tc.uint_max` / `tc.ulong_max`, not hardcoded 0xFFFFFFFF.** Previously `is_long = ... or mask >= 0xFFFFFFFF` — on uc80 (16-bit int) this signals "doesn't fit in int", but on uc386 where int and long are both 32-bit, mask=0xFFFFFFFF is just "fits in unsigned int" and doesn't imply long. The wrong is_long bit then leaked through `_literal_mask` (which returns long_long_mask when is_long is True and value > long_max), pushing nested folds (`(2147483647*2U) + 1U`) into long-long. Comparing against the actual type_config widths fixes it.
+
+  **Result: 1214/1514 gcc-c-torture**. Combined with c-testsuite, 1429 / 1734 (82.4%).
