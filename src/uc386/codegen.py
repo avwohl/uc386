@@ -296,6 +296,9 @@ class CodeGenerator:
         # (rounded up to struct alignment).
         self._structs: dict[str, list[tuple[str, ast.TypeNode, int]]] = {}
         self._struct_sizes: dict[str, int] = {}
+        # Names of structs that were declared with `union` so init/copy
+        # paths know members share storage.
+        self._struct_unions: set[str] = set()
         # Enum constant table — `enum c { A, B }` registers A=0, B=1.
         # Identifiers that aren't slots/globals/functions fall back here.
         self._enum_constants: dict[str, int] = {}
@@ -1078,6 +1081,16 @@ class CodeGenerator:
             return expr.value
         if isinstance(expr, ast.CharLiteral):
             return expr.value
+        if isinstance(expr, ast.SizeofType):
+            return self._size_of(expr.target_type)
+        if isinstance(expr, ast.SizeofExpr):
+            # `sizeof(expr)` — operand is unevaluated; we just need its
+            # static type. _type_of needs a ctx, but for top-level usage
+            # (array dimensions, global initializers) there's no function
+            # context. A fresh empty _FuncCtx works because the type-of
+            # path falls through to globals when no local matches.
+            ty = self._type_of(expr.expr, _FuncCtx())
+            return self._size_of(ty)
         if isinstance(expr, ast.Cast):
             # `(myint)1` etc. — the cast is a no-op for integer types
             # at compile time. We don't honor narrowing here; if the
@@ -1895,6 +1908,7 @@ class CodeGenerator:
             total = (total + max_align - 1) & ~(max_align - 1)
             self._structs[decl_name] = members
             self._struct_sizes[decl_name] = total
+            self._struct_unions.add(decl_name)
             return
 
         # Struct layout. Two cursors run in parallel: a byte cursor for
@@ -2098,7 +2112,10 @@ class CodeGenerator:
         read/write the field within that unit.
         """
         obj_ty = self._type_of(expr.obj, ctx)
-        if isinstance(obj_ty, ast.PointerType):
+        # Pointer / array decays to the struct (or struct-pointer) for
+        # member access purposes — `s->m` where `s` is array-of-struct
+        # is the same as `(&s[0])->m`.
+        if isinstance(obj_ty, (ast.PointerType, ast.ArrayType)):
             obj_ty = obj_ty.base_type
         if not isinstance(obj_ty, ast.StructType):
             return None
@@ -2953,8 +2970,11 @@ class CodeGenerator:
                 f"`{name}`: struct must be initialized with `{{...}}` "
                 f"(got {type(init).__name__})"
             )
-        members = self._structs[self._resolve_struct_name(struct_ty)]
+        struct_name = self._resolve_struct_name(struct_ty)
+        members = self._structs[struct_name]
         member_index = {m_name: i for i, (m_name, _, _) in enumerate(members)}
+        bitfields = self._struct_bitfields.get(struct_name, {})
+        is_union = struct_name in self._struct_unions
         # Brace-elide flat values for compound members.
         prev_ctx = self._elision_ctx
         self._elision_ctx = ctx
@@ -2967,6 +2987,13 @@ class CodeGenerator:
         # next un-designated value continues from cursor + 1. After the
         # walk, any unfilled members get zero-filled.
         out: list[str] = []
+        # Up-front whole-struct zero-fill when:
+        #   - there are bit-fields (share storage units across members)
+        #   - the type is a union (members share offset 0)
+        # Both cases break per-member end-zero-fill, which would overwrite
+        # earlier writes that share storage.
+        if bitfields or is_union:
+            out += self._zero_fill_at(base_disp, self._struct_sizes[struct_name])
         filled: set[int] = set()
         cursor = 0
         for value in elided_values:
@@ -3034,15 +3061,57 @@ class CodeGenerator:
                 out += self._struct_copy_from_expr(
                     actual, m_disp, m_ty, ctx,
                 )
+            elif self._is_float_type(m_ty):
+                out += self._eval_float_to_st0(actual, ctx)
+                out += self._store_st0_to(_ebp_addr(m_disp), m_ty)
+            elif self._is_long_long(m_ty):
+                value_ty = self._type_of(actual, ctx)
+                if self._is_long_long(value_ty):
+                    out += self._eval_expr_to_edx_eax(actual, ctx)
+                else:
+                    out += self._eval_expr_to_eax(actual, ctx)
+                    out.append(
+                        "        xor     edx, edx"
+                        if self._is_unsigned(value_ty)
+                        else "        cdq"
+                    )
+                out += self._store_from_edx_eax(_ebp_addr(m_disp))
+            elif m_name_i in bitfields:
+                # Bit-field: synthesize a fake Member node so _bitfield_store
+                # can compute the storage-unit address. We can't pass the
+                # base struct lvalue's name directly, so we build a Member
+                # against an auto-keyed Identifier whose type/address come
+                # from a one-shot synthesized lookup. Easiest: emit the
+                # store inline using the stored bit_offset/width.
+                bit_offset, bit_width = bitfields[m_name_i]
+                mask = (1 << bit_width) - 1
+                clear_mask = (~(mask << bit_offset)) & 0xFFFFFFFF
+                store = self._eval_expr_to_eax(actual, ctx)
+                store.append(f"        and     eax, {mask}")
+                if bit_offset > 0:
+                    store.append(f"        shl     eax, {bit_offset}")
+                # m_disp is the storage unit (offset already equals the
+                # unit_offset). RMW the unit at [ebp + m_disp].
+                unit_addr = _ebp_addr(m_disp)
+                store.append("        push    eax")
+                store.append(f"        mov     ecx, {unit_addr}")
+                store.append(f"        and     ecx, {clear_mask}")
+                store.append("        pop     edx")
+                store.append("        or      ecx, edx")
+                store.append(f"        mov     {unit_addr}, ecx")
+                out += store
             else:
                 out += self._eval_expr_to_eax(actual, ctx)
                 out += self._store_from_eax(_ebp_addr(m_disp), m_ty)
-        # Zero-fill any unfilled members in declaration order.
-        for i, (m_name_i, m_ty, m_off) in enumerate(members):
-            if i not in filled:
-                out += self._zero_fill_at(
-                    base_disp + m_off, self._size_of(m_ty)
-                )
+        # Zero-fill any unfilled non-bit-field members in declaration
+        # order. (Bit-fields and unions are already zeroed by the
+        # up-front whole-struct zero-fill above.)
+        if not bitfields and not is_union:
+            for i, (m_name_i, m_ty, m_off) in enumerate(members):
+                if i not in filled:
+                    out += self._zero_fill_at(
+                        base_disp + m_off, self._size_of(m_ty)
+                    )
         return out
 
     def _zero_fill_at(self, disp: int, size: int) -> list[str]:
@@ -3099,10 +3168,21 @@ class CodeGenerator:
                 stmt.value, ret_ty, retptr_disp, ctx
             ) + ["        jmp     .epilogue"]
         if self._is_long_long(ctx.return_type):
-            # cdecl returns 64-bit values in EDX:EAX (high:low).
-            return self._eval_expr_to_edx_eax(stmt.value, ctx) + [
-                "        jmp     .epilogue",
-            ]
+            # cdecl returns 64-bit values in EDX:EAX (high:low). If the
+            # value expression is itself 64-bit, eval directly; otherwise
+            # eval as 32-bit and widen per signedness.
+            value_ty = self._type_of(stmt.value, ctx)
+            if self._is_long_long(value_ty):
+                return self._eval_expr_to_edx_eax(stmt.value, ctx) + [
+                    "        jmp     .epilogue",
+                ]
+            out = self._eval_expr_to_eax(stmt.value, ctx)
+            if self._is_unsigned(value_ty):
+                out.append("        xor     edx, edx")
+            else:
+                out.append("        cdq")
+            out.append("        jmp     .epilogue")
+            return out
         # For sub-word return types (char / short), narrow EAX to the
         # type's width and re-extend per signedness — matches C's
         # "value narrows to the return type on return".
@@ -3340,16 +3420,18 @@ class CodeGenerator:
             return self._identifier_type(expr.name, ctx)
         if isinstance(expr, ast.IntLiteral):
             # Honor the L/U suffixes per C: 17L → long, 17U → unsigned int,
-            # 17LL → long long. uc_core's parser sets is_long=True for
-            # both L and LL, so we additionally check if the literal's
-            # value overflows 32 bits — that forces it to long long.
+            # 17LL → long long. The parser sets is_long_long=True for `LL`
+            # specifically; we also promote to long long when the value
+            # overflows 32 bits.
             name = "int"
             v = expr.value
             unsigned = getattr(expr, "is_unsigned", False)
             is_long = getattr(expr, "is_long", False)
+            is_long_long = getattr(expr, "is_long_long", False)
             limit = 0xFFFFFFFF if unsigned else 0x7FFFFFFF
             if (
-                (is_long and v > limit)
+                is_long_long
+                or (is_long and v > limit)
                 or v > 0xFFFFFFFF
                 or v < -0x80000000
             ):
@@ -3382,14 +3464,16 @@ class CodeGenerator:
             if expr.op in ("++", "--"):
                 # Mutation in place; the expression's type matches the operand.
                 return self._type_of(expr.operand, ctx)
-            # `+` and `-` and `~` propagate float / long long through;
-            # `!` always produces int.
+            # `+` and `-` and `~` propagate float / long long / unsigned
+            # through; `!` always produces int.
             if expr.op in ("+", "-", "~"):
                 inner = self._type_of(expr.operand, ctx)
                 if self._is_float_type(inner):
                     return inner
                 if self._is_long_long(inner):
                     return inner
+                if self._is_unsigned(inner):
+                    return ast.BasicType(name="int", is_signed=False)
             return ast.BasicType(name="int")
         if isinstance(expr, ast.Index):
             arr_type = self._type_of(expr.array, ctx)
@@ -3688,28 +3772,55 @@ class CodeGenerator:
                 out.append("        cdq")
             return out
         if isinstance(expr, ast.Index):
-            addr = self._index_address(expr, ctx)
-            # _index_address leaves &arr[i] in eax. Load 8 bytes through
-            # that, but be careful — load order matters because we
-            # clobber eax on the second mov. Use ecx as the addr.
-            out = list(addr)
-            return out + [
-                "        mov     ecx, eax",
-                "        mov     eax, [ecx]",
-                "        mov     edx, [ecx + 4]",
-            ]
+            elem_ty = self._type_of(expr, ctx)
+            if self._is_long_long(elem_ty):
+                addr = self._index_address(expr, ctx)
+                out = list(addr)
+                return out + [
+                    "        mov     ecx, eax",
+                    "        mov     eax, [ecx]",
+                    "        mov     edx, [ecx + 4]",
+                ]
+            # Sub-LL element in LL context: load 32-bit value via
+            # `_index_load`, then extend per signedness.
+            out = self._eval_expr_to_eax(expr, ctx)
+            if self._is_unsigned(elem_ty):
+                out.append("        xor     edx, edx")
+            else:
+                out.append("        cdq")
+            return out
         if isinstance(expr, ast.Member):
-            out = self._member_address(expr, ctx)
-            return out + [
-                "        mov     ecx, eax",
-                "        mov     eax, [ecx]",
-                "        mov     edx, [ecx + 4]",
-            ]
+            mem_ty = self._type_of(expr, ctx)
+            if self._is_long_long(mem_ty):
+                out = self._member_address(expr, ctx)
+                return out + [
+                    "        mov     ecx, eax",
+                    "        mov     eax, [ecx]",
+                    "        mov     edx, [ecx + 4]",
+                ]
+            out = self._eval_expr_to_eax(expr, ctx)
+            if self._is_unsigned(mem_ty):
+                out.append("        xor     edx, edx")
+            else:
+                out.append("        cdq")
+            return out
         if isinstance(expr, ast.Cast):
             target = expr.target_type
             src_ty = self._type_of(expr.expr, ctx)
-            if self._is_long_long(src_ty):
+            if self._is_long_long(src_ty) and self._is_long_long(target):
+                # ll → ll: pass through (signedness-only changes are
+                # bit-identical at the EDX:EAX level).
                 return self._eval_expr_to_edx_eax(expr.expr, ctx)
+            if self._is_long_long(src_ty):
+                # ll → narrow type, but parent wants 64 bits. Eval as 32
+                # via the int-cast path (truncates to target), then
+                # re-extend to fill EDX per the target's signedness.
+                out = self._eval_expr_to_eax(expr, ctx)
+                if self._is_unsigned(target):
+                    out.append("        xor     edx, edx")
+                else:
+                    out.append("        cdq")
+                return out
             if self._is_long_long(target):
                 # int → long long: extend per the SOURCE's signedness
                 # (since the value's bit pattern comes from the source).
@@ -3764,13 +3875,23 @@ class CodeGenerator:
                 out = self._eval_expr_to_edx_eax(expr.operand, ctx)
                 return out + ["        not     eax", "        not     edx"]
             if expr.op == "*":
-                # Dereferencing a long-long pointer.
-                out = self._eval_expr_to_eax(expr.operand, ctx)
-                return out + [
-                    "        mov     ecx, eax",
-                    "        mov     eax, [ecx]",
-                    "        mov     edx, [ecx + 4]",
-                ]
+                # Dereferencing in long-long context. If the pointee is
+                # itself long-long, load 8 bytes; otherwise load 32 bits
+                # via the standard path and extend per signedness.
+                pointee = self._type_of(expr, ctx)
+                if self._is_long_long(pointee):
+                    out = self._eval_expr_to_eax(expr.operand, ctx)
+                    return out + [
+                        "        mov     ecx, eax",
+                        "        mov     eax, [ecx]",
+                        "        mov     edx, [ecx + 4]",
+                    ]
+                out = self._eval_expr_to_eax(expr, ctx)
+                if self._is_unsigned(pointee):
+                    out.append("        xor     edx, edx")
+                else:
+                    out.append("        cdq")
+                return out
             if expr.op in ("++", "--"):
                 # ++/-- on a long-long lvalue.
                 return self._inc_dec_ll(expr, ctx)
@@ -3795,6 +3916,16 @@ class CodeGenerator:
             # path leaves the low half in EAX; we need to make sure EDX
             # is preserved as the high half.
             return self._call(expr, ctx)
+        if isinstance(expr, ast.VaArgExpr):
+            target_ty = expr.target_type
+            if self._is_long_long(target_ty):
+                ap_addr = self._va_arg_ap_addr(expr, ctx)
+                return [
+                    f"        mov     ecx, {ap_addr}",
+                    f"        add     dword {ap_addr}, 8",
+                    "        mov     eax, [ecx]",
+                    "        mov     edx, [ecx + 4]",
+                ]
         # Fallback: eval as 32-bit, sign-extend.
         out = self._eval_expr_to_eax(expr, ctx)
         try:
@@ -3815,6 +3946,19 @@ class CodeGenerator:
         """
         op = expr.op
         if op == "=":
+            # If the lhs isn't long-long itself, route through the
+            # regular 32-bit assign (which narrows to the lhs's width)
+            # and then re-extend EAX to EDX:EAX per the lhs's
+            # signedness — that matches C's "result of `=` is the value
+            # stored in the lhs after conversion to its type".
+            lhs_ty = self._type_of(expr.left, ctx)
+            if not self._is_long_long(lhs_ty):
+                out = self._assign(expr, ctx)
+                if self._is_unsigned(lhs_ty):
+                    out.append("        xor     edx, edx")
+                else:
+                    out.append("        cdq")
+                return out
             return self._assign_ll(expr, ctx)
         # Right to EDX:EAX, push (high then low so low ends up on top).
         right = self._eval_expr_to_edx_eax(expr.right, ctx)
@@ -4679,6 +4823,11 @@ class CodeGenerator:
             # the address it holds. The load width follows the pointee
             # type — `*char_ptr` reads one byte (sign-extended), not four.
             pointee_ty = self._type_of(expr, ctx)
+            # Array (or struct) pointee in value context decays to its
+            # address — `*pa` where `pa` has type `T(*)[N]` evaluates to
+            # the address of the array, not its contents.
+            if isinstance(pointee_ty, (ast.ArrayType, ast.StructType)):
+                return self._eval_expr_to_eax(expr.operand, ctx)
             return self._eval_expr_to_eax(expr.operand, ctx) + self._load_to_eax(
                 "[eax]", pointee_ty
             )
@@ -4764,6 +4913,13 @@ class CodeGenerator:
         (or `inc/dec` for step=1) — same shape as the Identifier path
         but with the address in a register rather than a slot.
         """
+        # Bit-field ++/--: read-modify-write the bit-field via load/store
+        # helpers since width-aware RMW on the storage unit can't be a
+        # simple `add dword [...]`.
+        if isinstance(expr.operand, ast.Member):
+            bf = self._bitfield_info(expr.operand, ctx)
+            if bf is not None:
+                return self._inc_dec_bitfield(expr, bf, ctx)
         if isinstance(expr.operand, ast.Index):
             addr_lines = self._index_address(expr.operand, ctx)
         elif isinstance(expr.operand, ast.UnaryOp) and expr.operand.op == "*":
@@ -4798,6 +4954,68 @@ class CodeGenerator:
         out.append("        mov     ecx, eax")
         out += self._load_to_eax("[ecx]", target_ty)
         out.append(f"        {op_mnem}     {width} [ecx], {step}")
+        return out
+
+    def _inc_dec_bitfield(
+        self,
+        expr: ast.UnaryOp,
+        bf: tuple[int, int, ast.TypeNode],
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """`++` / `--` on a bit-field member.
+
+        Compute &storage_unit once, load the field's value (with
+        bit-offset/width handling and signed sign-extend), bump it,
+        rewrite the storage unit. EAX holds the value the postfix /
+        prefix form should yield.
+        """
+        bit_offset, bit_width, member_ty = bf
+        mask = (1 << bit_width) - 1
+        clear_mask = (~(mask << bit_offset)) & 0xFFFFFFFF
+        is_unsigned = self._is_unsigned(member_ty)
+        delta = 1 if expr.op == "++" else -1
+        # eax = &unit, save in ebx
+        out = self._member_address(expr.operand, ctx)
+        out.append("        mov     ebx, eax")
+        # Load old value into eax (post-shift, post-mask, sign-extended).
+        out.append("        mov     eax, [ebx]")
+        if bit_offset > 0:
+            out.append(f"        shr     eax, {bit_offset}")
+        out.append(f"        and     eax, {mask}")
+        if not is_unsigned and bit_width < 32:
+            shift = 32 - bit_width
+            out.append(f"        shl     eax, {shift}")
+            out.append(f"        sar     eax, {shift}")
+        # ecx = bumped value. For postfix we save the OLD eax first.
+        if not expr.is_prefix:
+            out.append("        push    eax")
+        if delta == 1:
+            out.append("        lea     ecx, [eax + 1]")
+        else:
+            out.append("        lea     ecx, [eax - 1]")
+        # Mask the bumped value to bit_width and shift into position.
+        out.append(f"        and     ecx, {mask}")
+        if bit_offset > 0:
+            out.append(f"        shl     ecx, {bit_offset}")
+        # Read storage unit, clear the field bits, OR in new positioned val.
+        out.append("        mov     edx, [ebx]")
+        out.append(f"        and     edx, {clear_mask}")
+        out.append("        or      edx, ecx")
+        out.append("        mov     [ebx], edx")
+        if expr.is_prefix:
+            # eax already has the OLD value; we need the new one. The
+            # simplest is to reload from the just-stored unit so the
+            # sign-extend semantics match _bitfield_load.
+            out.append("        mov     eax, edx")
+            if bit_offset > 0:
+                out.append(f"        shr     eax, {bit_offset}")
+            out.append(f"        and     eax, {mask}")
+            if not is_unsigned and bit_width < 32:
+                shift = 32 - bit_width
+                out.append(f"        shl     eax, {shift}")
+                out.append(f"        sar     eax, {shift}")
+        else:
+            out.append("        pop     eax")
         return out
 
     @staticmethod

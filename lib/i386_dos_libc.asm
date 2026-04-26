@@ -685,47 +685,52 @@ _longjmp:
         mov     ax, 0x4C7F
         int     21h
 ___builtin_mul_overflow:
-        ; Three pointer args: (a, b, *result). Returns int (0=ok, 1=overflow).
-        ; We approximate without overflow detection: *result = a * b; return 0.
+        ; Three args: int a, int b, int *result. Returns 1 on overflow.
+        ; Uses one-operand IMUL so OF reflects whether the 64-bit signed
+        ; product fits in 32 bits.
         push    ebp
         mov     ebp, esp
         push    edi
         mov     eax, [ebp + 8]
-        imul    eax, [ebp + 12]
+        imul    dword [ebp + 12]
+        seto    cl
         mov     edi, [ebp + 16]
         mov     [edi], eax
-        xor     eax, eax
+        movzx   eax, cl
         pop     edi
         mov     esp, ebp
         pop     ebp
         ret
 ___builtin_add_overflow:
+        ; Three args: int a, int b, int *result. Returns 1 on overflow.
         push    ebp
         mov     ebp, esp
         push    edi
         mov     eax, [ebp + 8]
         add     eax, [ebp + 12]
+        seto    cl
         mov     edi, [ebp + 16]
         mov     [edi], eax
-        xor     eax, eax
+        movzx   eax, cl
         pop     edi
         mov     esp, ebp
         pop     ebp
         ret
 ___builtin_sub_overflow:
+        ; Three args: int a, int b, int *result. Returns 1 on overflow.
         push    ebp
         mov     ebp, esp
         push    edi
         mov     eax, [ebp + 8]
         sub     eax, [ebp + 12]
+        seto    cl
         mov     edi, [ebp + 16]
         mov     [edi], eax
-        xor     eax, eax
+        movzx   eax, cl
         pop     edi
         mov     esp, ebp
         pop     ebp
         ret
-
 ___builtin_bswap16:
         push    ebp
         mov     ebp, esp
