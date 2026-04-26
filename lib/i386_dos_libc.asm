@@ -707,6 +707,175 @@ ___builtin_bswap32:
         mov     esp, ebp
         pop     ebp
         ret
+
+; long-variants on i386 are 32-bit, so they're aliases.
+___builtin_clzl:        jmp ___builtin_clz
+___builtin_ctzl:        jmp ___builtin_ctz
+___builtin_popcountl:   jmp ___builtin_popcount
+___builtin_ffsl:        jmp ___builtin_ffs
+
+; ffs(x) — find first set: bit position of lowest set bit, 1-based,
+; or 0 if x is 0.
+___builtin_ffs:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        test    eax, eax
+        jz      .ffs_zero
+        bsf     eax, eax
+        inc     eax
+        jmp     .ffs_done
+.ffs_zero:
+        xor     eax, eax
+.ffs_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; long-long variants — 64-bit input is in [esp+4..11].
+___builtin_clzll:
+        push    ebp
+        mov     ebp, esp
+        mov     edx, [ebp + 12]   ; high 32
+        test    edx, edx
+        jz      .clzll_lo
+        bsr     ecx, edx
+        mov     eax, 31
+        sub     eax, ecx
+        jmp     .clzll_done
+.clzll_lo:
+        mov     eax, [ebp + 8]
+        test    eax, eax
+        jz      .clzll_zero
+        bsr     ecx, eax
+        mov     eax, 63
+        sub     eax, ecx
+        jmp     .clzll_done
+.clzll_zero:
+        mov     eax, 64
+.clzll_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+___builtin_ctzll:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        test    eax, eax
+        jz      .ctzll_hi
+        bsf     eax, eax
+        jmp     .ctzll_done
+.ctzll_hi:
+        mov     eax, [ebp + 12]
+        test    eax, eax
+        jz      .ctzll_zero
+        bsf     eax, eax
+        add     eax, 32
+        jmp     .ctzll_done
+.ctzll_zero:
+        mov     eax, 64
+.ctzll_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+___builtin_ffsll:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        test    eax, eax
+        jz      .ffsll_hi
+        bsf     eax, eax
+        inc     eax
+        jmp     .ffsll_done
+.ffsll_hi:
+        mov     eax, [ebp + 12]
+        test    eax, eax
+        jz      .ffsll_zero
+        bsf     eax, eax
+        add     eax, 33
+        jmp     .ffsll_done
+.ffsll_zero:
+        xor     eax, eax
+.ffsll_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+___builtin_popcountll:
+        push    ebp
+        mov     ebp, esp
+        push    [ebp + 8]
+        call    ___builtin_popcount
+        add     esp, 4
+        push    eax
+        push    [ebp + 12]
+        call    ___builtin_popcount
+        add     esp, 4
+        pop     ecx
+        add     eax, ecx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+___builtin_parity:
+        push    ebp
+        mov     ebp, esp
+        push    dword [ebp + 8]
+        call    ___builtin_popcount
+        add     esp, 4
+        and     eax, 1
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+___builtin_parityl:     jmp ___builtin_parity
+___builtin_parityll:
+        push    ebp
+        mov     ebp, esp
+        push    dword [ebp + 8]
+        call    ___builtin_popcountll
+        add     esp, 8
+        and     eax, 1
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; clrsb: count leading redundant sign bits — bits matching the
+; sign bit, minus 1.
+___builtin_clrsb:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        test    eax, eax
+        jns     .clrsb_pos
+        not     eax
+.clrsb_pos:
+        test    eax, eax
+        jz      .clrsb_zero
+        bsr     ecx, eax
+        mov     eax, 30
+        sub     eax, ecx
+        jmp     .clrsb_done
+.clrsb_zero:
+        mov     eax, 31
+.clrsb_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+___builtin_clrsbl:      jmp ___builtin_clrsb
+
+___builtin_bswap64:
+        push    ebp
+        mov     ebp, esp
+        mov     edx, [ebp + 8]
+        mov     eax, [ebp + 12]
+        bswap   eax
+        bswap   edx
+        mov     esp, ebp
+        pop     ebp
+        ret
 ___builtin_prefetch:
         ret                          ; no-op
 ___builtin_signbit:
