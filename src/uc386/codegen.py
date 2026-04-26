@@ -766,8 +766,84 @@ class CodeGenerator:
             # An enum is int-sized; treat the init as an int literal.
             value = self._const_eval(init, name)
             return [f"        dd      {value}"]
+        if isinstance(ty, ast.ComplexType):
+            return self._emit_global_complex_init(ty, init, name)
         raise CodegenError(
             f"global `{name}`: unsupported type {type(ty).__name__}"
+        )
+
+    def _emit_global_complex_init(
+        self,
+        ty: ast.ComplexType,
+        init: ast.Expression,
+        name: str,
+    ) -> list[str]:
+        """Lay out a `_Complex T` global as two T values: real, imag.
+
+        Supports compile-time complex arithmetic via
+        `_const_eval_complex`, which returns a `(real, imag)` tuple.
+        """
+        real, imag = self._const_eval_complex(init, name)
+        directive = "dd" if ty.base_type == "float" else "dq"
+        return [f"        {directive}      {real!r}, {imag!r}"]
+
+    def _const_eval_complex(
+        self, expr: ast.Expression, name: str,
+    ) -> tuple[float, float]:
+        """Compile-time fold a complex expression to a `(real, imag)`
+        pair of floats. Recognizes imaginary float literals, complex
+        unary `-/+`, and binary `+/-/*` between complex (or scalar)
+        operands.
+        """
+        while isinstance(expr, ast.Cast):
+            expr = expr.expr
+        if isinstance(expr, ast.FloatLiteral):
+            v = float(expr.value)
+            return (0.0, v) if expr.is_imaginary else (v, 0.0)
+        if isinstance(expr, ast.IntLiteral):
+            return (float(expr.value), 0.0)
+        if isinstance(expr, ast.UnaryOp):
+            if expr.op in ("+", "-"):
+                ar, ai = self._const_eval_complex(expr.operand, name)
+                if expr.op == "-":
+                    return (-ar, -ai)
+                return (ar, ai)
+            if expr.op == "~":
+                # Complex conjugate: negate imag.
+                ar, ai = self._const_eval_complex(expr.operand, name)
+                return (ar, -ai)
+        if isinstance(expr, ast.BinaryOp):
+            if expr.op in ("+", "-", "*", "/"):
+                lr, li = self._const_eval_complex(expr.left, name)
+                rr, ri = self._const_eval_complex(expr.right, name)
+                if expr.op == "+":
+                    return (lr + rr, li + ri)
+                if expr.op == "-":
+                    return (lr - rr, li - ri)
+                if expr.op == "*":
+                    return (lr * rr - li * ri, lr * ri + li * rr)
+                if expr.op == "/":
+                    denom = rr * rr + ri * ri
+                    if denom == 0:
+                        raise CodegenError(
+                            f"global `{name}`: complex division by zero"
+                        )
+                    return (
+                        (lr * rr + li * ri) / denom,
+                        (li * rr - lr * ri) / denom,
+                    )
+        # InitializerList `{r, i}` — explicit two-value form.
+        if isinstance(expr, ast.InitializerList):
+            if len(expr.values) == 1:
+                r, _ = self._const_eval_complex(expr.values[0], name)
+                return (r, 0.0)
+            if len(expr.values) == 2:
+                r, _ = self._const_eval_complex(expr.values[0], name)
+                i, _ = self._const_eval_complex(expr.values[1], name)
+                return (r, i)
+        raise CodegenError(
+            f"global `{name}`: complex init must be a constant "
+            f"expression (got {type(expr).__name__})"
         )
 
     def _emit_global_struct_init(
@@ -2125,6 +2201,17 @@ class CodeGenerator:
                 # via a per-cast temp slot.
                 size = (self._size_of(sub.target_type) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
+            elif isinstance(sub, (ast.BinaryOp, ast.UnaryOp, ast.Cast)):
+                # Complex-valued sub-expression: needs a temp slot
+                # to hold the (real, imag) result. One per node so
+                # `(a+b) + (c+d)` allocates distinct buffers.
+                try:
+                    ty = self._type_of(sub, ctx)
+                except CodegenError:
+                    continue
+                if isinstance(ty, ast.ComplexType):
+                    size = (self._size_of(ty) + 3) & ~3
+                    ctx.alloc_call_temp(sub, size)
 
     def _compound_temp_size(self, node: ast.Compound) -> int:
         """Size of the per-call-site temp slot for a compound literal.
@@ -2339,6 +2426,18 @@ class CodeGenerator:
             disp = ctx.call_temps[id(expr)]
             retptr_lines = [f"        lea     eax, {_ebp_addr(disp)}"]
             out = self._call_into_address(expr, retptr_lines, ctx)
+            out.append(f"        lea     eax, {_ebp_addr(disp)}")
+            return out
+        # Complex-valued sub-expression (BinaryOp / UnaryOp / Cast):
+        # evaluate into the pre-allocated temp slot reserved by
+        # `_collect_call_temps`, then return its address.
+        if (
+            isinstance(expr, (ast.BinaryOp, ast.UnaryOp, ast.Cast))
+            and id(expr) in ctx.call_temps
+        ):
+            disp = ctx.call_temps[id(expr)]
+            dest = [f"        lea     eax, {_ebp_addr(disp)}"]
+            out = self._eval_complex_to(expr, dest, ctx)
             out.append(f"        lea     eax, {_ebp_addr(disp)}")
             return out
         raise CodegenError(
@@ -4878,6 +4977,468 @@ class CodeGenerator:
         out.append("        jmp     .epilogue")
         return out
 
+    def _complex_promotion(
+        self, lt: ast.TypeNode, rt: ast.TypeNode,
+    ) -> ast.ComplexType:
+        """Result type of a complex-arithmetic op.
+
+        Per C: if either operand is `_Complex double`, the result is
+        `_Complex double`. Otherwise (one operand is `_Complex float`)
+        the result is `_Complex float`.
+        """
+        bases = []
+        for t in (lt, rt):
+            if isinstance(t, ast.ComplexType):
+                bases.append(t.base_type)
+            elif isinstance(t, ast.BasicType) and t.name == "double":
+                bases.append("double")
+        if "long double" in bases:
+            return ast.ComplexType(base_type="long double")
+        if "double" in bases:
+            return ast.ComplexType(base_type="double")
+        return ast.ComplexType(base_type="float")
+
+    def _expr_is_complex(self, expr: ast.Expression) -> bool:
+        """Cheap probe: does this expression yield a `_Complex T`?"""
+        ty = self._type_of_complex_expr(expr)
+        return ty is not None
+
+    def _type_of_complex_expr(
+        self, expr: ast.Expression,
+    ) -> ast.ComplexType | None:
+        """Return `ComplexType` for a complex-valued expression, else
+        None. Used to decide whether to allocate a temp and route
+        through the complex codegen path.
+
+        We can't always call `_type_of` here because the temp-alloc
+        pass runs on the function body before locals are bound — so
+        Identifier name lookup in `_type_of` may fail. Walk only the
+        structural cases the alloc pass needs.
+        """
+        if isinstance(expr, ast.FloatLiteral) and expr.is_imaginary:
+            # `1.0i` — `_Imaginary T` ≡ `_Complex T` with real=0.
+            return ast.ComplexType(
+                base_type="float" if expr.is_float else "double",
+            )
+        if isinstance(expr, ast.Cast):
+            if isinstance(expr.target_type, ast.ComplexType):
+                return expr.target_type
+            return None
+        if isinstance(expr, ast.UnaryOp):
+            if expr.op in ("+", "-", "~"):
+                return self._type_of_complex_expr(expr.operand)
+            if expr.op in ("__real__", "__imag__"):
+                return None
+            if expr.op in ("*", "&"):
+                return None
+            return None
+        if isinstance(expr, ast.BinaryOp):
+            if expr.op in ("+", "-", "*", "/", "="):
+                lt = self._type_of_complex_expr(expr.left)
+                rt = self._type_of_complex_expr(expr.right)
+                if lt is not None or rt is not None:
+                    return lt if lt is not None else rt
+            return None
+        return None
+
+    def _eval_complex_to(
+        self,
+        expr: ast.Expression,
+        dest_addr_in_eax: list[str],
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Evaluate a complex-typed expression, storing the result at
+        the address produced by `dest_addr_in_eax` (a sequence of asm
+        lines that leaves &dest in EAX).
+
+        After the helper runs, EAX holds &dest (callers can chain).
+        """
+        # Push the destination address.
+        out = list(dest_addr_in_eax)
+        out.append("        push    eax")
+        out += self._eval_complex_into_top(expr, ctx)
+        out.append("        pop     eax")
+        return out
+
+    def _eval_complex_into_top(
+        self, expr: ast.Expression, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Helper: store a complex value into `[esp]`'s pointed-to
+        slot (the top of stack is the destination address; we leave
+        it there so callers can pop it).
+        """
+        ty = self._type_of(expr, ctx)
+        # `(_Complex T) scalar` cast — store scalar as real, 0 as imag.
+        if isinstance(expr, ast.Cast) and isinstance(
+            expr.target_type, ast.ComplexType
+        ):
+            return self._cast_to_complex_into_top(expr, ctx)
+        if not isinstance(ty, ast.ComplexType):
+            # Real-valued expression in complex context: promote to
+            # (real, 0). Use a synthetic ComplexType matching the
+            # value's float width for the imag-zero fill.
+            promoted = ast.ComplexType(
+                base_type=(
+                    "double"
+                    if isinstance(ty, ast.BasicType) and ty.name == "double"
+                    else "float"
+                ),
+            )
+            return self._scalar_to_complex_into_top(expr, promoted, ctx)
+        half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
+        # If expr is an lvalue / Call / __real__ wrapper, we already
+        # have an addressing helper that gives us &expr; copy from there.
+        if isinstance(expr, (ast.Identifier, ast.Member, ast.Index)) or (
+            isinstance(expr, ast.UnaryOp) and expr.op == "*"
+        ) or (
+            isinstance(expr, ast.Call)
+            and self._is_complex_returning_call(expr, ctx)
+        ):
+            return self._copy_complex_lvalue_into_top(expr, ty, ctx)
+        if isinstance(expr, ast.UnaryOp):
+            if expr.op == "+":
+                return self._eval_complex_into_top(expr.operand, ctx)
+            if expr.op == "-":
+                return self._complex_neg_into_top(expr, ty, ctx)
+            if expr.op == "~":
+                return self._complex_conj_into_top(expr, ty, ctx)
+        if isinstance(expr, ast.BinaryOp):
+            if expr.op == "=":
+                return self._complex_assign_into_top(expr, ty, ctx)
+            if expr.op in ("+", "-"):
+                return self._complex_addsub_into_top(expr, ty, ctx)
+            if expr.op == "*":
+                return self._complex_mul_into_top(expr, ty, ctx)
+            if expr.op == "/":
+                return self._complex_div_into_top(expr, ty, ctx)
+        # Imaginary FloatLiteral or scalar-typed sub-expression that
+        # got promoted to complex (rare). Treat as (0, value) or
+        # (value, 0) depending on whether it's imaginary.
+        if isinstance(expr, ast.FloatLiteral) and expr.is_imaginary:
+            return self._complex_const_into_top(0.0, expr.value, ty)
+        # Fallback: evaluate as a scalar (real part), zero the imag.
+        return self._scalar_to_complex_into_top(expr, ty, ctx)
+
+    def _copy_complex_lvalue_into_top(
+        self,
+        expr: ast.Expression,
+        ty: ast.ComplexType,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Copy from a complex-valued lvalue/Call into the top-of-stack
+        destination."""
+        size = self._size_of(ty)
+        out = self._complex_value_address(expr, ctx)
+        out.append("        mov     edx, eax")
+        out.append("        mov     ecx, [esp]")
+        offset = 0
+        while size - offset >= 4:
+            out.append(f"        mov     eax, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], eax")
+            offset += 4
+        return out
+
+    def _cast_to_complex_into_top(
+        self, expr: ast.Cast, ctx: _FuncCtx,
+    ) -> list[str]:
+        """`(_Complex T) scalar` — store scalar as real part, 0 as imag."""
+        ty = expr.target_type
+        return self._scalar_to_complex_into_top(expr.expr, ty, ctx)
+
+    def _scalar_to_complex_into_top(
+        self,
+        scalar_expr: ast.Expression,
+        ty: ast.ComplexType,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Promote a real-typed expression to (real, 0)."""
+        half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
+        width = "dword" if half_size == 4 else "qword"
+        out = self._eval_float_to_st0(scalar_expr, ctx)
+        out.append("        mov     ecx, [esp]")
+        out.append(f"        fstp    {width} [ecx]")
+        if half_size == 4:
+            out.append(f"        mov     dword [ecx + {half_size}], 0")
+        else:
+            out.append(f"        mov     dword [ecx + {half_size}], 0")
+            out.append(f"        mov     dword [ecx + {half_size + 4}], 0")
+        return out
+
+    def _complex_neg_into_top(
+        self, expr: ast.UnaryOp, ty: ast.ComplexType, ctx: _FuncCtx,
+    ) -> list[str]:
+        """`-x` for complex x: (-real, -imag)."""
+        half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
+        width = "dword" if half_size == 4 else "qword"
+        # Eval operand into our temp first.
+        out = self._eval_complex_into_top(expr.operand, ctx)
+        out.append("        mov     ecx, [esp]")
+        out.append(f"        fld     {width} [ecx]")
+        out.append("        fchs")
+        out.append(f"        fstp    {width} [ecx]")
+        out.append(f"        fld     {width} [ecx + {half_size}]")
+        out.append("        fchs")
+        out.append(f"        fstp    {width} [ecx + {half_size}]")
+        return out
+
+    def _complex_conj_into_top(
+        self, expr: ast.UnaryOp, ty: ast.ComplexType, ctx: _FuncCtx,
+    ) -> list[str]:
+        """`~x` for complex x: (real, -imag) — complex conjugate."""
+        half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
+        width = "dword" if half_size == 4 else "qword"
+        out = self._eval_complex_into_top(expr.operand, ctx)
+        out.append("        mov     ecx, [esp]")
+        out.append(f"        fld     {width} [ecx + {half_size}]")
+        out.append("        fchs")
+        out.append(f"        fstp    {width} [ecx + {half_size}]")
+        return out
+
+    def _complex_const_into_top(
+        self, real: float, imag: float, ty: ast.ComplexType,
+    ) -> list[str]:
+        """Constant `(real, imag)` complex value — interned via the
+        float-constant table for each half."""
+        half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
+        width = "dword" if half_size == 4 else "qword"
+        r_label = self._intern_float(real, half_size)
+        i_label = self._intern_float(imag, half_size)
+        return [
+            "        mov     ecx, [esp]",
+            f"        fld     {width} [{r_label}]",
+            f"        fstp    {width} [ecx]",
+            f"        fld     {width} [{i_label}]",
+            f"        fstp    {width} [ecx + {half_size}]",
+        ]
+
+    def _complex_addsub_into_top(
+        self, expr: ast.BinaryOp, ty: ast.ComplexType, ctx: _FuncCtx,
+    ) -> list[str]:
+        """`a + b` or `a - b` for complex values. Component-wise.
+
+        Allocate scratch slot for left, evaluate left into scratch,
+        evaluate right into top-of-stack, then add/sub component-wise.
+        """
+        half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
+        width = "dword" if half_size == 4 else "qword"
+        # Use the left operand's pre-allocated temp (reserved by
+        # _collect_call_temps) — the left expression itself is a
+        # complex sub-expression so it'll have a temp.
+        # Actually, `a` may be a leaf (Identifier) without a temp.
+        # Easier: stack-allocate scratch space via push/pop.
+        size = self._size_of(ty)  # 8 or 16
+        # Reserve scratch on the stack: sub esp, size.
+        out = [f"        sub     esp, {size}"]
+        # Save destination ptr (currently [esp + size] after the sub).
+        # Push the scratch's address as a target.
+        out.append("        mov     eax, esp")
+        out.append("        push    eax")
+        # Eval left into scratch.
+        out += self._eval_complex_into_top(expr.left, ctx)
+        out.append("        add     esp, 4")  # discard scratch ptr
+        # Eval right into the original destination ([esp + size] now).
+        out.append(f"        mov     eax, [esp + {size}]")
+        out.append("        push    eax")
+        out += self._eval_complex_into_top(expr.right, ctx)
+        out.append("        add     esp, 4")
+        # ECX = original destination, EDX = scratch base (esp).
+        out.append(f"        mov     ecx, [esp + {size}]")
+        out.append("        mov     edx, esp")
+        # Apply faddp/fsubp component-wise.
+        op_word = "faddp" if expr.op == "+" else "fsubp"
+        # real
+        out.append(f"        fld     {width} [edx]")
+        out.append(f"        fld     {width} [ecx]")
+        out.append(f"        {op_word}   st1, st0")
+        out.append(f"        fstp    {width} [ecx]")
+        # imag
+        out.append(f"        fld     {width} [edx + {half_size}]")
+        out.append(f"        fld     {width} [ecx + {half_size}]")
+        out.append(f"        {op_word}   st1, st0")
+        out.append(f"        fstp    {width} [ecx + {half_size}]")
+        # Reclaim scratch.
+        out.append(f"        add     esp, {size}")
+        return out
+
+    def _complex_mul_into_top(
+        self, expr: ast.BinaryOp, ty: ast.ComplexType, ctx: _FuncCtx,
+    ) -> list[str]:
+        """`a * b` for complex values:
+            real = ar*br - ai*bi
+            imag = ar*bi + ai*br
+        """
+        half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
+        width = "dword" if half_size == 4 else "qword"
+        size = self._size_of(ty)
+        # Two scratch slots: left (lo) at [esp] and right (mid) at [esp + size].
+        out = [f"        sub     esp, {2 * size}"]
+        # Eval left into scratch lo.
+        out.append("        mov     eax, esp")
+        out.append("        push    eax")
+        out += self._eval_complex_into_top(expr.left, ctx)
+        out.append("        add     esp, 4")
+        # Eval right into scratch mid.
+        out.append(f"        lea     eax, [esp + {size}]")
+        out.append("        push    eax")
+        out += self._eval_complex_into_top(expr.right, ctx)
+        out.append("        add     esp, 4")
+        # ECX = original dest (at [esp + 2*size]).
+        out.append(f"        mov     ecx, [esp + {2 * size}]")
+        out.append("        mov     edx, esp")  # &lo
+        # real = ar*br - ai*bi
+        out.append(f"        fld     {width} [edx]")            # ar
+        out.append(f"        fld     {width} [edx + {size}]")   # br
+        out.append("        fmulp   st1, st0")                   # ar*br
+        out.append(f"        fld     {width} [edx + {half_size}]")  # ai
+        out.append(f"        fld     {width} [edx + {size + half_size}]")  # bi
+        out.append("        fmulp   st1, st0")                   # ai*bi
+        out.append("        fsubp   st1, st0")                   # ar*br - ai*bi
+        out.append(f"        fstp    {width} [ecx]")
+        # imag = ar*bi + ai*br
+        out.append(f"        fld     {width} [edx]")            # ar
+        out.append(f"        fld     {width} [edx + {size + half_size}]")  # bi
+        out.append("        fmulp   st1, st0")                   # ar*bi
+        out.append(f"        fld     {width} [edx + {half_size}]")  # ai
+        out.append(f"        fld     {width} [edx + {size}]")   # br
+        out.append("        fmulp   st1, st0")                   # ai*br
+        out.append("        faddp   st1, st0")                   # ar*bi + ai*br
+        out.append(f"        fstp    {width} [ecx + {half_size}]")
+        out.append(f"        add     esp, {2 * size}")
+        return out
+
+    def _complex_div_into_top(
+        self, expr: ast.BinaryOp, ty: ast.ComplexType, ctx: _FuncCtx,
+    ) -> list[str]:
+        """`a / b` for complex values:
+            denom = br*br + bi*bi
+            real = (ar*br + ai*bi) / denom
+            imag = (ai*br - ar*bi) / denom
+        """
+        half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
+        width = "dword" if half_size == 4 else "qword"
+        size = self._size_of(ty)
+        out = [f"        sub     esp, {2 * size}"]
+        out.append("        mov     eax, esp")
+        out.append("        push    eax")
+        out += self._eval_complex_into_top(expr.left, ctx)
+        out.append("        add     esp, 4")
+        out.append(f"        lea     eax, [esp + {size}]")
+        out.append("        push    eax")
+        out += self._eval_complex_into_top(expr.right, ctx)
+        out.append("        add     esp, 4")
+        out.append(f"        mov     ecx, [esp + {2 * size}]")
+        out.append("        mov     edx, esp")
+        # Compute denom = br*br + bi*bi, leave on st(0).
+        out.append(f"        fld     {width} [edx + {size}]")             # br
+        out.append("        fld     st0")                                  # br br
+        out.append("        fmulp   st1, st0")                              # br*br
+        out.append(f"        fld     {width} [edx + {size + half_size}]")  # bi
+        out.append("        fld     st0")
+        out.append("        fmulp   st1, st0")                              # bi*bi
+        out.append("        faddp   st1, st0")                              # denom
+        # st0 = denom. Now compute real numerator: ar*br + ai*bi.
+        out.append(f"        fld     {width} [edx]")            # ar
+        out.append(f"        fld     {width} [edx + {size}]")   # br
+        out.append("        fmulp   st1, st0")                   # ar*br
+        out.append(f"        fld     {width} [edx + {half_size}]")
+        out.append(f"        fld     {width} [edx + {size + half_size}]")
+        out.append("        fmulp   st1, st0")                   # ai*bi
+        out.append("        faddp   st1, st0")                   # ar*br+ai*bi
+        # st: numer_real, denom
+        out.append("        fdiv    st0, st1")                   # numer_real / denom
+        out.append(f"        fstp    {width} [ecx]")             # store real
+        # Imag numerator: ai*br - ar*bi
+        out.append(f"        fld     {width} [edx + {half_size}]")
+        out.append(f"        fld     {width} [edx + {size}]")
+        out.append("        fmulp   st1, st0")                   # ai*br
+        out.append(f"        fld     {width} [edx]")
+        out.append(f"        fld     {width} [edx + {size + half_size}]")
+        out.append("        fmulp   st1, st0")                   # ar*bi
+        out.append("        fsubp   st1, st0")                   # ai*br - ar*bi
+        out.append("        fdivp   st1, st0")                   # / denom
+        out.append(f"        fstp    {width} [ecx + {half_size}]")
+        out.append(f"        add     esp, {2 * size}")
+        return out
+
+    def _complex_compare(
+        self, expr: ast.BinaryOp, ctx: _FuncCtx,
+    ) -> list[str]:
+        """`a == b` or `a != b` for complex values. Returns 0/1 in EAX.
+
+        Plan: get &a and &b (handling lvalues, scalars, and complex
+        expressions). Compare both halves on the FPU. AND the two
+        boolean halves for `==` (or NAND for `!=`).
+        """
+        lt = self._type_of(expr.left, ctx)
+        rt = self._type_of(expr.right, ctx)
+        # Use whichever side is complex to determine the precision.
+        cty = lt if isinstance(lt, ast.ComplexType) else rt
+        half_size = self._COMPLEX_BASE_SIZES[cty.base_type]
+        width = "dword" if half_size == 4 else "qword"
+        size = self._size_of(cty)
+        # Materialize both operands into stack scratch slots so we
+        # can compare half by half.
+        out: list[str] = [f"        sub     esp, {2 * size}"]
+        # Eval left into [esp + size] (slot 1).
+        out.append(f"        lea     eax, [esp + {size}]")
+        out.append("        push    eax")
+        out += self._eval_complex_into_top(
+            expr.left if isinstance(lt, ast.ComplexType)
+            else ast.Cast(target_type=cty, expr=expr.left),
+            ctx,
+        )
+        out.append("        add     esp, 4")
+        # Eval right into [esp] (slot 0).
+        out.append("        mov     eax, esp")
+        out.append("        push    eax")
+        out += self._eval_complex_into_top(
+            expr.right if isinstance(rt, ast.ComplexType)
+            else ast.Cast(target_type=cty, expr=expr.right),
+            ctx,
+        )
+        out.append("        add     esp, 4")
+        # Compare reals: fld both, fucompp → ax via fnstsw.
+        out.append(f"        fld     {width} [esp + {size}]")        # left.real
+        out.append(f"        fld     {width} [esp]")                  # right.real
+        out.append("        fucompp")
+        out.append("        fnstsw  ax")
+        out.append("        sahf")
+        # Equal flag (ZF) → AL.
+        out.append("        sete    al")
+        out.append("        movzx   ecx, al")
+        # Compare imags.
+        out.append(f"        fld     {width} [esp + {size + half_size}]")  # left.imag
+        out.append(f"        fld     {width} [esp + {half_size}]")          # right.imag
+        out.append("        fucompp")
+        out.append("        fnstsw  ax")
+        out.append("        sahf")
+        out.append("        sete    al")
+        out.append("        movzx   eax, al")
+        # AND the two booleans → eax.
+        out.append("        and     eax, ecx")
+        if expr.op == "!=":
+            out.append("        xor     eax, 1")
+        out.append(f"        add     esp, {2 * size}")
+        return out
+
+    def _complex_assign_into_top(
+        self, expr: ast.BinaryOp, ty: ast.ComplexType, ctx: _FuncCtx,
+    ) -> list[str]:
+        """`lhs = rhs` for complex types. The result is the new value
+        of lhs; we copy lhs's content into the destination."""
+        # First do the assignment (which leaves &lhs in EAX), then
+        # copy lhs's content into our temp slot.
+        out = self._complex_copy_assign(expr, ty, ctx)  # eax = &lhs
+        out.append("        mov     edx, eax")
+        out.append("        mov     ecx, [esp]")
+        size = self._size_of(ty)
+        offset = 0
+        while size - offset >= 4:
+            out.append(f"        mov     eax, [edx + {offset}]")
+            out.append(f"        mov     [ecx + {offset}], eax")
+            offset += 4
+        return out
+
     def _complex_assign_from_scalar(
         self,
         lhs: ast.Expression,
@@ -4925,13 +5486,32 @@ class CodeGenerator:
     def _complex_copy_assign(
         self, expr: ast.BinaryOp, ty: ast.ComplexType, ctx: _FuncCtx,
     ) -> list[str]:
-        """`dst = src` where both are `_Complex T`. Per-dword copy."""
+        """`dst = src` where both are `_Complex T`. The src may be an
+        lvalue (Identifier, Member, etc.) or a complex sub-expression
+        (BinaryOp, UnaryOp, Cast). For lvalues we copy directly; for
+        sub-expressions we evaluate into &dst.
+        """
         size = self._size_of(ty)
-        out = self._complex_value_address(expr.right, ctx)
+        # Compute &dst, save it.
+        out = self._complex_value_address(expr.left, ctx)
         out.append("        push    eax")
-        out += self._complex_value_address(expr.left, ctx)
-        out.append("        mov     ecx, eax")
-        out.append("        pop     edx")
+        rhs = expr.right
+        if (
+            isinstance(rhs, (ast.BinaryOp, ast.UnaryOp, ast.Cast))
+            and not (
+                isinstance(rhs, ast.Cast)
+                and isinstance(rhs.target_type, ast.ComplexType) is False
+            )
+        ):
+            # Evaluate rhs into &dst directly.
+            out += self._eval_complex_into_top(rhs, ctx)
+            out.append("        pop     ecx")
+            out.append("        mov     eax, ecx")
+            return out
+        # Lvalue / Call / FloatLiteral source: get &src, per-dword copy.
+        out += self._complex_value_address(rhs, ctx)
+        out.append("        mov     edx, eax")
+        out.append("        pop     ecx")
         offset = 0
         while size - offset >= 4:
             out.append(f"        mov     eax, [edx + {offset}]")
@@ -5340,7 +5920,11 @@ class CodeGenerator:
         if isinstance(expr, ast.TypesCompatibleP):
             return ast.BasicType(name="int")
         if isinstance(expr, ast.FloatLiteral):
-            return ast.BasicType(name="float" if expr.is_float else "double")
+            base = "float" if expr.is_float else "double"
+            if expr.is_imaginary:
+                # GCC: `_Imaginary T` ≡ `_Complex T` with real=0.
+                return ast.ComplexType(base_type=base)
+            return ast.BasicType(name=base)
         if isinstance(expr, ast.StringLiteral):
             return ast.PointerType(base_type=ast.BasicType(name="char", is_const=True))
         if isinstance(expr, ast.UnaryOp):
@@ -5425,6 +6009,12 @@ class CodeGenerator:
             # not int.
             lt = self._type_of(expr.left, ctx)
             rt = self._type_of(expr.right, ctx)
+            # Complex promotion: any arithmetic with a complex operand
+            # yields complex.
+            if expr.op in ("+", "-", "*", "/") and (
+                isinstance(lt, ast.ComplexType) or isinstance(rt, ast.ComplexType)
+            ):
+                return self._complex_promotion(lt, rt)
             if expr.op in self._INT_RESULT_BINOPS:
                 # Pointer-arithmetic promotion above doesn't apply here,
                 # but float promotion does for `*` and `/`.
@@ -7351,6 +7941,12 @@ class CodeGenerator:
             return self._logical_or(expr, ctx)
         if expr.op in ("+", "-"):
             return self._add_sub(expr, ctx)
+        # Complex equality `a == b` / `a != b`: compare both halves.
+        if expr.op in ("==", "!="):
+            lt = self._type_of(expr.left, ctx)
+            rt = self._type_of(expr.right, ctx)
+            if isinstance(lt, ast.ComplexType) or isinstance(rt, ast.ComplexType):
+                return self._complex_compare(expr, ctx)
         # Float comparisons land here as int-typed expressions (their
         # result fits in EAX), but the operands are floats so the
         # standard "left to eax, right to ecx" path can't compare them.
