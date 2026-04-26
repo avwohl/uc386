@@ -411,6 +411,17 @@ class CodeGenerator:
                 self._register_struct(d)
             elif isinstance(d, ast.EnumDecl) and d.is_definition:
                 self._register_enum(d)
+            elif (
+                isinstance(d, ast.VarDecl)
+                and isinstance(d.var_type, ast.StructType)
+                and d.var_type.name
+                and d.var_type.members
+            ):
+                # `struct S { ... } u;` parses as VarDecl(u) with the
+                # struct definition inline in var_type. Register the
+                # struct under its tag so other top-level decls can
+                # reference it (e.g. `struct U { struct S s[4]; };`).
+                self._resolve_struct_name(d.var_type)
             elif isinstance(d, ast.TypedefDecl):
                 # Typedef'd enums register their constants at file scope
                 # (e.g. `typedef enum { X, Y } T;` declares X and Y).

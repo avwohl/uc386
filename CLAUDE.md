@@ -185,3 +185,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Static address resolution for global initializers.** New `_resolve_static_addr` walks any `&<lvalue>` chain (`Member`/`Index`/`*`/`Cast`) and resolves it to `(label, offset)`, so `int *p = &v.d.b;` and `void *foo[] = {(void *)&("X"[0])};` and `int *q = &arr[N];` all emit `dd <label> [+ N]` at link time. Pointer-init also strips leading casts and handles `&(string)[N]` directly.
 
   **Result: 1265/1514 gcc-c-torture** (up from 1245). Combined with c-testsuite still 215/220, the pipeline now passes 1480 / 1734 (85.4%).
+- **2026-04-25 — torture cluster: parser polish + decl typing (1265 → 1278)**:
+  - **Trailing `__attribute__` on local declarators.** `char tmp[3] __attribute__((aligned(2)));` now parses; `_skip_noise()` now runs after `_parse_declarator` returns.
+  - **`int *(p[25]);` parens-with-pointer.** The parens-grouping branch was dropping the outer `*` modifiers. Now applies them to the suffix's base before substitution, so `int *(p[25])` is "p as array of 25 pointers to int" (not "array of 25 ints").
+  - **Inline struct definition + variable decl.** `struct S { ... } u;` parses as a single VarDecl(u) with a struct type that has inline members. Added a top-level pass that resolves the struct under its tag so other top-level decls referencing `struct S` (e.g. `struct U { struct S s[4]; };`) find it.
+  - **`__signed`/`__signed__` keyword aliases for `signed`.** Used by some library headers.
+  - **GCC builtin types: `__INT_LEAST{8,16,32,64}_TYPE__`, `__INT_FAST*_TYPE__`, `__INTMAX_TYPE__`, `__builtin_va_list`.** Added as preprocessor predefines so type-introducing typedefs resolve.
+
+  **Result: 1278/1514 gcc-c-torture** (up from 1265).
