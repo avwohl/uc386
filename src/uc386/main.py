@@ -64,6 +64,23 @@ I386_DOS_PREDEFINES = {
     "__CHAR32_TYPE__": "unsigned long",
     # GCC predefines this for sources that probe.
     "__GNUC__": "4",
+    # IEEE-754 float / double limits — used by torture tests as
+    # `__FLT_MAX__` etc. Approximated as decimal literals in the
+    # source so the lexer parses them back as float/double values.
+    "__FLT_MAX__": "3.40282347e+38F",
+    "__FLT_MIN__": "1.17549435e-38F",
+    "__FLT_EPSILON__": "1.19209290e-07F",
+    "__DBL_MAX__": "1.7976931348623157e+308",
+    "__DBL_MIN__": "2.2250738585072014e-308",
+    "__DBL_EPSILON__": "2.2204460492503131e-16",
+    "__LDBL_MAX__": "1.7976931348623157e+308L",
+    "__LDBL_MIN__": "2.2250738585072014e-308L",
+    "__LDBL_EPSILON__": "2.2204460492503131e-16L",
+    "__INT_MAX__": "2147483647",
+    "__SHRT_MAX__": "32767",
+    "__SCHAR_MAX__": "127",
+    "__LONG_MAX__": "2147483647L",
+    "__LONG_LONG_MAX__": "9223372036854775807LL",
 }
 
 
@@ -110,7 +127,12 @@ def main() -> int:
     try:
         asts = []
         for p in input_paths:
-            source = p.read_text()
+            # C sources sometimes contain Latin-1 / extended ASCII
+            # bytes (e.g. embedded `\377` characters in string
+            # initializers). Read with errors='surrogateescape' so
+            # those bytes survive and the lexer's char-by-char path
+            # treats them as ordinary high-bit characters.
+            source = p.read_text(errors="surrogateescape")
             if not args.no_preprocess:
                 pp_predefines = {**I386_DOS_PREDEFINES, **type_config.predefined_macros()}
                 pp = Preprocessor(args.include, target_predefines=pp_predefines)

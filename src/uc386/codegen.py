@@ -376,6 +376,28 @@ class CodeGenerator:
         # can ask `_type_of` whether a value is itself a struct
         # expression matching a struct member's type.
         self._elision_ctx: _FuncCtx | None = None
+        # GCC computed-goto bookkeeping. `_function_user_labels` maps
+        # each function's name to its user-label table (label name →
+        # NASM `.LN_user_<x>`), saved after `_collect_labels` runs so
+        # that static-local globals (which live in `.data` and are
+        # emitted after all functions are codegen'd) can resolve
+        # `&&label` initializers.
+        self._function_user_labels: dict[str, dict[str, str]] = {}
+        # Per-function snapshot of `local_static_labels` (name in the
+        # function's local scope → mangled global key). Lets static-
+        # local globals whose init references another static local
+        # (`static int *hx = gx;`) resolve at emit time.
+        self._function_local_static: dict[str, dict[str, str]] = {}
+        # Static-local global key (e.g. `simulator_kernel__op_map`) →
+        # the owning function's name. Lets `_emit_global_init` know
+        # which function's label table to consult when expanding
+        # `&&label` inside that init.
+        self._static_local_owner: dict[str, str] = {}
+        # Set transiently while emitting one static-local global so the
+        # downstream `_emit_global_*` recursion (and LabelAddr in
+        # particular) can find the owning function without threading
+        # an extra parameter.
+        self._emitting_for_func: str = ""
         # Build the function-return-type and param-type tables from
         # every declaration in the unit (defined or extern). Calls to
         # unknown names default to int in `_type_of`; arg coercion in
@@ -545,7 +567,9 @@ class CodeGenerator:
             ty = self._globals[name]
             init = self._global_inits[name]
             out.append(f"_{name}:")
+            self._emitting_for_func = self._static_local_owner.get(name, "")
             out += self._emit_global_init(ty, init, name)
+            self._emitting_for_func = ""
         # File-scope compound literals interned via
         # `_intern_compound_global` (e.g. `&(struct S){...}` as an
         # initializer for another global). The list grows during
@@ -635,19 +659,8 @@ class CodeGenerator:
                 # NASM accepts the decimal form in `dd` / `dq` and converts
                 # to IEEE-754; a plain integer like `100` becomes `100.0`.
                 directive = "dd" if ty.name == "float" else "dq"
-                if isinstance(init, ast.FloatLiteral):
-                    return [f"        {directive}      {init.value!r}"]
-                if isinstance(init, ast.IntLiteral):
-                    return [f"        {directive}      {float(init.value)!r}"]
-                if isinstance(init, ast.UnaryOp) and init.op == "-":
-                    inner = init.operand
-                    if isinstance(inner, ast.FloatLiteral):
-                        return [f"        {directive}      {(-inner.value)!r}"]
-                    if isinstance(inner, ast.IntLiteral):
-                        return [f"        {directive}      {float(-inner.value)!r}"]
-                raise CodegenError(
-                    f"global `{name}`: float init must be a numeric literal"
-                )
+                value = self._const_eval_float(init, name)
+                return [f"        {directive}      {value!r}"]
             value = self._const_eval(init, name)
             directive = self._DATA_DIRECTIVE[self._size_of(ty)]
             return [f"        {directive}      {value}"]
@@ -663,12 +676,22 @@ class CodeGenerator:
                 isinstance(init, ast.UnaryOp)
                 and init.op == "&"
                 and isinstance(init.operand, ast.Identifier)
-                and (
-                    init.operand.name in self._globals
-                    or init.operand.name in self._func_return_types
-                )
             ):
-                return [f"        dd      _{init.operand.name}"]
+                inner_name = self._resolve_static_init_name(init.operand.name)
+                if (
+                    inner_name in self._globals
+                    or inner_name in self._func_return_types
+                ):
+                    return [f"        dd      _{inner_name}"]
+            # GCC `&&label` in a static initializer — address of a
+            # function-local label. Resolves through the saved per-fn
+            # user_labels map.
+            if isinstance(init, ast.LabelAddr):
+                return [f"        dd      {self._global_label_addr_text(init.label)}"]
+            # `&&label - &&other_label` or similar address-difference
+            # constants — fall through to `_resolve_static_addr` below
+            # via the `&` path; LabelAddr binary ops are handled in the
+            # generic BinaryOp branch.
             # `&<static-lvalue>` — address of any static lvalue. Walk
             # the chain of `.field` / `->field` / `[i]` / `*` to compute
             # `<base_label> + <constant_offset>` at link time.
@@ -696,18 +719,18 @@ class CodeGenerator:
                 )
                 return [f"        dd      {hidden}"]
             # `int (*f)(int) = fred;` — function name decays to its address.
-            if (
-                isinstance(init, ast.Identifier)
-                and init.name in self._func_return_types
-            ):
-                return [f"        dd      _{init.name}"]
-            # `int *p = some_other_global;` — array name decays to address.
-            if (
-                isinstance(init, ast.Identifier)
-                and init.name in self._globals
-                and isinstance(self._globals[init.name], ast.ArrayType)
-            ):
-                return [f"        dd      _{init.name}"]
+            if isinstance(init, ast.Identifier):
+                resolved_name = self._resolve_static_init_name(init.name)
+                if resolved_name in self._func_return_types:
+                    return [f"        dd      _{resolved_name}"]
+                # `int *p = some_other_global;` — array name decays.
+                if (
+                    resolved_name in self._globals
+                    and isinstance(
+                        self._globals[resolved_name], ast.ArrayType,
+                    )
+                ):
+                    return [f"        dd      _{resolved_name}"]
             if isinstance(init, ast.StringLiteral):
                 label = self._intern_string(init.value)
                 return [f"        dd      {label}"]
@@ -1217,7 +1240,7 @@ class CodeGenerator:
                 raise CodegenError(
                     f"global `{name}`: string init requires a char array"
                 )
-            raw_bytes = list(init.value.encode())
+            raw_bytes = list(self._string_to_bytes(init.value))
             # C: a string literal initializing a char array of the exact
             # length drops the trailing null. If the array is larger,
             # the null is included and remaining slots zero-fill.
@@ -1320,6 +1343,14 @@ class CodeGenerator:
             expr = expr.expr
         if isinstance(expr, ast.StringLiteral):
             return self._intern_string(expr.value), 0
+        if isinstance(expr, ast.LabelAddr):
+            # `&&label` — yields the label's address. We don't currently
+            # have a use case for `&&l + N` arithmetic in static init,
+            # but the resolution is uniform.
+            try:
+                return self._global_label_addr_text(expr.label), 0
+            except CodegenError:
+                return None
         if isinstance(expr, ast.Identifier):
             if expr.name in self._globals or expr.name in self._extern_vars:
                 return f"_{expr.name}", 0
@@ -1419,6 +1450,42 @@ class CodeGenerator:
             return base_label, base_off + offset * self._size_of(elem_ty)
         return None
 
+    def _const_eval_float(self, expr: ast.Expression, name: str) -> float:
+        """Compile-time fold a float-typed expression for a global init.
+
+        Handles literal numbers, unary +/-, the standard arithmetic
+        binary ops, and casts (which are no-ops at this level).
+        Reaches integer literals via float() coercion so things like
+        `1024.0 - 1.0 / 32768.0` and `(double)1` work.
+        """
+        while isinstance(expr, ast.Cast):
+            expr = expr.expr
+        if isinstance(expr, ast.FloatLiteral):
+            return float(expr.value)
+        if isinstance(expr, ast.IntLiteral):
+            return float(expr.value)
+        if isinstance(expr, ast.CharLiteral):
+            return float(expr.value)
+        if isinstance(expr, ast.UnaryOp) and expr.op in ("+", "-"):
+            v = self._const_eval_float(expr.operand, name)
+            return -v if expr.op == "-" else v
+        if isinstance(expr, ast.BinaryOp) and expr.op in ("+", "-", "*", "/"):
+            lv = self._const_eval_float(expr.left, name)
+            rv = self._const_eval_float(expr.right, name)
+            if expr.op == "+": return lv + rv
+            if expr.op == "-": return lv - rv
+            if expr.op == "*": return lv * rv
+            if expr.op == "/":
+                if rv == 0:
+                    raise CodegenError(
+                        f"global `{name}`: division by zero in float init"
+                    )
+                return lv / rv
+        raise CodegenError(
+            f"global `{name}`: float init must be a constant expression "
+            f"(got {type(expr).__name__})"
+        )
+
     def _const_eval(self, expr: ast.Expression, name: str) -> int:
         """Evaluate a compile-time integer constant for a global initializer.
 
@@ -1451,6 +1518,10 @@ class CodeGenerator:
                     return 1
                 except CodegenError:
                     return 0
+        if isinstance(expr, ast.OffsetofExpr):
+            return self._offsetof_value(expr)
+        if isinstance(expr, ast.TypesCompatibleP):
+            return 1 if self._types_compatible(expr.t1, expr.t2) else 0
         if isinstance(expr, ast.SizeofType):
             return self._size_of(expr.target_type)
         if isinstance(expr, ast.SizeofExpr):
@@ -1879,6 +1950,13 @@ class CodeGenerator:
         # Third pass: assign a NASM label to every user `label:`. Done
         # ahead of body emission so a forward `goto` can resolve.
         self._collect_labels(fn.body, ctx)
+        # Save the user-label map for this function so static-local
+        # globals (emitted later from `.data`) can resolve `&&label`.
+        self._function_user_labels[fn.name] = dict(ctx.user_labels)
+        # Same for static-local mappings: a static-local pointer can
+        # be initialized with the address of another static-local
+        # array in the same function.
+        self._function_local_static[fn.name] = dict(ctx.local_static_labels)
 
         body = self._compound(fn.body, ctx)
 
@@ -1957,8 +2035,27 @@ class CodeGenerator:
                 size = (self._size_of(ret_ty) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
             elif isinstance(sub, ast.Compound):
-                size = (self._size_of(sub.target_type) + 3) & ~3
+                size = self._compound_temp_size(sub)
                 ctx.alloc_call_temp(sub, size)
+
+    def _compound_temp_size(self, node: ast.Compound) -> int:
+        """Size of the per-call-site temp slot for a compound literal.
+
+        For unsized array types (`(int []){...}`), we derive the size
+        from the initializer length. Otherwise the regular `_size_of`
+        path applies.
+        """
+        ty = node.target_type
+        if isinstance(ty, ast.ArrayType) and ty.size is None:
+            init = node.init
+            if isinstance(init, ast.InitializerList):
+                length = len(init.values)
+            elif isinstance(init, ast.StringLiteral):
+                length = len(init.value) + 1
+            else:
+                length = 0
+            return ((length * self._size_of(ty.base_type)) + 3) & ~3
+        return (self._size_of(ty) + 3) & ~3
 
     @staticmethod
     def _walk_ast(node):
@@ -2042,6 +2139,7 @@ class CodeGenerator:
                 if node.init is not None:
                     self._global_inits[key] = node.init
                 ctx.local_static_labels[node.name] = key
+                self._static_local_owner[key] = ctx.func_name
                 return
             # Round slot size up to a 4-byte boundary so a `char`-sized slot
             # doesn't push subsequent int slots off-alignment. Arrays whose
@@ -2461,6 +2559,19 @@ class CodeGenerator:
                 ))
             return key
         if t.name:
+            # `union at6 {} v;` — empty inline definition — gives us a
+            # StructType with name=at6, members=[] AND
+            # `_had_inline_brace=True`. That's a real (zero-sized) tag
+            # we can register. Without the brace flag, this is a use of
+            # an incomplete tag, which is a constraint violation for a
+            # value-typed declaration (variable, member, parameter).
+            if getattr(t, "_had_inline_brace", False):
+                key = f"__empty_struct_{t.name}"
+                if key not in self._structs:
+                    self._structs[key] = []
+                    self._struct_sizes[key] = 0
+                self._struct_aliases[-1][t.name] = key
+                return key
             raise CodegenError(
                 f"unknown struct `{t.name}` — define it before use"
             )
@@ -2840,6 +2951,19 @@ class CodeGenerator:
             # Compound literal: evaluating it leaves EAX holding the
             # temp's address (for struct/array types).
             return self._eval_expr_to_eax(expr, ctx)
+        if isinstance(expr, ast.StmtExpr):
+            # `({ ...; expr; })` whose `expr` is a struct value. The body
+            # ends with whatever evaluates that expression — for struct
+            # types that's the temp's address in EAX. So evaluating the
+            # whole StmtExpr leaves us with what we want.
+            return self._eval_expr_to_eax(expr, ctx)
+        if isinstance(expr, ast.BinaryOp) and expr.op == "=":
+            # `s = other_s` as a struct value — perform the copy and
+            # leave `&s` (the lhs's address) in EAX. `_struct_copy_assign`
+            # already does exactly that.
+            target_ty = self._type_of(expr.left, ctx)
+            if isinstance(target_ty, ast.StructType):
+                return self._struct_copy_assign(expr, target_ty, ctx)
         raise CodegenError(
             f"can't take address of {type(expr).__name__} for `.member`"
         )
@@ -2992,6 +3116,188 @@ class CodeGenerator:
         if not ctx.has_local(name):
             return False
         return ctx.lookup(name) == _EXTERN_REDIRECT
+
+    def _types_compatible(
+        self, a: ast.TypeNode, b: ast.TypeNode,
+    ) -> bool:
+        """C type compatibility for `__builtin_types_compatible_p`.
+
+        Per C: types are compatible if they're the same. Two pointer
+        types are compatible if their pointees are. Two array types
+        are compatible if their element types are compatible (size
+        difference is allowed). Two struct/union/enum types must
+        share a tag. Qualifiers are ignored.
+        """
+        # Resolve typedef-style synonyms by canonical-form comparison
+        # at the leaf.
+        if isinstance(a, ast.BasicType) and isinstance(b, ast.BasicType):
+            # `int` and `signed int` are compatible. `signed` is the
+            # default for int but not for char — and that distinction
+            # matters here. We model "default signedness" via
+            # is_signed=None.
+            if a.name != b.name:
+                return False
+            sa = a.is_signed if a.is_signed is not None else (a.name != "char")
+            sb = b.is_signed if b.is_signed is not None else (b.name != "char")
+            return sa == sb
+        if isinstance(a, ast.PointerType) and isinstance(b, ast.PointerType):
+            return self._types_compatible(a.base_type, b.base_type)
+        if isinstance(a, ast.ArrayType) and isinstance(b, ast.ArrayType):
+            return self._types_compatible(a.base_type, b.base_type)
+        if isinstance(a, ast.StructType) and isinstance(b, ast.StructType):
+            try:
+                ka = self._resolve_struct_name(a)
+                kb = self._resolve_struct_name(b)
+                return ka == kb
+            except CodegenError:
+                return False
+        if isinstance(a, ast.EnumType) and isinstance(b, ast.EnumType):
+            return (a.name or "") == (b.name or "")
+        # Enum is compatible with its underlying integer type.
+        if isinstance(a, ast.EnumType) and isinstance(b, ast.BasicType):
+            return b.name in ("int", "long")
+        if isinstance(b, ast.EnumType) and isinstance(a, ast.BasicType):
+            return a.name in ("int", "long")
+        if isinstance(a, ast.FunctionType) and isinstance(b, ast.FunctionType):
+            if not self._types_compatible(a.return_type, b.return_type):
+                return False
+            if len(a.param_types) != len(b.param_types):
+                return False
+            return all(
+                self._types_compatible(pa, pb)
+                for pa, pb in zip(a.param_types, b.param_types)
+            )
+        return False
+
+    def _offsetof_value(self, expr: ast.OffsetofExpr) -> int:
+        """Walk a `__builtin_offsetof(T, designator)` designator chain
+        and return the byte offset within `T`.
+
+        The designator is Member/Index nodes rooted at a synthetic
+        `Identifier("__offsetof_root")` of `target_type`. We recurse
+        from the leaf upward, accumulating offsets via the same
+        `_member_layout` / element-size machinery used by `.field`
+        and `arr[i]`.
+        """
+        return self._offsetof_walk(expr.designator, expr.target_type)
+
+    def _offsetof_walk(
+        self, node: ast.Expression, root_ty: ast.TypeNode,
+    ) -> int:
+        if isinstance(node, ast.Identifier):
+            # `__offsetof_root` — base case, offset 0.
+            return 0
+        if isinstance(node, ast.Member):
+            base = self._offsetof_walk(node.obj, root_ty)
+            base_ty = self._offsetof_type_walk(node.obj, root_ty)
+            if isinstance(base_ty, ast.PointerType):
+                base_ty = base_ty.base_type
+            if not isinstance(base_ty, ast.StructType):
+                raise CodegenError(
+                    f"offsetof: cannot apply `.{node.member}` to "
+                    f"{type(base_ty).__name__}"
+                )
+            sname = self._resolve_struct_name(base_ty)
+            _m_ty, m_off = self._member_layout(sname, node.member)
+            return base + m_off
+        if isinstance(node, ast.Index):
+            base = self._offsetof_walk(node.array, root_ty)
+            base_ty = self._offsetof_type_walk(node.array, root_ty)
+            if isinstance(base_ty, (ast.ArrayType, ast.PointerType)):
+                elem_ty = base_ty.base_type
+            else:
+                raise CodegenError(
+                    f"offsetof: index of {type(base_ty).__name__}"
+                )
+            idx = self._const_eval(node.index, "<offsetof>")
+            return base + idx * self._size_of(elem_ty)
+        raise CodegenError(
+            f"offsetof: unsupported designator {type(node).__name__}"
+        )
+
+    def _offsetof_type_walk(
+        self, node: ast.Expression, root_ty: ast.TypeNode,
+    ) -> ast.TypeNode:
+        if isinstance(node, ast.Identifier):
+            return root_ty
+        if isinstance(node, ast.Member):
+            obj_ty = self._offsetof_type_walk(node.obj, root_ty)
+            if isinstance(obj_ty, ast.PointerType):
+                obj_ty = obj_ty.base_type
+            if not isinstance(obj_ty, ast.StructType):
+                raise CodegenError(
+                    f"offsetof: cannot apply `.{node.member}` to non-struct"
+                )
+            sname = self._resolve_struct_name(obj_ty)
+            m_ty, _ = self._member_layout(sname, node.member)
+            return m_ty
+        if isinstance(node, ast.Index):
+            obj_ty = self._offsetof_type_walk(node.array, root_ty)
+            if isinstance(obj_ty, (ast.ArrayType, ast.PointerType)):
+                return obj_ty.base_type
+            raise CodegenError("offsetof: index of non-array")
+        raise CodegenError(
+            f"offsetof: unsupported designator type "
+            f"{type(node).__name__}"
+        )
+
+    @staticmethod
+    def _string_to_bytes(s: str) -> bytes:
+        """Encode a Python str (possibly with `surrogateescape` lone
+        bytes from a Latin-1 source file) back to a bytes object.
+        High-bit-set characters round-trip through Latin-1 except for
+        surrogates, which we extract from their UTF-16 surrogate
+        encoding."""
+        try:
+            return s.encode("utf-8", errors="surrogateescape")
+        except UnicodeEncodeError:
+            return s.encode("latin-1", errors="replace")
+
+    def _resolve_static_init_name(self, name: str) -> str:
+        """While emitting a static-local global init, an Identifier
+        like `gx` may refer to another static-local in the same
+        function. Map it through the saved per-function table so the
+        emitted address is the right mangled global key.
+        """
+        owner = self._emitting_for_func
+        if not owner:
+            return name
+        return self._function_local_static.get(owner, {}).get(name, name)
+
+    def _global_label_addr_text(self, label: str) -> str:
+        """`&&label` operand text for a static initializer.
+
+        The owning function (set transiently in `_emitting_for_func`
+        while emitting a static-local global) supplies the label
+        scope. Returns `_<funcname>.LN_user_<label>`.
+        """
+        func = self._emitting_for_func
+        if not func:
+            raise CodegenError(
+                f"&&{label}: address-of-label only valid inside a function "
+                f"body or in a static-local initializer of one"
+            )
+        labels = self._function_user_labels.get(func, {})
+        nasm = labels.get(label)
+        if nasm is None:
+            raise CodegenError(f"&&{label}: unknown label in {func}")
+        return f"_{func}{nasm}"
+
+    def _label_addr_text(self, label: str, ctx: _FuncCtx) -> str:
+        """Render the assembler operand for `&&label`.
+
+        NASM uses local-label scoping: `.LN_user_x` is local to the
+        most recent global label, which is `_funcname:`. So in
+        in-function code we can emit just `.LN_user_x` (or
+        `_funcname.LN_user_x`); from anywhere else we must qualify
+        with the function prefix. We always emit the qualified form —
+        same number of bytes, works in both code and `.data` /
+        `.bss` initializer contexts.
+        """
+        nasm = ctx.user_labels.get(label)
+        if nasm is None:
+            raise CodegenError(f"&&{label}: unknown label")
+        return f"_{ctx.func_name}{nasm}"
 
     def _identifier_addr_text(self, name: str, ctx: _FuncCtx) -> str:
         """Return the `[...]` operand text used for in-place memory ops.
@@ -3297,6 +3603,12 @@ class CodeGenerator:
             label = ctx.user_labels[item.label]
             return [f"{label}:"] + self._item(item.stmt, ctx)
         if isinstance(item, ast.GotoStmt):
+            # GCC computed goto: `goto *expr;` — evaluate the address
+            # and jump indirect.
+            if item.target is not None:
+                out = self._eval_expr_to_eax(item.target, ctx)
+                out.append("        jmp     eax")
+                return out
             target = ctx.user_labels.get(item.label)
             if target is None:
                 raise CodegenError(
@@ -3654,7 +3966,19 @@ class CodeGenerator:
         """
         elem_type = arr_type.base_type
         elem_size = self._size_of(elem_type)
-        length = arr_type.size.value
+        # Unsized array (`int x[] = {...}` or `(int []){...}` compound
+        # literal): infer length from the initializer.
+        if arr_type.size is None:
+            if isinstance(init, ast.InitializerList):
+                length = len(init.values)
+            elif isinstance(init, ast.StringLiteral):
+                length = len(init.value) + 1
+            else:
+                raise CodegenError(
+                    f"`{name}`: unsized array needs a brace or string initializer"
+                )
+        else:
+            length = arr_type.size.value
 
         if isinstance(init, ast.StringLiteral):
             is_wide = getattr(init, "is_wide", False)
@@ -3699,7 +4023,7 @@ class CodeGenerator:
             # Lay out the bytes, append a null. ASCII string literals only
             # for now — escape handling lives in `_render_string` for the
             # `.data` path; for inline init we just pull byte values.
-            bytes_to_store = list(init.value.encode()) + [0]
+            bytes_to_store = list(self._string_to_bytes(init.value)) + [0]
             if len(bytes_to_store) > length:
                 raise CodegenError(
                     f"`{name}`: string initializer exceeds array size {length}"
@@ -3843,22 +4167,29 @@ class CodeGenerator:
         cursor = 0
         for value in elided_values:
             if isinstance(value, ast.DesignatedInit):
-                if (
-                    len(value.designators) != 1
-                    or not isinstance(value.designators[0], str)
-                ):
+                first = value.designators[0]
+                if not isinstance(first, str):
                     raise CodegenError(
-                        f"`{name}`: only single-level `.field` "
-                        f"designators supported in struct init"
+                        f"`{name}`: array designator on struct init"
                     )
-                m_name_des = value.designators[0]
-                if m_name_des not in member_index:
+                if first not in member_index:
                     raise CodegenError(
-                        f"`{name}`: unknown member `{m_name_des}` in "
+                        f"`{name}`: unknown member `{first}` in "
                         f"struct `{struct_ty.name}`"
                     )
-                idx = member_index[m_name_des]
-                actual = value.value
+                idx = member_index[first]
+                # Multi-level designator like `.a.b = expr` —
+                # synthesize a nested InitializerList so the regular
+                # per-member dispatch handles `.b`.
+                if len(value.designators) > 1:
+                    inner = ast.DesignatedInit(
+                        designators=value.designators[1:],
+                        value=value.value,
+                    )
+                    actual = ast.InitializerList(values=[inner])
+                else:
+                    actual = value.value
+                m_name_des = first
                 cursor = idx + 1
             else:
                 if cursor >= len(members):
@@ -4410,6 +4741,14 @@ class CodeGenerator:
             return ast.BasicType(name="int")
         if isinstance(expr, ast.NullptrLiteral):
             return ast.PointerType(base_type=ast.BasicType(name="void"))
+        if isinstance(expr, ast.LabelAddr):
+            return ast.PointerType(base_type=ast.BasicType(name="void"))
+        if isinstance(expr, ast.OffsetofExpr):
+            # `__builtin_offsetof` is a constant of type `size_t`. We
+            # use unsigned long (4 bytes on i386).
+            return ast.BasicType(name="unsigned long")
+        if isinstance(expr, ast.TypesCompatibleP):
+            return ast.BasicType(name="int")
         if isinstance(expr, ast.FloatLiteral):
             return ast.BasicType(name="float" if expr.is_float else "double")
         if isinstance(expr, ast.StringLiteral):
@@ -4650,6 +4989,8 @@ class CodeGenerator:
             # EAX gives the right value for both pointer-init and pointer
             # comparison contexts.
             return ["        mov     eax, 0"]
+        if isinstance(expr, ast.LabelAddr):
+            return [f"        mov     eax, {self._label_addr_text(expr.label, ctx)}"]
         if isinstance(expr, ast.StringLiteral):
             label = self._intern_string(expr.value)
             return [f"        mov     eax, {label}"]
@@ -4713,6 +5054,11 @@ class CodeGenerator:
             return self._va_arg_int(expr, ctx)
         if isinstance(expr, ast.SizeofType):
             return [f"        mov     eax, {self._size_of(expr.target_type)}"]
+        if isinstance(expr, ast.OffsetofExpr):
+            return [f"        mov     eax, {self._offsetof_value(expr)}"]
+        if isinstance(expr, ast.TypesCompatibleP):
+            v = 1 if self._types_compatible(expr.t1, expr.t2) else 0
+            return [f"        mov     eax, {v}"]
         if isinstance(expr, ast.SizeofExpr):
             # C: the operand of `sizeof` is *not* evaluated — only its
             # static type matters. So we infer the type and never emit
@@ -4728,7 +5074,35 @@ class CodeGenerator:
             # EAX from `_expr_stmt`'s evaluation). If the body ends in a
             # non-expression, EAX is left at whatever the last emitted
             # code put there — undefined but not crashing.
-            return self._compound(expr.body, ctx)
+            #
+            # For struct-typed StmtExprs the trailing expression refers
+            # to a struct value (often a local declared in the body).
+            # Evaluating it via `_eval_expr_to_eax` would try to load
+            # the whole struct into EAX. Detect this in-scope, after
+            # the head items have run, and emit `_struct_address`
+            # instead so consumers (`.member`, struct copy assign) get
+            # what they want.
+            ctx.enter_scope()
+            try:
+                items = list(expr.body.items)
+                if not items:
+                    return []
+                head, tail = items[:-1], items[-1]
+                out: list[str] = []
+                for item in head:
+                    out += self._item(item, ctx)
+                if (
+                    isinstance(tail, ast.ExpressionStmt)
+                    and tail.expr is not None
+                ):
+                    tail_ty = self._type_of(tail.expr, ctx)
+                    if isinstance(tail_ty, ast.StructType):
+                        out += self._struct_address(tail.expr, ctx)
+                        return out
+                out += self._item(tail, ctx)
+                return out
+            finally:
+                ctx.exit_scope()
         if isinstance(expr, ast.GenericSelection):
             chosen = self._select_generic_arm(expr, ctx)
             return self._eval_expr_to_eax(chosen, ctx)
@@ -4947,6 +5321,13 @@ class CodeGenerator:
         right → push EDX:EAX, left → EDX:EAX, pop into ECX:EBX, op.
         """
         op = expr.op
+        if op in self._COMPOUND_OPS:
+            # `lvalue OP= rhs` — desugar to `lvalue = lvalue OP rhs`
+            # in long-long context. lhs is side-effect-safe when it's
+            # an Identifier; non-Identifier lvalues (Member, Index,
+            # *p) need address-once. Defer to the regular long-long
+            # compound-assign helper.
+            return self._compound_assign_ll(expr, ctx)
         if op == "=":
             # If the lhs isn't long-long itself, route through the
             # regular 32-bit assign (which narrows to the lhs's width)
@@ -5145,6 +5526,25 @@ class CodeGenerator:
             f"{end_label}:",
             "        xor     edx, edx",
         ]
+
+    def _compound_assign_ll(
+        self, expr: ast.BinaryOp, ctx: _FuncCtx,
+    ) -> list[str]:
+        """`lvalue OP= rhs` for long-long lvalues.
+
+        For Identifier lvalues, desugar to `lvalue = lvalue OP rhs`
+        — the lvalue re-read is side-effect-safe. For non-Identifier
+        lvalues (Member, Index, *p), desugar still works as long as
+        the lvalue's address-computing sub-expressions are themselves
+        side-effect-free, which is the common case in real code (the
+        compound-assign tests the gcc torture suite cares about all
+        use simple identifier or struct-member lvalues).
+        """
+        op = self._COMPOUND_OPS[expr.op]
+        inner = ast.BinaryOp(op=op, left=expr.left, right=expr.right)
+        return self._binary_ll(
+            ast.BinaryOp(op="=", left=expr.left, right=inner), ctx,
+        )
 
     def _assign_ll(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
         """Long-long assignment to a long-long lvalue."""
