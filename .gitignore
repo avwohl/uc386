@@ -6,3 +6,4 @@ dist/
 .pytest_cache/
 .coverage
 .venv/
+.claude/scheduled_tasks.lock
