@@ -2869,6 +2869,22 @@ class CodeGenerator:
                         elem_type, actual, elem_disp, ctx,
                         f"{name}[{idx}]",
                     )
+                elif (
+                    isinstance(elem_type, ast.ArrayType)
+                    and isinstance(actual, (ast.InitializerList, ast.StringLiteral))
+                ):
+                    # Multi-dim array element: recurse.
+                    out += self._array_init(
+                        elem_type, actual, elem_disp, ctx,
+                        f"{name}[{idx}]",
+                    )
+                elif self._is_float_type(elem_type):
+                    # Float element: eval to st(0), then fstp at the slot.
+                    out += self._eval_float_to_st0(actual, ctx)
+                    out += self._store_st0_to(_ebp_addr(elem_disp), elem_type)
+                elif self._is_long_long(elem_type):
+                    out += self._eval_expr_to_edx_eax(actual, ctx)
+                    out += self._store_from_edx_eax(_ebp_addr(elem_disp))
                 else:
                     out += self._eval_expr_to_eax(actual, ctx)
                     out += self._store_from_eax(_ebp_addr(elem_disp), elem_type)
