@@ -668,22 +668,45 @@ ___builtin_sprintf:
         jmp     _sprintf
 ___builtin_snprintf:
         jmp     _snprintf
-___builtin_longjmp:
-        ; Real longjmp restores a saved jmp_buf. We don't really
-        ; support setjmp/longjmp, so just exit non-zero so any test
-        ; that depends on them fails visibly.
-        mov     ax, 0x4C7F
-        int     21h
-___builtin_setjmp:
-        ; setjmp returns 0 on direct call (no longjmp). Return 0.
-        xor     eax, eax
-        ret
+; jmp_buf layout (32-byte / 8-int): ebx, esi, edi, ebp, esp, return-eip,
+; (slots 6 and 7 are spare). Both _setjmp and __builtin_setjmp populate
+; this layout. _longjmp / __builtin_longjmp restore from it and jump.
 _setjmp:
+___builtin_setjmp:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]            ; eax = jmp_buf
+        mov     [eax + 0],  ebx
+        mov     [eax + 4],  esi
+        mov     [eax + 8],  edi
+        mov     ecx, [ebp]                ; saved EBP from caller
+        mov     [eax + 12], ecx
+        lea     ecx, [ebp + 8]            ; caller's ESP after our pop
+        mov     [eax + 16], ecx
+        mov     ecx, [ebp + 4]            ; return EIP
+        mov     [eax + 20], ecx
         xor     eax, eax
+        mov     esp, ebp
+        pop     ebp
         ret
 _longjmp:
-        mov     ax, 0x4C7F
-        int     21h
+___builtin_longjmp:
+        ; longjmp(buf, val): restore the jmp_buf and return `val` from
+        ; setjmp. Per C, `val == 0` is treated as 1 to keep setjmp's
+        ; "0 means direct call" sentinel meaningful.
+        mov     ecx, [esp + 4]            ; ecx = jmp_buf (no frame yet)
+        mov     eax, [esp + 8]            ; eax = val
+        test    eax, eax
+        jne     .lj_have_val
+        mov     eax, 1
+.lj_have_val:
+        mov     ebx, [ecx + 0]
+        mov     esi, [ecx + 4]
+        mov     edi, [ecx + 8]
+        mov     ebp, [ecx + 12]
+        mov     esp, [ecx + 16]
+        push    dword [ecx + 20]
+        ret
 ___builtin_mul_overflow:
         ; Three args: int a, int b, int *result. Returns 1 on overflow.
         ; Uses one-operand IMUL so OF reflects whether the 64-bit signed
