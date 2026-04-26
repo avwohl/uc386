@@ -364,3 +364,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Float globals: `inf` / `nan` as IEEE-754 bit-pattern hex.** Python's `repr(float('inf'))` produces `'inf'` which NASM rejects. Now we emit the IEEE-754 bit pattern (`dd 0x7F800000` etc.) for inf/nan in float-typed globals.
 
   **Result: 1415/1514 gcc-c-torture** (up from 1409, +6 tests). Combined with c-testsuite still 215/220, the pipeline now passes 1630/1734 (94.0%).
+- **2026-04-26 — qsort + vector cast in scalar context (1415 → 1416)**: more torture wins.
+  - **`qsort(base, nmemb, size, cmp)` in libc.** Insertion sort with per-element scratch on the stack. Closes pr34456.c (qsort + comparator).
+  - **`(int) (long long) (V2SI){...}`: vector → ll → int cast chain.** Previously the inner ll cast returned the vector temp's address (size-8 ll cast falls through to passthrough), so the outer int cast compared the address with the expected value. Now `_cast` recognizes vector-source casts to int-family targets and loads the low dword directly. Closes 20050607-1.c.
+  - **`(vec_t) scalar` cast (e.g. `(V2SI) 0LL`).** `_collect_call_temps` allocates a per-cast temp slot for vector-target casts whose source isn't a vector. `_vector_value_address(Cast)` evaluates the scalar (LL → EDX:EAX, otherwise EAX) into the temp, zero-fills any tail, and returns &temp. Closes 20050316-1.c.
+  - **`_cast` for ArrayType target falls back to `_vector_value_address`** so a scalar-context cast to vector produces a pointer to the temp. Closes pr70903.c.
+
+  **Result: 1416/1514 gcc-c-torture** (up from 1415, +1 net after one test moved between buckets). Combined still 1631/1734 (94.1%).
