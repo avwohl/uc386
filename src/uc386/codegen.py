@@ -661,6 +661,13 @@ class CodeGenerator:
                 directive = "dd" if ty.name == "float" else "dq"
                 value = self._const_eval_float(init, name)
                 return [f"        {directive}      {value!r}"]
+            # `&&l1 - &&l2` — label-difference constant. NASM resolves
+            # the difference at assemble time. Common in static jump
+            # tables.
+            label_diff = self._global_label_diff(init)
+            if label_diff is not None:
+                directive = self._DATA_DIRECTIVE[self._size_of(ty)]
+                return [f"        {directive}      {label_diff}"]
             value = self._const_eval(init, name)
             directive = self._DATA_DIRECTIVE[self._size_of(ty)]
             return [f"        {directive}      {value}"]
@@ -770,9 +777,10 @@ class CodeGenerator:
         name: str,
     ) -> list[str]:
         if not isinstance(init, ast.InitializerList):
-            raise CodegenError(
-                f"global `{name}`: struct init must be `{{...}}`"
-            )
+            # Brace-elide: a non-list value initializing a struct is
+            # like `{ value }` — the value lands in the first member,
+            # rest of the struct zero-fills.
+            init = ast.InitializerList(values=[init])
         sname = self._resolve_struct_name(struct_ty)
         members = self._structs[sname]
         total = self._struct_sizes[sname]
@@ -1356,13 +1364,21 @@ class CodeGenerator:
                 and elem_size in self._DATA_DIRECTIVE
             ):
                 directive = self._DATA_DIRECTIVE[elem_size]
-                values = []
-                for i in range(length):
-                    if i in slots:
-                        values.append(str(self._const_eval(slots[i], name)))
-                    else:
-                        values.append("0")
-                return [f"        {directive}      {', '.join(values)}"]
+                # Check whether any element needs the recursive
+                # `_emit_global_init` path (label-diff, etc.). If so,
+                # fall through to that.
+                any_non_const = any(
+                    self._needs_recursive_init(slots[i])
+                    for i in slots
+                )
+                if not any_non_const:
+                    values = []
+                    for i in range(length):
+                        if i in slots:
+                            values.append(str(self._const_eval(slots[i], name)))
+                        else:
+                            values.append("0")
+                    return [f"        {directive}      {', '.join(values)}"]
             out: list[str] = []
             for i in range(length):
                 if i in slots:
@@ -2093,6 +2109,13 @@ class CodeGenerator:
                 ctx.alloc_call_temp(sub, size)
             elif isinstance(sub, ast.Compound):
                 size = self._compound_temp_size(sub)
+                ctx.alloc_call_temp(sub, size)
+            elif isinstance(sub, ast.Cast) and isinstance(
+                sub.target_type, (ast.StructType,)
+            ):
+                # `(struct T) value` — type-pun into a struct/union
+                # via a per-cast temp slot.
+                size = (self._size_of(sub.target_type) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
 
     def _compound_temp_size(self, node: ast.Compound) -> int:
@@ -3055,9 +3078,52 @@ class CodeGenerator:
             target_ty = self._type_of(expr.left, ctx)
             if isinstance(target_ty, ast.StructType):
                 return self._struct_copy_assign(expr, target_ty, ctx)
+        if isinstance(expr, ast.Cast) and isinstance(
+            expr.target_type, ast.StructType
+        ):
+            # `(struct T) value` — type-pun the value into the
+            # pre-allocated struct temp slot, then return its address.
+            return self._cast_to_struct(expr, ctx)
         raise CodegenError(
             f"can't take address of {type(expr).__name__} for `.member`"
         )
+
+    def _cast_to_struct(
+        self, expr: ast.Cast, ctx: _FuncCtx,
+    ) -> list[str]:
+        """`(struct T) value` — store `value`'s bits into the temp slot
+        reserved for this Cast and leave its address in EAX.
+
+        Common case: long-long → union of {long long, struct {...}} is
+        a 64-bit type-pun. Smaller widths zero-fill the rest.
+        """
+        disp = ctx.call_temps[id(expr)]
+        size = self._size_of(expr.target_type)
+        src_ty = self._type_of(expr.expr, ctx)
+        out: list[str] = []
+        if self._is_long_long(src_ty):
+            out += self._eval_expr_to_edx_eax(expr.expr, ctx)
+            out += self._store_from_edx_eax(_ebp_addr(disp))
+            # Zero-fill any tail beyond 8 bytes.
+            if size > 8:
+                out += self._zero_fill_at(disp + 8, size - 8)
+        elif self._is_float_type(src_ty):
+            out += self._eval_float_to_st0(expr.expr, ctx)
+            width = "qword" if self._size_of(src_ty) == 8 else "dword"
+            out.append(f"        fstp    {width} {_ebp_addr(disp)}")
+            written = self._size_of(src_ty)
+            if size > written:
+                out += self._zero_fill_at(disp + written, size - written)
+        else:
+            out += self._eval_expr_to_eax(expr.expr, ctx)
+            out += self._store_from_eax(_ebp_addr(disp), src_ty)
+            written = self._size_of(src_ty) if not isinstance(
+                src_ty, (ast.PointerType, ast.ArrayType)
+            ) else 4
+            if size > written:
+                out += self._zero_fill_at(disp + written, size - written)
+        out.append(f"        lea     eax, {_ebp_addr(disp)}")
+        return out
 
     def _bitfield_info(
         self, expr: ast.Member, ctx: _FuncCtx
@@ -3580,6 +3646,42 @@ class CodeGenerator:
         if not owner:
             return name
         return self._function_local_static.get(owner, {}).get(name, name)
+
+    def _needs_recursive_init(self, expr: ast.Expression) -> bool:
+        """Does `expr` need the recursive `_emit_global_init` path
+        rather than a flat `_const_eval` (e.g., it contains a
+        `&&label` or address-arithmetic that NASM resolves)?"""
+        if isinstance(expr, ast.LabelAddr):
+            return True
+        if isinstance(expr, ast.UnaryOp) and expr.op == "&":
+            return True
+        if isinstance(expr, ast.BinaryOp):
+            return (
+                self._needs_recursive_init(expr.left)
+                or self._needs_recursive_init(expr.right)
+            )
+        if isinstance(expr, ast.Cast):
+            return self._needs_recursive_init(expr.expr)
+        return False
+
+    def _global_label_diff(self, expr: ast.Expression) -> str | None:
+        """If `expr` is `&&l1 - &&l2` (or `+`-flavored), return the
+        NASM difference operand; otherwise None.
+        """
+        if (
+            isinstance(expr, ast.BinaryOp)
+            and expr.op in ("+", "-")
+            and isinstance(expr.left, ast.LabelAddr)
+            and isinstance(expr.right, ast.LabelAddr)
+        ):
+            try:
+                a = self._global_label_addr_text(expr.left.label)
+                b = self._global_label_addr_text(expr.right.label)
+            except CodegenError:
+                return None
+            sep = " - " if expr.op == "-" else " + "
+            return f"{a}{sep}{b}"
+        return None
 
     def _global_label_addr_text(self, label: str) -> str:
         """`&&label` operand text for a static initializer.
