@@ -7194,6 +7194,12 @@ class CodeGenerator:
             return ast.BasicType(name="int")
         if isinstance(expr, ast.Index):
             arr_type = self._type_of(expr.array, ctx)
+            # C allows `int[ptr]` swapped form. If `array` isn't pointer-
+            # like but `index` is, treat the index as the pointer.
+            if not self._is_pointer_like(arr_type):
+                idx_type = self._type_of(expr.index, ctx)
+                if self._is_pointer_like(idx_type):
+                    arr_type = idx_type
             if not self._is_pointer_like(arr_type):
                 raise CodegenError(
                     f"index target must be array or pointer "
@@ -8765,15 +8771,40 @@ class CodeGenerator:
         whether `expr.array` is an array name, a pointer variable, or a
         more complex expression that produces a pointer — the address
         flow is the same: base in eax, scale the index by element size,
-        then add.
+        then add. For VLA elements (size depends on a runtime value),
+        emit a runtime sizeof and multiply by the index.
+
+        C allows the swapped form `int[ptr]` (= ptr[int]) — if `array`
+        isn't pointer-like but `index` is, swap them.
         """
         arr_type = self._type_of(expr.array, ctx)
+        idx_type = self._type_of(expr.index, ctx)
+        if not self._is_pointer_like(arr_type) and self._is_pointer_like(idx_type):
+            expr = ast.Index(
+                array=expr.index, index=expr.array, location=expr.location,
+            )
+            arr_type, idx_type = idx_type, arr_type
         if not self._is_pointer_like(arr_type):
             raise CodegenError(
                 f"index target must be array or pointer "
                 f"(got {type(arr_type).__name__})"
             )
-        elem_size = self._size_of(arr_type.base_type)
+        elem_ty = arr_type.base_type
+        if self._type_has_vla(elem_ty):
+            # Runtime stride: eval array → push, eval index → push,
+            # eval sizeof(elem) → eax, multiply, add.
+            out = self._eval_expr_to_eax(expr.array, ctx)
+            out.append("        push    eax")
+            out += self._eval_expr_to_eax(expr.index, ctx)
+            out.append("        push    eax")
+            out += self._emit_runtime_size_of(elem_ty, ctx)
+            out.append("        pop     ecx")    # ecx = index
+            out.append("        imul    eax, ecx")
+            out.append("        mov     ecx, eax")
+            out.append("        pop     eax")    # eax = array base
+            out.append("        add     eax, ecx")
+            return out
+        elem_size = self._size_of(elem_ty)
         out = self._eval_expr_to_eax(expr.array, ctx)
         out.append("        push    eax")
         out += self._eval_expr_to_eax(expr.index, ctx)
