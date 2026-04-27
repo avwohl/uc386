@@ -433,6 +433,27 @@ class CodeGenerator:
         for name in ("__builtin_bswap64",):
             self._func_return_types[name] = ull
             self._func_param_types[name] = [ull]
+        # Float-precision builtins: register so the call site narrows /
+        # widens correctly per the param's declared width. Without this,
+        # a `float`-typed value passed to `__builtin_isinff` would push
+        # 8 bytes (default double width) and the callee would see
+        # garbage in the low 4.
+        flt = ast.BasicType(name="float")
+        dbl = ast.BasicType(name="double")
+        ldbl = ast.BasicType(name="long double")
+        intt = ast.BasicType(name="int")
+        for name in ("__builtin_isinff", "__builtin_isnanf",
+                     "__builtin_isfinitef", "__builtin_signbitf"):
+            self._func_return_types[name] = intt
+            self._func_param_types[name] = [flt]
+        for name in ("__builtin_isinf", "__builtin_isnan",
+                     "__builtin_isfinite", "__builtin_signbit"):
+            self._func_return_types[name] = intt
+            self._func_param_types[name] = [dbl]
+        for name in ("__builtin_isinfl", "__builtin_isnanl",
+                     "__builtin_isfinitel", "__builtin_signbitl"):
+            self._func_return_types[name] = intt
+            self._func_param_types[name] = [ldbl]
         for d in top_decls:
             if isinstance(d, ast.FunctionDecl):
                 self._func_return_types[d.name] = d.return_type
@@ -638,9 +659,17 @@ class CodeGenerator:
             emitted += 1
         # Strings come last so any string interned during the global
         # init walk above is included.
-        for value, label in sorted(self._strings.items(), key=lambda kv: kv[1]):
+        for key, label in sorted(self._strings.items(), key=lambda kv: kv[1]):
+            is_wide = key.startswith("W:")
+            value = key[2:] if is_wide else key
             out.append(f"{label}:")
-            out.append(f"        db      {self._render_string(value)}, 0")
+            if is_wide:
+                # Wide strings: each codepoint is `sizeof(wchar_t)` (2 on
+                # this i386 build via __WCHAR_TYPE__=unsigned short).
+                cps = [str(ord(c)) for c in value] + ["0"]
+                out.append(f"        dw      {', '.join(cps)}")
+            else:
+                out.append(f"        db      {self._render_string(value)}, 0")
         for (value, size), label in sorted(
             self._float_constants.items(), key=lambda kv: kv[1]
         ):
@@ -1998,11 +2027,14 @@ class CodeGenerator:
             )
         return False
 
-    def _intern_string(self, value: str) -> str:
-        if value in self._strings:
-            return self._strings[value]
+    def _intern_string(self, value: str, is_wide: bool = False) -> str:
+        # Wide strings get a separate keyspace so the same characters
+        # don't collapse into one byte sequence.
+        key = ("W:" if is_wide else "") + value
+        if key in self._strings:
+            return self._strings[key]
         label = f"_uc386_str{len(self._strings)}"
-        self._strings[value] = label
+        self._strings[key] = label
         return label
 
     def _intern_compound_global(
@@ -6847,6 +6879,13 @@ class CodeGenerator:
                 return ast.ComplexType(base_type=base)
             return ast.BasicType(name=base)
         if isinstance(expr, ast.StringLiteral):
+            if getattr(expr, "is_wide", False):
+                # Wide: pointer to unsigned short (our wchar_t typedef).
+                return ast.PointerType(
+                    base_type=ast.BasicType(
+                        name="short", is_signed=False, is_const=True,
+                    )
+                )
             return ast.PointerType(base_type=ast.BasicType(name="char", is_const=True))
         if isinstance(expr, ast.UnaryOp):
             if expr.op == "&":
@@ -7124,7 +7163,8 @@ class CodeGenerator:
         if isinstance(expr, ast.LabelAddr):
             return [f"        mov     eax, {self._label_addr_text(expr.label, ctx)}"]
         if isinstance(expr, ast.StringLiteral):
-            label = self._intern_string(expr.value)
+            is_wide = getattr(expr, "is_wide", False)
+            label = self._intern_string(expr.value, is_wide=is_wide)
             return [f"        mov     eax, {label}"]
         if isinstance(expr, ast.Identifier):
             return self._identifier_load(expr.name, ctx)

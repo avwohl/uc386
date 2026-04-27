@@ -110,6 +110,11 @@ I386_DOS_PREDEFINES = {
     "__SIZEOF_PTRDIFF_T__": "4",
     "__SIZEOF_WCHAR_T__": "2",
     "__SIZEOF_WINT_T__": "4",
+    # Endianness predefines — i386 is little-endian.
+    "__BYTE_ORDER__": "1234",
+    "__ORDER_LITTLE_ENDIAN__": "1234",
+    "__ORDER_BIG_ENDIAN__": "4321",
+    "__ORDER_PDP_ENDIAN__": "3412",
 }
 
 
