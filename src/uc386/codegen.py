@@ -304,6 +304,9 @@ class CodeGenerator:
         # Per-global alignment override from `__attribute__((aligned(N)))`.
         # Keys without an entry use the default (no align directive).
         self._global_alignments: dict[str, int] = {}
+        # Per-struct alignment when a member has `aligned(N)` or the
+        # struct itself has it. Used to align globals of struct type.
+        self._struct_alignments: dict[str, int] = {}
         # Struct definitions: name → list of (member_name, member_type,
         # offset). `_struct_sizes` is the corresponding total size in bytes
         # (rounded up to struct alignment).
@@ -583,6 +586,12 @@ class CodeGenerator:
             ty = self._globals[name]
             init = self._global_inits[name]
             align = self._global_alignments.get(name)
+            if align is None:
+                # Derive from the type's required alignment so structs
+                # with aligned members get the right placement.
+                ta = self._alignment_of(ty)
+                if ta > 1:
+                    align = ta
             if align and align > 1:
                 out.append(f"        align {align}")
             out.append(f"_{name}:")
@@ -655,6 +664,10 @@ class CodeGenerator:
             ty = self._globals[name]
             size = self._size_of(ty)
             align = self._global_alignments.get(name)
+            if align is None:
+                ta = self._alignment_of(ty)
+                if ta > 1:
+                    align = ta
             if align and align > 1:
                 out.append(f"        alignb {align}")
             out.append(f"_{name}:")
@@ -3208,6 +3221,12 @@ class CodeGenerator:
                 continue
             self._check_supported_type(m.member_type, f"{decl.name}.{m.name}")
             align = self._alignment_of(m.member_type)
+            # Honor an `__attribute__((aligned(N)))` on the member —
+            # bumps both the member's effective alignment and the
+            # struct's overall alignment.
+            ma = getattr(m, "alignment", None)
+            if ma is not None and ma > align:
+                align = ma
             if align > max_align:
                 max_align = align
 
@@ -3334,6 +3353,11 @@ class CodeGenerator:
                     unit_used = 0
                 unit_size = 4
                 align = self._alignment_of(m.member_type)
+                # `__attribute__((aligned(N)))` on the member bumps its
+                # required alignment.
+                ma = getattr(m, "alignment", None)
+                if ma is not None and ma > align:
+                    align = ma
                 offset = (unit_offset + align - 1) & ~(align - 1)
                 if m.name is None:
                     # Anonymous nested struct/union — promote each inner
@@ -3348,6 +3372,8 @@ class CodeGenerator:
         total = (total + max_align - 1) & ~(max_align - 1)
         self._structs[decl_name] = members
         self._struct_sizes[decl_name] = total
+        if max_align > 1:
+            self._struct_alignments[decl_name] = max_align
         if bitfields:
             self._struct_bitfields[decl_name] = bitfields
 
@@ -3379,7 +3405,13 @@ class CodeGenerator:
         if isinstance(t, ast.ArrayType):
             return self._alignment_of(t.base_type)
         if isinstance(t, ast.StructType):
-            members = self._structs.get(self._resolve_struct_name(t))
+            sname = self._resolve_struct_name(t)
+            # If a member has `aligned(N)`, the struct's alignment was
+            # bumped at registration time — honor it.
+            override = self._struct_alignments.get(sname)
+            if override is not None:
+                return override
+            members = self._structs.get(sname)
             if not members:
                 return 1
             return max(self._alignment_of(mt) for _, mt, _ in members)
