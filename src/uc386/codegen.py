@@ -9774,6 +9774,24 @@ class CodeGenerator:
             bf = self._bitfield_info(expr.left, ctx)
             if bf is not None:
                 return self._compound_assign_bitfield(expr, bf, ctx)
+            # Vector member: desugar to `s.m = s.m OP rhs` and let
+            # the vector-copy assign path handle it. Pre-allocate
+            # the inner BinaryOp's temp slot since the regular
+            # call-temp pre-pass already ran.
+            mty = self._type_of(expr.left, ctx)
+            if (
+                isinstance(mty, ast.ArrayType)
+                and getattr(mty, "is_vector", False)
+            ):
+                inner = ast.BinaryOp(
+                    op=op, left=expr.left, right=expr.right,
+                )
+                size = (self._size_of(mty) + 3) & ~3
+                ctx.alloc_call_temp(inner, size)
+                return self._assign(
+                    ast.BinaryOp(op="=", left=expr.left, right=inner),
+                    ctx,
+                )
             addr_lines = self._member_address(expr.left, ctx)
         else:
             raise CodegenError(
