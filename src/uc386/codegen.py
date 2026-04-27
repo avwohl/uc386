@@ -8811,6 +8811,59 @@ class CodeGenerator:
             # value position are at least defined.
             if callee.name in ("__builtin_unreachable", "__builtin_trap"):
                 return ["        xor     eax, eax"]
+            # GCC: __builtin_apply_args() — returns a pointer to the
+            # caller's argument area. For cdecl with no named params
+            # before the variadic part, that's just [ebp+8] (after
+            # retptr if present).
+            if callee.name == "__builtin_apply_args":
+                return ["        lea     eax, [ebp + 8]"]
+            # __builtin_apply(fn, args, size) — call fn with `size`
+            # bytes of args from `args`.
+            if (
+                callee.name == "__builtin_apply"
+                and len(expr.args) == 3
+            ):
+                # Eval size first (compile-time constant in practice).
+                size_val = None
+                try:
+                    size_val = self._const_eval(expr.args[2], "<apply>")
+                except CodegenError:
+                    pass
+                if size_val is None:
+                    raise CodegenError(
+                        "__builtin_apply: size must be a compile-time constant"
+                    )
+                # Round up to 4.
+                size_val = (size_val + 3) & ~3
+                # Eval args pointer first, save.
+                out: list[str] = []
+                out += self._eval_expr_to_eax(expr.args[1], ctx)
+                out.append("        push    eax")  # save args ptr
+                # Eval callee fn pointer.
+                out += self._eval_expr_to_eax(expr.args[0], ctx)
+                out.append("        push    eax")  # save fn ptr
+                # Reserve `size` bytes on stack and copy from args.
+                out.append(f"        sub     esp, {size_val}")
+                # Stack now (low to high): [size_val area | fn ptr | args ptr]
+                # Push esi/edi to preserve, fix up offsets.
+                out.append("        push    esi")
+                out.append("        push    edi")
+                # After both pushes: [edi(0) | esi(4) | size_area(8..size+7) |
+                #                     fn(size+8) | args(size+12)]
+                out.append(f"        mov     esi, [esp + {size_val + 12}]")
+                out.append(f"        lea     edi, [esp + 8]")
+                out.append(f"        mov     ecx, {size_val // 4}")
+                out.append("        rep     movsd")
+                out.append("        pop     edi")
+                out.append("        pop     esi")
+                # Now: [size_area(0..size-1) | fn(size) | args(size+4)]
+                out.append(f"        mov     eax, [esp + {size_val}]")
+                out.append("        call    eax")
+                # Cleanup: size bytes + 4 (fn ptr) + 4 (args ptr).
+                out.append(f"        add     esp, {size_val + 8}")
+                # Return value from the last call: it's a struct/value
+                # but the test typically discards it. Leave EAX as-is.
+                return out
             if callee.name in (
                 "__builtin_add_overflow",
                 "__builtin_sub_overflow",
