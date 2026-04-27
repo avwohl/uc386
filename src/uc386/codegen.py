@@ -8461,6 +8461,54 @@ class CodeGenerator:
             out = self._eval_expr_to_edx_eax(expr, ctx)
             out.append("        or      eax, edx")
             return out
+        if isinstance(ty, ast.ComplexType):
+            # `if (c)` for complex — true if either half is non-zero.
+            # Materialize into a stack temp, then OR-or-FUCOMP both halves.
+            half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
+            size = self._size_of(ty)
+            out = [f"        sub     esp, {size}"]
+            out.append("        mov     eax, esp")
+            out.append("        push    eax")
+            out += self._eval_complex_into_top(expr, ctx, ty)
+            out.append("        add     esp, 4")
+            if ty.base_type in self._COMPLEX_INT_BASES:
+                int_widths = {1: ("byte", "al"), 2: ("word", "ax"),
+                              4: ("dword", "eax")}
+                if half_size == 8:
+                    out.append("        mov     eax, [esp]")
+                    out.append("        or      eax, [esp + 4]")
+                    out.append("        or      eax, [esp + 8]")
+                    out.append("        or      eax, [esp + 12]")
+                else:
+                    w, lo = int_widths[half_size]
+                    if half_size == 4:
+                        out.append("        mov     eax, [esp]")
+                        out.append("        or      eax, [esp + 4]")
+                    else:
+                        out.append(f"        mov     {lo}, [esp]")
+                        out.append(f"        or      {lo}, [esp + {half_size}]")
+                        out.append("        movzx   eax, " + lo)
+                out.append("        setne   al")
+                out.append("        movzx   eax, al")
+            else:
+                width = "dword" if half_size == 4 else "qword"
+                out.append(f"        fld     {width} [esp]")
+                out.append("        fldz")
+                out.append("        fucompp")
+                out.append("        fnstsw  ax")
+                out.append("        sahf")
+                out.append("        setne   cl")
+                out.append("        movzx   ecx, cl")
+                out.append(f"        fld     {width} [esp + {half_size}]")
+                out.append("        fldz")
+                out.append("        fucompp")
+                out.append("        fnstsw  ax")
+                out.append("        sahf")
+                out.append("        setne   al")
+                out.append("        movzx   eax, al")
+                out.append("        or      eax, ecx")
+            out.append(f"        add     esp, {size}")
+            return out
         return self._eval_expr_to_eax(expr, ctx)
 
     def _float_compare(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
