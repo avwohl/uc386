@@ -4607,6 +4607,55 @@ class CodeGenerator:
             out += self._fistp_truncate_dword_to_eax()
             out.append(f"{label_done}:")
             return out
+        # Float → signed int with saturation (gcc convention): if the
+        # float is >= INT_MAX+1 or <= INT_MIN-1, fistp would produce
+        # 0x80000000 ("indefinite integer"). Saturate to INT_MAX /
+        # INT_MIN respectively.
+        if (
+            self._is_float_type(src_ty)
+            and isinstance(target, ast.BasicType)
+            and self._size_of(target) == 4
+            and not self._is_unsigned(target)
+        ):
+            # Use a single-eval path: eval once into st(0), check
+            # against 2^31 and -2^31, fistp, fixup if needed.
+            out = self._eval_float_to_st0(expr.expr, ctx)
+            high_label = self._intern_float(2147483648.0, 4)   # 2^31
+            low_label = self._intern_float(-2147483648.0, 4)   # -2^31
+            label_high = ctx.label("f2i_high")
+            label_low = ctx.label("f2i_low")
+            label_done = ctx.label("f2i_done")
+            # Check if value >= 2^31 → saturate to INT_MAX.
+            out.append("        fld     st0")          # dup st(0)
+            out.append(f"        fld     dword [{high_label}]")
+            out.append("        fucompp")               # cmp 2^31 vs dup
+            out.append("        fnstsw  ax")
+            out.append("        sahf")
+            # value >= 2^31 means dup >= 2^31 means ST(1) >= ST(0)
+            # for the order (st0=2^31, st1=dup): "ST(0) <= ST(1)" → setbe.
+            # In jcc: jbe for CF=1 OR ZF=1. Use jbe.
+            out.append(f"        jbe     {label_high}")
+            # Check if value < -2^31 → saturate to INT_MIN.
+            out.append("        fld     st0")
+            out.append(f"        fld     dword [{low_label}]")
+            out.append("        fucompp")
+            out.append("        fnstsw  ax")
+            out.append("        sahf")
+            # value < -2^31 means ST(1) < ST(0) (since st0=-2^31, st1=value).
+            # ST(0) > ST(1) → CF=0 AND ZF=0 → ja.
+            out.append(f"        ja      {label_low}")
+            # Normal range: fistp truncate.
+            out += self._fistp_truncate_dword_to_eax()
+            out.append(f"        jmp     {label_done}")
+            out.append(f"{label_high}:")
+            out.append("        fstp    st0")          # discard st(0)
+            out.append("        mov     eax, 0x7FFFFFFF")
+            out.append(f"        jmp     {label_done}")
+            out.append(f"{label_low}:")
+            out.append("        fstp    st0")          # discard st(0)
+            out.append("        mov     eax, 0x80000000")
+            out.append(f"{label_done}:")
+            return out
         # Vector → integer cast in scalar context. The vector's bytes
         # are type-punned: for size==4 we read the low dword; for
         # size==8 (long long) we'd need EDX:EAX, but the caller of
