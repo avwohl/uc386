@@ -689,6 +689,18 @@ ___builtin_strcat:        jmp _strcat
 ___builtin_abs:           jmp _abs
 ___builtin_labs:          jmp _abs
 ___builtin_alloca:        jmp _alloca
+___builtin_alloca_with_align:
+        ; alloca_with_align(size, alignment) — second arg is in BITS;
+        ; we ignore it (our malloc is 16-byte aligned) and just allocate
+        ; size bytes.
+        push    ebp
+        mov     ebp, esp
+        push    dword [ebp + 8]
+        call    _alloca
+        add     esp, 4
+        mov     esp, ebp
+        pop     ebp
+        ret
 ___builtin_classify_type:
         ; gcc returns an integer indicating the type class of an
         ; unevaluated expression. We always return 1 (integer_type)
