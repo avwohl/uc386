@@ -1791,14 +1791,35 @@ class CodeGenerator:
         """Compile-time fold a float-typed expression for a global init.
 
         Handles literal numbers, unary +/-, the standard arithmetic
-        binary ops, and casts (which are no-ops at this level).
+        binary ops, and casts (which narrow to the target precision).
         Reaches integer literals via float() coercion so things like
-        `1024.0 - 1.0 / 32768.0` and `(double)1` work.
+        `1024.0 - 1.0 / 32768.0` and `(double)1` work. Float-typed
+        literals are first narrowed to 32-bit IEEE-754 so subsequent
+        arithmetic respects the source precision (matches the FPU
+        runtime path: `fld dword` loads a float, exact in 80-bit, then
+        ops). This matters for boundary values like FLT_MIN / 2.0 where
+        the double approximation of the decimal `1.17549435e-38` differs
+        from the actual 32-bit FLT_MIN.
         """
+        import struct
         while isinstance(expr, ast.Cast):
+            target = expr.target_type
+            inner = self._const_eval_float(expr.expr, name)
+            if (
+                isinstance(target, ast.BasicType)
+                and target.name == "float"
+            ):
+                # Round to 32-bit float precision.
+                return struct.unpack("<f", struct.pack("<f", inner))[0]
             expr = expr.expr
+            return inner
         if isinstance(expr, ast.FloatLiteral):
-            return float(expr.value)
+            v = float(expr.value)
+            # `1.0F` is float-typed in C — narrow to 32-bit precision so
+            # the decimal-to-double approximation doesn't leak through.
+            if getattr(expr, "is_float", False):
+                v = struct.unpack("<f", struct.pack("<f", v))[0]
+            return v
         if isinstance(expr, ast.IntLiteral):
             return float(expr.value)
         if isinstance(expr, ast.CharLiteral):
