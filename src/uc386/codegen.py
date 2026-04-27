@@ -301,6 +301,9 @@ class CodeGenerator:
         # supplied, so the `.data` emission can produce constants.
         self._globals: dict[str, ast.TypeNode] = {}
         self._global_inits: dict[str, ast.Expression] = {}
+        # Per-global alignment override from `__attribute__((aligned(N)))`.
+        # Keys without an entry use the default (no align directive).
+        self._global_alignments: dict[str, int] = {}
         # Struct definitions: name → list of (member_name, member_type,
         # offset). `_struct_sizes` is the corresponding total size in bytes
         # (rounded up to struct alignment).
@@ -499,6 +502,9 @@ class CodeGenerator:
                 resolved = self._resolved_var_type(d)
                 self._check_supported_type(resolved, d.name)
                 self._globals[d.name] = resolved
+                align = getattr(d, "alignment", None)
+                if align is not None:
+                    self._global_alignments[d.name] = align
                 if d.init is not None:
                     if d.name in self._global_inits:
                         raise CodegenError(
@@ -576,6 +582,9 @@ class CodeGenerator:
         for name in initialized_globals:
             ty = self._globals[name]
             init = self._global_inits[name]
+            align = self._global_alignments.get(name)
+            if align and align > 1:
+                out.append(f"        align {align}")
             out.append(f"_{name}:")
             self._emitting_for_func = self._static_local_owner.get(name, "")
             out += self._emit_global_init(ty, init, name)
@@ -645,6 +654,9 @@ class CodeGenerator:
         for name in uninit:
             ty = self._globals[name]
             size = self._size_of(ty)
+            align = self._global_alignments.get(name)
+            if align and align > 1:
+                out.append(f"        alignb {align}")
             out.append(f"_{name}:")
             out.append(f"        resb    {size}")
         return out
