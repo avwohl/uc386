@@ -7418,10 +7418,14 @@ class CodeGenerator:
         return ast.BasicType(name="int")
 
     def _type_has_vla(self, t: ast.TypeNode) -> bool:
-        """Does `t` contain a variable-length array (preserved on
-        `_vla_size`)?"""
+        """Does `t` contain a variable-length array? Recognized via
+        either a saved `_vla_size` (set by `_check_supported_type`'s
+        VLA fallback) or a non-literal `size` expression on a fresh
+        ArrayType the codegen hasn't fully resolved yet."""
         if isinstance(t, ast.ArrayType):
             if getattr(t, "_vla_size", None) is not None:
+                return True
+            if t.size is not None and not isinstance(t.size, ast.IntLiteral):
                 return True
             return self._type_has_vla(t.base_type)
         if isinstance(t, ast.StructType):
@@ -7446,6 +7450,13 @@ class CodeGenerator:
             return [f"        mov     eax, {self._size_of(t)}"]
         if isinstance(t, ast.ArrayType):
             vla_size = getattr(t, "_vla_size", None)
+            if vla_size is None and t.size is not None and not isinstance(
+                t.size, ast.IntLiteral
+            ):
+                # Fresh VLA — typedef'd or otherwise hasn't been
+                # processed by `_check_supported_type`. Use the size
+                # expression directly.
+                vla_size = t.size
             if vla_size is not None:
                 inner = self._emit_runtime_size_of(t.base_type, ctx)
                 out = list(inner)
