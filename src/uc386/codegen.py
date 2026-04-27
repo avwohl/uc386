@@ -7947,6 +7947,36 @@ class CodeGenerator:
             out.append("        cdq")
         return out
 
+    def _bitfield_precision_mask(
+        self, *operands: ast.Expression, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Mask EDX:EAX to the WIDEST bit-field width among `operands`.
+        Per gcc, arithmetic on a bit-field of declared type
+        `unsigned long long b:N` keeps results modulo 2^N. For mixed
+        bit-field operands, the result's precision is the wider of the
+        two."""
+        max_width = 0
+        for operand in operands:
+            if not isinstance(operand, ast.Member):
+                continue
+            bf = self._bitfield_info(operand, ctx)
+            if bf is None:
+                continue
+            _bit_offset, bit_width, _member_ty, unit_size = bf
+            if unit_size != 8 or bit_width >= 64:
+                continue
+            if bit_width > max_width:
+                max_width = bit_width
+        if max_width == 0:
+            return []
+        if max_width <= 32:
+            return [
+                f"        and     eax, {(1 << max_width) - 1}",
+                "        xor     edx, edx",
+            ]
+        high_mask = (1 << (max_width - 32)) - 1
+        return [f"        and     edx, {high_mask}"]
+
     def _binary_ll(
         self, expr: ast.BinaryOp, ctx: _FuncCtx,
     ) -> list[str]:
@@ -7989,9 +8019,9 @@ class CodeGenerator:
         ]
         # Now: EDX:EAX = left, EBX:ECX = right.
         if op == "+":
-            return out + ["        add     eax, ecx", "        adc     edx, ebx"]
+            return out + ["        add     eax, ecx", "        adc     edx, ebx"] + self._bitfield_precision_mask(expr.left, expr.right, ctx=ctx)
         if op == "-":
-            return out + ["        sub     eax, ecx", "        sbb     edx, ebx"]
+            return out + ["        sub     eax, ecx", "        sbb     edx, ebx"] + self._bitfield_precision_mask(expr.left, expr.right, ctx=ctx)
         if op == "&":
             return out + ["        and     eax, ecx", "        and     edx, ebx"]
         if op == "|":
@@ -8007,7 +8037,7 @@ class CodeGenerator:
         if op == "<<":
             big = ctx.label("ll_shl_big")
             done = ctx.label("ll_shl_done")
-            return out + [
+            shift_lines = [
                 "        test    cl, 32",
                 f"        jnz     {big}",
                 "        shld    edx, eax, cl",
@@ -8020,13 +8050,14 @@ class CodeGenerator:
                 "        shl     edx, cl",
                 f"{done}:",
             ]
+            return out + shift_lines + self._bitfield_precision_mask(expr.left, ctx=ctx)
         if op == ">>":
             unsigned = self._is_unsigned(self._type_of(expr.left, ctx))
             shift_high = "shr" if unsigned else "sar"
             ext = "xor edx, edx" if unsigned else "sar edx, 31"
             big = ctx.label("ll_shr_big")
             done = ctx.label("ll_shr_done")
-            return out + [
+            shift_lines = [
                 "        test    cl, 32",
                 f"        jnz     {big}",
                 "        shrd    eax, edx, cl",
@@ -8039,12 +8070,13 @@ class CodeGenerator:
                 f"        {shift_high}    eax, cl",
                 f"{done}:",
             ]
+            return out + shift_lines + self._bitfield_precision_mask(expr.left, ctx=ctx)
         if op == "*":
             # 64x64 → 64 truncated multiply.
             #   left  = LH:LL (EDX:EAX);  right = RH:RC (EBX:ECX)
             #   low  32 = (LL*RC) low
             #   high 32 = (LL*RC) high + (LL*RH) low + (LH*RC) low
-            return out + [
+            mul_lines = [
                 "        push    edx",          # [esp+8] = LH
                 "        push    eax",          # [esp+4] = LL (after one more push below)
                 "        mul     ecx",          # edx:eax = LL * RC
@@ -8060,6 +8092,8 @@ class CodeGenerator:
                 "        mov     edx, esi",     # edx = high 32 of full product
                 "        add     esp, 8",       # discard LL and LH
             ]
+            mask = self._bitfield_precision_mask(expr.left, expr.right, ctx=ctx)
+            return out + mul_lines + mask
         if op in ("/", "%"):
             # Long-long div/mod: route through the harness via INT 0x80
             # (a private trap vector — DOS doesn't use it, so our hook
