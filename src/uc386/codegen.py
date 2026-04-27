@@ -6933,26 +6933,42 @@ class CodeGenerator:
             retptr=retptr_lines,
         )
 
-    def _is_struct_returning_call(self, call: ast.Call, ctx: _FuncCtx) -> bool:
-        """True iff `call` invokes a known function that returns a struct.
-
-        Indirect calls through function pointers always return False —
-        we don't track function-pointer return types yet, so we treat
-        them as "not struct" to avoid spurious detection.
+    def _call_return_type(
+        self, call: ast.Call, ctx: _FuncCtx | None,
+    ) -> ast.TypeNode | None:
+        """Resolve a Call's return type — directly when the callee is a
+        named function, or by walking the indirect callee's function-
+        pointer type.
         """
         target = self._call_target(call)
-        if target is None:
-            return False
-        return isinstance(self._func_return_types[target], ast.StructType)
+        if target is not None:
+            return self._func_return_types.get(target)
+        if ctx is None:
+            return None
+        try:
+            ty = self._type_of(call.func, ctx)
+        except CodegenError:
+            return None
+        # Strip leading `*`s that the user may have layered on a fn
+        # pointer — `(*fp)()` and `(***fp)()` are idempotent.
+        if isinstance(ty, ast.PointerType) and isinstance(
+            ty.base_type, ast.FunctionType
+        ):
+            return ty.base_type.return_type
+        if isinstance(ty, ast.FunctionType):
+            return ty.return_type
+        return None
+
+    def _is_struct_returning_call(self, call: ast.Call, ctx) -> bool:
+        """True iff `call` returns a struct (direct or via known
+        function-pointer type)."""
+        rt = self._call_return_type(call, ctx)
+        return isinstance(rt, ast.StructType)
 
     def _is_vector_returning_call(self, call: ast.Call, ctx) -> bool:
-        """True iff `call` invokes a known function that returns a vector
-        (modeled as ArrayType in our AST). Vectors use the same caller-
-        provided buffer ABI as structs."""
-        target = self._call_target(call)
-        if target is None:
-            return False
-        return isinstance(self._func_return_types[target], ast.ArrayType)
+        """True iff `call` returns a vector (ArrayType, by-value)."""
+        rt = self._call_return_type(call, ctx)
+        return isinstance(rt, ast.ArrayType)
 
     # ---- expressions ----------------------------------------------------
 
