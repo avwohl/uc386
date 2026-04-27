@@ -908,7 +908,15 @@ class CodeGenerator:
         `_const_eval_complex`, which returns a `(real, imag)` tuple.
         """
         real, imag = self._const_eval_complex(init, name)
-        directive = "dd" if ty.base_type == "float" else "dq"
+        half_size = self._COMPLEX_BASE_SIZES.get(ty.base_type, 8)
+        # Float halves accept the decimal float repr; integer halves
+        # use db/dw/dd/dq with the int value.
+        if ty.base_type in self._COMPLEX_INT_BASES:
+            directive = self._DATA_DIRECTIVE.get(half_size, "dd")
+            r = int(real)
+            i = int(imag)
+            return [f"        {directive}      {r}, {i}"]
+        directive = "dd" if half_size == 4 else "dq"
         return [f"        {directive}      {real!r}, {imag!r}"]
 
     def _const_eval_complex(
@@ -5828,6 +5836,18 @@ class CodeGenerator:
         if isinstance(expr, ast.BinaryOp):
             if expr.op == "=":
                 return self._complex_assign_into_top(expr, eff_ty, ctx)
+            # Integer-base complex constant arithmetic: fold at compile
+            # time and store the integer halves directly. Avoids the
+            # FPU paths that would mishandle 1/2-byte halves.
+            if (
+                eff_ty.base_type in self._COMPLEX_INT_BASES
+                and expr.op in ("+", "-", "*")
+            ):
+                try:
+                    real, imag = self._const_eval_complex(expr, "<complex-int>")
+                    return self._complex_const_into_top(real, imag, eff_ty)
+                except CodegenError:
+                    pass
             if expr.op in ("+", "-"):
                 return self._complex_addsub_into_top(expr, eff_ty, ctx)
             if expr.op == "*":
@@ -6164,8 +6184,31 @@ class CodeGenerator:
         self, real: float, imag: float, ty: ast.ComplexType,
     ) -> list[str]:
         """Constant `(real, imag)` complex value — interned via the
-        float-constant table for each half."""
+        float-constant table for each half. For int-base complex,
+        each half stores the integer value with width-appropriate
+        directives.
+        """
         half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
+        if ty.base_type in self._COMPLEX_INT_BASES:
+            r = int(real)
+            i = int(imag)
+            int_widths = {1: ("byte", "al"), 2: ("word", "ax"), 4: ("dword", "eax")}
+            if half_size == 8:
+                rl, rh = r & 0xFFFFFFFF, (r >> 32) & 0xFFFFFFFF
+                il, ih = i & 0xFFFFFFFF, (i >> 32) & 0xFFFFFFFF
+                return [
+                    "        mov     ecx, [esp]",
+                    f"        mov     dword [ecx], 0x{rl:08X}",
+                    f"        mov     dword [ecx + 4], 0x{rh:08X}",
+                    f"        mov     dword [ecx + 8], 0x{il:08X}",
+                    f"        mov     dword [ecx + 12], 0x{ih:08X}",
+                ]
+            w, lo = int_widths[half_size]
+            return [
+                "        mov     ecx, [esp]",
+                f"        mov     {w} [ecx], {r}",
+                f"        mov     {w} [ecx + {half_size}], {i}",
+            ]
         width = "dword" if half_size == 4 else "qword"
         r_label = self._intern_float(real, half_size)
         i_label = self._intern_float(imag, half_size)
@@ -6332,15 +6375,16 @@ class CodeGenerator:
         """`a == b` or `a != b` for complex values. Returns 0/1 in EAX.
 
         Plan: get &a and &b (handling lvalues, scalars, and complex
-        expressions). Compare both halves on the FPU. AND the two
-        boolean halves for `==` (or NAND for `!=`).
+        expressions). Compare both halves and AND the boolean halves
+        for `==` (or NAND for `!=`). Float-typed halves go through
+        FPU compare; integer halves use plain `cmp`.
         """
         lt = self._type_of(expr.left, ctx)
         rt = self._type_of(expr.right, ctx)
         # Use whichever side is complex to determine the precision.
         cty = lt if isinstance(lt, ast.ComplexType) else rt
         half_size = self._COMPLEX_BASE_SIZES[cty.base_type]
-        width = "dword" if half_size == 4 else "qword"
+        is_int = cty.base_type in self._COMPLEX_INT_BASES
         size = self._size_of(cty)
         # Materialize both operands into stack scratch slots so we
         # can compare half by half.
@@ -6363,25 +6407,69 @@ class CodeGenerator:
             ctx, cty,
         )
         out.append("        add     esp, 4")
-        # Compare reals: fld both, fucompp → ax via fnstsw.
-        out.append(f"        fld     {width} [esp + {size}]")        # left.real
-        out.append(f"        fld     {width} [esp]")                  # right.real
-        out.append("        fucompp")
-        out.append("        fnstsw  ax")
-        out.append("        sahf")
-        # Equal flag (ZF) → AL.
-        out.append("        sete    al")
-        out.append("        movzx   ecx, al")
-        # Compare imags.
-        out.append(f"        fld     {width} [esp + {size + half_size}]")  # left.imag
-        out.append(f"        fld     {width} [esp + {half_size}]")          # right.imag
-        out.append("        fucompp")
-        out.append("        fnstsw  ax")
-        out.append("        sahf")
-        out.append("        sete    al")
-        out.append("        movzx   eax, al")
-        # AND the two booleans → eax.
-        out.append("        and     eax, ecx")
+        if is_int:
+            # Integer halves: load each half and compare with cmp.
+            int_widths = {1: ("byte", "al"), 2: ("word", "ax"), 4: ("dword", "eax")}
+            int_widths_b = {1: ("byte", "bl"), 2: ("word", "bx"), 4: ("dword", "ebx")}
+            if half_size == 8:
+                # Long-long halves — use a pair of cmps.
+                out.append(f"        mov     eax, [esp + {size}]")
+                out.append(f"        mov     edx, [esp + {size} + 4]")
+                out.append("        cmp     eax, [esp]")
+                out.append("        jne     .L_cc_neq_real")
+                out.append("        cmp     edx, [esp + 4]")
+                out.append("        jne     .L_cc_neq_real")
+                out.append("        mov     ecx, 1")
+                out.append("        jmp     .L_cc_real_done")
+                out.append(".L_cc_neq_real:")
+                out.append("        mov     ecx, 0")
+                out.append(".L_cc_real_done:")
+                # imag halves at [esp+size+8] vs [esp+8]
+                out.append(f"        mov     eax, [esp + {size + 8}]")
+                out.append(f"        mov     edx, [esp + {size + 8} + 4]")
+                out.append("        cmp     eax, [esp + 8]")
+                out.append("        jne     .L_cc_neq_imag")
+                out.append("        cmp     edx, [esp + 12]")
+                out.append("        jne     .L_cc_neq_imag")
+                out.append("        mov     eax, 1")
+                out.append("        jmp     .L_cc_imag_done")
+                out.append(".L_cc_neq_imag:")
+                out.append("        mov     eax, 0")
+                out.append(".L_cc_imag_done:")
+                out.append("        and     eax, ecx")
+            else:
+                w, lo = int_widths[half_size]
+                _, lo_b = int_widths_b[half_size]
+                out.append(f"        mov     {lo}, [esp + {size}]")
+                out.append(f"        cmp     {lo}, [esp]")
+                out.append("        sete    al")
+                out.append("        movzx   ecx, al")
+                out.append(f"        mov     {lo}, [esp + {size + half_size}]")
+                out.append(f"        cmp     {lo}, [esp + {half_size}]")
+                out.append("        sete    al")
+                out.append("        movzx   eax, al")
+                out.append("        and     eax, ecx")
+        else:
+            width = "dword" if half_size == 4 else "qword"
+            # Compare reals: fld both, fucompp → ax via fnstsw.
+            out.append(f"        fld     {width} [esp + {size}]")        # left.real
+            out.append(f"        fld     {width} [esp]")                  # right.real
+            out.append("        fucompp")
+            out.append("        fnstsw  ax")
+            out.append("        sahf")
+            # Equal flag (ZF) → AL.
+            out.append("        sete    al")
+            out.append("        movzx   ecx, al")
+            # Compare imags.
+            out.append(f"        fld     {width} [esp + {size + half_size}]")  # left.imag
+            out.append(f"        fld     {width} [esp + {half_size}]")          # right.imag
+            out.append("        fucompp")
+            out.append("        fnstsw  ax")
+            out.append("        sahf")
+            out.append("        sete    al")
+            out.append("        movzx   eax, al")
+            # AND the two booleans → eax.
+            out.append("        and     eax, ecx")
         if expr.op == "!=":
             out.append("        xor     eax, 1")
         out.append(f"        add     esp, {2 * size}")
@@ -6410,27 +6498,52 @@ class CodeGenerator:
     ) -> list[str]:
         """`c = scalar` for `_Complex T c` — store scalar as the real
         part, zero the imag part. Per C, an integer or float assigned
-        to a complex extends with imag=0.
+        to a complex extends with imag=0. Int-base complex stores the
+        scalar via `_store_from_eax`; float-base via `fstp`.
         """
         half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
         # Compute &c, hold in a register.
         out = self._complex_value_address(lhs, ctx)
         out.append("        push    eax")
-        # Evaluate the scalar as a float (handles both int rhs and
-        # float rhs through the existing _eval_float_to_st0 path with
-        # int-promotion).
+        if ty.base_type in self._COMPLEX_INT_BASES:
+            half_basic = ast.BasicType(name=ty.base_type)
+            scalar_ty = self._type_of(rhs, ctx)
+            if self._is_float_type(scalar_ty):
+                out += self._eval_float_to_st0(rhs, ctx)
+                out += self._fistp_truncate_dword_to_eax()
+            elif half_size == 8:
+                # Long-long destination: widen scalar to LL.
+                out += self._eval_expr_to_edx_eax(rhs, ctx)
+                out.append("        pop     ecx")
+                out.append("        mov     [ecx], eax")
+                out.append("        mov     [ecx + 4], edx")
+                out.append("        mov     dword [ecx + 8], 0")
+                out.append("        mov     dword [ecx + 12], 0")
+                out.append("        mov     eax, ecx")
+                return out
+            else:
+                out += self._eval_expr_to_eax(rhs, ctx)
+            out.append("        pop     ecx")
+            out += self._store_from_eax("[ecx]", half_basic)
+            # Zero the imag half.
+            if half_size == 1:
+                out.append(f"        mov     byte [ecx + {half_size}], 0")
+            elif half_size == 2:
+                out.append(f"        mov     word [ecx + {half_size}], 0")
+            else:
+                out.append(f"        mov     dword [ecx + {half_size}], 0")
+            out.append("        mov     eax, ecx")
+            return out
+        # Float halves — eval to st(0), fstp.
         out += self._eval_float_to_st0(rhs, ctx)
         out.append("        pop     ecx")
-        # Store real part.
         width = "dword" if half_size == 4 else "qword"
         out.append(f"        fstp    {width} [ecx]")
-        # Zero-fill the imag half.
         if half_size == 4:
             out.append(f"        mov     dword [ecx + {half_size}], 0")
         else:
             out.append(f"        mov     dword [ecx + {half_size}], 0")
             out.append(f"        mov     dword [ecx + {half_size + 4}], 0")
-        # Leave EAX = address (matching struct-copy convention).
         out.append("        mov     eax, ecx")
         return out
 
