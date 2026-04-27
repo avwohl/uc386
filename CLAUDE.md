@@ -430,3 +430,7 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Typedef'd VLAs.** `typedef int c[i+2];` declares an ArrayType with a non-literal size but doesn't go through `_check_supported_type` (which would have mutated to size=16 and saved `_vla_size`). `_type_has_vla` and `_emit_runtime_size_of` now recognize a fresh ArrayType with a non-literal size as a VLA and use that size expression directly. Closes 20040411-1.
 
   **Result: 1470/1514 gcc-c-torture** (+1). Pipeline 1686/1734 (97.2%).
+- **2026-04-27 — __builtin_setjmp uses 5-word jmp_buf (1470 → 1471)**:
+  - **`__builtin_setjmp` per gcc convention**: only 5 words for buffer (EBP/ESP/EIP plus 2 spare). Previously our impl wrote 6 slots (EBX/ESI/EDI/EBP/ESP/EIP at offsets 0/4/8/12/16/20), so a caller declaring `void *buf[5]` (= 20 bytes) had its return-EIP write spill into the saved-EBP slot, corrupting the frame on longjmp + return. Split: __builtin_setjmp / __builtin_longjmp save only EBP/ESP/EIP into 12 bytes; standard `setjmp` / `longjmp` (used via setjmp.h) keep the 6-word callee-saved layout. Closes pr84521.
+
+  **Result: 1471/1514 gcc-c-torture** (+1). Pipeline 1687/1734 (97.3%).
