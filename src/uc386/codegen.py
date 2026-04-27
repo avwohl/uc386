@@ -6674,29 +6674,93 @@ class CodeGenerator:
         chain. Used by `_return` when the function returns a struct and
         the value is a struct l-value (Identifier, `*p`, `arr[i]`, or a
         member access).
+
+        When the source is a runtime-pointer-derived l-value (`*p`,
+        `arr[i]`, `p->m` chain), the source and destination might
+        alias (caller's destination is a global / pointee that overlaps
+        with our pointer). Forward unrolled copy would corrupt under
+        overlap. Use memmove-direction selection: when dst > src, copy
+        backward; otherwise forward.
         """
         size = self._size_of(ret_ty)
-        # eax = retptr first (destination); push it for after the source
-        # eval, which clobbers EAX.
+        # Detect when aliasing is plausible — i.e. the source isn't a
+        # local Identifier (which can't overlap with the caller's buffer).
+        may_alias = self._may_alias_caller(src_expr, ctx)
         out = [f"        mov     eax, {_ebp_addr(retptr_disp)}"]
         out.append("        push    eax")
         out += self._struct_address(src_expr, ctx)  # eax = &src
         out.append("        mov     edx, eax")
         out.append("        pop     ecx")           # ecx = retptr
-        offset = 0
-        while size - offset >= 4:
-            out.append(f"        mov     eax, [edx + {offset}]")
-            out.append(f"        mov     [ecx + {offset}], eax")
-            offset += 4
-        if size - offset >= 2:
-            out.append(f"        mov     ax, [edx + {offset}]")
-            out.append(f"        mov     [ecx + {offset}], ax")
-            offset += 2
-        if size - offset >= 1:
-            out.append(f"        mov     al, [edx + {offset}]")
-            out.append(f"        mov     [ecx + {offset}], al")
+        if may_alias:
+            # Runtime memmove-direction selection: branch on dst vs src.
+            label_back = ctx.label("crs_back")
+            label_done = ctx.label("crs_done")
+            out.append("        cmp     ecx, edx")
+            out.append(f"        ja      {label_back}")
+            offset = 0
+            while size - offset >= 4:
+                out.append(f"        mov     eax, [edx + {offset}]")
+                out.append(f"        mov     [ecx + {offset}], eax")
+                offset += 4
+            if size - offset >= 2:
+                out.append(f"        mov     ax, [edx + {offset}]")
+                out.append(f"        mov     [ecx + {offset}], ax")
+                offset += 2
+            if size - offset >= 1:
+                out.append(f"        mov     al, [edx + {offset}]")
+                out.append(f"        mov     [ecx + {offset}], al")
+            out.append(f"        jmp     {label_done}")
+            out.append(f"{label_back}:")
+            offset = size
+            while offset >= 4:
+                offset -= 4
+                out.append(f"        mov     eax, [edx + {offset}]")
+                out.append(f"        mov     [ecx + {offset}], eax")
+            if offset >= 2:
+                offset -= 2
+                out.append(f"        mov     ax, [edx + {offset}]")
+                out.append(f"        mov     [ecx + {offset}], ax")
+            if offset >= 1:
+                offset -= 1
+                out.append(f"        mov     al, [edx + {offset}]")
+                out.append(f"        mov     [ecx + {offset}], al")
+            out.append(f"{label_done}:")
+        else:
+            offset = 0
+            while size - offset >= 4:
+                out.append(f"        mov     eax, [edx + {offset}]")
+                out.append(f"        mov     [ecx + {offset}], eax")
+                offset += 4
+            if size - offset >= 2:
+                out.append(f"        mov     ax, [edx + {offset}]")
+                out.append(f"        mov     [ecx + {offset}], ax")
+                offset += 2
+            if size - offset >= 1:
+                out.append(f"        mov     al, [edx + {offset}]")
+                out.append(f"        mov     [ecx + {offset}], al")
         out.append("        mov     eax, ecx")     # return retptr
         return out
+
+    def _may_alias_caller(
+        self, src_expr: ast.Expression, ctx: _FuncCtx,
+    ) -> bool:
+        """Conservative test: does this source expression potentially
+        alias the caller's struct-return buffer? Stack-local
+        Identifiers can't (their storage lives in this frame). Anything
+        that goes through a runtime pointer might."""
+        # Strip a single dereference / index / member chain.
+        e = src_expr
+        while isinstance(e, ast.Member):
+            e = e.obj
+        if isinstance(e, ast.Identifier):
+            # Local variable: can't alias caller's buffer.
+            if ctx.has_local(e.name):
+                return False
+            # Global: could alias if the caller's destination points
+            # into the same global. Conservative: yes.
+            return True
+        # `*p`, `arr[i]`, etc. — pointer-derived, potentially aliased.
+        return True
 
     # ---- variadic builtins (va_start / va_arg / va_end) -----------------
 
