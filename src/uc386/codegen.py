@@ -2315,6 +2315,29 @@ class CodeGenerator:
         out.append("        mov     ebp, esp")
         if ctx.frame_size:
             out.append(f"        sub     esp, {ctx.frame_size}")
+        # VLA parameter sizes: `int b[a++]` evaluates `a++` for its
+        # side effects at function entry per C99. The parser captured
+        # these on `param.size_side_effects` before adjusting the array
+        # type to a pointer. Wrapped in a broad try — if the operand
+        # references something we can't bind in this scope (e.g. a
+        # nested fn whose param size mentions the outer fn's local),
+        # silently skip rather than blow up codegen.
+        for param in fn.params:
+            sse = getattr(param, "size_side_effects", None)
+            if not sse:
+                continue
+            for size_expr in sse:
+                try:
+                    self._const_eval(size_expr, f"<vla-{param.name}>")
+                    # Pure constant; nothing to emit.
+                    continue
+                except CodegenError:
+                    pass
+                try:
+                    out += self._eval_expr_to_eax(size_expr, ctx)
+                except CodegenError:
+                    # Operand not resolvable in this scope; skip.
+                    pass
         # If any of our params are captured by a nested function, copy
         # the param's incoming value into its mangled global so the
         # nested fn (compiled separately) sees the right initial value.
