@@ -315,6 +315,12 @@ class CodeGenerator:
         # Names of structs that were declared with `union` so init/copy
         # paths know members share storage.
         self._struct_unions: set[str] = set()
+        # Per-member group id: members promoted from the same anonymous
+        # nested struct/union share the same group id. Used by
+        # `_emit_global_struct_init` (union path) to distribute a
+        # brace-list init across an anonymous-struct member's promoted
+        # body. Parallel to `_structs[name]`.
+        self._struct_member_groups: dict[str, list[int]] = {}
         # Enum constant table — `enum c { A, B }` registers A=0, B=1.
         # Identifiers that aren't slots/globals/functions fall back here.
         self._enum_constants: dict[str, int] = {}
@@ -420,6 +426,13 @@ class CodeGenerator:
             ct = ast.ComplexType(base_type=base)
             self._func_return_types[name] = ct
             self._func_param_types[name] = [ct]
+        # 64-bit builtins return `unsigned long long` (EDX:EAX). Without
+        # this registration, `_return` would `cdq` after the call,
+        # smashing the high half.
+        ull = ast.BasicType(name="long long", is_signed=False)
+        for name in ("__builtin_bswap64",):
+            self._func_return_types[name] = ull
+            self._func_param_types[name] = [ull]
         for d in top_decls:
             if isinstance(d, ast.FunctionDecl):
                 self._func_return_types[d.name] = d.return_type
@@ -493,8 +506,18 @@ class CodeGenerator:
         # up like globals, but no storage allocated; the linker resolves
         # the symbol. NASM `extern _name` is emitted in the header.
         self._extern_vars: dict[str, ast.TypeNode] = {}
+        # `__attribute__((alias("target")))` on a VarDecl makes the
+        # declared name a NASM-level alias for `_target` — emitted as
+        # `_name equ _target` in the output. Both names refer to the
+        # same address.
+        self._global_aliases: dict[str, str] = {}
         for d in top_decls:
             if isinstance(d, ast.VarDecl) and not isinstance(d.var_type, ast.FunctionType):
+                target = getattr(d, "alias_target", None)
+                if target is not None:
+                    self._global_aliases[d.name] = target
+                    self._extern_vars[d.name] = self._resolved_var_type(d)
+                    continue
                 if (
                     getattr(d, "storage_class", None) == "extern"
                     and d.init is None
@@ -557,6 +580,10 @@ class CodeGenerator:
         ]
         for name in externs:
             out.append(f"        extern  _{name}")
+        # `__attribute__((alias("target")))` — emit `_alias equ _target`
+        # so all references resolve to the target's address.
+        for alias_name, target in sorted(self._global_aliases.items()):
+            out.append(f"        _{alias_name} equ _{target}")
         out += [
             f"        section .text",
             f"        global _start",
@@ -934,6 +961,43 @@ class CodeGenerator:
             if not init.values:
                 return [f"        times {total} db 0"]
             first_value = init.values[0]
+            # If the first conceptual member is an anonymous nested
+            # struct (multiple promoted members share group 0), and the
+            # init's first value is itself a brace list, distribute the
+            # inner values across the anonymous struct's promoted
+            # members. Drives `union { struct {char x[4]; char y[4];}; ... } u = {{"a","b"}}`.
+            groups = self._struct_member_groups.get(sname, [])
+            if (
+                groups
+                and not isinstance(first_value, ast.DesignatedInit)
+                and isinstance(first_value, ast.InitializerList)
+            ):
+                first_group = groups[0]
+                group_indices = [
+                    i for i, g in enumerate(groups) if g == first_group
+                ]
+                if len(group_indices) > 1:
+                    sub_out: list[str] = []
+                    written = 0
+                    for src_idx, mi in enumerate(group_indices):
+                        if src_idx >= len(first_value.values):
+                            break
+                        m_name, m_ty, m_off = members[mi]
+                        if m_off > written:
+                            sub_out.append(
+                                f"        times {m_off - written} db 0"
+                            )
+                            written = m_off
+                        sub_out += self._emit_global_init(
+                            m_ty, first_value.values[src_idx],
+                            f"{name}.{m_name}",
+                        )
+                        written = m_off + self._size_of(m_ty)
+                    if total > written:
+                        sub_out.append(
+                            f"        times {total - written} db 0"
+                        )
+                    return sub_out
             if isinstance(first_value, ast.DesignatedInit):
                 # `.field = value` — find the named member.
                 first = first_value.designators[0]
@@ -1758,6 +1822,8 @@ class CodeGenerator:
         if isinstance(expr, ast.TypesCompatibleP):
             return 1 if self._types_compatible(expr.t1, expr.t2) else 0
         if isinstance(expr, ast.SizeofType):
+            if getattr(expr, "is_alignof", False):
+                return self._alignment_of(expr.target_type)
             return self._size_of(expr.target_type)
         if isinstance(expr, ast.SizeofExpr):
             # `sizeof(expr)` — operand is unevaluated; we just need its
@@ -1766,6 +1832,8 @@ class CodeGenerator:
             # context. A fresh empty _FuncCtx works because the type-of
             # path falls through to globals when no local matches.
             ty = self._type_of(expr.expr, _FuncCtx())
+            if getattr(expr, "is_alignof", False):
+                return self._alignment_of(ty)
             return self._size_of(ty)
         if isinstance(expr, ast.Cast):
             # Recurse on the operand, then narrow per the target type.
@@ -3190,6 +3258,10 @@ class CodeGenerator:
         # Validate every member up front. Unions and structs share the
         # same per-member checks; only the layout step differs.
         members: list[tuple[str, ast.TypeNode, int]] = []
+        # Parallel list: group id (= original index in decl.members)
+        # per flattened member. Anon-promoted entries share the group id
+        # of their parent decl member.
+        member_groups: list[int] = []
         bitfields: dict[str, tuple[int, int]] = {}
         max_align = 1
         for m in decl.members:
@@ -3237,7 +3309,7 @@ class CodeGenerator:
             # across bit-fields like in a struct, since they all
             # alias).
             total = 0
-            for m in decl.members:
+            for group_idx, m in enumerate(decl.members):
                 if m.bit_width is not None:
                     if not isinstance(m.bit_width, ast.IntLiteral):
                         raise CodegenError(
@@ -3252,6 +3324,7 @@ class CodeGenerator:
                         )
                     if m.name is not None:
                         members.append((m.name, m.member_type, 0))
+                        member_groups.append(group_idx)
                         bitfields[m.name] = (0, width)
                     if 4 > total:
                         total = 4
@@ -3262,13 +3335,16 @@ class CodeGenerator:
                     inner_key = self._anon_member_layout_key(m.member_type)
                     for in_name, in_ty, in_off in self._structs[inner_key]:
                         members.append((in_name, in_ty, 0 + in_off))
+                        member_groups.append(group_idx)
                 else:
                     members.append((m.name, m.member_type, 0))
+                    member_groups.append(group_idx)
                 size = self._size_of(m.member_type)
                 if size > total:
                     total = size
             total = (total + max_align - 1) & ~(max_align - 1)
             self._structs[decl_name] = members
+            self._struct_member_groups[decl_name] = member_groups
             self._struct_sizes[decl_name] = total
             self._struct_unions.add(decl_name)
             if bitfields:
@@ -3285,7 +3361,7 @@ class CodeGenerator:
         unit_offset = 0     # byte offset of the current bit-field unit
         unit_used = 0       # bits used in the current unit (0..unit_size*8)
         unit_size = 4       # storage unit width in bytes (4 or 8)
-        for m in decl.members:
+        for group_idx, m in enumerate(decl.members):
             if m.bit_width is not None:
                 # Common case: integer literal. Otherwise reduce
                 # through `_const_eval` so things like
@@ -3343,6 +3419,7 @@ class CodeGenerator:
                     unit_used += width
                     continue
                 members.append((m.name, m.member_type, unit_offset))
+                member_groups.append(group_idx)
                 bitfields[m.name] = (unit_used, width, unit_size)
                 unit_used += width
             else:
@@ -3365,12 +3442,15 @@ class CodeGenerator:
                     inner_key = self._anon_member_layout_key(m.member_type)
                     for in_name, in_ty, in_off in self._structs[inner_key]:
                         members.append((in_name, in_ty, offset + in_off))
+                        member_groups.append(group_idx)
                 else:
                     members.append((m.name, m.member_type, offset))
+                    member_groups.append(group_idx)
                 unit_offset = offset + self._size_of(m.member_type)
         total = unit_offset + (unit_size if unit_used > 0 else 0)
         total = (total + max_align - 1) & ~(max_align - 1)
         self._structs[decl_name] = members
+        self._struct_member_groups[decl_name] = member_groups
         self._struct_sizes[decl_name] = total
         if max_align > 1:
             self._struct_alignments[decl_name] = max_align
@@ -7119,7 +7199,11 @@ class CodeGenerator:
         if isinstance(expr, ast.VaArgExpr):
             return self._va_arg_int(expr, ctx)
         if isinstance(expr, ast.SizeofType):
-            return [f"        mov     eax, {self._size_of(expr.target_type)}"]
+            if getattr(expr, "is_alignof", False):
+                value = self._alignment_of(expr.target_type)
+            else:
+                value = self._size_of(expr.target_type)
+            return [f"        mov     eax, {value}"]
         if isinstance(expr, ast.OffsetofExpr):
             return [f"        mov     eax, {self._offsetof_value(expr)}"]
         if isinstance(expr, ast.TypesCompatibleP):
@@ -7130,9 +7214,12 @@ class CodeGenerator:
             # static type matters. So we infer the type and never emit
             # any of the operand's lowering code (no slot loads, no
             # function calls).
-            return [
-                f"        mov     eax, {self._size_of(self._type_of(expr.expr, ctx))}"
-            ]
+            ty = self._type_of(expr.expr, ctx)
+            if getattr(expr, "is_alignof", False):
+                value = self._alignment_of(ty)
+            else:
+                value = self._size_of(ty)
+            return [f"        mov     eax, {value}"]
         if isinstance(expr, ast.StmtExpr):
             # GCC statement expression: `({ stmt; stmt; expr; })`. Lower
             # the body as a regular compound; the value of the last
@@ -7382,10 +7469,19 @@ class CodeGenerator:
             out.append(f"{end_label}:")
             return out
         if isinstance(expr, ast.Call):
-            # cdecl returns 64-bit values in EDX:EAX. The standard call
-            # path leaves the low half in EAX; we need to make sure EDX
-            # is preserved as the high half.
-            return self._call(expr, ctx)
+            # cdecl returns 64-bit values in EDX:EAX. If the callee's
+            # return type is sub-LL, the call leaves only EAX defined
+            # — extend EDX from EAX per the return type's signedness so
+            # the LL result has a valid high half.
+            ret_ty = self._type_of(expr, ctx)
+            if self._is_long_long(ret_ty):
+                return self._call(expr, ctx)
+            out = self._call(expr, ctx)
+            if self._is_unsigned(ret_ty):
+                out.append("        xor     edx, edx")
+            else:
+                out.append("        cdq")
+            return out
         if isinstance(expr, ast.VaArgExpr):
             target_ty = expr.target_type
             if self._is_long_long(target_ty):
@@ -8257,12 +8353,16 @@ class CodeGenerator:
             # `__builtin_constant_p(x)` returns 1 if x is a compile-time
             # constant integer expression, 0 otherwise. We can answer
             # "yes" only when `_const_eval` succeeds without side effects.
+            # String literals and FloatLiterals also count.
             if (
                 callee.name == "__builtin_constant_p"
                 and len(expr.args) == 1
             ):
+                arg = expr.args[0]
+                if isinstance(arg, (ast.StringLiteral, ast.FloatLiteral)):
+                    return ["        mov     eax, 1"]
                 try:
-                    self._const_eval(expr.args[0], "<bcp>")
+                    self._const_eval(arg, "<bcp>")
                     return ["        mov     eax, 1"]
                 except CodegenError:
                     return ["        xor     eax, eax"]

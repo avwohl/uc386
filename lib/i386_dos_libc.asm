@@ -1617,12 +1617,29 @@ ___builtin_bswap16:
 
 ; ---- abs -------------------------------------------------------------------
 _abs:
+_labs:
         push    ebp
         mov     ebp, esp
         mov     eax, [ebp + 8]
         test    eax, eax
         jns     .pos
         neg     eax
+.pos:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- llabs -----------------------------------------------------------------
+_llabs:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        mov     edx, [ebp + 12]
+        test    edx, edx
+        jns     .pos
+        neg     eax
+        adc     edx, 0
+        neg     edx
 .pos:
         mov     esp, ebp
         pop     ebp
