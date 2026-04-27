@@ -371,3 +371,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`_cast` for ArrayType target falls back to `_vector_value_address`** so a scalar-context cast to vector produces a pointer to the temp. Closes pr70903.c.
 
   **Result: 1416/1514 gcc-c-torture** (up from 1415, +1 net after one test moved between buckets). Combined still 1631/1734 (94.1%).
+- **2026-04-26 — LL bitfield correctness, va_start aliases (1416 → 1425)**: a load-bearing bitfield bug plus a small builtin alias.
+  - **`_assign_ll(Member)` was a raw 8-byte store**, smashing the storage unit with the rhs value (which is the bit-field's value, not a properly masked / RMW'd update). For a struct `{u8 a:8; u32 b:32}` initialized with `a=12; b=0xCDEF1234`, the second store overwrote `a` with 0x34 (low byte of 0xCDEF1234 shifted into bit 8). Now routes through `_bitfield_store_ll_simple` (8-byte storage) or `_bitfield_store` (4-byte storage) when the lvalue is a bit-field.
+  - **`_eval_expr_to_edx_eax(Member)` was `cdq`-ing after `_bitfield_load_ll`**, but that helper already returns the fully sign/zero-extended 64-bit value in EDX:EAX. The `cdq` overwrote EDX with the sign of EAX (the low 32 bits) — losing the high bits for any value > 2^31. Removed the redundant extension.
+  - **`__builtin_va_start` / `__builtin_va_end`** aliases (the bare `va_start` / `va_end` were already special-cased; the underscore-prefixed forms were falling through to a normal call which the linker couldn't resolve).
+
+  **Result: 1425/1514 gcc-c-torture** (up from 1416, +9 tests). Combined with c-testsuite still 215/220, the pipeline now passes 1640/1734 (94.6%). Closes 930126-1, 20040709-1, 20040709-2, 20040709-3, 991118-1, bf64-1, pr57344-4, 20041214-1, plus one incidental.
