@@ -8749,7 +8749,14 @@ class CodeGenerator:
             if callee.name in ("va_start", "__builtin_va_start"):
                 return self._va_start(expr.args, ctx)
             if callee.name in ("va_end", "__builtin_va_end"):
-                return ["        xor     eax, eax"]
+                # `va_end(ap)` is a no-op for cdecl, but we still
+                # evaluate `ap` for any side effects (e.g.
+                # `va_end(*ap_ptr++)` increments ap_ptr).
+                out: list[str] = []
+                for arg in expr.args:
+                    out += self._eval_expr_to_eax(arg, ctx)
+                out.append("        xor     eax, eax")
+                return out
             # GCC branch-prediction hint: `__builtin_expect(expr, val)`
             # has the value of `expr`. We ignore the hint and just emit
             # the first argument's value.
