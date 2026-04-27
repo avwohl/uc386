@@ -68,7 +68,7 @@ def run_test(c_file: Path, *, compile_only: bool = True) -> tuple[str, str]:
     from uc386.dos_emu import assemble_and_run
     try:
         emu_res = assemble_and_run(
-            asm_file, timeout_seconds=10, instruction_limit=200_000_000,
+            asm_file, timeout_seconds=30, instruction_limit=500_000_000,
         )
     except Exception as e:
         return "asm", f"emu: {type(e).__name__}: {e}"

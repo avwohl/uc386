@@ -447,3 +447,6 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Float→signed-int saturation on OOB.** Per gcc, `(int) float_outside_int_range` saturates to INT_MAX or INT_MIN rather than producing the x87 "indefinite integer" 0x80000000. Mirror the existing unsigned-int OOB path: dup the value, compare against 2^31 and -2^31, branch to saturation if out of range, otherwise fistp truncate. Closes 20031003-1.
 
   **Result: 1480/1514 gcc-c-torture** (+3 tests). Pipeline 1696/1734 (97.8%).
+- **2026-04-27 — runner timeout bump (1480 → 1481)**: bumped `run_gcc_torture.py` runner from 10s/200M instructions to 30s/500M instructions. 20011008-3 — a sequence of large stack-allocated structs feeding `__db_txnlist_lsnadd` — runs cleanly but emulator-slow (≈25s wall, ~330M insns). One test moved from timeout to pass; the remaining 4 timeouts (20040811-1, 920929-1, pr43220, vla-dealloc-1) are all VLA-in-loop tests that need actual VLA storage with scope-correct dealloc — a real frame-pointer-relative alloca that we don't implement.
+
+  **Result: 1481/1514 gcc-c-torture** (+1 test). Pipeline 1697/1734 (97.9%).
