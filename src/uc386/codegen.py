@@ -2816,6 +2816,7 @@ class CodeGenerator:
             # struct/enum layouts now so any subsequent locals that use
             # them resolve correctly during slot allocation.
             if isinstance(node, ast.StructDecl) and node.is_definition:
+                self._capture_struct_vla_member_sizes(node, ctx)
                 self._register_struct(node)
             elif isinstance(node, ast.EnumDecl) and node.is_definition:
                 self._register_enum(node)
@@ -4797,10 +4798,27 @@ class CodeGenerator:
         if isinstance(item, ast.StructDecl):
             # In-function struct/union definition (e.g. `struct T { int x; };`
             # in the middle of a body). Register the layout if it's a
-            # definition; emit no code.
+            # definition; emit no code beyond VLA-capture stores.
+            out: list[str] = []
+            captures = getattr(item, "_vla_member_captures", None)
+            if captures:
+                # Re-bind capture slot names in the current scope and
+                # emit eval+store per VLA dim. The slots were allocated
+                # in `_collect_locals`'s pre-pass.
+                for slot_name, orig_size in captures:
+                    ctx.alloc_local(
+                        slot_name, ast.BasicType(name="int"),
+                        decl=orig_size,
+                    )
+                    try:
+                        out += self._eval_expr_to_eax(orig_size, ctx)
+                    except CodegenError:
+                        continue
+                    cdisp = ctx.lookup(slot_name)
+                    out.append(f"        mov     {_ebp_addr(cdisp)}, eax")
             if item.is_definition:
                 self._register_struct(item)
-            return []
+            return out
         if isinstance(item, ast.EnumDecl):
             # Likewise for in-function enum definitions.
             if item.is_definition:
@@ -8031,6 +8049,54 @@ class CodeGenerator:
                 t.size = ast.Identifier(name=slot_name, location=t.size.location)
             self._replace_vla_size_with_capture(t.base_type, captured, fn_name)
             return
+
+    def _capture_struct_vla_member_sizes(
+        self, decl: ast.StructDecl, ctx: _FuncCtx,
+    ) -> None:
+        """Pre-pass for in-function struct decls with VLA members:
+        allocate a hidden capture slot per VLA dimension, replace each
+        ArrayType.size in the member with Identifier(slot_name) so
+        sizeof reads the captured value. The eval+store happens in
+        `_item(StructDecl)` at struct-decl emission time."""
+        captures: list[tuple[ast.ArrayType, ast.Expression, str]] = []
+
+        def walk(t: ast.TypeNode) -> None:
+            if isinstance(t, ast.PointerType):
+                walk(t.base_type)
+                return
+            if isinstance(t, ast.ArrayType):
+                if (
+                    t.size is not None
+                    and not isinstance(t.size, ast.IntLiteral)
+                ):
+                    slot_name = (
+                        f"__vla_capture_struct_"
+                        f"{decl.name or '<anon>'}_{len(captures)}"
+                    )
+                    captures.append((t, t.size, slot_name))
+                walk(t.base_type)
+                return
+            if isinstance(t, ast.StructType):
+                # Don't recurse — that struct has its own captures (or
+                # was already processed).
+                return
+
+        for m in decl.members:
+            walk(m.member_type)
+        if not captures:
+            return
+        for arr_t, orig_size, slot_name in captures:
+            ctx.alloc_local(
+                slot_name, ast.BasicType(name="int"),
+                decl=orig_size,
+            )
+        for arr_t, orig_size, slot_name in captures:
+            arr_t.size = ast.Identifier(
+                name=slot_name, location=orig_size.location,
+            )
+        decl._vla_member_captures = [
+            (slot_name, orig_size) for _arr_t, orig_size, slot_name in captures
+        ]
 
     def _capture_vla_sizes(
         self,
