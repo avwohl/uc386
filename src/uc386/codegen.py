@@ -7001,6 +7001,19 @@ class CodeGenerator:
                     )
                 struct_name = self._resolve_struct_name(obj_ty)
             ty, _ = self._member_layout(struct_name, expr.member)
+            # Bit-field integer promotion (C 6.3.1.1): a bit-field
+            # narrower than int promotes to int (signed). 32-bit unsigned
+            # bit-fields stay unsigned (not representable in signed int).
+            # 32-bit signed bit-fields stay signed int. Bit-fields with
+            # width > 32 keep their declared LL type.
+            bf = self._struct_bitfields.get(struct_name, {}).get(expr.member)
+            if bf is not None:
+                bit_width = bf[1]
+                unit_size = bf[2] if len(bf) >= 3 else 4
+                if bit_width < 32:
+                    return ast.BasicType(name="int")
+                if bit_width == 32 and not self._is_unsigned(ty):
+                    return ast.BasicType(name="int")
             return ty
         if isinstance(expr, ast.BinaryOp):
             if expr.op == "=":
