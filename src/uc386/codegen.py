@@ -2658,6 +2658,22 @@ class CodeGenerator:
                 ret_ty = self._call_return_type(sub, ctx)
                 size = (self._size_of(ret_ty) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
+            elif (
+                isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Identifier)
+                and sub.func.name == "__builtin_shuffle"
+                and len(sub.args) >= 1
+            ):
+                # Vector shuffle result lands in a per-call temp.
+                try:
+                    ret_ty = self._type_of(sub.args[0], ctx)
+                except CodegenError:
+                    ret_ty = None
+                if isinstance(ret_ty, ast.ArrayType) and getattr(
+                    ret_ty, "is_vector", False
+                ):
+                    size = (self._size_of(ret_ty) + 3) & ~3
+                    ctx.alloc_call_temp(sub, size)
             elif isinstance(sub, ast.Call) and self._is_complex_returning_call(sub, ctx):
                 # Complex-returning calls need a per-call-site temp
                 # so consumers like `__real foo()` can address the
@@ -7680,6 +7696,14 @@ class CodeGenerator:
                 fname = ctx.nested_fn_names.get(
                     expr.func.name, expr.func.name,
                 )
+                # `__builtin_shuffle(src, mask)` returns a vector with
+                # the same shape as `src` (the first arg). Resolve the
+                # type from the arg so vector-aware lvalue paths work.
+                if (
+                    expr.func.name == "__builtin_shuffle"
+                    and len(expr.args) >= 1
+                ):
+                    return self._type_of(expr.args[0], ctx)
                 rt = self._func_return_types.get(fname)
                 if rt is not None:
                     return rt
@@ -10631,9 +10655,152 @@ class CodeGenerator:
             out = self._call_into_address(expr, retptr_lines, ctx)
             # Callee leaves &temp in EAX; that's already the address.
             return out
+        if (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Identifier)
+            and expr.func.name == "__builtin_shuffle"
+            and id(expr) in ctx.call_temps
+        ):
+            return self._emit_builtin_shuffle(expr, ctx)
         raise CodegenError(
             f"vector value: unsupported expression {type(expr).__name__}"
         )
+
+    def _emit_builtin_shuffle(
+        self, expr: ast.Call, ctx: _FuncCtx
+    ) -> list[str]:
+        """Lower `__builtin_shuffle(src, mask)` (or 2-source variant) into
+        a per-element copy.
+
+        2-arg form: `result[i] = src[mask[i] mod N]`.
+        3-arg form: `__builtin_shuffle(s1, s2, mask)` — `result[i]` picks
+        from `s1` if `mask[i] mod (2N) < N`, else from `s2[mask[i] mod N]`.
+        """
+        if len(expr.args) == 2:
+            src_a, mask_arg = expr.args[0], expr.args[1]
+            src_b = None
+        elif len(expr.args) == 3:
+            src_a, src_b, mask_arg = expr.args
+        else:
+            raise CodegenError(
+                f"__builtin_shuffle: expected 2 or 3 args, got {len(expr.args)}"
+            )
+        src_ty = self._type_of(src_a, ctx)
+        if not isinstance(src_ty, ast.ArrayType):
+            raise CodegenError("__builtin_shuffle: src must be a vector")
+        elem_ty = self._vector_element_type(src_ty)
+        elem_size = self._size_of(elem_ty)
+        n_raw = src_ty.size
+        if isinstance(n_raw, ast.IntLiteral):
+            n = n_raw.value
+        elif isinstance(n_raw, int):
+            n = n_raw
+        else:
+            raise CodegenError(
+                "__builtin_shuffle: vector size must be a constant"
+            )
+        if not n or (n & (n - 1)) != 0:
+            raise CodegenError(
+                "__builtin_shuffle: only power-of-2 vector sizes supported"
+            )
+        # Mask element size — for the index extraction we just take
+        # the low 32 bits of mask[i] (works because n is small).
+        mask_ty = self._type_of(mask_arg, ctx)
+        if not isinstance(mask_ty, ast.ArrayType):
+            raise CodegenError("__builtin_shuffle: mask must be a vector")
+        mask_elem_size = self._size_of(self._vector_element_type(mask_ty))
+        disp = ctx.call_temps[id(expr)]
+        # Layout on stack:
+        #   [ebp + ?]  &src_a   (2nd source if any)
+        #   [ebp + ?]  &src_b
+        #   &mask    in ESI
+        #   &dst     in EDI
+        # Push &mask and &src(s) onto the stack to free up registers.
+        out: list[str] = []
+        out += self._vector_value_address(src_a, ctx)  # eax = &src_a
+        out.append("        push    eax")
+        if src_b is not None:
+            out += self._vector_value_address(src_b, ctx)
+            out.append("        push    eax")
+        out += self._vector_value_address(mask_arg, ctx)
+        out.append("        mov     esi, eax")
+        out.append(f"        lea     edi, {_ebp_addr(disp)}")
+        # Total source-pointer slots that we pushed.
+        n_pushed = 2 if src_b is not None else 1
+        # &src_a is at [esp + (n_pushed-1)*4]; &src_b at [esp + 0]
+        src_a_off = (n_pushed - 1) * 4
+        src_b_off = 0
+        idx_mask = n - 1  # power-of-2 modulus
+        for i in range(n):
+            mask_off = i * mask_elem_size
+            # idx = mask[i] (low 32 bits) & idx_mask
+            out.append(f"        mov     eax, [esi + {mask_off}]")
+            if src_b is not None:
+                # Two-source shuffle: keep full lo dword for branch test.
+                out.append(f"        mov     ecx, eax")
+                out.append(f"        and     ecx, {2 * n - 1}")
+                out.append(f"        cmp     ecx, {n}")
+                pick_b = ctx.label("shuf_b")
+                done = ctx.label("shuf_done")
+                out.append(f"        jge     {pick_b}")
+                # Pick from src_a:
+                out.append(f"        and     eax, {idx_mask}")
+                if elem_size in (1, 2, 4, 8):
+                    out += self._emit_shuffle_one_lane(
+                        f"[esp + {src_a_off}]", "eax", elem_size, i, "edi",
+                    )
+                out.append(f"        jmp     {done}")
+                out.append(f"{pick_b}:")
+                out.append(f"        and     eax, {idx_mask}")
+                out += self._emit_shuffle_one_lane(
+                    f"[esp + {src_b_off}]", "eax", elem_size, i, "edi",
+                )
+                out.append(f"{done}:")
+            else:
+                out.append(f"        and     eax, {idx_mask}")
+                out += self._emit_shuffle_one_lane(
+                    f"[esp + {src_a_off}]", "eax", elem_size, i, "edi",
+                )
+        # Pop our pushed src pointers.
+        out.append(f"        add     esp, {n_pushed * 4}")
+        out.append(f"        lea     eax, {_ebp_addr(disp)}")
+        return out
+
+    def _emit_shuffle_one_lane(
+        self,
+        src_ptr_mem: str,
+        idx_reg: str,
+        elem_size: int,
+        dst_lane: int,
+        dst_reg: str,
+    ) -> list[str]:
+        """Copy `src[idx]` (where idx is in `idx_reg` as a small int) into
+        `dst[dst_lane]`. `src_ptr_mem` is a memory operand holding &src.
+        Element size must be 1/2/4/8."""
+        # Compute idx*elem_size into idx_reg (shift by log2).
+        out: list[str] = []
+        if elem_size > 1:
+            shift = {2: 1, 4: 2, 8: 3}[elem_size]
+            out.append(f"        shl     {idx_reg}, {shift}")
+        # Load &src into EBX (we have ESI=&mask, EDI=&dst already).
+        out.append(f"        mov     ebx, {src_ptr_mem}")
+        out.append(f"        add     ebx, {idx_reg}")
+        dst_off = dst_lane * elem_size
+        if elem_size == 1:
+            out.append(f"        mov     al, [ebx]")
+            out.append(f"        mov     [{dst_reg} + {dst_off}], al")
+        elif elem_size == 2:
+            out.append(f"        mov     ax, [ebx]")
+            out.append(f"        mov     [{dst_reg} + {dst_off}], ax")
+        elif elem_size == 4:
+            out.append(f"        mov     eax, [ebx]")
+            out.append(f"        mov     [{dst_reg} + {dst_off}], eax")
+        elif elem_size == 8:
+            out.append(f"        mov     eax, [ebx]")
+            out.append(f"        mov     [{dst_reg} + {dst_off}], eax")
+            out.append(f"        mov     eax, [ebx + 4]")
+            out.append(f"        mov     [{dst_reg} + {dst_off + 4}], eax")
+        return out
 
     def _eval_vector_into_temp(
         self, expr: ast.Expression, ctx: _FuncCtx

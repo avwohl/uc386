@@ -461,3 +461,7 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`&&label` from a lifted nested fn referencing an outer label.** `_label_addr_text` walks the lift chain (`_lifted_outer_fn[mangled] → outer_name → _function_user_labels[outer_name]`) so a lifted nested fn that does `&&lab1` resolves to `_<outer>.LN_user_lab1`. Closes 920721-4.
 
   **Result: 1492/1514 gcc-c-torture** (+8 tests). Combined with c-testsuite still 216/220, the pipeline now passes 1708/1734 (98.5%).
+- **2026-04-27 — torture sweep: __builtin_shuffle (1492 → 1493)**:
+  - **`__builtin_shuffle(src, mask)` and `__builtin_shuffle(s1, s2, mask)`.** New `_emit_builtin_shuffle`: per-call temp slot (allocated by `_collect_call_temps`), per-element loop loading `mask[i]`'s low dword, AND'ing with `n-1` (power-of-2 N), then memcpy from `&src[idx]` to `&dst[i]`. Three-arg form does a 2*N modulo + branch to pick from s1 or s2. `_type_of(Call(__builtin_shuffle))` returns the type of the first arg so vector-aware lvalue paths (e.g. `*r = __builtin_shuffle(y, m)`) route through `_vector_copy_assign`. Closes pr85331.
+
+  **Result: 1493/1514 gcc-c-torture** (+1 test). Combined with c-testsuite still 216/220, the pipeline now passes 1709/1734 (98.6%).
