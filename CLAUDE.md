@@ -382,3 +382,8 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`__attribute__((aligned(N)))` capture (uc_core) + global emit (uc386)**. Parser now tracks `_pending_alignment` like `_pending_vector_size`, with the declarator loop snapshotting it onto VarDecl.alignment. Codegen emits `align N` (.data) / `alignb N` (.bss) before the global's label. Currently only direct `int x __attribute__((aligned(N)))` on a declarator is honored — member-level aligned (which more torture tests need) requires layout work that isn't yet wired up. No torture wins yet; useful for future tests.
 
   **Result: 1426/1514 gcc-c-torture** (up from 1425, +1 test). Combined still 1641/1734 (94.6%).
+- **2026-04-26 — long-long switch + struct-member aligned (1426 → 1430)**:
+  - **Long-long switch dispatch.** When the controlling expression is `long long`, eval into EDX:EAX and emit per-case 64-bit comparisons (and per-range 64-bit two-leg comparisons honoring signedness). Closes pr34154.c (case range with ULL endpoints > 2^31).
+  - **Struct-member `__attribute__((aligned(N)))`** is now captured (uc_core) and honored in `_register_struct` (uc386). The member's effective alignment is `max(natural, attr)`, which feeds the offset computation and the struct's overall alignment. New `_struct_alignments` table tracks the override; `_alignment_of(StructType)` consults it. Globals of the struct get `align N` emitted in .data/.bss. Closes pr23467.c, 20010904-1.c, 20010904-2.c.
+
+  **Result: 1430/1514 gcc-c-torture** (up from 1426, +4 tests). Combined with c-testsuite still 215/220, the pipeline now passes 1645/1734 (94.9%).
