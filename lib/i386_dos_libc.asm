@@ -1520,11 +1520,36 @@ ___builtin_sprintf:
         jmp     _sprintf
 ___builtin_snprintf:
         jmp     _snprintf
-; jmp_buf layout (32-byte / 8-int): ebx, esi, edi, ebp, esp, return-eip,
-; (slots 6 and 7 are spare). Both _setjmp and __builtin_setjmp populate
-; this layout. _longjmp / __builtin_longjmp restore from it and jump.
-_setjmp:
+; jmp_buf layouts:
+;   __builtin_setjmp: 5-word buffer per gcc convention. Slots 0..4 hold
+;     EBP, ESP, EIP, spare, spare. No callee-saved register save —
+;     gcc treats __builtin_setjmp as a less-restrictive variant.
+;   setjmp (C99): 6-word buffer with EBX/ESI/EDI/EBP/ESP/EIP. Saves
+;     callee-saved regs in case the caller is using them across
+;     non-local jumps.
 ___builtin_setjmp:
+        mov     eax, [esp + 4]            ; eax = jmp_buf (no frame yet)
+        ; Save caller's EBP, ESP-after-our-ret, and our return EIP.
+        mov     [eax + 0],  ebp
+        lea     ecx, [esp + 4]            ; ESP after the upcoming ret
+        mov     [eax + 4],  ecx
+        mov     ecx, [esp]                ; return EIP
+        mov     [eax + 8],  ecx
+        xor     eax, eax
+        ret
+___builtin_longjmp:
+        ; longjmp(buf, val): restore EBP/ESP/EIP and return `val`.
+        mov     ecx, [esp + 4]            ; ecx = jmp_buf
+        mov     eax, [esp + 8]            ; eax = val
+        test    eax, eax
+        jne     .blj_have_val
+        mov     eax, 1
+.blj_have_val:
+        mov     ebp, [ecx + 0]
+        mov     esp, [ecx + 4]
+        push    dword [ecx + 8]
+        ret
+_setjmp:
         push    ebp
         mov     ebp, esp
         mov     eax, [ebp + 8]            ; eax = jmp_buf
@@ -1542,10 +1567,9 @@ ___builtin_setjmp:
         pop     ebp
         ret
 _longjmp:
-___builtin_longjmp:
-        ; longjmp(buf, val): restore the jmp_buf and return `val` from
-        ; setjmp. Per C, `val == 0` is treated as 1 to keep setjmp's
-        ; "0 means direct call" sentinel meaningful.
+        ; longjmp(buf, val): restore the full jmp_buf and return `val`
+        ; from setjmp. Per C, `val == 0` is treated as 1 to keep
+        ; setjmp's "0 means direct call" sentinel meaningful.
         mov     ecx, [esp + 4]            ; ecx = jmp_buf (no frame yet)
         mov     eax, [esp + 8]            ; eax = val
         test    eax, eax
