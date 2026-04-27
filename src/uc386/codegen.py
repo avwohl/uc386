@@ -2212,22 +2212,31 @@ class CodeGenerator:
                     and sub.body is not None
                 ):
                     inner_nested_names.add(sub.name)
-            for sub in self._walk_ast(nested.body):
-                if isinstance(sub, ast.Identifier):
-                    n = sub.name
-                    if n in inner_bound:
-                        continue
-                    if n in inner_nested_names:
-                        continue
-                    if n in sibling_nested_names:
-                        continue
-                    if n in self._globals or n in self._extern_vars:
-                        continue
-                    if n in self._func_return_types:
-                        continue
-                    if n in self._enum_constants:
-                        continue
-                    captured.add(n)
+            # Also collect names referenced in the nested fn's param
+            # size-side-effect expressions — `int foo(int a[N++])`
+            # references `N` even though foo's body might be empty.
+            roots: list = [nested.body]
+            for p in nested.params:
+                sse = getattr(p, "size_side_effects", None)
+                if sse:
+                    roots.extend(sse)
+            for root in roots:
+                for sub in self._walk_ast(root):
+                    if isinstance(sub, ast.Identifier):
+                        n = sub.name
+                        if n in inner_bound:
+                            continue
+                        if n in inner_nested_names:
+                            continue
+                        if n in sibling_nested_names:
+                            continue
+                        if n in self._globals or n in self._extern_vars:
+                            continue
+                        if n in self._func_return_types:
+                            continue
+                        if n in self._enum_constants:
+                            continue
+                        captured.add(n)
         # Promote captures to globals. Outer params are allocated
         # normally (they live on the call stack); if a param is
         # captured we copy its value into the global at function entry
