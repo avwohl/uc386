@@ -8349,6 +8349,15 @@ class CodeGenerator:
             "*": "fmulp",
             "/": "fdivp",
         }
+        # Reverse-direction mnemonics: if we evaluate the right side
+        # first, we need fsubrp/fdivrp because the operand order is
+        # flipped. faddp/fmulp are commutative.
+        op_to_mnem_rev = {
+            "+": "faddp",
+            "-": "fsubrp",
+            "*": "fmulp",
+            "/": "fdivrp",
+        }
         if expr.op == ",":
             # Comma operator: eval lhs for side effects, then yield rhs.
             # Lhs may be int or float; we need to drop its value.
@@ -8364,10 +8373,41 @@ class CodeGenerator:
             raise CodegenError(
                 f"binary `{expr.op}` not supported on float operands"
             )
+        # Pick eval order to minimize peak FPU stack depth. When the
+        # right side is deeper than the left (a leaf or shallow), eval
+        # right first so the left's value isn't sitting on the stack
+        # for the duration of right's deep ladder. Crucial for level-7
+        # Horner-form polynomials in pr58574 — left-first overflows
+        # the 8-deep x87 stack at level 7.
+        l_depth = self._fpu_depth(expr.left, ctx)
+        r_depth = self._fpu_depth(expr.right, ctx)
+        if r_depth > l_depth:
+            out = self._eval_float_to_st0(expr.right, ctx)
+            out += self._eval_float_to_st0(expr.left, ctx)
+            out.append(f"        {op_to_mnem_rev[expr.op]}   st1, st0")
+            return out
         out = self._eval_float_to_st0(expr.left, ctx)
         out += self._eval_float_to_st0(expr.right, ctx)
         out.append(f"        {op_to_mnem[expr.op]}   st1, st0")
         return out
+
+    def _fpu_depth(self, expr: ast.Expression, ctx: _FuncCtx) -> int:
+        """Conservative estimate of the peak FPU stack depth needed to
+        evaluate `expr`. Leaves use depth 1; binary ops use 1 + min(left,
+        right) + abs(left - right) — the standard formula for
+        register-allocation peak when we eval the deeper side first.
+        For our purposes, a coarse upper bound suffices.
+        """
+        if isinstance(expr, ast.BinaryOp) and expr.op in ("+", "-", "*", "/"):
+            l = self._fpu_depth(expr.left, ctx)
+            r = self._fpu_depth(expr.right, ctx)
+            return max(l, r) + 1
+        if isinstance(expr, ast.UnaryOp):
+            return self._fpu_depth(expr.operand, ctx)
+        if isinstance(expr, ast.Cast):
+            return self._fpu_depth(expr.expr, ctx)
+        # Leaves: literals, identifiers, member/index, function calls.
+        return 1
 
     def _float_cast(self, expr: ast.Cast, ctx: _FuncCtx) -> list[str]:
         """Cast to a float target. The source may be int or float.
