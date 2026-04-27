@@ -183,6 +183,11 @@ class _FuncCtx:
         # reads/writes route through the global so the nested fn,
         # also reading the same global, sees a coherent value.
         self.local_captures: dict[str, str] = {}
+        # Outer-label → buf-global-name for non-local gotos. Set on
+        # the outer ctx (so the prologue knows to emit setjmp dispatch)
+        # and on lifted nested-fn ctxs (so `goto label` lowers to a
+        # longjmp instead of a regular jmp).
+        self.nonlocal_goto_targets: dict[str, str] = {}
         # The current function's name. Used to mangle static-local
         # labels so two functions with the same `static int x` don't
         # collide.
@@ -588,6 +593,18 @@ class CodeGenerator:
         # may call sibling nested fns that share the same outer; this
         # maps `t0` → `_outer__t0` etc.
         self._lifted_nested_fn_names: dict[str, dict[str, str]] = {}
+        # Non-local goto bookkeeping. `_nonlocal_goto_targets` maps
+        # outer-fn name → (label name → buf-global-name) for labels in
+        # outer that get goto'd from nested fns. `_lifted_nonlocal_gotos`
+        # mirrors that on the inner side: lifted-mangled-name → (label
+        # → buf). `_nonlocal_goto_bufs` is the set of buf labels we
+        # need to emit in `.bss` (12 bytes each per __builtin_setjmp).
+        self._nonlocal_goto_targets: dict[str, dict[str, str]] = {}
+        self._lifted_nonlocal_gotos: dict[str, dict[str, str]] = {}
+        self._nonlocal_goto_bufs: set[str] = set()
+        # Lifted-mangled-name → outer-fn-name. Used by `&&label` and
+        # the goto-fallback to resolve labels declared in the outer.
+        self._lifted_outer_fn: dict[str, str] = {}
         while self._pending_functions:
             fn = self._pending_functions.pop(0)
             function_blocks.append(self._function(fn))
@@ -726,7 +743,7 @@ class CodeGenerator:
         uninit = sorted(
             name for name in self._globals if name not in self._global_inits
         )
-        if not uninit:
+        if not uninit and not self._nonlocal_goto_bufs:
             return []
         out = ["        section .bss"]
         for name in uninit:
@@ -741,6 +758,11 @@ class CodeGenerator:
                 out.append(f"        alignb {align}")
             out.append(f"_{name}:")
             out.append(f"        resb    {size}")
+        # Non-local goto buffers — 12 bytes per __builtin_setjmp.
+        for buf in sorted(self._nonlocal_goto_bufs):
+            out.append("        alignb 4")
+            out.append(f"_{buf}:")
+            out.append("        resb    12")
         return out
 
     def _emit_global_init(
@@ -2142,6 +2164,10 @@ class CodeGenerator:
             ctx.nested_fn_names = dict(
                 self._lifted_nested_fn_names[fn.name]
             )
+        if fn.name in getattr(self, "_lifted_nonlocal_gotos", {}):
+            ctx.nonlocal_goto_targets = dict(
+                self._lifted_nonlocal_gotos[fn.name]
+            )
         # Lift nested function definitions to file scope. Each gets a
         # mangled name (`<outer>__<inner>`); calls / address-takes in
         # the outer body resolve through `ctx.nested_fn_names`.
@@ -2306,11 +2332,49 @@ class CodeGenerator:
         # (for outer-of-outer references) AND our siblings' lifts (so
         # nested t1 can call sibling nested t0).
         sibling_lifts = dict(ctx.nested_fn_names)
+        # Non-local gotos: a nested fn's `goto X` where `X` is a label
+        # declared in the outer (via `__label__ X`) is a cross-frame
+        # jump — gcc handles this with trampolines, but we use a
+        # setjmp/longjmp pair. Collect each such (outer_label, set of
+        # nested fns) pairing now; later we'll allocate a jmp_buf
+        # global and emit the setjmp+dispatch in outer's prologue.
+        outer_user_labels: set[str] = set()
+        for sub in self._walk_ast(fn.body):
+            if isinstance(sub, ast.LabelStmt):
+                outer_user_labels.add(sub.label)
+        nonlocal_goto_targets: dict[str, str] = {}
+        nonlocal_goto_per_inner: dict[str, dict[str, str]] = {}
+        for nested in nested_decls:
+            inner_user_labels: set[str] = set()
+            for sub in self._walk_ast(nested.body):
+                if isinstance(sub, ast.LabelStmt):
+                    inner_user_labels.add(sub.label)
+            for sub in self._walk_ast(nested.body):
+                if (
+                    isinstance(sub, ast.GotoStmt)
+                    and sub.target is None
+                    and sub.label in outer_user_labels
+                    and sub.label not in inner_user_labels
+                ):
+                    buf_name = f"__nlg_{fn.name}__{sub.label}"
+                    nonlocal_goto_targets[sub.label] = buf_name
+                    self._nonlocal_goto_bufs.add(buf_name)
+                    inner_mangled = ctx.nested_fn_names.get(nested.name)
+                    if inner_mangled:
+                        nonlocal_goto_per_inner.setdefault(inner_mangled, {})[
+                            sub.label
+                        ] = buf_name
+        # Save the outer's mapping so the body emit can do the setjmp.
+        self._nonlocal_goto_targets[fn.name] = nonlocal_goto_targets
         for sub in nested_decls:
             mangled = ctx.nested_fn_names.get(sub.name)
             if mangled:
                 self._lifted_captures[mangled] = capture_remap
                 self._lifted_nested_fn_names[mangled] = sibling_lifts
+                inner_map = nonlocal_goto_per_inner.get(mangled, {})
+                if inner_map:
+                    self._lifted_nonlocal_gotos[mangled] = inner_map
+                self._lifted_outer_fn[mangled] = fn.name
         # Parameters live above EBP at cdecl offsets; the first sits at
         # [ebp + 8], and each subsequent param is offset by its predecessor's
         # padded size. For scalars/pointers/floats that's `(size + 3) & ~3`
@@ -2459,6 +2523,26 @@ class CodeGenerator:
                 else:
                     out += self._load_to_eax(_ebp_addr(param_disp), ptype)
                     out += self._store_from_eax(f"[_{mangled}]", ptype)
+        # Non-local goto setjmp dispatch. For every outer label X that
+        # gets goto'd from a nested fn, emit:
+        #   push offset _<buf>
+        #   call __builtin_setjmp
+        #   add esp, 4
+        #   test eax, eax
+        #   jnz .L_user_<X>
+        # This way, when the nested fn does longjmp(_<buf>, 1), control
+        # returns to outer at this point with EAX=1 and we dispatch to
+        # the user label.
+        nlg = self._nonlocal_goto_targets.get(fn.name, {})
+        for label_name, buf in nlg.items():
+            user_target = ctx.user_labels.get(label_name)
+            if user_target is None:
+                continue
+            out.append(f"        push    _{buf}")
+            out.append("        call    ___builtin_setjmp")
+            out.append("        add     esp, 4")
+            out.append("        test    eax, eax")
+            out.append(f"        jnz     {user_target}")
         out += body
         # C99: falling off the end of main returns 0. For other functions
         # this is technically undefined, but a deterministic zero beats
@@ -3869,13 +3953,13 @@ class CodeGenerator:
             # Array decay — leave the address in eax.
             return addr
         if isinstance(member_ty, ast.StructType):
-            # Reading a nested struct as a value requires struct-copy
-            # codegen; defer until that slice lands. Until then, only
-            # uses that immediately take an address (`.inner.field`) work,
-            # and those go through `_struct_address` not `_member_load`.
-            raise CodegenError(
-                "reading a nested struct as a value is not supported yet"
-            )
+            # Struct value as expression result — return its address,
+            # like array decay. Consumers that need to copy the struct
+            # (assignment, by-value pass, return) go through
+            # `_struct_address` / `_struct_copy_assign`. Consumers that
+            # do something else (a no-op `(struct S)w->t.s` cast, for
+            # instance) treat the address as the struct value.
+            return addr
         return addr + self._load_to_eax("[eax]", member_ty)
 
     def _bitfield_load(
@@ -4433,9 +4517,19 @@ class CodeGenerator:
         `.bss` initializer contexts.
         """
         nasm = ctx.user_labels.get(label)
-        if nasm is None:
-            raise CodegenError(f"&&{label}: unknown label")
-        return f"_{ctx.func_name}{nasm}"
+        if nasm is not None:
+            return f"_{ctx.func_name}{nasm}"
+        # Non-local label: a `&&X` reference inside a lifted nested fn
+        # where X is declared in the outer. Resolve via outer's
+        # user-label map. We may need to walk up several lift levels
+        # for deeply nested fns.
+        outer = self._lifted_outer_fn.get(ctx.func_name)
+        while outer is not None:
+            outer_labels = self._function_user_labels.get(outer, {})
+            if label in outer_labels:
+                return f"_{outer}{outer_labels[label]}"
+            outer = self._lifted_outer_fn.get(outer)
+        raise CodegenError(f"&&{label}: unknown label")
 
     def _identifier_addr_text(self, name: str, ctx: _FuncCtx) -> str:
         """Return the `[...]` operand text used for in-place memory ops.
@@ -4820,6 +4914,18 @@ class CodeGenerator:
                 out = self._eval_expr_to_eax(item.target, ctx)
                 out.append("        jmp     eax")
                 return out
+            # Non-local goto: a `goto X` from inside a lifted nested
+            # fn where X was declared in the outer via `__label__ X`.
+            # Lower to `__builtin_longjmp(&buf, 1)` — outer's prologue
+            # has a matching `__builtin_setjmp` that dispatches to X.
+            buf = ctx.nonlocal_goto_targets.get(item.label)
+            if buf is not None:
+                return [
+                    "        push    1",
+                    f"        push    _{buf}",
+                    "        call    ___builtin_longjmp",
+                    "        add     esp, 8",
+                ]
             target = ctx.user_labels.get(item.label)
             if target is None:
                 raise CodegenError(
