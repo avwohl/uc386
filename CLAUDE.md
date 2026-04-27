@@ -441,3 +441,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **VLA local size capture.** Same idea for local VarDecls. Allocate `__vla_capture_local_<name>_<idx>` slots, evaluate the size at decl point, replace `_vla_size` references with `Identifier(slot_name)`. Hooks into `_var_init` via an outer wrapper that emits the capture stores as a prefix to the inner init code. Closes nothing alone but unblocks future VLA work.
 
   **Result: 1477/1514 gcc-c-torture** (+6 tests). Pipeline 1693/1734 (97.6%).
+- **2026-04-27 — pr22061-4, struct VLA capture, float→int saturate (1477 → 1480)**:
+  - **Nested-fn capture also walks param size-side-effects.** `int foo(int a[N++])` declared as a nested function references `N` (an outer-fn local) in its param size expression even when foo's body is empty. Capture detection now walks each nested-fn param's `size_side_effects` so N gets promoted to a global. Closes pr22061-4.
+  - **VLA struct member size capture at decl.** In-function `struct s { char b[n]; }` declarations capture `n` at the struct-decl point so subsequent `n++` doesn't alter sizeof(s). Allocate `__vla_capture_struct_<name>_<idx>` slots, replace ArrayType.size in members with Identifier(slot), emit eval+store at struct-decl emission. Closes 20041218-2.
+  - **Float→signed-int saturation on OOB.** Per gcc, `(int) float_outside_int_range` saturates to INT_MAX or INT_MIN rather than producing the x87 "indefinite integer" 0x80000000. Mirror the existing unsigned-int OOB path: dup the value, compare against 2^31 and -2^31, branch to saturation if out of range, otherwise fistp truncate. Closes 20031003-1.
+
+  **Result: 1480/1514 gcc-c-torture** (+3 tests). Pipeline 1696/1734 (97.8%).
