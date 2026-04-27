@@ -4554,6 +4554,7 @@ class CodeGenerator:
         # for callers that want both halves.)
         if (
             isinstance(src_ty, ast.ArrayType)
+            and getattr(src_ty, "is_vector", False)
             and isinstance(target, ast.BasicType)
             and self._size_of(src_ty) >= self._size_of(target)
         ):
