@@ -2335,6 +2335,29 @@ class CodeGenerator:
             ctx.alloc_param(param.name, disp, param.param_type)
             size = self._size_of(param.param_type)
             disp += (size + 3) & ~3
+        # Pre-allocate VLA size-capture slots for params with side
+        # effects (`int b[a++]`). Each unique side-effect expression
+        # gets a 4-byte hidden local. After alloc, replace ArrayType
+        # `size` references in the param's type with Identifier(slot)
+        # so sizeof() reads the captured value.
+        for param in fn.params:
+            sse = getattr(param, "size_side_effects", None)
+            if not sse:
+                continue
+            captured: dict[int, str] = {}
+            for i, size_expr in enumerate(sse):
+                try:
+                    self._const_eval(size_expr, f"<vla-{param.name}>")
+                    continue
+                except CodegenError:
+                    pass
+                slot_name = f"__vla_capture_{param.name}_{i}"
+                ctx.alloc_local(slot_name, ast.BasicType(name="int"))
+                captured[id(size_expr)] = slot_name
+            if captured:
+                self._replace_vla_size_with_capture(
+                    param.param_type, captured, fn.name,
+                )
         # First pass: allocate every local up front so the prologue knows
         # the frame size before we emit body code.
         self._collect_locals(fn.body, ctx)
@@ -2375,29 +2398,31 @@ class CodeGenerator:
         out.append("        mov     ebp, esp")
         if ctx.frame_size:
             out.append(f"        sub     esp, {ctx.frame_size}")
-        # VLA parameter sizes: `int b[a++]` evaluates `a++` for its
-        # side effects at function entry per C99. The parser captured
-        # these on `param.size_side_effects` before adjusting the array
-        # type to a pointer. Wrapped in a broad try — if the operand
-        # references something we can't bind in this scope (e.g. a
-        # nested fn whose param size mentions the outer fn's local),
-        # silently skip rather than blow up codegen.
+        # VLA parameter sizes: evaluate side effects + capture sizes.
+        # Slots were pre-allocated in `_collect_locals` (or here, after
+        # the prologue, but before frame_size was finalized) — we just
+        # eval the captured side-effect expr and store. Replacement of
+        # `size` references with `Identifier(slot)` already happened
+        # in the pre-pass.
         for param in fn.params:
             sse = getattr(param, "size_side_effects", None)
             if not sse:
                 continue
-            for size_expr in sse:
+            for i, size_expr in enumerate(sse):
                 try:
                     self._const_eval(size_expr, f"<vla-{param.name}>")
-                    # Pure constant; nothing to emit.
                     continue
                 except CodegenError:
                     pass
+                slot_name = f"__vla_capture_{param.name}_{i}"
+                if not ctx.has_local(slot_name):
+                    continue
                 try:
                     out += self._eval_expr_to_eax(size_expr, ctx)
                 except CodegenError:
-                    # Operand not resolvable in this scope; skip.
-                    pass
+                    continue
+                disp = ctx.lookup(slot_name)
+                out.append(f"        mov     {_ebp_addr(disp)}, eax")
         # If any of our params are captured by a nested function, copy
         # the param's incoming value into its mangled global so the
         # nested fn (compiled separately) sees the right initial value.
@@ -7946,6 +7971,22 @@ class CodeGenerator:
         else:
             out.append("        cdq")
         return out
+
+    def _replace_vla_size_with_capture(
+        self, t: ast.TypeNode, captured: dict[int, str], fn_name: str,
+    ) -> None:
+        """Walk `t` and replace any ArrayType.size expression whose
+        identity matches a captured side-effect with an Identifier
+        reading from the captured hidden local."""
+        if isinstance(t, ast.PointerType):
+            self._replace_vla_size_with_capture(t.base_type, captured, fn_name)
+            return
+        if isinstance(t, ast.ArrayType):
+            if t.size is not None and id(t.size) in captured:
+                slot_name = captured[id(t.size)]
+                t.size = ast.Identifier(name=slot_name, location=t.size.location)
+            self._replace_vla_size_with_capture(t.base_type, captured, fn_name)
+            return
 
     def _bitfield_precision_mask(
         self, *operands: ast.Expression, ctx: _FuncCtx,
