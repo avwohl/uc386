@@ -1232,6 +1232,7 @@ ___builtin_parityl:     jmp ___builtin_parity
 ___builtin_parityll:
         push    ebp
         mov     ebp, esp
+        push    dword [ebp + 12]
         push    dword [ebp + 8]
         call    ___builtin_popcountll
         add     esp, 8
@@ -2556,10 +2557,15 @@ _malloc:
         push    ebp
         mov     ebp, esp
         mov     ecx, [ebp + 8]
-        ; round up to 4
-        add     ecx, 3
-        and     ecx, ~3
+        ; round size up to 16 so successive allocations stay aligned.
+        add     ecx, 15
+        and     ecx, ~15
         mov     eax, [__heap_ptr]
+        ; align the returned pointer up to 16 bytes — matches GCC's
+        ; default `__alignof__(struct {int x __attribute__((aligned));})
+        ; == 16` on i386, so alloca-1 sees a 16-byte-aligned buffer.
+        add     eax, 15
+        and     eax, ~15
         mov     edx, eax
         add     edx, ecx
         cmp     edx, __heap_end

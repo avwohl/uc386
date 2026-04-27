@@ -307,6 +307,9 @@ class CodeGenerator:
         # Per-struct alignment when a member has `aligned(N)` or the
         # struct itself has it. Used to align globals of struct type.
         self._struct_alignments: dict[str, int] = {}
+        # Per-function alignment when the function (or its declaration)
+        # has `__attribute__((aligned(N)))`. Read by `__alignof__(funcname)`.
+        self._func_alignments: dict[str, int] = {}
         # Struct definitions: name → list of (member_name, member_type,
         # offset). `_struct_sizes` is the corresponding total size in bytes
         # (rounded up to struct alignment).
@@ -460,8 +463,14 @@ class CodeGenerator:
                 self._func_param_types[d.name] = [
                     p.param_type for p in d.params
                 ]
+                fa = getattr(d, "alignment", None)
+                if fa is not None:
+                    self._func_alignments[d.name] = fa
             elif isinstance(d, ast.VarDecl) and isinstance(d.var_type, ast.FunctionType):
                 self._func_return_types[d.name] = d.var_type.return_type
+                fa = getattr(d, "alignment", None)
+                if fa is not None:
+                    self._func_alignments[d.name] = fa
                 self._func_param_types[d.name] = list(d.var_type.param_types)
 
         # Reset struct + globals state. Structs need to be registered
@@ -1860,6 +1869,12 @@ class CodeGenerator:
             # (array dimensions, global initializers) there's no function
             # context. A fresh empty _FuncCtx works because the type-of
             # path falls through to globals when no local matches.
+            if (
+                getattr(expr, "is_alignof", False)
+                and isinstance(expr.expr, ast.Identifier)
+                and expr.expr.name in self._func_alignments
+            ):
+                return self._func_alignments[expr.expr.name]
             ty = self._type_of(expr.expr, _FuncCtx())
             if getattr(expr, "is_alignof", False):
                 return self._alignment_of(ty)
@@ -7277,6 +7292,13 @@ class CodeGenerator:
             # static type matters. So we infer the type and never emit
             # any of the operand's lowering code (no slot loads, no
             # function calls).
+            if (
+                getattr(expr, "is_alignof", False)
+                and isinstance(expr.expr, ast.Identifier)
+                and expr.expr.name in self._func_alignments
+            ):
+                value = self._func_alignments[expr.expr.name]
+                return [f"        mov     eax, {value}"]
             ty = self._type_of(expr.expr, ctx)
             if getattr(expr, "is_alignof", False):
                 value = self._alignment_of(ty)
