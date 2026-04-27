@@ -4708,28 +4708,87 @@ class CodeGenerator:
 
         walk(stmt.body)
 
-        # Eval the controlling expression once. For LL switches we'd
-        # need a different dispatch (EDX:EAX); not yet implemented.
-        # Single-value LL cases still pass through here as 32-bit
-        # comparisons (truncating the high half), which is wrong for
-        # very-large values but works for typical small-value LL
-        # switches.
-        out = self._eval_expr_to_eax(stmt.expr, ctx)
-        for kind, value, value_end, target in case_specs:
-            if kind == "case":
-                out.append(f"        cmp     eax, {value}")
-                out.append(f"        je      {target}")
-            elif kind == "range":
-                skip = ctx.label("rskip")
-                # Use signed comparison since case values may be
-                # negative. Unsigned ranges still work as long as
-                # both endpoints are < 2^31.
-                out.append(f"        cmp     eax, {value}")
-                out.append(f"        jl      {skip}")
-                out.append(f"        cmp     eax, {value_end}")
-                out.append(f"        jle     {target}")
-                out.append(f"{skip}:")
-        out.append(f"        jmp     {default_label or end_label}")
+        # Eval the controlling expression once. Long-long switches
+        # use EDX:EAX dispatch; otherwise EAX.
+        ctrl_ty = self._type_of(stmt.expr, ctx)
+        is_ll = self._is_long_long(ctrl_ty)
+        if is_ll:
+            ctrl_unsigned = self._is_unsigned(ctrl_ty)
+            out = self._eval_expr_to_edx_eax(stmt.expr, ctx)
+            for kind, value, value_end, target in case_specs:
+                if kind == "case":
+                    v = value & 0xFFFFFFFFFFFFFFFF
+                    lo = v & 0xFFFFFFFF
+                    hi = (v >> 32) & 0xFFFFFFFF
+                    skip = ctx.label("ll_neq")
+                    out.append(f"        cmp     edx, 0x{hi:08X}")
+                    out.append(f"        jne     {skip}")
+                    out.append(f"        cmp     eax, 0x{lo:08X}")
+                    out.append(f"        je      {target}")
+                    out.append(f"{skip}:")
+                elif kind == "range":
+                    # value <= ctrl <= value_end. Use unsigned
+                    # comparison if the controlling type is unsigned.
+                    a = value & 0xFFFFFFFFFFFFFFFF
+                    b = value_end & 0xFFFFFFFFFFFFFFFF
+                    a_lo = a & 0xFFFFFFFF
+                    a_hi = (a >> 32) & 0xFFFFFFFF
+                    b_lo = b & 0xFFFFFFFF
+                    b_hi = (b >> 32) & 0xFFFFFFFF
+                    skip = ctx.label("ll_rskip")
+                    take = ctx.label("ll_rtake")
+                    # Compare ctrl with `a` (lower bound); if ctrl < a,
+                    # skip. Compare high first; if higher, ctrl > a so
+                    # might match. If equal, compare low.
+                    out.append(f"        cmp     edx, 0x{a_hi:08X}")
+                    if ctrl_unsigned:
+                        out.append(f"        jb      {skip}")
+                        out.append(f"        ja      .L{ctx._next_label}_ge_a")
+                    else:
+                        out.append(f"        jl      {skip}")
+                        out.append(f"        jg      .L{ctx._next_label}_ge_a")
+                    out.append(f"        cmp     eax, 0x{a_lo:08X}")
+                    if ctrl_unsigned:
+                        out.append(f"        jb      {skip}")
+                    else:
+                        out.append(f"        jl      {skip}")
+                    out.append(f".L{ctx._next_label}_ge_a:")
+                    ctx._next_label += 1
+                    # Compare ctrl with `b` (upper bound); if ctrl > b,
+                    # skip. Otherwise take.
+                    out.append(f"        cmp     edx, 0x{b_hi:08X}")
+                    if ctrl_unsigned:
+                        out.append(f"        ja      {skip}")
+                        out.append(f"        jb      {take}")
+                    else:
+                        out.append(f"        jg      {skip}")
+                        out.append(f"        jl      {take}")
+                    out.append(f"        cmp     eax, 0x{b_lo:08X}")
+                    if ctrl_unsigned:
+                        out.append(f"        ja      {skip}")
+                    else:
+                        out.append(f"        jg      {skip}")
+                    out.append(f"{take}:")
+                    out.append(f"        jmp     {target}")
+                    out.append(f"{skip}:")
+            out.append(f"        jmp     {default_label or end_label}")
+        else:
+            out = self._eval_expr_to_eax(stmt.expr, ctx)
+            for kind, value, value_end, target in case_specs:
+                if kind == "case":
+                    out.append(f"        cmp     eax, {value}")
+                    out.append(f"        je      {target}")
+                elif kind == "range":
+                    skip = ctx.label("rskip")
+                    # Use signed comparison since case values may be
+                    # negative. Unsigned ranges still work as long as
+                    # both endpoints are < 2^31.
+                    out.append(f"        cmp     eax, {value}")
+                    out.append(f"        jl      {skip}")
+                    out.append(f"        cmp     eax, {value_end}")
+                    out.append(f"        jle     {target}")
+                    out.append(f"{skip}:")
+            out.append(f"        jmp     {default_label or end_label}")
 
         # Body emission. `_item`'s CaseStmt branch consults
         # `ctx.active_case_labels[-1]` to find the right label for each
