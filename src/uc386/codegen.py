@@ -1895,6 +1895,10 @@ class CodeGenerator:
         if isinstance(expr, ast.SizeofType):
             if getattr(expr, "is_alignof", False):
                 return self._alignment_of(expr.target_type)
+            # If the type contains a VLA, refuse the constant fold so
+            # the runtime sizeof path runs instead.
+            if self._type_has_vla(expr.target_type):
+                raise CodegenError("sizeof: VLA — runtime evaluation needed")
             return self._size_of(expr.target_type)
         if isinstance(expr, ast.SizeofExpr):
             # `sizeof(expr)` — operand is unevaluated; we just need its
@@ -2953,11 +2957,14 @@ class CodeGenerator:
                     folded = self._const_eval(t.size, name)
                     t.size = ast.IntLiteral(value=folded)
                 except CodegenError:
-                    # Variable-length arrays (`int a[n]`) aren't truly
-                    # supported — there's no run-time `alloca` step. As a
-                    # compile-only convenience we pick a fixed slot size
-                    # so codegen proceeds; the program won't run correctly
-                    # but it won't crash the compiler either.
+                    # Variable-length arrays (`int a[n]`) aren't fully
+                    # supported (no runtime alloca). As a compile-only
+                    # convenience we pick a fixed slot size of 16 so
+                    # struct layout proceeds; the original size
+                    # expression is preserved on `t._vla_size` so
+                    # `_emit_runtime_size_of` can recompute the real
+                    # byte count for `sizeof`.
+                    t._vla_size = t.size
                     t.size = ast.IntLiteral(value=16)
             self._check_supported_type(t.base_type, name)
             return
@@ -7410,6 +7417,77 @@ class CodeGenerator:
                 ctx.exit_scope()
         return ast.BasicType(name="int")
 
+    def _type_has_vla(self, t: ast.TypeNode) -> bool:
+        """Does `t` contain a variable-length array (preserved on
+        `_vla_size`)?"""
+        if isinstance(t, ast.ArrayType):
+            if getattr(t, "_vla_size", None) is not None:
+                return True
+            return self._type_has_vla(t.base_type)
+        if isinstance(t, ast.StructType):
+            sname = self._resolve_struct_name(t)
+            for _name, mt, _off in self._structs.get(sname, []):
+                if self._type_has_vla(mt):
+                    return True
+        return False
+
+    def _emit_runtime_size_of(
+        self, t: ast.TypeNode, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Compute sizeof(t) at runtime when t contains a VLA.
+
+        For non-VLA types we just emit the static size. For VLA-shaped
+        arrays (with the original size expression on `_vla_size`), we
+        evaluate that expression and multiply by element size. For
+        structs we walk members so a VLA member contributes runtime
+        size while regular members fold.
+        """
+        if not self._type_has_vla(t):
+            return [f"        mov     eax, {self._size_of(t)}"]
+        if isinstance(t, ast.ArrayType):
+            vla_size = getattr(t, "_vla_size", None)
+            if vla_size is not None:
+                inner = self._emit_runtime_size_of(t.base_type, ctx)
+                out = list(inner)
+                out.append("        push    eax")
+                out += self._eval_expr_to_eax(vla_size, ctx)
+                out.append("        pop     ecx")
+                out.append("        imul    eax, ecx")
+                return out
+            # ArrayType with constant size whose base contains a VLA.
+            inner = self._emit_runtime_size_of(t.base_type, ctx)
+            count = t.size.value if isinstance(t.size, ast.IntLiteral) else 1
+            out = list(inner)
+            out.append(f"        imul    eax, eax, {count}")
+            return out
+        if isinstance(t, ast.StructType):
+            sname = self._resolve_struct_name(t)
+            members = self._structs.get(sname, [])
+            if not members:
+                return ["        xor     eax, eax"]
+            total_const = 0
+            runtime_lines: list[str] = []
+            for _name, mt, _off in members:
+                if self._type_has_vla(mt):
+                    sub = self._emit_runtime_size_of(mt, ctx)
+                    if not runtime_lines:
+                        runtime_lines = list(sub)
+                    else:
+                        runtime_lines.append("        push    eax")
+                        runtime_lines += sub
+                        runtime_lines.append("        pop     ecx")
+                        runtime_lines.append("        add     eax, ecx")
+                    continue
+                total_const += self._size_of(mt)
+            if not runtime_lines:
+                return [f"        mov     eax, {total_const}"]
+            out = list(runtime_lines)
+            if total_const:
+                out.append(f"        add     eax, {total_const}")
+            return out
+        # Other type categories don't carry VLA in our subset.
+        return [f"        mov     eax, {self._size_of(t)}"]
+
     def _fistp_truncate_dword_to_eax(self) -> list[str]:
         """Pop st(0), truncate toward zero, store as 32-bit signed int
         in EAX. Saves and restores the FPU control word so we don't
@@ -7553,9 +7631,8 @@ class CodeGenerator:
         if isinstance(expr, ast.SizeofType):
             if getattr(expr, "is_alignof", False):
                 value = self._alignment_of(expr.target_type)
-            else:
-                value = self._size_of(expr.target_type)
-            return [f"        mov     eax, {value}"]
+                return [f"        mov     eax, {value}"]
+            return self._emit_runtime_size_of(expr.target_type, ctx)
         if isinstance(expr, ast.OffsetofExpr):
             return [f"        mov     eax, {self._offsetof_value(expr)}"]
         if isinstance(expr, ast.TypesCompatibleP):
