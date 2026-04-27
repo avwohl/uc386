@@ -2566,20 +2566,19 @@ class CodeGenerator:
 
     def _collect_call_temps_inner(self, node, ctx: _FuncCtx) -> None:
         for sub in self._walk_ast(node):
-            if isinstance(sub, ast.Call) and self._is_struct_returning_call(sub, None):
-                ret_ty = self._func_return_types[self._call_target(sub)]
+            if isinstance(sub, ast.Call) and self._is_struct_returning_call(sub, ctx):
+                ret_ty = self._call_return_type(sub, ctx)
                 size = (self._size_of(ret_ty) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
-            elif isinstance(sub, ast.Call) and self._is_vector_returning_call(sub, None):
-                ret_ty = self._func_return_types[self._call_target(sub)]
+            elif isinstance(sub, ast.Call) and self._is_vector_returning_call(sub, ctx):
+                ret_ty = self._call_return_type(sub, ctx)
                 size = (self._size_of(ret_ty) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
-            elif isinstance(sub, ast.Call) and self._is_complex_returning_call(sub, None):
+            elif isinstance(sub, ast.Call) and self._is_complex_returning_call(sub, ctx):
                 # Complex-returning calls need a per-call-site temp
                 # so consumers like `__real foo()` can address the
                 # halves via a stable slot.
-                target = self._call_target(sub)
-                ret_ty = self._func_return_types[target]
+                ret_ty = self._call_return_type(sub, ctx)
                 size = (self._size_of(ret_ty) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
             elif isinstance(sub, ast.Compound):
@@ -6224,9 +6223,13 @@ class CodeGenerator:
                 for i, (constraint, lvalue) in enumerate(outputs):
                     rhs = self._asm_match_input(constraint, i, inputs)
                     if rhs is None:
-                        # Unmatched output: just evaluate for side
-                        # effects.
-                        out += self._eval_expr_to_eax(lvalue, ctx)
+                        # Unmatched output: try to evaluate for side
+                        # effects, but tolerate non-loadable lvalues
+                        # (e.g. structs in `+m (s)`).
+                        try:
+                            out += self._eval_expr_to_eax(lvalue, ctx)
+                        except CodegenError:
+                            pass
                         continue
                     # `lvalue = rhs` semantics.
                     out += self._asm_emit_assign(lvalue, rhs, ctx)
@@ -6943,6 +6946,7 @@ class CodeGenerator:
         if isinstance(dest_ty, ast.PointerType):
             dest_ty = dest_ty.base_type
         unsigned = self._is_unsigned(dest_ty)
+        dest_is_ll = self._is_long_long(dest_ty)
         if self._is_long_long(a_ty) or self._is_long_long(b_ty):
             raise CodegenError(
                 f"{name}: long-long operand not supported"
@@ -6969,19 +6973,76 @@ class CodeGenerator:
             out.append("        sub     eax, ecx")
             flag = "setc" if unsigned else "seto"
         else:  # mul
-            if unsigned:
-                # `mul ecx` → EDX:EAX = unsigned product. Overflow iff
-                # EDX != 0. Capture before EDX is clobbered.
+            # GCC: operands are conceptually widened to a common signed
+            # type before multiplication. When either operand is signed,
+            # use signed multiply; when both are unsigned, use unsigned.
+            both_unsigned = self._is_unsigned(a_ty) and self._is_unsigned(b_ty)
+            if both_unsigned:
+                # `mul ecx` → EDX:EAX = unsigned product.
                 out.append("        mul     ecx")
-                out.append("        test    edx, edx")
-                out.append("        setnz   dl")
+                if dest_is_ll:
+                    out.append("        mov     [ebx], eax")
+                    out.append("        mov     [ebx + 4], edx")
+                    out.append("        xor     eax, eax")
+                    return out
+                if unsigned:
+                    # 32-bit unsigned dest: overflow iff EDX != 0.
+                    out.append("        test    edx, edx")
+                    out.append("        setnz   dl")
+                else:
+                    # 32-bit signed dest: overflow iff result > INT_MAX
+                    # (EDX != 0 OR sign bit of EAX set).
+                    out.append("        test    edx, edx")
+                    out.append("        setnz   dl")
+                    out.append("        test    eax, eax")
+                    out.append("        sets    dh")
+                    out.append("        or      dl, dh")
                 out.append("        mov     [ebx], eax")
                 out.append("        movzx   eax, dl")
                 return out
+            # Signed multiply (at least one operand signed).
             out.append("        imul    ecx")
+            if dest_is_ll:
+                # Signed full 64-bit product fits in LL dest.
+                out.append("        mov     [ebx], eax")
+                out.append("        mov     [ebx + 4], edx")
+                if unsigned:
+                    # If product is negative (high bit of EDX set) and
+                    # dest is unsigned, technically that's an overflow.
+                    # Gcc does report this; but the test we're chasing
+                    # (pr84169) ignores the return value. Mark overflow
+                    # as 1 if EDX < 0.
+                    out.append("        test    edx, edx")
+                    out.append("        sets    al")
+                    out.append("        movzx   eax, al")
+                else:
+                    out.append("        xor     eax, eax")
+                return out
+            if unsigned:
+                # 32-bit unsigned dest: overflow if result is negative
+                # or doesn't fit (EDX != 0 for positive, EDX != -1 for
+                # negative — the latter still overflows because dest is
+                # unsigned and can't hold negatives).
+                out.append("        mov     [ebx], eax")
+                out.append("        test    edx, edx")
+                out.append("        setnz   dl")
+                # Also: if EDX==0 but EAX is negative (high bit set),
+                # the int value fits 32-bit signed but doesn't fit
+                # unsigned (negative). But here EDX==0 means non-negative.
+                # If EDX==-1 (sign-extension), dl already nonzero.
+                out.append("        movzx   eax, dl")
+                return out
             flag = "seto"
         out.append(f"        {flag}    dl")
         out.append("        mov     [ebx], eax")
+        if dest_is_ll:
+            # 32-bit add/sub result, sign- or zero-extend to LL slot.
+            if unsigned:
+                out.append("        mov     dword [ebx + 4], 0")
+            else:
+                out.append("        mov     ecx, eax")
+                out.append("        sar     ecx, 31")
+                out.append("        mov     [ebx + 4], ecx")
         out.append("        movzx   eax, dl")
         return out
 
@@ -7119,14 +7180,21 @@ class CodeGenerator:
             callee = callee.operand
         return callee
 
-    def _call_target(self, call: ast.Call) -> str | None:
-        """If the call is direct (a known function name), return that name."""
+    def _call_target(self, call: ast.Call, ctx=None) -> str | None:
+        """If the call is direct (a known function name), return that name.
+
+        When ctx is provided, nested-fn names get remapped to their
+        lifted top-level mangled name first, so `Foo()` inside an
+        outer fn resolves to `_outer__Foo` (which is what's registered
+        in `_func_return_types`).
+        """
         callee = self._stripped_callee(call)
-        if (
-            isinstance(callee, ast.Identifier)
-            and callee.name in self._func_return_types
-        ):
-            return callee.name
+        if isinstance(callee, ast.Identifier):
+            name = callee.name
+            if ctx is not None:
+                name = ctx.nested_fn_names.get(name, name)
+            if name in self._func_return_types:
+                return name
         return None
 
     def _call_into_address(
@@ -7160,7 +7228,7 @@ class CodeGenerator:
         named function, or by walking the indirect callee's function-
         pointer type.
         """
-        target = self._call_target(call)
+        target = self._call_target(call, ctx)
         if target is not None:
             return self._func_return_types.get(target)
         if ctx is None:
