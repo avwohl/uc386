@@ -377,6 +377,10 @@ class CodeGenerator:
             elif isinstance(d, ast.VarDecl) and isinstance(d.var_type, ast.FunctionType):
                 externs.add(d.name)
         externs -= defined_names
+        # Drop `_start` — we always define it (and its `__start` alias)
+        # as the program entry stub. The user's `extern void _start(void)`
+        # would otherwise conflict with our self-defined entry symbol.
+        externs.discard("_start")
         extern_list = sorted(externs)
         # Strings are collected lazily as expressions get lowered; reset
         # the table at the top of each generate() call so the codegen is
@@ -2102,8 +2106,12 @@ class CodeGenerator:
     def _start_stub(self) -> list[str]:
         # _start: call user main, take its int return in EAX, exit DOS via
         # INT 21h/4Ch with AL = exit code. AH=4Ch leaves AL untouched.
+        # `__start` aliases `_start` so a user `extern void _start(void)`
+        # / `_start()` call (which our naming convention prefixes to
+        # `__start`) reaches the entry stub.
         return [
             "_start:",
+            "__start:",
             "        call    _main",
             "        mov     ah, 4Ch",
             "        int     21h",
