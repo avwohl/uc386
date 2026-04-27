@@ -8148,17 +8148,13 @@ class CodeGenerator:
         return out
 
     def _float_cast(self, expr: ast.Cast, ctx: _FuncCtx) -> list[str]:
-        """Cast to a float target. The source may be int or float."""
-        target = expr.target_type
-        source_ty = self._type_of(expr.expr, ctx)
-        if self._is_float_type(source_ty):
-            # Float-to-float cast — for our purposes (single x87 path),
-            # the bit-pattern conversion would happen on store, but on
-            # st(0) the value is in 80-bit form regardless. Just leave
-            # it on st(0); the eventual fstp picks the width.
-            return self._eval_float_to_st0(expr.expr, ctx)
-        # Int-to-float — `_eval_float_to_st0` already promotes via fild
-        # when the operand is int-typed.
+        """Cast to a float target. The source may be int or float.
+
+        x87 keeps intermediate results at 80-bit precision and the C
+        standard allows that — so we don't force a fstp+fld dword
+        round-trip on every cast. The eventual fstp at the consuming
+        end picks the storage width.
+        """
         return self._eval_float_to_st0(expr.expr, ctx)
 
     def _float_ternary(self, expr: ast.TernaryOp, ctx: _FuncCtx) -> list[str]:
