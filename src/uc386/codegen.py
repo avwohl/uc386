@@ -2744,6 +2744,13 @@ class CodeGenerator:
             raw = self._size_of(var_type)
             slot = (raw + 3) & ~3
             ctx.alloc_local(node.name, var_type, slot, decl=node)
+            # For local VLAs, allocate a hidden capture slot per VLA
+            # dimension so sizeof reads the size at DECL TIME (not the
+            # current value of the size expression). Replace the
+            # ArrayType.size references with Identifier(slot_name);
+            # `_var_init` will emit "eval size expr; mov slot, eax"
+            # at decl point.
+            self._capture_vla_sizes(var_type, node.name, ctx, node)
             return
         if isinstance(node, ast.CompoundStmt):
             ctx.enter_scope()
@@ -5064,6 +5071,34 @@ class CodeGenerator:
         return self._eval_expr_to_eax(stmt.expr, ctx)
 
     def _var_init(self, decl: ast.VarDecl, ctx: _FuncCtx) -> list[str]:
+        # Re-bind the per-VLA-capture slot names in the current scope.
+        # `_capture_vla_sizes` allocated these in `_collect_locals` (a
+        # different scope chain); use `alloc_local`'s decl-based
+        # rebind path to restore the disp without bumping frame_size.
+        captures = getattr(decl, "_vla_captures", None)
+        if captures:
+            for slot_name, orig_size in captures:
+                ctx.alloc_local(
+                    slot_name, ast.BasicType(name="int"),
+                    decl=orig_size,
+                )
+        out = self._var_init_inner(decl, ctx)
+        # If the decl has VLA captures, prepend the capture stores so
+        # `sizeof(decl)` (which reads the captured slot) sees the
+        # correct value. Captures evaluate at decl point.
+        if captures:
+            prefix: list[str] = []
+            for slot_name, orig_size in captures:
+                try:
+                    prefix += self._eval_expr_to_eax(orig_size, ctx)
+                except CodegenError:
+                    continue
+                cdisp = ctx.lookup(slot_name)
+                prefix.append(f"        mov     {_ebp_addr(cdisp)}, eax")
+            return prefix + out
+        return out
+
+    def _var_init_inner(self, decl: ast.VarDecl, ctx: _FuncCtx) -> list[str]:
         # Local function declaration (`int f(int);`): registered as an
         # extern in `_collect_locals`; nothing to emit here.
         if isinstance(decl.var_type, ast.FunctionType):
@@ -7987,6 +8022,55 @@ class CodeGenerator:
                 t.size = ast.Identifier(name=slot_name, location=t.size.location)
             self._replace_vla_size_with_capture(t.base_type, captured, fn_name)
             return
+
+    def _capture_vla_sizes(
+        self,
+        var_type: ast.TypeNode,
+        var_name: str,
+        ctx: _FuncCtx,
+        decl: ast.VarDecl,
+    ) -> None:
+        """For each VLA dimension in a local's type, allocate a hidden
+        capture slot and replace the size expression with an Identifier
+        reading from that slot. The init code emitted by `_var_init`
+        will store the captured size into the slot at decl time."""
+        slots: list[tuple[ast.ArrayType, ast.Expression, str]] = []
+
+        def walk(t: ast.TypeNode) -> None:
+            if isinstance(t, ast.ArrayType):
+                # Prefer `_vla_size` (saved by `_check_supported_type`'s
+                # VLA fallback when it mutated `size` to IntLiteral(16)).
+                # Otherwise capture a non-literal `size`.
+                vla = getattr(t, "_vla_size", None)
+                cand = vla if vla is not None else t.size
+                if (
+                    cand is not None
+                    and not isinstance(cand, ast.IntLiteral)
+                ):
+                    slot_name = f"__vla_capture_local_{var_name}_{len(slots)}"
+                    slots.append((t, cand, slot_name))
+                walk(t.base_type)
+
+        walk(var_type)
+        for arr_t, orig_size, slot_name in slots:
+            ctx.alloc_local(
+                slot_name, ast.BasicType(name="int"),
+                decl=orig_size,
+            )
+        if slots:
+            # Save the captures on the decl so `_var_init` can emit
+            # the runtime evaluation later.
+            decl._vla_captures = [
+                (slot_name, orig_size) for _arr_t, orig_size, slot_name in slots
+            ]
+            for arr_t, orig_size, slot_name in slots:
+                # Replace BOTH `size` (the post-fallback IntLiteral)
+                # AND `_vla_size` (the original expression) with an
+                # Identifier reading from the captured slot.
+                slot_id = ast.Identifier(
+                    name=slot_name, location=orig_size.location,
+                )
+                arr_t._vla_size = slot_id
 
     def _bitfield_precision_mask(
         self, *operands: ast.Expression, ctx: _FuncCtx,
