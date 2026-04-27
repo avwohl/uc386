@@ -421,3 +421,8 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Preprocessor blue-paint.** Bring back the rescan loop in `_expand_macros` (token-paste producing a macro name like `CAT(A,B)(x)` → `AB(x)` should re-expand) but blue-paint each expanded macro's mentions in its result with `\x01<name>\x02` sentinels so self-referential macros don't infinitely re-expand. Closes c-testsuite 00201.
 
   **Result: 1467/1514 gcc-c-torture** (up from 1456, +11 tests). c-testsuite now 216/220 (00201 passes). Pipeline 1683/1734 (97.1%).
+- **2026-04-27 — torture sweep cont'd: __builtin_apply, runtime VLA sizeof (1467 → 1469)**:
+  - **`__builtin_apply` / `__builtin_apply_args`**. Inline at the call site: `__builtin_apply_args()` returns `lea eax, [ebp+8]` (caller's arg area); `__builtin_apply(fn, args, size)` reserves `size` bytes on the stack, `rep movsd` from `args`, `call eax` with the fn pointer. Size must be a compile-time constant. Closes pr47237.
+  - **Runtime sizeof for VLA-shaped types**. `_check_supported_type`'s VLA fallback already mutates the size to a literal 16; now also save the original size expr on `t._vla_size`. New `_emit_runtime_size_of(t, ctx)` evaluates the saved expression at sizeof sites — multiplies by element size for arrays, sums VLA + constant member contributions for structs. `_const_eval(SizeofType)` refuses the fold when the target type contains a VLA so callers fall through to the runtime path. Closes 20040423-1 (sizeof of VLA struct typedef'd inside a function).
+
+  **Result: 1469/1514 gcc-c-torture** (up from 1467, +2 tests). Pipeline 1685/1734 (97.2%).
