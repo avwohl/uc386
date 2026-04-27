@@ -3,6 +3,42 @@
 Phase 4 slices 0–32 done. Phase 5 (floats) slices 1–9 done.
 va_list slice done. uc386's own suite: 310 tests passing.
 
+## Resume checkpoint (2026-04-27)
+
+Both repos clean and pushed to origin/main.
+
+Latest session delivered +44 torture wins (1601 → 1645 combined).
+See CLAUDE.md session log for full slice-by-slice details.
+
+Key recent slices:
+- vector_size: arithmetic, ABI, scalar broadcast, float vectors,
+  compound assign, cast-from-scalar, cast-to-int (simd-1..6 + many pr*)
+- LL bitfield: read (don't redundantly cdq) + write
+  (`_assign_ll(Member)` route through bitfield store)
+- LL switch dispatch (single + range with signedness)
+- struct-member `__attribute__((aligned(N)))` honored in layout
+- libc additions: memchr, qsort, copysign[f|l],
+  __builtin_frame_address, __builtin_clrsbll
+- Float globals: emit inf/nan as IEEE-754 hex pattern
+- case `A ... B:` range syntax (parser + codegen)
+
+Remaining 84 fails (21 compile + 57 run + 6 timeout) cluster around:
+- VLA + alloca runtime support (~12 tests)
+- Nested-fn label / trampoline (~8 tests)
+- File I/O + vprintf (~8 tests)
+- Inline asm with operand binding (~5 tests)
+- _Decimal64 / __int128 / _Complex char (~5 tests)
+- Bitfield-precision arithmetic (GCC-specific, ~4 tests)
+- Long tail of one-offs (alias attribute, label_values + && diff
+  in nested fns, etc.)
+
+Next slice ideas in order of yield:
+1. VLA + alloca → unlocks a cluster of similar tests at once
+2. Nested-fn cross-frame labels via small trampoline shim
+3. vprintf in libc (would unlock several printf-chk tests)
+4. Bitfield-precision arithmetic (mostly gcc-specific test
+   semantics, but a couple unlock cleanly)
+
 ## ANSI C testsuite runners
 
 Four runner scripts at the repo root mirror uc80's setup:
