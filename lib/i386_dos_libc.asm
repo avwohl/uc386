@@ -1797,6 +1797,21 @@ _printf:
         pop     ebp
         ret
 
+; vprintf(const char *fmt, va_list ap) — same as printf but `ap` is the
+; va_ptr passed in directly instead of derived from the call frame.
+_vprintf:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        mov     ecx, [ebp + 8]       ; fmt
+        mov     edx, [ebp + 12]      ; ap (va_ptr)
+        mov     ah, 0x5E
+        int     21h
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
 ; fprintf(FILE *stream, const char *fmt, ...) — formats to the FILE.
 ; The harness reads stream as fd (1=stdout, 2=stderr). Since our
 ; libc declares stdin/stdout/stderr as 0/1/2 globals, the FILE *
@@ -1809,6 +1824,36 @@ _fprintf:
         mov     ecx, [ebp + 12]      ; fmt
         lea     edx, [ebp + 16]      ; va_args
         mov     ah, 0x5F
+        int     21h
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; vfprintf(FILE *stream, const char *fmt, va_list ap) — fprintf with ap.
+_vfprintf:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        mov     ebx, [ebp + 8]       ; FILE *stream → fd
+        mov     ecx, [ebp + 12]      ; fmt
+        mov     edx, [ebp + 16]      ; ap
+        mov     ah, 0x5F
+        int     21h
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; vsprintf(char *buf, const char *fmt, va_list ap) — sprintf with ap.
+_vsprintf:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        mov     ebx, [ebp + 8]       ; buf
+        mov     ecx, [ebp + 12]      ; fmt
+        mov     edx, [ebp + 16]      ; ap
+        mov     ah, 0x5C
         int     21h
         pop     ebx
         mov     esp, ebp
