@@ -4525,20 +4525,17 @@ class CodeGenerator:
             # Compare returns: ST(0) < ST(1) → CF=0 ZF=0; equal → CF=0 ZF=1; greater → CF=1.
             # We want value < bias, i.e. ST(1) < ST(0), which means ST(0) > ST(1) → CF=0 (ja).
             out.append(f"        ja      {label_below}")
-            # value >= bias: re-eval, subtract bias, fistp, add 0x80000000.
+            # value >= bias: re-eval, subtract bias, fistp (truncate),
+            # add 0x80000000 back.
             out += self._eval_float_to_st0(expr.expr, ctx)
             out.append(f"        fld     dword [{bias_label}]")
             out.append("        fsubp   st1, st0")
-            out.append("        sub     esp, 4")
-            out.append("        fistp   dword [esp]")
-            out.append("        pop     eax")
+            out += self._fistp_truncate_dword_to_eax()
             out.append("        add     eax, 0x80000000")
             out.append(f"        jmp     {label_done}")
             out.append(f"{label_below}:")
             out += self._eval_float_to_st0(expr.expr, ctx)
-            out.append("        sub     esp, 4")
-            out.append("        fistp   dword [esp]")
-            out.append("        pop     eax")
+            out += self._fistp_truncate_dword_to_eax()
             out.append(f"{label_done}:")
             return out
         # Vector → integer cast in scalar context. The vector's bytes
@@ -7211,15 +7208,56 @@ class CodeGenerator:
                 ctx.exit_scope()
         return ast.BasicType(name="int")
 
+    def _fistp_truncate_dword_to_eax(self) -> list[str]:
+        """Pop st(0), truncate toward zero, store as 32-bit signed int
+        in EAX. Saves and restores the FPU control word so we don't
+        corrupt the rounding mode used by surrounding FPU code.
+
+        Frame layout while running:
+          [esp + 4] = result slot (later popped to eax)
+          [esp + 2..3] = patched control word (truncate-rc set)
+          [esp + 0..1] = saved control word
+        """
+        return [
+            "        sub     esp, 8",
+            "        fnstcw  [esp]",
+            "        mov     ax, [esp]",
+            "        or      ax, 0x0C00",  # RC = 11 (truncate)
+            "        mov     [esp + 2], ax",
+            "        fldcw   [esp + 2]",
+            "        fistp   dword [esp + 4]",
+            "        fldcw   [esp]",
+            "        mov     eax, [esp + 4]",
+            "        add     esp, 8",
+        ]
+
+    def _fistp_truncate_qword_to_edx_eax(self) -> list[str]:
+        """Pop st(0), truncate toward zero, store as 64-bit signed int
+        in EDX:EAX (high:low). Saves/restores FPU control word."""
+        return [
+            "        sub     esp, 12",
+            "        fnstcw  [esp]",
+            "        mov     ax, [esp]",
+            "        or      ax, 0x0C00",
+            "        mov     [esp + 2], ax",
+            "        fldcw   [esp + 2]",
+            "        fistp   qword [esp + 4]",
+            "        fldcw   [esp]",
+            "        mov     eax, [esp + 4]",
+            "        mov     edx, [esp + 8]",
+            "        add     esp, 12",
+        ]
+
     def _eval_expr_to_eax(self, expr: ast.Expression, ctx: _FuncCtx) -> list[str]:
         # Float-typed expressions live on the FPU stack; if a caller
         # wants the value in EAX (e.g. `int x = (float)n`), evaluate to
         # st(0) then convert via `fistp` through a stack scratch slot.
+        # C requires truncation toward zero (not the FPU's default
+        # round-to-nearest), so we set the rounding mode to truncate
+        # for the duration of the fistp.
         if self._is_float_type(self._type_of(expr, ctx)):
             out = self._eval_float_to_st0(expr, ctx)
-            out.append("        sub     esp, 4")
-            out.append("        fistp   dword [esp]")
-            out.append("        pop     eax")
+            out += self._fistp_truncate_dword_to_eax()
             return out
         if isinstance(expr, ast.IntLiteral):
             return [f"        mov     eax, {expr.value}"]
@@ -7489,12 +7527,7 @@ class CodeGenerator:
                 # (since the value's bit pattern comes from the source).
                 if self._is_float_type(src_ty):
                     out = self._eval_float_to_st0(expr.expr, ctx)
-                    out += [
-                        "        sub     esp, 8",
-                        "        fistp   qword [esp]",
-                        "        pop     eax",
-                        "        pop     edx",
-                    ]
+                    out += self._fistp_truncate_qword_to_edx_eax()
                     return out
                 # 8-byte vector (ArrayType) → long long: type-pun by
                 # loading both halves of the vector's storage.
@@ -7520,12 +7553,7 @@ class CodeGenerator:
             # signedness — `(unsigned int)(-1)` should zero-extend.
             if self._is_float_type(src_ty):
                 out = self._eval_float_to_st0(expr.expr, ctx)
-                out += [
-                    "        sub     esp, 8",
-                    "        fistp   qword [esp]",
-                    "        pop     eax",
-                    "        pop     edx",
-                ]
+                out += self._fistp_truncate_qword_to_edx_eax()
                 return out
             out = self._eval_expr_to_eax(expr, ctx)
             if self._is_unsigned(target):
