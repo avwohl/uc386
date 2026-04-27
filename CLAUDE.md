@@ -426,3 +426,7 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Runtime sizeof for VLA-shaped types**. `_check_supported_type`'s VLA fallback already mutates the size to a literal 16; now also save the original size expr on `t._vla_size`. New `_emit_runtime_size_of(t, ctx)` evaluates the saved expression at sizeof sites — multiplies by element size for arrays, sums VLA + constant member contributions for structs. `_const_eval(SizeofType)` refuses the fold when the target type contains a VLA so callers fall through to the runtime path. Closes 20040423-1 (sizeof of VLA struct typedef'd inside a function).
 
   **Result: 1469/1514 gcc-c-torture** (up from 1467, +2 tests). Pipeline 1685/1734 (97.2%).
+- **2026-04-27 — VLA typedef sizeof (1469 → 1470)**:
+  - **Typedef'd VLAs.** `typedef int c[i+2];` declares an ArrayType with a non-literal size but doesn't go through `_check_supported_type` (which would have mutated to size=16 and saved `_vla_size`). `_type_has_vla` and `_emit_runtime_size_of` now recognize a fresh ArrayType with a non-literal size as a VLA and use that size expression directly. Closes 20040411-1.
+
+  **Result: 1470/1514 gcc-c-torture** (+1). Pipeline 1686/1734 (97.2%).
