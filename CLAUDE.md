@@ -377,3 +377,8 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`__builtin_va_start` / `__builtin_va_end`** aliases (the bare `va_start` / `va_end` were already special-cased; the underscore-prefixed forms were falling through to a normal call which the linker couldn't resolve).
 
   **Result: 1425/1514 gcc-c-torture** (up from 1416, +9 tests). Combined with c-testsuite still 215/220, the pipeline now passes 1640/1734 (94.6%). Closes 930126-1, 20040709-1, 20040709-2, 20040709-3, 991118-1, bf64-1, pr57344-4, 20041214-1, plus one incidental.
+- **2026-04-26 — vector compound assign on Member lvalues + alignment skeleton (1425 → 1426)**:
+  - **`u.v += rhs` for vector struct/union members.** Previously fell through `_compound_assign`'s generic Member path which calls `_load_to_eax` (rejects vectors). Now desugars to `u.v = u.v op rhs` and routes through `_vector_copy_assign` via `_assign`, mirroring the Identifier-lvalue path. Pre-allocates the inner BinaryOp's temp slot since the regular call-temp pre-pass already ran. Closes 20050604-1.c.
+  - **`__attribute__((aligned(N)))` capture (uc_core) + global emit (uc386)**. Parser now tracks `_pending_alignment` like `_pending_vector_size`, with the declarator loop snapshotting it onto VarDecl.alignment. Codegen emits `align N` (.data) / `alignb N` (.bss) before the global's label. Currently only direct `int x __attribute__((aligned(N)))` on a declarator is honored — member-level aligned (which more torture tests need) requires layout work that isn't yet wired up. No torture wins yet; useful for future tests.
+
+  **Result: 1426/1514 gcc-c-torture** (up from 1425, +1 test). Combined still 1641/1734 (94.6%).
