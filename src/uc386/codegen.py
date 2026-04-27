@@ -1915,6 +1915,10 @@ class CodeGenerator:
             ty = self._type_of(expr.expr, _FuncCtx())
             if getattr(expr, "is_alignof", False):
                 return self._alignment_of(ty)
+            # Refuse the fold when the type contains a VLA so the
+            # runtime sizeof path runs instead.
+            if self._type_has_vla(ty):
+                raise CodegenError("sizeof: VLA — runtime evaluation needed")
             return self._size_of(ty)
         if isinstance(expr, ast.Cast):
             # Recurse on the operand, then narrow per the target type.
@@ -7664,9 +7668,8 @@ class CodeGenerator:
             ty = self._type_of(expr.expr, ctx)
             if getattr(expr, "is_alignof", False):
                 value = self._alignment_of(ty)
-            else:
-                value = self._size_of(ty)
-            return [f"        mov     eax, {value}"]
+                return [f"        mov     eax, {value}"]
+            return self._emit_runtime_size_of(ty, ctx)
         if isinstance(expr, ast.StmtExpr):
             # GCC statement expression: `({ stmt; stmt; expr; })`. Lower
             # the body as a regular compound; the value of the last
