@@ -3352,6 +3352,39 @@ def test_decimal64_keyword_compiles_as_double():
     assert "section .data" in asm
 
 
+def test_bare_int128_keyword_parses_as_type():
+    # `__int128` as a bare type name (not preceded by signed/unsigned)
+    # used to fail with "Expected SEMICOLON" because uc_core's parser
+    # didn't recognize the IDENTIFIER token as a declaration start.
+    # `unsigned __int128` worked because the unsigned keyword
+    # triggered TYPE_SPECIFIER detection.
+    # Same fix applies to `__int128_t` and `__uint128_t`.
+    asm = _compile(
+        "int main(void) {\n"
+        "    __int128 x = 100;\n"
+        "    return (long long)x == 100 ? 0 : 1;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
+def test_int128_to_int_cast_chain_loads_through_address():
+    # `(int)(long long)((__int128)0x100 << 16)` produced garbage
+    # because `_eval_expr_to_eax` for an int128 expression returns
+    # the value's ADDRESS (not the value), and `_cast(target=long
+    # long)` just passed it through, then `_cast(target=int)`
+    # truncated the address rather than loading the int128's low
+    # bytes. Fix: in `_cast`, when src is int128, dispatch through
+    # `_int128_value_address` and load through the address.
+    asm = _compile(
+        "int main(void) {\n"
+        "    int n = (int)(long long)((__int128)0x100 << 16);\n"
+        "    return n == 0x1000000 ? 0 : 1;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
 def test_logical_not_on_complex_lvalue_compiles():
     # `!c` for a _Complex double Identifier crashed with "can't load
     # size-16 value into eax" because `_unary` did an upfront

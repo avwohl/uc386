@@ -6926,6 +6926,36 @@ class CodeGenerator:
                 mnem = "movzx" if target.is_signed is False else "movsx"
                 out.append(f"        {mnem}   eax, ax")
             return out
+        # __int128 source in EAX-eval context: `_eval_expr_to_eax` for
+        # an int128 expression returns the value's ADDRESS in EAX, not
+        # the value itself. To cast it to a scalar type we need to
+        # load through that address. The full int128 → long long path
+        # lives in `_eval_expr_to_edx_eax(Cast)`; this branch handles
+        # the EAX-only callers (further cast to int, narrow type,
+        # etc.) by loading the low 4 bytes.
+        if self._is_int128(src_ty):
+            out = self._int128_value_address(expr.expr, ctx)
+            target = expr.target_type
+            if isinstance(target, ast.PointerType):
+                # Pointer cast from int128: load the low 4 bytes.
+                out.append("        mov     eax, [eax]")
+                return out
+            if isinstance(target, ast.BasicType):
+                size = self._size_of(target)
+                if size == 4 or size == 8:
+                    # int128 → int / long / long long (in EAX context):
+                    # load low 4 bytes; the high 4 bytes stay implicit.
+                    # `_eval_expr_to_edx_eax(Cast)` handles the LL
+                    # case for callers that want both dwords.
+                    out.append("        mov     eax, [eax]")
+                    return out
+                # int128 → char / short. Load + narrow.
+                out.append("        mov     eax, [eax]")
+                mnem = "movzx" if target.is_signed is False else "movsx"
+                half = "al" if size == 1 else "ax"
+                out.append(f"        {mnem}   eax, {half}")
+                return out
+            # Fall through to the generic raise below for other targets.
         out = self._eval_expr_to_eax(expr.expr, ctx)
         target = expr.target_type
         if isinstance(target, ast.PointerType):
