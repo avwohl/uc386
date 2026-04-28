@@ -2777,9 +2777,11 @@ class CodeGenerator:
             isinstance(fn.return_type, ast.ArrayType)
             and getattr(fn.return_type, "is_vector", False)
         )
+        ret_is_int128 = self._is_int128(fn.return_type)
         if (
             isinstance(fn.return_type, (ast.StructType, ast.ComplexType))
             or ret_is_vector
+            or ret_is_int128
         ):
             ctx.alloc_param(
                 "__retptr__", disp,
@@ -3180,6 +3182,11 @@ class CodeGenerator:
                 ret_ty = self._call_return_type(sub, ctx)
                 size = (self._size_of(ret_ty) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
+            elif isinstance(sub, ast.Call) and self._is_int128_returning_call(sub, ctx):
+                # __int128-returning call uses the retptr ABI; reserve
+                # a 16-byte temp slot so the caller's expression chain
+                # (e.g. `f() + g()`) sees stable addresses.
+                ctx.alloc_call_temp(sub, 16)
             elif isinstance(sub, ast.Compound):
                 size = self._compound_temp_size(sub)
                 ctx.alloc_call_temp(sub, size)
@@ -4507,6 +4514,18 @@ class CodeGenerator:
             return self._member_address(expr, ctx)
         if isinstance(expr, ast.Index):
             return self._index_address(expr, ctx)
+        # int128-returning Call: route through its per-call-site temp
+        # via the retptr ABI (same as struct/complex/vector returns).
+        if (
+            isinstance(expr, ast.Call)
+            and self._is_int128_returning_call(expr, ctx)
+            and id(expr) in ctx.call_temps
+        ):
+            disp = ctx.call_temps[id(expr)]
+            retptr_lines = [f"        lea     eax, {_ebp_addr(disp)}"]
+            out = self._call_into_address(expr, retptr_lines, ctx)
+            out.append(f"        lea     eax, {_ebp_addr(disp)}")
+            return out
         # Sub-expressions evaluate into a per-node temp slot.
         if (
             isinstance(expr, (ast.BinaryOp, ast.UnaryOp, ast.Cast))
@@ -5203,6 +5222,32 @@ class CodeGenerator:
                 out.append(f"        mov     eax, [esi + {off}]")
                 out.append("        not     eax")
                 out.append(f"        mov     [edi + {off}], eax")
+            return out
+        if op in ("++", "--"):
+            # Pre/post increment/decrement on an int128 lvalue.
+            # Compute &lvalue, modify in place, return the relevant
+            # value (post = old, pre = new) into dest_disp.
+            is_inc = op == "++"
+            is_prefix = expr.is_prefix
+            out = self._int128_value_address(expr.operand, ctx)
+            out.append("        mov     esi, eax")           # &lvalue
+            out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+            if not is_prefix:
+                # Postfix: copy current value to dest before bumping.
+                for off in (0, 4, 8, 12):
+                    out.append(f"        mov     eax, [esi + {off}]")
+                    out.append(f"        mov     [edi + {off}], eax")
+            # Bump in place.
+            instr0 = "add" if is_inc else "sub"
+            instrN = "adc" if is_inc else "sbb"
+            out.append(f"        {instr0}     dword [esi], 1")
+            for off in (4, 8, 12):
+                out.append(f"        {instrN}     dword [esi + {off}], 0")
+            if is_prefix:
+                # Prefix: copy the post-bump value to dest.
+                for off in (0, 4, 8, 12):
+                    out.append(f"        mov     eax, [esi + {off}]")
+                    out.append(f"        mov     [edi + {off}], eax")
             return out
         raise CodegenError(f"__int128 unary op `{op}` not supported")
 
@@ -7567,6 +7612,20 @@ class CodeGenerator:
                 return self._copy_vector_to_retptr(
                     stmt.value, ret_ty, retptr_disp, ctx
                 ) + ["        jmp     .epilogue"]
+            # __int128 return: copy 16 bytes of the value through
+            # `_int128_value_address` into the caller's retptr.
+            if self._is_int128(ret_ty):
+                src_lines = self._int128_value_address(stmt.value, ctx)
+                out = list(src_lines)
+                out.append("        mov     esi, eax")
+                out.append(f"        mov     edi, {_ebp_addr(retptr_disp)}")
+                for off in (0, 4, 8, 12):
+                    out.append(f"        mov     eax, [esi + {off}]")
+                    out.append(f"        mov     [edi + {off}], eax")
+                # Forward retptr in EAX (matches struct convention).
+                out.append(f"        mov     eax, {_ebp_addr(retptr_disp)}")
+                out.append("        jmp     .epilogue")
+                return out
             return self._copy_struct_to_retptr(
                 stmt.value, ret_ty, retptr_disp, ctx
             ) + ["        jmp     .epilogue"]
@@ -9189,6 +9248,13 @@ class CodeGenerator:
         """True iff `call` returns a vector (ArrayType, by-value)."""
         rt = self._call_return_type(call, ctx)
         return isinstance(rt, ast.ArrayType)
+
+    def _is_int128_returning_call(self, call: ast.Call, ctx) -> bool:
+        """True iff `call` returns __int128. Uses the same retptr ABI
+        as struct/complex/vector returns: hidden first param is a
+        pointer to a 16-byte buffer in the caller's frame."""
+        rt = self._call_return_type(call, ctx)
+        return self._is_int128(rt)
 
     # ---- expressions ----------------------------------------------------
 
@@ -11570,6 +11636,7 @@ class CodeGenerator:
             if (
                 isinstance(arg_ty, (ast.StructType, ast.ComplexType))
                 or arg_is_vector
+                or self._is_int128(arg_ty)
             ):
                 size = self._size_of(arg_ty)
                 padded = (size + 3) & ~3
@@ -11578,6 +11645,8 @@ class CodeGenerator:
                     out += self._complex_value_address(arg, ctx)
                 elif arg_is_vector:
                     out += self._vector_value_address(arg, ctx)
+                elif self._is_int128(arg_ty):
+                    out += self._int128_value_address(arg, ctx)
                 else:
                     out += self._struct_address(arg, ctx)
                 out.append("        mov     edx, eax")

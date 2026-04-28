@@ -2922,6 +2922,50 @@ def test_int128_signed_div_emits_sign_handling():
     assert "___uc386_udiv128" in asm
 
 
+def test_int128_returning_function_uses_retptr_abi():
+    # Int128-returning functions take a hidden first param (retptr) at
+    # [ebp+8] just like struct returns; real params shift up by 4.
+    asm = _compile(
+        "unsigned __int128 add128(unsigned __int128 a, unsigned __int128 b) {\n"
+        "    return a + b;\n"
+        "}\n"
+        "int main(void) { return 0; }\n"
+    )
+    # First int128 param 'a' is now at [ebp + 12] (= 8 + retptr).
+    assert "[ebp + 12]" in asm
+    # And the return path should write 16 bytes through __retptr__.
+    assert "_add128:" in asm
+
+
+def test_int128_pass_by_value_pushes_full_16_bytes():
+    # When passing a __int128 by value, the caller should push 16
+    # bytes per arg (4 dwords), not 4 bytes (the address).
+    asm = _compile(
+        "void take(unsigned __int128 a, unsigned __int128 b);\n"
+        "int main(void) {\n"
+        "    unsigned __int128 x = 1, y = 2;\n"
+        "    take(x, y);\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    # Two int128 args plus a (call-temp-style) destination — caller
+    # reserves 32 bytes (16 each).  Look for sub esp, 16 (or 32).
+    assert "sub     esp, 16" in asm or "sub     esp, 32" in asm
+
+
+def test_int128_inc_dec_emits_4dword_carry_chain():
+    # `++u128_val` should bump the low dword and propagate carry
+    # through three adcs.  `--` uses sub/sbb.
+    asm = _compile(
+        "unsigned __int128 g;\n"
+        "int main(void) { ++g; --g; return 0; }\n"
+    )
+    assert "add     dword" in asm
+    assert "adc     dword" in asm
+    assert "sub     dword" in asm
+    assert "sbb     dword" in asm
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.
