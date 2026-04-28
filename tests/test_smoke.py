@@ -2123,6 +2123,38 @@ def test_local_array_of_struct_multi_level_designator():
     assert "_main:" in asm
 
 
+def test_global_pointer_init_array_decay_plus_offset():
+    """`int *p = arr + N` (bare-name array decay + integer arithmetic)
+    must lay down `dd _arr + N*sizeof(elem)`. Same shape for `&arr[0] + N`
+    and `&arr[N]` — all three are equivalent. Previously only the
+    `UnaryOp(&)` forms worked; bare-name decay raised a const-eval error."""
+    asm = _compile(
+        "int arr[10] = {0,1,2,3,4,5,6,7,8,9}; "
+        "int *p1 = arr; "
+        "int *p2 = arr + 3; "
+        "int *p3 = &arr[0] + 5; "
+        "int *p4 = &arr[7]; "
+        "int main(void) { return 0; }"
+    )
+    assert "_p1:" in asm
+    # _p1 is `_arr` (zero offset).
+    p1_idx = asm.find("_p1:")
+    p1_block = asm[p1_idx:p1_idx + 80]
+    assert "dd      _arr\n" in p1_block
+    # _p2 is `_arr + 12` (3 * sizeof(int)).
+    p2_idx = asm.find("_p2:")
+    p2_block = asm[p2_idx:p2_idx + 80]
+    assert "dd      _arr + 12" in p2_block
+    # _p3 is `_arr + 20` (5 * sizeof(int)).
+    p3_idx = asm.find("_p3:")
+    p3_block = asm[p3_idx:p3_idx + 80]
+    assert "dd      _arr + 20" in p3_block
+    # _p4 is `_arr + 28` (7 * sizeof(int)).
+    p4_idx = asm.find("_p4:")
+    p4_block = asm[p4_idx:p4_idx + 80]
+    assert "dd      _arr + 28" in p4_block
+
+
 def test_global_array_of_struct_multi_level_designator():
     """Same as above but for a global array of struct."""
     asm = _compile(
@@ -3600,6 +3632,31 @@ def test_ll_bitfield_compound_arr_index_side_effect_evals_once():
     assert inc_count == 1, (
         f"i++ should evaluate exactly once; found {inc_count}"
     )
+
+
+def test_int128_negation_uses_mov_eax_zero_to_preserve_borrow():
+    """`-(__int128)1` must produce all-bits-set (-1 as 128-bit). The
+    naive 4-dword negation `0 - x` requires the borrow flag to
+    propagate across iterations; using `xor eax, eax` between sbb's
+    CLEARS the borrow, breaking the high 96 bits. Must use `mov eax, 0`
+    (which doesn't affect flags)."""
+    asm = _compile(
+        "int main(void) { __int128 a = 1; __int128 b = -a; "
+        "if ((int)(b >> 32) != -1) return 99; return 0; }"
+    )
+    # The negation block uses `mov eax, 0` between sbb, not xor.
+    asm_lines = asm.splitlines()
+    # Find a block containing both `sub` (initial) and `sbb` (continuation).
+    found_sbb = False
+    for i, l in enumerate(asm_lines):
+        if "sbb     eax, [esi" in l:
+            # The line BEFORE this should be a `mov eax, 0`, not `xor eax, eax`.
+            prev = asm_lines[i - 1]
+            assert "mov     eax, 0" in prev, (
+                f"sbb at line {i} preceded by {prev!r}, expected `mov eax, 0`"
+            )
+            found_sbb = True
+    assert found_sbb, "no sbb pattern found — did the int128 negation path emit?"
 
 
 def test_for_loop_same_name_different_types_allocates_int128_temp():

@@ -1026,6 +1026,18 @@ class CodeGenerator:
                     return [f"        dd      {label}"]
                 sign = "+" if offset > 0 else "-"
                 return [f"        dd      {label} {sign} {abs(offset)}"]
+            # `arr + N`, `&arr[0] + N`, `&v.m + N` etc. — any address
+            # expression that resolves to a static label via the
+            # `_resolve_static_addr` walker. Catches bare-name array
+            # decay, pointer-arithmetic chains, and address-of cast
+            # combinations that don't have a leading `&`.
+            resolved = self._resolve_static_addr(init, name)
+            if resolved is not None:
+                base_label, offset = resolved
+                if offset == 0:
+                    return [f"        dd      {base_label}"]
+                sign = "+" if offset > 0 else "-"
+                return [f"        dd      {base_label} {sign} {abs(offset)}"]
             value = self._const_eval(init, name)
             return [f"        dd      {value}"]
         if isinstance(ty, ast.ArrayType):
@@ -2085,6 +2097,11 @@ class CodeGenerator:
             # global+offset.
             inner = self._resolve_static_addr(expr.operand, name)
             return inner
+        if isinstance(expr, ast.UnaryOp) and expr.op == "&":
+            # `&lvalue`: address-of an l-value. The walker already
+            # produces the address of any l-value chain, so `&` here is
+            # idempotent — strip and recurse.
+            return self._resolve_static_addr(expr.operand, name)
         if isinstance(expr, ast.Member):
             # `obj.field` — resolve obj's address, then add field offset.
             try:
@@ -2137,9 +2154,57 @@ class CodeGenerator:
             return base_label, base_off + idx * self._size_of(elem_ty)
         if isinstance(expr, ast.BinaryOp) and expr.op in ("+", "-"):
             # `arr + N` or `arr - N` — pointer arithmetic.
-            inner = self._resolve_static_addr(expr.left, name)
-            if inner is None:
-                # Try the other side for `N + arr`.
+            # In a global initializer, the address-bearing operand
+            # must DECAY to a static address (array name, function
+            # name, string literal, or `&...` chain). A bare
+            # pointer-typed Identifier represents a runtime read of
+            # the pointer's value — not foldable.
+            def _decays_to_static(e: ast.Expression) -> bool:
+                # Strip casts.
+                while isinstance(e, ast.Cast):
+                    e = e.expr
+                if isinstance(e, ast.Identifier):
+                    if e.name in self._globals:
+                        gty = self._globals[e.name]
+                        return isinstance(
+                            gty, (ast.ArrayType, ast.FunctionType),
+                        )
+                    if e.name in self._func_return_types:
+                        return True
+                    return False
+                if isinstance(e, ast.StringLiteral):
+                    return True
+                if (
+                    isinstance(e, ast.UnaryOp)
+                    and e.op == "&"
+                ):
+                    return True
+                if isinstance(e, ast.Index):
+                    return True
+                if isinstance(e, ast.Member):
+                    return True
+                if isinstance(e, ast.BinaryOp) and e.op in ("+", "-"):
+                    return _decays_to_static(e.left) or _decays_to_static(e.right)
+                return False
+
+            left_decays = _decays_to_static(expr.left)
+            right_decays = _decays_to_static(expr.right)
+            if not left_decays and not right_decays:
+                return None
+            if left_decays:
+                inner = self._resolve_static_addr(expr.left, name)
+                if inner is None:
+                    return None
+                try:
+                    offset = self._const_eval(expr.right, name)
+                except CodegenError:
+                    return None
+                if expr.op == "-":
+                    offset = -offset
+                addr_side = expr.left
+            else:
+                if expr.op == "-":
+                    return None  # `N - arr` doesn't make sense
                 inner = self._resolve_static_addr(expr.right, name)
                 if inner is None:
                     return None
@@ -2147,19 +2212,9 @@ class CodeGenerator:
                     offset = self._const_eval(expr.left, name)
                 except CodegenError:
                     return None
-            else:
-                try:
-                    offset = self._const_eval(expr.right, name)
-                except CodegenError:
-                    return None
-                if expr.op == "-":
-                    offset = -offset
+                addr_side = expr.right
             try:
-                arr_ty = self._type_of(
-                    expr.left if inner == self._resolve_static_addr(expr.left, name)
-                    else expr.right,
-                    _FuncCtx(),
-                )
+                arr_ty = self._type_of(addr_side, _FuncCtx())
             except CodegenError:
                 return None
             if isinstance(arr_ty, ast.PointerType):
@@ -5487,7 +5542,11 @@ class CodeGenerator:
             out += self._emit_int128_copy("esi", "edi")
             return out
         if op == "-":
-            # Negation: 0 - x via 4-dword sub.
+            # Negation: 0 - x via 4-dword sub. Critical: use `mov
+            # eax, 0` between sbb iterations (NOT `xor eax, eax`),
+            # because xor clears the carry/borrow flag from the
+            # prior subtraction. mov leaves CF intact so the borrow
+            # propagates across all four dwords.
             out = self._int128_value_address(expr.operand, ctx)
             out.append("        mov     esi, eax")
             out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
@@ -5495,7 +5554,7 @@ class CodeGenerator:
             out.append("        sub     eax, [esi]")
             out.append("        mov     [edi], eax")
             for off in (4, 8, 12):
-                out.append("        xor     eax, eax")
+                out.append("        mov     eax, 0")
                 out.append(f"        sbb     eax, [esi + {off}]")
                 out.append(f"        mov     [edi + {off}], eax")
             return out
