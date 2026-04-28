@@ -4760,7 +4760,8 @@ class CodeGenerator:
             o.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
             o += self._emit_int128_copy("esi", "edi")
             return o
-        # `>>` and `<<` by a constant integer.
+        # `>>` and `<<` by a constant integer (fast path) or variable
+        # (runtime per-bit loop).
         if op in (">>", "<<"):
             if not self._is_int128(lt):
                 raise CodegenError(
@@ -4769,8 +4770,9 @@ class CodeGenerator:
             try:
                 shift_n = self._const_eval(expr.right, "<int128-shift>")
             except CodegenError:
-                raise CodegenError(
-                    "__int128 shift by non-constant not supported"
+                # Variable shift count: emit a runtime per-bit loop.
+                return self._int128_shift_runtime(
+                    expr.left, expr.right, dest_disp, op, lt, ctx,
                 )
             shift_n = shift_n & 127
             return self._int128_shift(expr.left, dest_disp, shift_n, op, lt, ctx)
@@ -5186,6 +5188,58 @@ class CodeGenerator:
         out.append("        xor     eax, eax")
         out.append(f"{end}:")
         out.append("        add     esp, 32")
+        return out
+
+    def _int128_shift_runtime(
+        self,
+        left_expr: ast.Expression,
+        count_expr: ast.Expression,
+        dest_disp: int,
+        op: str,
+        lt: ast.TypeNode,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Lower `int128 op count` where count is a runtime int (not a
+        compile-time constant). Uses a per-bit loop: shifts dest by 1
+        bit per iteration.
+
+        This is O(count) — slow for large counts but correct."""
+        signed = not self._is_unsigned(lt)
+        # First copy the value into dest.
+        out = self._int128_value_address(left_expr, ctx)
+        out.append("        mov     esi, eax")
+        out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+        out += self._emit_int128_copy("esi", "edi")
+        # Now load count into ECX. Mask to 0..127 (per gcc undefined
+        # behavior beyond width, but we mask for safety).
+        out += self._eval_expr_to_eax(count_expr, ctx)
+        out.append("        and     eax, 127")
+        out.append("        mov     ecx, eax")
+        # If count is 0, skip the loop.
+        end_label = ctx.label("i128_shift_end")
+        loop_label = ctx.label("i128_shift_loop")
+        out.append("        test    ecx, ecx")
+        out.append(f"        jz      {end_label}")
+        out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+        out.append(f"{loop_label}:")
+        if op == "<<":
+            # Left shift: low → high. shl dword [edi], 1 then rcl
+            # propagates the carry up through the higher dwords.
+            out.append("        shl     dword [edi], 1")
+            out.append("        rcl     dword [edi + 4], 1")
+            out.append("        rcl     dword [edi + 8], 1")
+            out.append("        rcl     dword [edi + 12], 1")
+        else:
+            # Right shift: high → low. sar/shr the high dword (sets CF
+            # from the bit shifted out), rcr propagates to lower.
+            top_instr = "sar" if signed else "shr"
+            out.append(f"        {top_instr}     dword [edi + 12], 1")
+            out.append("        rcr     dword [edi + 8], 1")
+            out.append("        rcr     dword [edi + 4], 1")
+            out.append("        rcr     dword [edi], 1")
+        out.append("        dec     ecx")
+        out.append(f"        jnz     {loop_label}")
+        out.append(f"{end_label}:")
         return out
 
     def _int128_shift(
@@ -9623,6 +9677,9 @@ class CodeGenerator:
                 return self._type_of(expr.left, ctx)
             if expr.op in self._COMPOUND_OPS:
                 return self._type_of(expr.left, ctx)
+            # Comma: the result type is the right operand's type.
+            if expr.op == ",":
+                return self._type_of(expr.right, ctx)
             # `*` `/` (and the relational/bitwise ops) need to know if
             # either operand is float — the result of `1.5 * 2` is float,
             # not int.

@@ -630,3 +630,8 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`(__int128[N]){...}` as an array initializer.** `_array_init` strips the outer Compound wrapper to expose the inner InitializerList / StringLiteral. Lets `u128 arr[3] = (u128[3]){10, 20, 30};` work.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +3 smoke tests (333 total).
+- **2026-04-28 — __int128: variable shift + comma type-of**: more completeness for non-constant-shift idioms.
+  - **Variable shift count** (`u128 << n` where `n` is a runtime `int`). New `_int128_shift_runtime` does a per-bit loop: copy left's value into dest, mask count to 0..127, then `shl/rcl` (left) or `sar`/`shr`+`rcr` (right) the four dwords by 1 bit per iteration. O(count) per shift but correct for any count. Constant shifts still take the fast `_int128_shift` path with shrd/shld and word-shift dispatch.
+  - **`_type_of(BinaryOp(","))` returns right arm's type.** Was falling through to the general arithmetic-promotion path, which would (now that int128 propagates through `+`/`-`) sometimes return int128 even when the right arm was an `(int)` cast. The miscalculation made `int r = (u128 += 5, (int)y);` route the rhs through `_binary_int128`'s comma branch (incorrectly trying to materialize an int128). Per C the comma's value type is the right side's type — added a direct dispatch.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +2 smoke tests (335 total).

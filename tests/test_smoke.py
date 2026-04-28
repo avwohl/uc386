@@ -3094,6 +3094,34 @@ def test_int128_compound_literal_array_init():
     assert "mov     eax, 30" in asm
 
 
+def test_int128_variable_shift_emits_per_bit_loop():
+    # `u128 << n` where n is a runtime int falls through to a
+    # per-bit-loop runtime path. Look for the loop label and the
+    # shl/rcl chain.
+    asm = _compile(
+        "unsigned __int128 sl(unsigned __int128 a, int n) {\n"
+        "    return a << n;\n"
+        "}\n"
+        "int main(void) { return 0; }\n"
+    )
+    assert "i128_shift_loop" in asm
+    assert "shl     dword [edi], 1" in asm
+    assert "rcl     dword [edi + 4], 1" in asm
+
+
+def test_int128_comma_type_of_returns_right_arm():
+    # `int r = (u128_compound, (int)y)` should compile — the comma's
+    # result type is the right arm's, not int128.
+    asm = _compile(
+        "int main(void) {\n"
+        "    unsigned __int128 y = 10;\n"
+        "    int r = (y += 5, (int)y);\n"
+        "    return r;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.
