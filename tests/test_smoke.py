@@ -3352,6 +3352,31 @@ def test_decimal64_keyword_compiles_as_double():
     assert "section .data" in asm
 
 
+def test_ll_bitfield_compound_arr_index_side_effect_evals_once():
+    # `arr[i++].bf += rhs` for a long-long-storage bit-field used to
+    # fire `i++` twice: `_compound_assign_bitfield_ll` desugared to
+    # `lvalue = lvalue OP rhs` and passed it through
+    # `_bitfield_store_ll_simple`, which computed the address (1st
+    # i++) and then re-evaluated the inner BinaryOp (2nd i++ via
+    # `_eval_expr_to_edx_eax(inner)`'s read of expr.left).
+    # Fix: address-once snapshot pattern — compute &storage_unit,
+    # save in addr_slot; extract current bit-field value into a
+    # snap_slot; compute `snap OP rhs`; mask + RMW [addr_slot].
+    asm = _compile(
+        "int main(void) {\n"
+        "    struct S { unsigned long long a:40; };\n"
+        "    struct S arr[3] = {{0}, {0}, {0}};\n"
+        "    int i = 0;\n"
+        "    arr[i++].a += 100;\n"
+        "    return (arr[0].a == 100 && i == 1) ? 0 : 1;\n"
+        "}\n"
+    )
+    inc_count = asm.count("        inc     dword [ebp -")
+    assert inc_count == 1, (
+        f"i++ should evaluate exactly once; found {inc_count}"
+    )
+
+
 def test_for_loop_same_name_different_types_allocates_int128_temp():
     # Two for-loops in sequence each declaring `i` — first int, then
     # __int128. `_collect_call_temps` previously walked with a flat
