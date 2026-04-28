@@ -616,3 +616,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - Verified end-to-end: global int128 with init, array of int128 with int-literal init, struct with mixed int + int128 members initialized, `b.v = 2000` updating int128 member, pointer-to-int128 deref + store.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +3 smoke tests (327 total).
+- **2026-04-28 — __int128: ternary, comma, bool context, va_arg, unary type prop**: more completeness for the operator and call paths.
+  - **`cond ? T : F` with `__int128` arms.** `_collect_call_temps` now allocates a 16-byte temp for `TernaryOp` whose result type is `__int128`. New `_int128_ternary` evaluates the condition through `_eval_to_bool_eax`, then per-branch copies the chosen arm's value into the dest slot. `_int128_value_address` and `_eval_int128_into_temp` dispatch `TernaryOp` to it.
+  - **Comma operator with `__int128` rhs.** `_int128_value_address(BinaryOp(","))` evaluates the lhs for side effects then returns the rhs's value address. `_binary_int128`'s comma branch was rewritten to copy the rhs's int128 value into the dest slot via `_int128_value_address` instead of (incorrectly) recursing through `_eval_int128_into_temp`.
+  - **`if (u128_val)` boolean context.** `_eval_to_bool_eax` gained an int128 branch that ORs all four dwords of the int128 address into EAX so a value with non-zero bits in any half is truthy.
+  - **`va_arg(ap, __int128)`.** `_collect_call_temps` allocates a 16-byte per-VaArgExpr temp; `_int128_value_address(VaArgExpr)` routes through `_va_arg_struct_copy` (which already handles arbitrary-size byte copies) into the temp.
+  - **`_type_of(UnaryOp +/-/~)` propagates `__int128`.** Was falling through to int, which broke `return -a;` for an int128-arg function (the temp pre-pass didn't see the result type as int128 and never allocated a slot).
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +3 smoke tests (330 total).

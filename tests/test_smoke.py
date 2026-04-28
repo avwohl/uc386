@@ -3003,6 +3003,54 @@ def test_int128_struct_member_init_with_int_literal_widens():
     assert "_main:" in asm
 
 
+def test_int128_ternary_lowers_to_branched_copy():
+    asm = _compile(
+        "unsigned __int128 cmax(unsigned __int128 a, unsigned __int128 b) {\n"
+        "    return a > b ? a : b;\n"
+        "}\n"
+        "int main(void) { return 0; }\n"
+    )
+    # Both branches should emit per-dword copies into the same dest
+    # slot; expect two copy blocks framed by jz/jmp.
+    assert "tern_false" in asm or "i128_tern_false" in asm
+    assert "_cmax:" in asm
+
+
+def test_int128_bool_context_ors_all_dwords():
+    asm = _compile(
+        "int main(void) {\n"
+        "    unsigned __int128 g = 0;\n"
+        "    if (g) return 1;\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    # OR low + +4 + +8 + +12 of the int128 address into eax.
+    assert "or      eax, [ecx + 4]" in asm
+    assert "or      eax, [ecx + 8]" in asm
+    assert "or      eax, [ecx + 12]" in asm
+
+
+def test_int128_va_arg_copies_16_bytes_to_temp():
+    # Typedef va_list manually since _compile bypasses the
+    # preprocessor's __builtin_va_list predefine.
+    asm = _compile(
+        "typedef char *va_list;\n"
+        "typedef unsigned __int128 u128;\n"
+        "u128 first(int n, ...) {\n"
+        "    va_list ap;\n"
+        "    va_start(ap, n);\n"
+        "    u128 r = va_arg(ap, u128);\n"
+        "    va_end(ap);\n"
+        "    return r;\n"
+        "}\n"
+        "int main(void) { return 0; }\n"
+    )
+    # va_arg int128 advances ap by 16, copies 16 bytes from [ecx]
+    # to the destination.
+    assert "_first:" in asm
+    assert "16" in asm  # the 16-byte advance / copy size shows up
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.

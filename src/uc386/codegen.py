@@ -3224,7 +3224,7 @@ class CodeGenerator:
                 if not isinstance(src_ty_check, ast.ArrayType):
                     size = (self._size_of(sub.target_type) + 3) & ~3
                     ctx.alloc_call_temp(sub, size)
-            elif isinstance(sub, (ast.BinaryOp, ast.UnaryOp, ast.Cast)):
+            elif isinstance(sub, (ast.BinaryOp, ast.UnaryOp, ast.Cast, ast.TernaryOp)):
                 # Complex-valued sub-expression: needs a temp slot
                 # to hold the (real, imag) result. One per node so
                 # `(a+b) + (c+d)` allocates distinct buffers.
@@ -3251,9 +3251,9 @@ class CodeGenerator:
                     size = (self._size_of(ty) + 3) & ~3
                     ctx.alloc_call_temp(sub, size)
                 elif self._is_int128(ty):
-                    # __int128 arithmetic / cast: needs a 16-byte temp
-                    # to hold the result. Per-node so chained ops get
-                    # distinct slots.
+                    # __int128 arithmetic / cast / ternary: needs a
+                    # 16-byte temp to hold the result. Per-node so
+                    # chained ops get distinct slots.
                     ctx.alloc_call_temp(sub, 16)
             elif (
                 isinstance(sub, ast.FloatLiteral) and sub.is_imaginary
@@ -3263,6 +3263,13 @@ class CodeGenerator:
                 if isinstance(ty, ast.ComplexType):
                     size = (self._size_of(ty) + 3) & ~3
                     ctx.alloc_call_temp(sub, size)
+            elif (
+                isinstance(sub, ast.VaArgExpr)
+                and self._is_int128(sub.target_type)
+            ):
+                # `va_arg(ap, __int128)` materializes into a per-call
+                # 16-byte temp; consumers see the temp's address.
+                ctx.alloc_call_temp(sub, 16)
 
     def _compound_temp_size(self, node: ast.Compound) -> int:
         """Size of the per-call-site temp slot for a compound literal.
@@ -4539,11 +4546,29 @@ class CodeGenerator:
             return out
         # Sub-expressions evaluate into a per-node temp slot.
         if (
-            isinstance(expr, (ast.BinaryOp, ast.UnaryOp, ast.Cast))
+            isinstance(expr, (ast.BinaryOp, ast.UnaryOp, ast.Cast, ast.TernaryOp))
             and id(expr) in ctx.call_temps
         ):
             disp = ctx.call_temps[id(expr)]
             out = self._eval_int128_into_temp(expr, disp, ctx)
+            out.append(f"        lea     eax, {_ebp_addr(disp)}")
+            return out
+        # Comma operator with __int128 result: eval left for side
+        # effects, then eval right as the int128 value.
+        if isinstance(expr, ast.BinaryOp) and expr.op == ",":
+            out = self._eval_expr_to_eax(expr.left, ctx)
+            out += self._int128_value_address(expr.right, ctx)
+            return out
+        # `va_arg(ap, __int128)` — copy 16 bytes from the va_list
+        # pointer into a per-expr temp and return its address.
+        if (
+            isinstance(expr, ast.VaArgExpr)
+            and self._is_int128(expr.target_type)
+            and id(expr) in ctx.call_temps
+        ):
+            disp = ctx.call_temps[id(expr)]
+            dest = [f"        lea     eax, {_ebp_addr(disp)}"]
+            out = self._va_arg_struct_copy(expr, dest, ctx)
             out.append(f"        lea     eax, {_ebp_addr(disp)}")
             return out
         raise CodegenError(
@@ -4569,17 +4594,44 @@ class CodeGenerator:
     def _eval_int128_into_temp(
         self, expr: ast.Expression, dest_disp: int, ctx: _FuncCtx,
     ) -> list[str]:
-        """Evaluate `expr` (BinaryOp / UnaryOp / Cast) into the 16-byte
-        slot at `[ebp - dest_disp]`."""
+        """Evaluate `expr` (BinaryOp / UnaryOp / Cast / TernaryOp) into
+        the 16-byte slot at `[ebp - dest_disp]`."""
         if isinstance(expr, ast.Cast):
             return self._cast_to_int128(expr, dest_disp, ctx)
         if isinstance(expr, ast.BinaryOp):
             return self._binary_int128(expr, dest_disp, ctx)
         if isinstance(expr, ast.UnaryOp):
             return self._unary_int128(expr, dest_disp, ctx)
+        if isinstance(expr, ast.TernaryOp):
+            return self._int128_ternary(expr, dest_disp, ctx)
         raise CodegenError(
             f"can't evaluate `{type(expr).__name__}` as __int128"
         )
+
+    def _int128_ternary(
+        self, expr: ast.TernaryOp, dest_disp: int, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Lower `cond ? T : F` where T/F are __int128 expressions.
+        Evaluates the chosen branch into the dest slot via an
+        int128 copy."""
+        false_label = ctx.label("i128_tern_false")
+        end_label = ctx.label("i128_tern_end")
+        out = self._eval_to_bool_eax(expr.condition, ctx)
+        out.append("        test    eax, eax")
+        out.append(f"        jz      {false_label}")
+        # True branch: copy its value into dest.
+        out += self._int128_value_address(expr.true_expr, ctx)
+        out.append("        mov     esi, eax")
+        out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+        out += self._emit_int128_copy("esi", "edi")
+        out.append(f"        jmp     {end_label}")
+        out.append(f"{false_label}:")
+        out += self._int128_value_address(expr.false_expr, ctx)
+        out.append("        mov     esi, eax")
+        out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+        out += self._emit_int128_copy("esi", "edi")
+        out.append(f"{end_label}:")
+        return out
 
     def _cast_to_int128(
         self, expr: ast.Cast, dest_disp: int, ctx: _FuncCtx,
@@ -4663,10 +4715,14 @@ class CodeGenerator:
         op = expr.op
         lt = self._type_of(expr.left, ctx)
         rt = self._type_of(expr.right, ctx)
-        # Comma operator: evaluate left for side effects, then right.
+        # Comma operator: evaluate left for side effects, then copy
+        # right's int128 value into the dest slot.
         if op == ",":
             out = self._eval_expr_to_eax(expr.left, ctx)
-            out += self._eval_int128_into_temp(expr.right, dest_disp, ctx)
+            out += self._int128_value_address(expr.right, ctx)
+            out.append("        mov     esi, eax")
+            out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+            out += self._emit_int128_copy("esi", "edi")
             return out
         # Helper: copy left's int128 value into dest_disp slot.
         def copy_left_into_dest() -> list[str]:
@@ -9440,8 +9496,9 @@ class CodeGenerator:
                 # On a non-complex operand, __real__ is identity and
                 # __imag__ is zero (per gcc semantics).
                 return inner
-            # `+` and `-` and `~` propagate float / long long / unsigned
-            # / complex / vector through; `!` always produces int.
+            # `+` and `-` and `~` propagate float / long long / int128
+            # / unsigned / complex / vector through; `!` always
+            # produces int.
             if expr.op in ("+", "-", "~"):
                 inner = self._type_of(expr.operand, ctx)
                 if isinstance(inner, ast.ComplexType):
@@ -9450,6 +9507,8 @@ class CodeGenerator:
                     # Vector componentwise unary.
                     return inner
                 if self._is_float_type(inner):
+                    return inner
+                if self._is_int128(inner):
                     return inner
                 if self._is_long_long(inner):
                     return inner
@@ -11236,6 +11295,17 @@ class CodeGenerator:
         if self._is_long_long(ty):
             out = self._eval_expr_to_edx_eax(expr, ctx)
             out.append("        or      eax, edx")
+            return out
+        if self._is_int128(ty):
+            # `if (u128_val)` — true iff any of the four dwords is
+            # non-zero. OR them together and let the caller's
+            # `test eax, eax` decide.
+            out = self._int128_value_address(expr, ctx)
+            out.append("        mov     ecx, eax")
+            out.append("        mov     eax, [ecx]")
+            out.append("        or      eax, [ecx + 4]")
+            out.append("        or      eax, [ecx + 8]")
+            out.append("        or      eax, [ecx + 12]")
             return out
         if isinstance(ty, ast.ComplexType):
             # `if (c)` for complex — true if either half is non-zero.
