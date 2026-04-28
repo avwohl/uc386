@@ -1358,9 +1358,21 @@ class CodeGenerator:
         i = 0
         while i < len(members):
             m_name, m_ty, m_off = members[i]
-            # Find the run of members sharing this offset.
+            # Zero-size members (empty struct) take no storage and aren't
+            # part of any union-alternation group. Skip past, but still
+            # invoke their init for side effects' sake (no-op for empty).
+            if self._size_of(m_ty) == 0:
+                i += 1
+                continue
+            # Find the run of NON-ZERO members sharing this offset.
+            # (Anonymous-union members alternate at the same offset; we
+            # pick the one with an init and emit it once.)
             j = i + 1
-            while j < len(members) and members[j][2] == m_off:
+            while (
+                j < len(members)
+                and members[j][2] == m_off
+                and self._size_of(members[j][1]) > 0
+            ):
                 j += 1
             # Pick the index to emit: prefer one with an init value.
             chosen = i
