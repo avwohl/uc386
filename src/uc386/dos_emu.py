@@ -410,6 +410,20 @@ def run(
             elif conv == b"p":
                 val = read32_le(ap_box) & 0xFFFFFFFF
                 out += f"0x{val:x}".encode()
+            elif conv == b"n":
+                # Write the count of characters output so far to the
+                # int* argument. Length modifiers (`%hn`, `%hhn`,
+                # `%lln`) select narrower stores.
+                ptr = read32_le(ap_box)
+                count = len(out)
+                if length_long_long:
+                    mu.mem_write(ptr, count.to_bytes(8, "little"))
+                elif length_short:
+                    mu.mem_write(ptr, (count & 0xFFFF).to_bytes(2, "little"))
+                elif length_char:
+                    mu.mem_write(ptr, bytes([count & 0xFF]))
+                else:
+                    mu.mem_write(ptr, (count & 0xFFFFFFFF).to_bytes(4, "little"))
             elif conv in (b"f", b"g", b"e", b"E", b"G"):
                 bs = bytes(mu.mem_read(ap_box[0], 8))
                 ap_box[0] += 8
