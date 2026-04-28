@@ -4095,3 +4095,38 @@ def test_global_anon_union_arr_has_correct_size():
     # cursor.
     assert "db      65" in asm
     assert "db      66" in asm
+
+
+def test_address_of_scalar_compound_literal():
+    # `int *p = &(int){100};` previously stored 100 in p's slot
+    # directly (treating `&` as no-op since the compound returned
+    # the value, not the address). The fix routes through the
+    # compound's pre-allocated temp slot and returns &temp via
+    # `lea`, so p holds the temp's address.
+    asm = _compile(
+        "int main(void) {\n"
+        "    int *p = &(int){100};\n"
+        "    return *p == 100 ? 0 : 1;\n"
+        "}\n"
+    )
+    main = asm.split("_main:", 1)[1].split(".epilogue:", 1)[0]
+    # There should be a `lea eax, [ebp - N]` for the temp and a
+    # `mov [ebp - M], eax` storing that address in p's slot. The
+    # bug had `mov eax, 100` followed by `mov [ebp-N], eax`
+    # writing 100 directly into p's slot.
+    assert "lea     eax, [ebp - 8]" in main
+    # And p (at [ebp - 4]) holds an address, not the constant 100.
+    # That means the value 100 is stored at [ebp - 8] (the temp),
+    # and a `lea` precedes the store at p's slot.
+    lines = main.split("\n")
+    found_lea_before_p_store = False
+    for i, line in enumerate(lines):
+        if "lea     eax, [ebp - 8]" in line:
+            # Next non-blank line should be `mov [ebp - 4], eax`.
+            for j in range(i + 1, min(i + 3, len(lines))):
+                if "mov     [ebp - 4], eax" in lines[j]:
+                    found_lea_before_p_store = True
+                    break
+            if found_lea_before_p_store:
+                break
+    assert found_lea_before_p_store

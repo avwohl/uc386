@@ -4048,6 +4048,24 @@ class CodeGenerator:
                 f"        fstp    {width} {_ebp_addr(disp + half_size)}",
                 f"        lea     eax, {_ebp_addr(disp)}",
             ]
+        if (
+            isinstance(expr, ast.Compound)
+            and isinstance(expr.target_type, ast.ComplexType)
+            and id(expr) in ctx.call_temps
+        ):
+            # `(complex T){...}` — evaluate the init into the
+            # compound's temp slot and yield its address.
+            disp = ctx.call_temps[id(expr)]
+            inner = expr.init
+            if (
+                isinstance(inner, ast.InitializerList)
+                and len(inner.values) == 1
+            ):
+                inner = inner.values[0]
+            dest = [f"        lea     eax, {_ebp_addr(disp)}"]
+            out = self._eval_complex_to(inner, dest, ctx)
+            out.append(f"        lea     eax, {_ebp_addr(disp)}")
+            return out
         raise CodegenError(
             f"can't take address of complex `{type(expr).__name__}`"
         )
@@ -13537,9 +13555,40 @@ class CodeGenerator:
             # &s.m or &p->m — member-address lowering, no deref.
             return self._member_address(expr.operand, ctx)
         if isinstance(expr.operand, ast.Compound):
-            # &(T){init}: evaluating the compound leaves EAX holding
-            # the temp's address (per `_eval_expr_to_eax`).
-            return self._eval_expr_to_eax(expr.operand, ctx)
+            # `&(T){init}`: route by the target type. Struct/array/
+            # vector/complex/int128 compounds all materialize into a
+            # temp and `_eval_expr_to_eax` (or the type-specific
+            # value_address helper) leaves EAX = &temp. For SCALAR
+            # compounds, `_eval_expr_to_eax(Compound)` loads the
+            # value rather than returning the address — so we have
+            # to emit the store and yield the temp's address.
+            comp = expr.operand
+            target_ty = comp.target_type
+            if isinstance(target_ty, (ast.StructType, ast.ArrayType)):
+                return self._eval_expr_to_eax(comp, ctx)
+            if isinstance(target_ty, ast.ComplexType):
+                return self._complex_value_address(comp, ctx)
+            if self._is_int128(target_ty):
+                return self._int128_value_address(comp, ctx)
+            disp = ctx.call_temps[id(comp)]
+            if (
+                isinstance(comp.init, ast.InitializerList)
+                and len(comp.init.values) == 1
+            ):
+                inner = comp.init.values[0]
+            else:
+                inner = comp.init
+            if self._is_long_long(target_ty):
+                out = self._eval_expr_to_edx_eax(inner, ctx)
+                out += self._store_from_edx_eax(_ebp_addr(disp))
+            elif self._is_float_type(target_ty):
+                out = self._eval_float_to_st0(inner, ctx)
+                out += self._store_st0_to(_ebp_addr(disp), target_ty)
+            else:
+                out = self._eval_expr_to_eax(inner, ctx)
+                out += self._store_from_eax(_ebp_addr(disp), target_ty)
+            out.append(f"        lea     eax, {_ebp_addr(disp)}")
+            return out
         if isinstance(expr.operand, ast.UnaryOp) and expr.operand.op == "*":
             # &*p is a no-op — just produce p.
             return self._eval_expr_to_eax(expr.operand.operand, ctx)
