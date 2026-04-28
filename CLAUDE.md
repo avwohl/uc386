@@ -624,3 +624,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`_type_of(UnaryOp +/-/~)` propagates `__int128`.** Was falling through to int, which broke `return -a;` for an int128-arg function (the temp pre-pass didn't see the result type as int128 and never allocated a slot).
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +3 smoke tests (330 total).
+- **2026-04-28 — __int128: return widening + compound literals**: more completeness for expressive int128 code.
+  - **`return 1;` from a `__int128`-returning function widens.** `_return`'s int128 branch now wraps a smaller-integer value in a synthetic `Cast(target=int128, expr=value)` and pre-allocates the 16-byte temp via `alloc_call_temp`, mirroring `_var_init`'s pattern. Without this, `if (n <= 1) return 1;` raised "can't take address of __int128 IntLiteral".
+  - **`(__int128){init}` compound literal.** `_int128_value_address(Compound)` recognizes int128-target compound literals: unwraps the inner InitializerList (or uses the bare value), widens via synthetic Cast if needed, copies into the compound's pre-allocated 16-byte temp, returns its address. Lets `&(u128){42}` and `(u128){42}` flow through any int128 expression context.
+  - **`(__int128[N]){...}` as an array initializer.** `_array_init` strips the outer Compound wrapper to expose the inner InitializerList / StringLiteral. Lets `u128 arr[3] = (u128[3]){10, 20, 30};` work.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +3 smoke tests (333 total).

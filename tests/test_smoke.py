@@ -3051,6 +3051,49 @@ def test_int128_va_arg_copies_16_bytes_to_temp():
     assert "16" in asm  # the 16-byte advance / copy size shows up
 
 
+def test_int128_return_widens_int_literal():
+    # `return 1;` from a __int128-returning function widens via a
+    # synthetic Cast (sign-extends the int via cdq + fanout).
+    asm = _compile(
+        "unsigned __int128 fact(unsigned __int128 n) {\n"
+        "    if (n <= 1) return 1;\n"
+        "    return n * fact(n - 1);\n"
+        "}\n"
+        "int main(void) { return 0; }\n"
+    )
+    assert "_fact:" in asm
+
+
+def test_int128_compound_literal_address():
+    # `&(__int128){42}` allocates a per-expr 16-byte temp, stores 42
+    # into it, returns the address.
+    asm = _compile(
+        "int main(void) {\n"
+        "    unsigned __int128 *p = &(unsigned __int128){42};\n"
+        "    return (int)*p;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+    # The compound literal's value 42 should land in the temp.
+    assert "mov     eax, 42" in asm
+
+
+def test_int128_compound_literal_array_init():
+    # `(__int128[3]){1, 2, 3}` as an array initializer strips the
+    # compound's wrapper and treats the inner InitializerList as the
+    # source.
+    asm = _compile(
+        "int main(void) {\n"
+        "    unsigned __int128 arr[3] = "
+        "(unsigned __int128[3]){10, 20, 30};\n"
+        "    return (int)arr[1];\n"
+        "}\n"
+    )
+    assert "mov     eax, 10" in asm
+    assert "mov     eax, 20" in asm
+    assert "mov     eax, 30" in asm
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.

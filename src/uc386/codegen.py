@@ -4571,6 +4571,35 @@ class CodeGenerator:
             out = self._va_arg_struct_copy(expr, dest, ctx)
             out.append(f"        lea     eax, {_ebp_addr(disp)}")
             return out
+        # `(__int128){init}` — compound literal whose target is
+        # int128. The temp is allocated by `_collect_call_temps` (with
+        # size 16). Store the init's value into the temp and return
+        # its address.
+        if (
+            isinstance(expr, ast.Compound)
+            and self._is_int128(expr.target_type)
+            and id(expr) in ctx.call_temps
+        ):
+            disp = ctx.call_temps[id(expr)]
+            inner = expr.init
+            if (
+                isinstance(inner, ast.InitializerList)
+                and len(inner.values) == 1
+            ):
+                inner = inner.values[0]
+            inner_ty = self._type_of(inner, ctx)
+            if not self._is_int128(inner_ty):
+                synth_cast = ast.Cast(
+                    target_type=expr.target_type, expr=inner,
+                )
+                ctx.alloc_call_temp(synth_cast, 16)
+                inner = synth_cast
+            out = self._int128_value_address(inner, ctx)
+            out.append("        mov     esi, eax")
+            out.append(f"        lea     edi, {_ebp_addr(disp)}")
+            out += self._emit_int128_copy("esi", "edi")
+            out.append(f"        lea     eax, {_ebp_addr(disp)}")
+            return out
         raise CodegenError(
             f"can't take address of __int128 `{type(expr).__name__}`"
         )
@@ -7209,6 +7238,11 @@ class CodeGenerator:
         """
         elem_type = arr_type.base_type
         elem_size = self._size_of(elem_type)
+        # Compound literal as the array initializer (e.g.
+        # `int arr[3] = (int[3]){1, 2, 3};`) — strip the compound's
+        # outer wrapper to expose its InitializerList / StringLiteral.
+        if isinstance(init, ast.Compound):
+            init = init.init
         # Unsized array (`int x[] = {...}` or `(int []){...}` compound
         # literal): infer length from the initializer.
         if arr_type.size is None:
@@ -7731,8 +7765,17 @@ class CodeGenerator:
                 ) + ["        jmp     .epilogue"]
             # __int128 return: copy 16 bytes of the value through
             # `_int128_value_address` into the caller's retptr.
+            # Smaller-integer return values widen via synthetic Cast.
             if self._is_int128(ret_ty):
-                src_lines = self._int128_value_address(stmt.value, ctx)
+                value_expr = stmt.value
+                value_ty = self._type_of(value_expr, ctx)
+                if not self._is_int128(value_ty):
+                    synth_cast = ast.Cast(
+                        target_type=ret_ty, expr=value_expr,
+                    )
+                    ctx.alloc_call_temp(synth_cast, 16)
+                    value_expr = synth_cast
+                src_lines = self._int128_value_address(value_expr, ctx)
                 out = list(src_lines)
                 out.append("        mov     esi, eax")
                 out.append(f"        mov     edi, {_ebp_addr(retptr_disp)}")
