@@ -344,6 +344,9 @@ class CodeGenerator:
         # Per-struct alignment when a member has `aligned(N)` or the
         # struct itself has it. Used to align globals of struct type.
         self._struct_alignments: dict[str, int] = {}
+        # Set of struct names that have `__attribute__((packed))`.
+        # Members are byte-aligned; the struct's overall alignment is 1.
+        self._struct_packed: set[str] = set()
         # Per-function alignment when the function (or its declaration)
         # has `__attribute__((aligned(N)))`. Read by `__alignof__(funcname)`.
         self._func_alignments: dict[str, int] = {}
@@ -1402,6 +1405,87 @@ class CodeGenerator:
         elided_values = self._elide_braces_for_struct(
             init.values, members, name,
         )
+        # Pre-pass: expand `{...}` brace wrappers for anon-promoted-group
+        # scalar members into designated entries (mirror of `_struct_init`
+        # for locals; same rationale).
+        groups_pre = self._struct_member_groups.get(sname, [])
+        expanded_pre: list = []
+        cursor_pre = 0
+        for value in elided_values:
+            advance = True
+            if (
+                not isinstance(value, ast.DesignatedInit)
+                and isinstance(value, ast.InitializerList)
+                and cursor_pre < len(members)
+            ):
+                _, m_ty_pre, _ = members[cursor_pre]
+                if not isinstance(m_ty_pre, (
+                    ast.StructType, ast.ArrayType, ast.ComplexType,
+                )) and cursor_pre < len(groups_pre):
+                    my_group = groups_pre[cursor_pre]
+                    run_end = cursor_pre
+                    while (
+                        run_end + 1 < len(members)
+                        and run_end + 1 < len(groups_pre)
+                        and groups_pre[run_end + 1] == my_group
+                    ):
+                        run_end += 1
+                    if run_end > cursor_pre:
+                        sub_cursor = cursor_pre
+                        for inner in value.values:
+                            if isinstance(inner, ast.DesignatedInit):
+                                first = inner.designators[0]
+                                if (
+                                    isinstance(first, str)
+                                    and first in member_index
+                                ):
+                                    target_idx = member_index[first]
+                                    inner_value = (
+                                        ast.InitializerList(values=[
+                                            ast.DesignatedInit(
+                                                designators=inner.designators[1:],
+                                                value=inner.value,
+                                            )
+                                        ])
+                                        if len(inner.designators) > 1
+                                        else inner.value
+                                    )
+                                    target_name = members[target_idx][0]
+                                else:
+                                    expanded_pre.append(inner)
+                                    continue
+                            else:
+                                if sub_cursor > run_end:
+                                    expanded_pre.append(inner)
+                                    continue
+                                target_idx = sub_cursor
+                                target_name = members[target_idx][0]
+                                inner_value = inner
+                                sub_cursor += 1
+                            expanded_pre.append(ast.DesignatedInit(
+                                designators=[target_name],
+                                value=inner_value,
+                            ))
+                        cursor_pre = run_end + 1
+                        advance = False
+            if advance:
+                expanded_pre.append(value)
+                if isinstance(value, ast.DesignatedInit):
+                    first = value.designators[0]
+                    if isinstance(first, str) and first in member_index:
+                        cursor_pre = member_index[first] + 1
+                else:
+                    if cursor_pre < len(members):
+                        next_pre = cursor_pre + 1
+                        _, this_ty_pre, this_off_pre = members[cursor_pre]
+                        if self._size_of(this_ty_pre) > 0:
+                            while (
+                                next_pre < len(members)
+                                and members[next_pre][2] == this_off_pre
+                            ):
+                                next_pre += 1
+                        cursor_pre = next_pre
+        elided_values = expanded_pre
         slot_values: dict[int, ast.Expression] = {}
         cursor = 0
         for value in elided_values:
@@ -1422,7 +1506,19 @@ class CodeGenerator:
                     )
                 idx = member_index[m_name_des]
                 actual = value.value
-                cursor = idx + 1
+                # Advance past the entire anon-promoted group, not just
+                # the targeted member, so following positional values
+                # land on the next outer subobject.
+                next_cur = idx + 1
+                if idx < len(groups_pre):
+                    g = groups_pre[idx]
+                    while (
+                        next_cur < len(members)
+                        and next_cur < len(groups_pre)
+                        and groups_pre[next_cur] == g
+                    ):
+                        next_cur += 1
+                cursor = next_cur
             else:
                 if cursor >= len(members):
                     raise CodegenError(
@@ -1445,6 +1541,35 @@ class CodeGenerator:
                     ):
                         next_cursor += 1
                 cursor = next_cursor
+            # C99 brace-elision for scalar promoted member: when the
+            # init is a single-value InitializerList for an anon-union
+            # member (`{3, {.as_int = 100}}`), unwrap. Single designator
+            # may target a different promoted member of the same union.
+            _, m_ty_check, _ = members[idx]
+            if (
+                isinstance(actual, ast.InitializerList)
+                and not isinstance(m_ty_check, (
+                    ast.StructType, ast.ArrayType, ast.ComplexType,
+                ))
+                and len(actual.values) == 1
+            ):
+                inner = actual.values[0]
+                if isinstance(inner, ast.DesignatedInit):
+                    first = inner.designators[0]
+                    if isinstance(first, str) and first in member_index:
+                        idx = member_index[first]
+                        actual = (
+                            ast.InitializerList(values=[ast.DesignatedInit(
+                                designators=inner.designators[1:],
+                                value=inner.value,
+                            )])
+                            if len(inner.designators) > 1
+                            else inner.value
+                        )
+                    else:
+                        actual = inner
+                else:
+                    actual = inner
             # Non-consecutive multi-level designators targeting the same
             # outer member — e.g. `.s.a = 11, .extra = 99, .s.b = 22` —
             # arrive here as TWO separate `.s = {...}` slot writes after
@@ -2025,16 +2150,24 @@ class CodeGenerator:
                         idx_range = list(range(start, end + 1))
                         actual = value.value
                         cursor = end + 1
-                    elif (
-                        len(value.designators) != 1
-                        or not isinstance(designator, ast.IntLiteral)
-                    ):
+                    elif len(value.designators) != 1:
                         raise CodegenError(
                             f"global `{name}`: only single-level integer "
                             f"designators supported in array init"
                         )
                     else:
-                        idx = designator.value
+                        if isinstance(designator, ast.IntLiteral):
+                            idx = designator.value
+                        else:
+                            try:
+                                idx = self._const_eval(
+                                    designator, f"global `{name}` array index"
+                                )
+                            except CodegenError:
+                                raise CodegenError(
+                                    f"global `{name}`: array designator must "
+                                    f"reduce to an integer constant"
+                                )
                         actual = value.value
                         cursor = idx + 1
                         idx_range = [idx]
@@ -4466,6 +4599,7 @@ class CodeGenerator:
                     from types import SimpleNamespace
                     self._register_struct(SimpleNamespace(
                         name=t.name, members=t.members, is_union=t.is_union,
+                        is_packed=getattr(t, "is_packed", False),
                     ))
                     after = self._resolve_struct_alias(t.name)
                     if after is not None:
@@ -4477,6 +4611,7 @@ class CodeGenerator:
                 from types import SimpleNamespace
                 self._register_struct(SimpleNamespace(
                     name=key, members=t.members, is_union=t.is_union,
+                    is_packed=getattr(t, "is_packed", False),
                 ))
             return key
         if t.name:
@@ -4593,6 +4728,7 @@ class CodeGenerator:
             decl_name = None
         if decl_name and decl_name in self._structs:
             return
+        is_packed = getattr(decl, "is_packed", False)
         # Validate every member up front. Unions and structs share the
         # same per-member checks; only the layout step differs.
         members: list[tuple[str, ast.TypeNode, int]] = []
@@ -4630,15 +4766,20 @@ class CodeGenerator:
                     max_align = align
                 continue
             self._check_supported_type(m.member_type, f"{decl.name}.{m.name}")
-            align = self._alignment_of(m.member_type)
-            # Honor an `__attribute__((aligned(N)))` on the member —
-            # bumps both the member's effective alignment and the
-            # struct's overall alignment.
-            ma = getattr(m, "alignment", None)
-            if ma is not None and ma > align:
-                align = ma
-            if align > max_align:
-                max_align = align
+            if is_packed:
+                # Packed: every member byte-aligned, struct overall
+                # alignment is 1.
+                align = 1
+            else:
+                align = self._alignment_of(m.member_type)
+                # Honor an `__attribute__((aligned(N)))` on the member —
+                # bumps both the member's effective alignment and the
+                # struct's overall alignment.
+                ma = getattr(m, "alignment", None)
+                if ma is not None and ma > align:
+                    align = ma
+                if align > max_align:
+                    max_align = align
 
         if decl.is_union:
             # All members share offset 0; total size = max member size,
@@ -4767,12 +4908,15 @@ class CodeGenerator:
                     unit_offset += unit_size
                     unit_used = 0
                 unit_size = 4
-                align = self._alignment_of(m.member_type)
-                # `__attribute__((aligned(N)))` on the member bumps its
-                # required alignment.
-                ma = getattr(m, "alignment", None)
-                if ma is not None and ma > align:
-                    align = ma
+                if is_packed:
+                    align = 1
+                else:
+                    align = self._alignment_of(m.member_type)
+                    # `__attribute__((aligned(N)))` on the member bumps its
+                    # required alignment.
+                    ma = getattr(m, "alignment", None)
+                    if ma is not None and ma > align:
+                        align = ma
                 offset = (unit_offset + align - 1) & ~(align - 1)
                 if m.name is None:
                     # Anonymous nested struct/union — promote each inner
@@ -4792,6 +4936,8 @@ class CodeGenerator:
         self._struct_sizes[decl_name] = total
         if max_align > 1:
             self._struct_alignments[decl_name] = max_align
+        if is_packed:
+            self._struct_packed.add(decl_name)
         if bitfields:
             self._struct_bitfields[decl_name] = bitfields
 
@@ -4824,6 +4970,8 @@ class CodeGenerator:
             return self._alignment_of(t.base_type)
         if isinstance(t, ast.StructType):
             sname = self._resolve_struct_name(t)
+            if sname in self._struct_packed:
+                return 1
             # If a member has `aligned(N)`, the struct's alignment was
             # bumped at registration time — honor it.
             override = self._struct_alignments.get(sname)
@@ -8256,16 +8404,26 @@ class CodeGenerator:
                         idx_range = list(range(start, end + 1))
                         actual = value_expr.value
                         cursor = end + 1
-                    elif (
-                        len(value_expr.designators) != 1
-                        or not isinstance(designator, ast.IntLiteral)
-                    ):
+                    elif len(value_expr.designators) != 1:
                         raise CodegenError(
                             f"`{name}`: only single-level integer "
                             f"designators supported in array init"
                         )
                     else:
-                        idx = designator.value
+                        # Designator must be a constant integer expression
+                        # (IntLiteral, enum constant, sizeof, etc).
+                        if isinstance(designator, ast.IntLiteral):
+                            idx = designator.value
+                        else:
+                            try:
+                                idx = self._const_eval(
+                                    designator, f"`{name}` array index"
+                                )
+                            except CodegenError:
+                                raise CodegenError(
+                                    f"`{name}`: array designator must reduce "
+                                    f"to an integer constant"
+                                )
                         actual = value_expr.value
                         cursor = idx + 1
                         idx_range = [idx]
@@ -8411,6 +8569,102 @@ class CodeGenerator:
         # `_struct_init(s, ...)` and the recursion's end-zero-fill
         # would clobber the previous iteration's writes.
         elided_values = self._merge_nested_designators(elided_values)
+        # Pre-pass: expand `{...}` brace-wrappers for anon-promoted-group
+        # scalar members (e.g. `struct { int p; struct { int x, y; }; int s; } c
+        # = {1, {2, 3}, 4}`). The flat members list has [p, x, y, s] but the
+        # init has 3 values — the inner `{2, 3}` must be unfolded across
+        # x and y. Convert it to designated entries that target the group's
+        # members directly.
+        groups = self._struct_member_groups.get(struct_name, [])
+        expanded_values: list = []
+        cursor_pre = 0
+        for value in elided_values:
+            advance = True
+            if (
+                not isinstance(value, ast.DesignatedInit)
+                and isinstance(value, ast.InitializerList)
+                and cursor_pre < len(members)
+            ):
+                _, m_ty_pre, _ = members[cursor_pre]
+                # Only spread for scalar promoted-anon-group members (struct
+                # / array / complex members handle InitializerList natively).
+                if not isinstance(m_ty_pre, (
+                    ast.StructType, ast.ArrayType, ast.ComplexType,
+                )) and cursor_pre < len(groups):
+                    my_group = groups[cursor_pre]
+                    run_start = cursor_pre
+                    while (
+                        run_start > 0
+                        and groups[run_start - 1] == my_group
+                        and members[run_start - 1][2] == members[cursor_pre][2]
+                    ):
+                        run_start -= 1
+                    run_end = cursor_pre
+                    while (
+                        run_end + 1 < len(members)
+                        and run_end + 1 < len(groups)
+                        and groups[run_end + 1] == my_group
+                    ):
+                        run_end += 1
+                    if run_end > cursor_pre:
+                        # Multi-member anon-promoted group: spread the
+                        # InitializerList's values across the run via
+                        # synthesized designated entries.
+                        sub_cursor = cursor_pre
+                        for inner in value.values:
+                            if isinstance(inner, ast.DesignatedInit):
+                                first = inner.designators[0]
+                                if (
+                                    isinstance(first, str)
+                                    and first in member_index
+                                ):
+                                    target_idx = member_index[first]
+                                    inner_value = (
+                                        ast.InitializerList(values=[
+                                            ast.DesignatedInit(
+                                                designators=inner.designators[1:],
+                                                value=inner.value,
+                                            )
+                                        ])
+                                        if len(inner.designators) > 1
+                                        else inner.value
+                                    )
+                                    target_name = members[target_idx][0]
+                                else:
+                                    expanded_values.append(inner)
+                                    continue
+                            else:
+                                if sub_cursor > run_end:
+                                    expanded_values.append(inner)
+                                    continue
+                                target_idx = sub_cursor
+                                target_name = members[target_idx][0]
+                                inner_value = inner
+                                sub_cursor += 1
+                            expanded_values.append(ast.DesignatedInit(
+                                designators=[target_name],
+                                value=inner_value,
+                            ))
+                        cursor_pre = run_end + 1
+                        advance = False
+            if advance:
+                expanded_values.append(value)
+                if isinstance(value, ast.DesignatedInit):
+                    first = value.designators[0]
+                    if isinstance(first, str) and first in member_index:
+                        cursor_pre = member_index[first] + 1
+                else:
+                    if cursor_pre < len(members):
+                        next_pre = cursor_pre + 1
+                        _, this_ty_pre, this_off_pre = members[cursor_pre]
+                        if self._size_of(this_ty_pre) > 0:
+                            while (
+                                next_pre < len(members)
+                                and members[next_pre][2] == this_off_pre
+                            ):
+                                next_pre += 1
+                        cursor_pre = next_pre
+        elided_values = expanded_values
         # Walk source values in order, tracking the implicit cursor. A
         # `.field = expr` sets the cursor to that member's index; the
         # next un-designated value continues from cursor + 1. After the
@@ -8450,7 +8704,21 @@ class CodeGenerator:
                 else:
                     actual = value.value
                 m_name_des = first
-                cursor = idx + 1
+                # Advance cursor past the targeted member. If `idx` is
+                # part of an anon-promoted group (multiple members at
+                # this offset / same group id), advance past the entire
+                # group so the next positional value lands on the next
+                # outer subobject.
+                next_cur = idx + 1
+                if idx < len(groups):
+                    g = groups[idx]
+                    while (
+                        next_cur < len(members)
+                        and next_cur < len(groups)
+                        and groups[next_cur] == g
+                    ):
+                        next_cur += 1
+                cursor = next_cur
             else:
                 if cursor >= len(members):
                     raise CodegenError(
@@ -8476,6 +8744,41 @@ class CodeGenerator:
             filled.add(idx)
             m_name_i, m_ty, m_off = members[idx]
             m_disp = base_disp + m_off
+            # C99 6.7.8: a brace-enclosed initializer for a scalar
+            # subobject is allowed (`int x = {1};`). Unwrap a
+            # single-value non-designated InitializerList here so a
+            # scalar member receives the inner value. Also handles
+            # the anon-union case `{3, {.as_int = 100}}` where the
+            # inner brace targets a promoted scalar member by name.
+            if (
+                isinstance(actual, ast.InitializerList)
+                and not isinstance(m_ty, (ast.StructType, ast.ArrayType,
+                                          ast.ComplexType))
+                and len(actual.values) == 1
+            ):
+                inner = actual.values[0]
+                if isinstance(inner, ast.DesignatedInit):
+                    # `{.as_int = 100}`: the designator names a
+                    # promoted member, possibly different from idx.
+                    # Resolve it through member_index.
+                    first = inner.designators[0]
+                    if isinstance(first, str) and first in member_index:
+                        idx = member_index[first]
+                        m_name_i, m_ty, m_off = members[idx]
+                        m_disp = base_disp + m_off
+                        actual = (
+                            ast.InitializerList(values=[ast.DesignatedInit(
+                                designators=inner.designators[1:],
+                                value=inner.value,
+                            )])
+                            if len(inner.designators) > 1
+                            else inner.value
+                        )
+                        filled.add(idx)
+                    else:
+                        actual = inner
+                else:
+                    actual = inner
             if (
                 isinstance(m_ty, ast.StructType)
                 and isinstance(actual, ast.InitializerList)
