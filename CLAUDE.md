@@ -639,3 +639,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`cond ? expr : 0` with int128 result** now widens each arm. `_int128_ternary` wraps any non-int128 arm in a synthetic `Cast(target=int128, expr=arm)` and pre-allocates the 16-byte temp. Was raising "can't take address of __int128 IntLiteral" when an arm was a plain `0` or `1`.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (336 total).
+- **2026-04-28 — StmtExpr in non-int contexts**: GCC `({ ...; expr; })` now works when the trailing expression is a long long, float, double, or `__int128`.
+  - **`_eval_float_to_st0(StmtExpr)`** runs head items inside `enter_scope` / `exit_scope`, then dispatches the trailing expression through `_eval_float_to_st0` so the value lands on st(0).
+  - **`_eval_expr_to_edx_eax(StmtExpr)`** does the same for long-long-typed StmtExprs — head items emit, trailing expression goes through the LL evaluator.
+  - **`_int128_value_address(StmtExpr)`** mirrors the pattern for int128.
+  - The integer / struct StmtExpr paths in `_eval_expr_to_eax` were already in place.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +2 smoke tests (338 total).

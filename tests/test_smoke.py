@@ -3137,6 +3137,31 @@ def test_int128_ternary_with_int_literal_arm_widens():
     assert "_f:" in asm
 
 
+def test_stmt_expr_with_float_trailing_value():
+    # `({ ...; float_expr; })` evaluates head items, then leaves the
+    # trailing float on st(0). Used to fall through to "not implemented".
+    asm = _compile(
+        "int main(void) {\n"
+        "    float f = ({ float x = 1.5f; x + 0.5f; });\n"
+        "    return f != 2.0f;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+    # The trailing add lands as faddp.
+    assert "faddp" in asm or "fadd" in asm
+
+
+def test_stmt_expr_with_int128_trailing_value():
+    asm = _compile(
+        "int main(void) {\n"
+        "    unsigned __int128 v = "
+        "({ unsigned __int128 a = 21; a * 2; });\n"
+        "    return (int)v;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.

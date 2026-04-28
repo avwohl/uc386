@@ -4571,6 +4571,29 @@ class CodeGenerator:
             out = self._va_arg_struct_copy(expr, dest, ctx)
             out.append(f"        lea     eax, {_ebp_addr(disp)}")
             return out
+        # GCC statement expression returning __int128: emit head
+        # items in scope, then yield the trailing expression's
+        # int128 value's address.
+        if isinstance(expr, ast.StmtExpr):
+            ctx.enter_scope()
+            try:
+                items = list(expr.body.items)
+                if not items:
+                    return []
+                head, tail = items[:-1], items[-1]
+                out: list[str] = []
+                for item in head:
+                    out += self._item(item, ctx)
+                if (
+                    isinstance(tail, ast.ExpressionStmt)
+                    and tail.expr is not None
+                ):
+                    out += self._int128_value_address(tail.expr, ctx)
+                    return out
+                out += self._item(tail, ctx)
+                return out
+            finally:
+                ctx.exit_scope()
         # `(__int128){init}` — compound literal whose target is
         # int128. The temp is allocated by `_collect_call_temps` (with
         # size 16). Store the init's value into the temp and return
@@ -10256,6 +10279,28 @@ class CodeGenerator:
         (high:low). Mirrors `_eval_expr_to_eax` but maintains the full
         64-bit value through every node.
         """
+        # GCC statement expression: emit head items in scope, then
+        # evaluate the trailing expression as long long.
+        if isinstance(expr, ast.StmtExpr):
+            ctx.enter_scope()
+            try:
+                items = list(expr.body.items)
+                if not items:
+                    return []
+                head, tail = items[:-1], items[-1]
+                out: list[str] = []
+                for item in head:
+                    out += self._item(item, ctx)
+                if (
+                    isinstance(tail, ast.ExpressionStmt)
+                    and tail.expr is not None
+                ):
+                    out += self._eval_expr_to_edx_eax(tail.expr, ctx)
+                else:
+                    out += self._item(tail, ctx)
+                return out
+            finally:
+                ctx.exit_scope()
         # __int128 expression in LL context: evaluate to a 16-byte
         # temp, then load the low 8 bytes into EDX:EAX (truncation
         # per C's standard conversion rules).
@@ -11128,6 +11173,29 @@ class CodeGenerator:
             return self._call(expr, ctx)
         if isinstance(expr, ast.VaArgExpr):
             return self._va_arg_float(expr, ctx)
+        if isinstance(expr, ast.StmtExpr):
+            # GCC statement expression returning a float — emit head
+            # items in scope, then evaluate the trailing expression
+            # to st(0).
+            ctx.enter_scope()
+            try:
+                items = list(expr.body.items)
+                if not items:
+                    return []
+                head, tail = items[:-1], items[-1]
+                out: list[str] = []
+                for item in head:
+                    out += self._item(item, ctx)
+                if (
+                    isinstance(tail, ast.ExpressionStmt)
+                    and tail.expr is not None
+                ):
+                    out += self._eval_float_to_st0(tail.expr, ctx)
+                else:
+                    out += self._item(tail, ctx)
+                return out
+            finally:
+                ctx.exit_scope()
         raise CodegenError(
             f"float expression {type(expr).__name__} not implemented yet"
         )
