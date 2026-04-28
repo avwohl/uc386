@@ -3325,6 +3325,22 @@ def test_vector_compound_arr_index_side_effect_evals_once():
     assert inc_count == 1
 
 
+def test_complex_struct_member_init_routes_through_complex_eval():
+    # `struct S { _Complex double v; }; struct S s = {1.0+2.0i};`
+    # was failing because _struct_init's complex-member branch was
+    # missing; fell through to _eval_expr_to_eax which can't handle
+    # complex BinaryOp. Now the complex member init goes through
+    # _eval_complex_into_top.
+    asm = _compile(
+        "struct S { _Complex double v; };\n"
+        "int main(void) {\n"
+        "    struct S s = {1.0+2.0i};\n"
+        "    return __real__ s.v == 1.0 && __imag__ s.v == 2.0 ? 0 : 1;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.

@@ -5438,6 +5438,70 @@ class CodeGenerator:
             return out
         raise CodegenError(f"__int128 unary op `{op}` not supported")
 
+    def _compound_assign_complex_lvalue(
+        self,
+        expr: ast.BinaryOp,
+        op: str,
+        cplx_ty: ast.ComplexType,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """`complex_lvalue OP= rhs`. For Identifier lvalues use the
+        simple desugar; for non-Identifier use the snapshot pattern."""
+        size = self._size_of(cplx_ty)
+        if isinstance(expr.left, ast.Identifier):
+            inner = ast.BinaryOp(op=op, left=expr.left, right=expr.right)
+            ctx.alloc_call_temp(inner, size)
+            return self._complex_copy_assign(
+                ast.BinaryOp(op="=", left=expr.left, right=inner),
+                cplx_ty, ctx,
+            )
+        # Non-Identifier: snapshot.
+        addr_slot_name = f"__compcx_addr_{id(expr)}"
+        snap_slot_name = f"__compcx_snap_{id(expr)}"
+        addr_disp = ctx.alloc_local(
+            addr_slot_name,
+            ast.PointerType(base_type=cplx_ty),
+            size=4,
+        )
+        snap_disp = ctx.alloc_local(snap_slot_name, cplx_ty, size=size)
+        out: list[str] = []
+        if isinstance(expr.left, ast.Index):
+            out += self._index_address(expr.left, ctx)
+        elif (
+            isinstance(expr.left, ast.UnaryOp)
+            and expr.left.op == "*"
+        ):
+            out += self._eval_expr_to_eax(expr.left.operand, ctx)
+        elif isinstance(expr.left, ast.Member):
+            out += self._member_address(expr.left, ctx)
+        else:
+            raise CodegenError(
+                f"_Complex compound assign target not supported: "
+                f"{type(expr.left).__name__}"
+            )
+        out.append(f"        mov     {_ebp_addr(addr_disp)}, eax")
+        # Copy current value into snap_slot.
+        out.append("        mov     esi, eax")
+        out.append(f"        lea     edi, {_ebp_addr(snap_disp)}")
+        for off in range(0, size, 4):
+            out.append(f"        mov     eax, [esi + {off}]")
+            out.append(f"        mov     [edi + {off}], eax")
+        # Synthesize Identifier(snap) OP rhs and assign back through
+        # *addr_slot. We re-route through _complex_copy_assign with
+        # a synthetic *p lvalue that dereferences the addr_slot.
+        snap_id = ast.Identifier(name=snap_slot_name)
+        inner = ast.BinaryOp(op=op, left=snap_id, right=expr.right)
+        ctx.alloc_call_temp(inner, size)
+        # We need to build the dereference of the address slot's value.
+        # Easiest: compose a new lvalue = `*addr_slot_id`. Then
+        # complex_copy_assign(BinaryOp("=", *addr_slot_id, inner)).
+        addr_id = ast.Identifier(name=addr_slot_name)
+        deref_lvalue = ast.UnaryOp(op="*", operand=addr_id, is_prefix=True)
+        return out + self._complex_copy_assign(
+            ast.BinaryOp(op="=", left=deref_lvalue, right=inner),
+            cplx_ty, ctx,
+        )
+
     def _compound_assign_vector_lvalue(
         self,
         expr: ast.BinaryOp,
@@ -7658,6 +7722,18 @@ class CodeGenerator:
                             out.append(
                                 f"        mov     [edi + {byte_off}], eax"
                             )
+                    elif isinstance(elem_type, ast.ComplexType):
+                        # _Complex element: evaluate into the element
+                        # slot via _eval_complex_into_top with &slot
+                        # on the stack as the destination.
+                        out.append(
+                            f"        lea     eax, {_ebp_addr(elem_disp)}"
+                        )
+                        out.append("        push    eax")
+                        out += self._eval_complex_into_top(
+                            actual, ctx, elem_type,
+                        )
+                        out.append("        add     esp, 4")
                     else:
                         out += self._eval_expr_to_eax(actual, ctx)
                         out += self._store_from_eax(_ebp_addr(elem_disp), elem_type)
@@ -7825,6 +7901,23 @@ class CodeGenerator:
                 for byte_off in (0, 4, 8, 12):
                     out.append(f"        mov     eax, [esi + {byte_off}]")
                     out.append(f"        mov     [edi + {byte_off}], eax")
+            elif (
+                isinstance(m_ty, ast.ComplexType)
+                and m_name_i not in bitfields
+            ):
+                # _Complex member: route through `_complex_copy_assign`
+                # with a synthetic *p lvalue so the value lands at
+                # &m_disp.
+                size = self._size_of(m_ty)
+                # Compute &(struct_base + m_disp) as a value, then
+                # use _complex_copy_assign on a synthetic lvalue.
+                # Easiest: copy via _eval_complex_into_top into the
+                # member's slot on the stack. The dest_top dance:
+                # save &dest, eval into &dest, restore.
+                out.append(f"        lea     eax, {_ebp_addr(m_disp)}")
+                out.append("        push    eax")
+                out += self._eval_complex_into_top(actual, ctx, m_ty)
+                out.append("        add     esp, 4")
             elif m_name_i in bitfields:
                 # Bit-field: synthesize a fake Member node so _bitfield_store
                 # can compute the storage-unit address. We can't pass the
@@ -13880,6 +13973,13 @@ class CodeGenerator:
             and not isinstance(expr.left, ast.Identifier)
         ):
             return self._compound_assign_vector_lvalue(
+                expr, op, target_ty_check, ctx,
+            )
+        # Complex compound assign on any lvalue: snapshot pattern.
+        # Identifier path desugars trivially (re-reading is
+        # side-effect-free); non-Identifier uses snapshot.
+        if isinstance(target_ty_check, ast.ComplexType):
+            return self._compound_assign_complex_lvalue(
                 expr, op, target_ty_check, ctx,
             )
 

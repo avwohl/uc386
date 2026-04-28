@@ -694,3 +694,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Fix**: dispatch all non-Identifier vector lvalues to a new `_compound_assign_vector_lvalue` that uses the same hidden-snapshot pattern as the LL/int128 fixes. Hidden 4-byte addr slot + N-byte snapshot slot. Compute &lvalue once into addr, copy current bytes into snapshot, synthesize `Identifier(snap_slot) OP rhs`, evaluate via `_vector_value_address` into a result temp, then copy back to *addr_slot.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (348 total).
+- **2026-04-28 — _Complex compound + struct/array init for complex members (real bug)**:
+  - **Complex compound assign on any lvalue**: `c += rhs` for `_Complex T` types fell through to the generic 32-bit path, which then evaluated `rhs` as int — failing for complex BinaryOp like `10.0+20.0i`. Added a dispatch in `_compound_assign` that routes ComplexType lvalues to a new `_compound_assign_complex_lvalue`. Identifier path desugars trivially through `_complex_copy_assign(BinaryOp("=", lhs, BinaryOp(op, lhs, rhs)))`. Non-Identifier path uses the snapshot pattern: hidden 4-byte addr + N-byte snap slots, compute &lhs once, copy to snap, synthesize `Identifier(snap) OP rhs`, route through `_complex_copy_assign` with a synthetic `*addr_id` lvalue.
+  - **Complex struct member init**: `struct S { _Complex double v; }; struct S s = {1.0+2.0i};` — `_struct_init` had branches for float / long-long / int128 members but not complex, falling through to `_eval_expr_to_eax` which fails for complex BinaryOp. Added a complex-member branch that emits `&dest` on the stack and evaluates the complex expression directly into the destination via `_eval_complex_into_top`.
+  - **Complex array element init**: `_Complex double arr[2] = {1.0+2.0i, 3.0+4.0i};` — same pattern in `_array_init`.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (349 total).
