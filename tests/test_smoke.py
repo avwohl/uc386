@@ -3352,6 +3352,21 @@ def test_decimal64_keyword_compiles_as_double():
     assert "section .data" in asm
 
 
+def test_sizeof_wide_string_uses_wchar_t_size():
+    # `sizeof(L"hi")` returned 3 (= len + 1, treating wchar_t as
+    # 1 byte) instead of 6 (= (len + 1) * sizeof(wchar_t) where
+    # wchar_t is 2 bytes per uc386's __WCHAR_TYPE__). uc_core's
+    # optimizer folded `sizeof(StringLiteral)` to len+1 regardless
+    # of `is_wide`. Fix: skip the fold for wide strings (in uc_core)
+    # so uc386's codegen can apply (len+1)*sizeof(wchar_t).
+    asm = _compile(
+        "int main(void) {\n"
+        "    return sizeof(L\"hi\") - 6;\n"
+        "}\n"
+    )
+    assert "mov     eax, 6" in asm
+
+
 def test_sizeof_double_returns_8():
     # `sizeof(double)` returned 4 because uc_core's `WATCOM_FLAT32`
     # TypeConfig didn't override `double_size`, so it took the

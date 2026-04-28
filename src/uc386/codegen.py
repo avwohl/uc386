@@ -2259,6 +2259,15 @@ class CodeGenerator:
                 and expr.expr.name in self._func_alignments
             ):
                 return self._func_alignments[expr.expr.name]
+            # Wide string literal: bytes = (len + 1) * sizeof(wchar_t).
+            # uc_core's optimizer skips folding wide-string sizeof so
+            # we can apply the right wchar size (2 bytes) here.
+            if (
+                isinstance(expr.expr, ast.StringLiteral)
+                and getattr(expr.expr, "is_wide", False)
+                and not getattr(expr, "is_alignof", False)
+            ):
+                return (len(expr.expr.value) + 1) * 2
             ty = self._type_of(expr.expr, _FuncCtx())
             if getattr(expr, "is_alignof", False):
                 return self._alignment_of(ty)
@@ -10636,6 +10645,19 @@ class CodeGenerator:
                 and expr.expr.name in self._func_alignments
             ):
                 value = self._func_alignments[expr.expr.name]
+                return [f"        mov     eax, {value}"]
+            # Wide string literal `L"..."`: sizeof yields the byte
+            # count of the wchar_t array, not the pointer (which is
+            # what `_type_of(StringLiteral)` would give). uc_core's
+            # optimizer leaves these unfolded so we can apply the
+            # right wchar_t size here. uc386 uses `wchar_t = unsigned
+            # short` (2 bytes) per `__WCHAR_TYPE__`.
+            if (
+                isinstance(expr.expr, ast.StringLiteral)
+                and getattr(expr.expr, "is_wide", False)
+                and not getattr(expr, "is_alignof", False)
+            ):
+                value = (len(expr.expr.value) + 1) * 2
                 return [f"        mov     eax, {value}"]
             ty = self._type_of(expr.expr, ctx)
             if getattr(expr, "is_alignof", False):
