@@ -3141,135 +3141,198 @@ class CodeGenerator:
         turn out to have a known destination (var init, struct
         assignment, return chain) and won't read from the temp, but
         allocating them anyway keeps this pass context-free.
+
+        Walks the AST with proper scope management mirroring
+        `_collect_locals` so that two for-loops declaring the same
+        name with different types (e.g. `for(int i=0;...) ... for(u128 i=0;...)`)
+        each see the right type binding when `_type_of(Identifier)`
+        is consulted to decide whether a sub-expression needs a temp.
         """
-        # `_collect_locals` already exited its scope stack by the time we
-        # run, so `_type_of(Identifier)` for body locals would fail. Push
-        # a flat scope with all body VarDecls' resolved types so vector-
-        # arithmetic detection (`_type_of(BinaryOp)` → ArrayType) sees
-        # the right types for k0/k1/etc. The dummy slot disp doesn't
-        # matter — `_type_of` only reads `ctx.types`.
         ctx.enter_scope()
-        for sub in self._walk_ast(node):
-            if isinstance(sub, ast.VarDecl):
-                t = ctx.decl_types.get(id(sub))
-                if t is not None and sub.name not in ctx.slots[-1]:
-                    ctx.slots[-1][sub.name] = 0
-                    ctx.types[-1][sub.name] = t
         try:
-            self._collect_call_temps_inner(node, ctx)
+            self._collect_call_temps_walk(node, ctx)
         finally:
             ctx.exit_scope()
 
-    def _collect_call_temps_inner(self, node, ctx: _FuncCtx) -> None:
-        for sub in self._walk_ast(node):
-            if isinstance(sub, ast.Call) and self._is_struct_returning_call(sub, ctx):
-                ret_ty = self._call_return_type(sub, ctx)
-                size = (self._size_of(ret_ty) + 3) & ~3
-                ctx.alloc_call_temp(sub, size)
-            elif isinstance(sub, ast.Call) and self._is_vector_returning_call(sub, ctx):
-                ret_ty = self._call_return_type(sub, ctx)
-                size = (self._size_of(ret_ty) + 3) & ~3
-                ctx.alloc_call_temp(sub, size)
-            elif (
-                isinstance(sub, ast.Call)
-                and isinstance(sub.func, ast.Identifier)
-                and sub.func.name == "__builtin_shuffle"
-                and len(sub.args) >= 1
+    def _collect_call_temps_walk(self, node, ctx: _FuncCtx) -> None:
+        """Scope-aware AST walk. Registers VarDecls into the current
+        scope (so `_type_of(Identifier)` sees the right type) and
+        allocates per-node temps via `_collect_call_temps_node`.
+        """
+        if node is None:
+            return
+        # Scope-introducing nodes: push a fresh scope around the body.
+        if isinstance(node, ast.CompoundStmt):
+            ctx.enter_scope()
+            try:
+                for item in node.items:
+                    self._collect_call_temps_walk(item, ctx)
+            finally:
+                ctx.exit_scope()
+            return
+        if isinstance(node, ast.ForStmt):
+            ctx.enter_scope()
+            try:
+                if node.init is not None:
+                    self._collect_call_temps_walk(node.init, ctx)
+                if node.condition is not None:
+                    self._collect_call_temps_walk(node.condition, ctx)
+                if node.update is not None:
+                    self._collect_call_temps_walk(node.update, ctx)
+                if node.body is not None:
+                    self._collect_call_temps_walk(node.body, ctx)
+            finally:
+                ctx.exit_scope()
+            return
+        # VarDecl: register the name in the current scope BEFORE
+        # recursing into the init expr, so the init can reference the
+        # newly-declared name in the right scope (e.g. `int i = i;`
+        # is technically valid C and reads the outer i).
+        if isinstance(node, ast.VarDecl):
+            t = ctx.decl_types.get(id(node))
+            if t is not None:
+                ctx.slots[-1][node.name] = 0
+                ctx.types[-1][node.name] = t
+            if node.init is not None:
+                self._collect_call_temps_walk(node.init, ctx)
+            return
+        # ParamDecl declarations also bring a name into the function
+        # scope; `_function` adds them via alloc_param at the outermost
+        # level, but a local extern/static can also produce a ParamDecl
+        # in the body (rare). Handle for completeness.
+        if isinstance(node, ast.ParamDecl):
+            t = ctx.decl_types.get(id(node))
+            if t is not None:
+                ctx.slots[-1][node.name] = 0
+                ctx.types[-1][node.name] = t
+            return
+        # Per-node temp allocation, then recurse into children.
+        self._collect_call_temps_node(node, ctx)
+        if dataclasses.is_dataclass(node):
+            for f in dataclasses.fields(node):
+                child = getattr(node, f.name, None)
+                self._collect_call_temps_walk(child, ctx)
+        elif isinstance(node, list):
+            for item in node:
+                self._collect_call_temps_walk(item, ctx)
+        elif isinstance(node, tuple):
+            for item in node:
+                self._collect_call_temps_walk(item, ctx)
+
+    def _collect_call_temps_node(self, sub, ctx: _FuncCtx) -> None:
+        """Per-node temp allocation logic. Inspects `sub` and reserves
+        a per-node temp via `ctx.alloc_call_temp(sub, size)` if the
+        node's result needs a buffer (struct/vector/complex/int128
+        return, compound literal, complex/vector/int128 sub-expression).
+        """
+        if isinstance(sub, ast.Call) and self._is_struct_returning_call(sub, ctx):
+            ret_ty = self._call_return_type(sub, ctx)
+            size = (self._size_of(ret_ty) + 3) & ~3
+            ctx.alloc_call_temp(sub, size)
+        elif isinstance(sub, ast.Call) and self._is_vector_returning_call(sub, ctx):
+            ret_ty = self._call_return_type(sub, ctx)
+            size = (self._size_of(ret_ty) + 3) & ~3
+            ctx.alloc_call_temp(sub, size)
+        elif (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Identifier)
+            and sub.func.name == "__builtin_shuffle"
+            and len(sub.args) >= 1
+        ):
+            # Vector shuffle result lands in a per-call temp.
+            try:
+                ret_ty = self._type_of(sub.args[0], ctx)
+            except CodegenError:
+                ret_ty = None
+            if isinstance(ret_ty, ast.ArrayType) and getattr(
+                ret_ty, "is_vector", False
             ):
-                # Vector shuffle result lands in a per-call temp.
-                try:
-                    ret_ty = self._type_of(sub.args[0], ctx)
-                except CodegenError:
-                    ret_ty = None
-                if isinstance(ret_ty, ast.ArrayType) and getattr(
-                    ret_ty, "is_vector", False
-                ):
-                    size = (self._size_of(ret_ty) + 3) & ~3
-                    ctx.alloc_call_temp(sub, size)
-            elif isinstance(sub, ast.Call) and self._is_complex_returning_call(sub, ctx):
-                # Complex-returning calls need a per-call-site temp
-                # so consumers like `__real foo()` can address the
-                # halves via a stable slot.
-                ret_ty = self._call_return_type(sub, ctx)
                 size = (self._size_of(ret_ty) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
-            elif isinstance(sub, ast.Call) and self._is_int128_returning_call(sub, ctx):
-                # __int128-returning call uses the retptr ABI; reserve
-                # a 16-byte temp slot so the caller's expression chain
-                # (e.g. `f() + g()`) sees stable addresses.
-                ctx.alloc_call_temp(sub, 16)
-            elif isinstance(sub, ast.Compound):
-                size = self._compound_temp_size(sub)
-                ctx.alloc_call_temp(sub, size)
-            elif isinstance(sub, ast.Cast) and isinstance(
-                sub.target_type, (ast.StructType,)
-            ):
-                # `(struct T) value` — type-pun into a struct/union
-                # via a per-cast temp slot.
+        elif isinstance(sub, ast.Call) and self._is_complex_returning_call(sub, ctx):
+            # Complex-returning calls need a per-call-site temp
+            # so consumers like `__real foo()` can address the
+            # halves via a stable slot.
+            ret_ty = self._call_return_type(sub, ctx)
+            size = (self._size_of(ret_ty) + 3) & ~3
+            ctx.alloc_call_temp(sub, size)
+        elif isinstance(sub, ast.Call) and self._is_int128_returning_call(sub, ctx):
+            # __int128-returning call uses the retptr ABI; reserve
+            # a 16-byte temp slot so the caller's expression chain
+            # (e.g. `f() + g()`) sees stable addresses.
+            ctx.alloc_call_temp(sub, 16)
+        elif isinstance(sub, ast.Compound):
+            size = self._compound_temp_size(sub)
+            ctx.alloc_call_temp(sub, size)
+        elif isinstance(sub, ast.Cast) and isinstance(
+            sub.target_type, (ast.StructType,)
+        ):
+            # `(struct T) value` — type-pun into a struct/union
+            # via a per-cast temp slot.
+            size = (self._size_of(sub.target_type) + 3) & ~3
+            ctx.alloc_call_temp(sub, size)
+        elif (
+            isinstance(sub, ast.Cast)
+            and isinstance(sub.target_type, ast.ArrayType)
+            and getattr(sub.target_type, "is_vector", False)
+        ):
+            # `(vec_t) scalar` — type-pun a scalar value into a
+            # vector slot. The codegen needs an address to hand
+            # back to consumers, so allocate a temp.
+            src_ty_check = None
+            try:
+                src_ty_check = self._type_of(sub.expr, ctx)
+            except CodegenError:
+                pass
+            if not isinstance(src_ty_check, ast.ArrayType):
                 size = (self._size_of(sub.target_type) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
-            elif (
-                isinstance(sub, ast.Cast)
-                and isinstance(sub.target_type, ast.ArrayType)
-                and getattr(sub.target_type, "is_vector", False)
-            ):
-                # `(vec_t) scalar` — type-pun a scalar value into a
-                # vector slot. The codegen needs an address to hand
-                # back to consumers, so allocate a temp.
-                src_ty_check = None
-                try:
-                    src_ty_check = self._type_of(sub.expr, ctx)
-                except CodegenError:
-                    pass
-                if not isinstance(src_ty_check, ast.ArrayType):
-                    size = (self._size_of(sub.target_type) + 3) & ~3
-                    ctx.alloc_call_temp(sub, size)
-            elif isinstance(sub, (ast.BinaryOp, ast.UnaryOp, ast.Cast, ast.TernaryOp)):
-                # Complex-valued sub-expression: needs a temp slot
-                # to hold the (real, imag) result. One per node so
-                # `(a+b) + (c+d)` allocates distinct buffers.
-                # `_type_of` may fail because the temp-collection
-                # pass runs after the local-scope chain has been
-                # exited; fall back to the structural complex
-                # detector for those cases.
-                try:
-                    ty = self._type_of(sub, ctx)
-                except CodegenError:
-                    ty = self._type_of_complex_expr(sub)
-                if isinstance(ty, ast.ComplexType):
-                    size = (self._size_of(ty) + 3) & ~3
-                    ctx.alloc_call_temp(sub, size)
-                elif (
-                    isinstance(ty, ast.ArrayType)
-                    and self._is_vector_op_node(sub)
-                    and self._is_genuine_vector_op(sub, ctx)
-                ):
-                    # Vector arithmetic / unary: needs a temp to hold
-                    # the componentwise result. Distinguish from
-                    # pointer arithmetic (`arr + i`) which also has
-                    # ArrayType-flavored result type.
-                    size = (self._size_of(ty) + 3) & ~3
-                    ctx.alloc_call_temp(sub, size)
-                elif self._is_int128(ty):
-                    # __int128 arithmetic / cast / ternary: needs a
-                    # 16-byte temp to hold the result. Per-node so
-                    # chained ops get distinct slots.
-                    ctx.alloc_call_temp(sub, 16)
-            elif (
-                isinstance(sub, ast.FloatLiteral) and sub.is_imaginary
-            ):
-                # `1.0i` as a complex value — needs a temp slot.
+        elif isinstance(sub, (ast.BinaryOp, ast.UnaryOp, ast.Cast, ast.TernaryOp)):
+            # Complex-valued sub-expression: needs a temp slot
+            # to hold the (real, imag) result. One per node so
+            # `(a+b) + (c+d)` allocates distinct buffers.
+            # `_type_of` may fail because the temp-collection
+            # pass runs after the local-scope chain has been
+            # exited; fall back to the structural complex
+            # detector for those cases.
+            try:
+                ty = self._type_of(sub, ctx)
+            except CodegenError:
                 ty = self._type_of_complex_expr(sub)
-                if isinstance(ty, ast.ComplexType):
-                    size = (self._size_of(ty) + 3) & ~3
-                    ctx.alloc_call_temp(sub, size)
+            if isinstance(ty, ast.ComplexType):
+                size = (self._size_of(ty) + 3) & ~3
+                ctx.alloc_call_temp(sub, size)
             elif (
-                isinstance(sub, ast.VaArgExpr)
-                and self._is_int128(sub.target_type)
+                isinstance(ty, ast.ArrayType)
+                and self._is_vector_op_node(sub)
+                and self._is_genuine_vector_op(sub, ctx)
             ):
-                # `va_arg(ap, __int128)` materializes into a per-call
-                # 16-byte temp; consumers see the temp's address.
+                # Vector arithmetic / unary: needs a temp to hold
+                # the componentwise result. Distinguish from
+                # pointer arithmetic (`arr + i`) which also has
+                # ArrayType-flavored result type.
+                size = (self._size_of(ty) + 3) & ~3
+                ctx.alloc_call_temp(sub, size)
+            elif self._is_int128(ty):
+                # __int128 arithmetic / cast / ternary: needs a
+                # 16-byte temp to hold the result. Per-node so
+                # chained ops get distinct slots.
                 ctx.alloc_call_temp(sub, 16)
+        elif (
+            isinstance(sub, ast.FloatLiteral) and sub.is_imaginary
+        ):
+            # `1.0i` as a complex value — needs a temp slot.
+            ty = self._type_of_complex_expr(sub)
+            if isinstance(ty, ast.ComplexType):
+                size = (self._size_of(ty) + 3) & ~3
+                ctx.alloc_call_temp(sub, size)
+        elif (
+            isinstance(sub, ast.VaArgExpr)
+            and self._is_int128(sub.target_type)
+        ):
+            # `va_arg(ap, __int128)` materializes into a per-call
+            # 16-byte temp; consumers see the temp's address.
+            ctx.alloc_call_temp(sub, 16)
 
     def _compound_temp_size(self, node: ast.Compound) -> int:
         """Size of the per-call-site temp slot for a compound literal.

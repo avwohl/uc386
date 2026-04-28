@@ -3352,6 +3352,32 @@ def test_decimal64_keyword_compiles_as_double():
     assert "section .data" in asm
 
 
+def test_for_loop_same_name_different_types_allocates_int128_temp():
+    # Two for-loops in sequence each declaring `i` — first int, then
+    # __int128. `_collect_call_temps` previously walked with a flat
+    # name-keyed scope; the second `i` was deduplicated against the
+    # first, so `_type_of(Identifier("i"))` returned `int` for the
+    # u128 for-loop's `i++`. The int128 UnaryOp temp wasn't allocated
+    # and codegen failed with "can't take address of __int128 UnaryOp".
+    # Fix: scope-aware traversal in `_collect_call_temps_walk`
+    # mirrors `_collect_locals` so each for-init's `i` lives in its
+    # own scope.
+    asm = _compile(
+        "typedef unsigned __int128 u128;\n"
+        "int main(void) {\n"
+        "    for (int i = 1; i <= 10; i++) { (void)i; }\n"
+        "    u128 total = 0;\n"
+        "    for (u128 i = 0; i < 100; i++) total += i;\n"
+        "    return (unsigned long long)total == 4950 ? 0 : 1;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+    # Per-frame int128 temp slot for the UnaryOp(++); without it the
+    # generator would have raised. Verify by spot-checking that the
+    # int128 add chain (add/adc/adc/adc) appears in the body.
+    assert "        adc     [edi + 12], eax" in asm
+
+
 def test_nested_fn_with_nonlocal_goto_emits_trampoline_and_setjmp():
     asm = _compile(
         "extern void exit(int);\n"
