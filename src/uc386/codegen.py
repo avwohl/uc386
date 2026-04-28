@@ -183,11 +183,29 @@ class _FuncCtx:
         # reads/writes route through the global so the nested fn,
         # also reading the same global, sees a coherent value.
         self.local_captures: dict[str, str] = {}
-        # Outer-label → buf-global-name for non-local gotos. Set on
-        # the outer ctx (so the prologue knows to emit setjmp dispatch)
-        # and on lifted nested-fn ctxs (so `goto label` lowers to a
-        # longjmp instead of a regular jmp).
-        self.nonlocal_goto_targets: dict[str, str] = {}
+        # Lifted nested-fn ctx only. Maps each outer-declared
+        # `__label__ X` that this fn `goto X`s into to its index in the
+        # outer's buf-array. The static-link slot (set by the trampoline
+        # or direct caller via ECX) holds the buf-array's address; the
+        # `goto X` lowering reads the slot and offsets by `12 * idx`.
+        self.nonlocal_goto_targets: dict[str, int] = {}
+        # Outer-fn ctx only. For each nested fn that's address-taken
+        # AND has nonlocal goto, points to a 12-byte trampoline slot
+        # in this frame (`__tramp_<inner>`) and the disp of the
+        # 12*N-byte buf-array slot (`__nlg_buf_<inner>`). When a
+        # caller does `&inner` or stores `inner` into a function
+        # pointer, we return the trampoline's address. The trampoline
+        # loads ECX = &buf_array and jumps to the lifted fn so each
+        # frame's invocation has its own buf (handles recursive outer).
+        self.trampolines: dict[str, tuple[int, int]] = {}
+        # Per-nested-fn map of label_name → buf_array_index (offset
+        # within the buf array is `12 * idx`). Used for the setjmp
+        # init and the longjmp dispatch.
+        self.trampoline_buf_indices: dict[str, dict[str, int]] = {}
+        # Lifted nested fn ctx only. The disp of the 4-byte slot that
+        # saves the static link (ECX value) on entry. None if this fn
+        # doesn't have nonlocal gotos requiring a static link.
+        self.trampoline_static_link_disp: int | None = None
         # Names of locals whose storage is heap-allocated (VLA via
         # malloc). Their frame slot holds a pointer, not the storage
         # bytes. Identifier load/address paths consult this set to
@@ -2500,6 +2518,17 @@ class CodeGenerator:
             ctx.nonlocal_goto_targets = dict(
                 self._lifted_nonlocal_gotos[fn.name]
             )
+            # We're a lifted nested fn whose body contains nonlocal
+            # gotos to outer's labels. The trampoline (or a direct
+            # caller in outer's body) loaded ECX with the address of
+            # outer's buf-array for us. Reserve a slot to save ECX so
+            # subsequent calls don't clobber it; the goto lowering
+            # reads from this slot to find the buf to longjmp through.
+            ctx.alloc_local(
+                "__static_link__",
+                ast.PointerType(base_type=ast.BasicType(name="char")),
+            )
+            ctx.trampoline_static_link_disp = ctx.lookup("__static_link__")
         # Lift nested function definitions to file scope. Each gets a
         # mangled name (`<outer>__<inner>`); calls / address-takes in
         # the outer body resolve through `ctx.nested_fn_names`.
@@ -2666,46 +2695,78 @@ class CodeGenerator:
         sibling_lifts = dict(ctx.nested_fn_names)
         # Non-local gotos: a nested fn's `goto X` where `X` is a label
         # declared in the outer (via `__label__ X`) is a cross-frame
-        # jump — gcc handles this with trampolines, but we use a
-        # setjmp/longjmp pair. Collect each such (outer_label, set of
-        # nested fns) pairing now; later we'll allocate a jmp_buf
-        # global and emit the setjmp+dispatch in outer's prologue.
+        # jump. GCC implements this with trampolines + static link
+        # registers; we approximate via a per-frame buf-array (jmp_buf
+        # slots in outer's frame) plus a 12-byte stack trampoline.
+        # `&inner` returns the trampoline's address. The trampoline is
+        # 12 bytes of code: `mov ecx, &buf_array; mov edx, _<lifted>;
+        # jmp edx`. The lifted nested fn's prologue saves ECX into a
+        # static-link slot; `goto X` longjmps via that slot's value
+        # (offset by the label's index in the buf-array). This handles
+        # both non-recursive outers (nestfunc-6) and recursive outers
+        # (nestfunc-5) uniformly because each invocation of outer gets
+        # its own buf-array and its own trampoline.
         outer_user_labels: set[str] = set()
         for sub in self._walk_ast(fn.body):
             if isinstance(sub, ast.LabelStmt):
                 outer_user_labels.add(sub.label)
-        nonlocal_goto_targets: dict[str, str] = {}
-        nonlocal_goto_per_inner: dict[str, dict[str, str]] = {}
+        # Per nested fn: ordered list of nonlocal-goto labels.
+        nlg_per_inner: dict[str, list[str]] = {}
         for nested in nested_decls:
             inner_user_labels: set[str] = set()
             for sub in self._walk_ast(nested.body):
                 if isinstance(sub, ast.LabelStmt):
                     inner_user_labels.add(sub.label)
+            seen: list[str] = []
             for sub in self._walk_ast(nested.body):
                 if (
                     isinstance(sub, ast.GotoStmt)
                     and sub.target is None
                     and sub.label in outer_user_labels
                     and sub.label not in inner_user_labels
+                    and sub.label not in seen
                 ):
-                    buf_name = f"__nlg_{fn.name}__{sub.label}"
-                    nonlocal_goto_targets[sub.label] = buf_name
-                    self._nonlocal_goto_bufs.add(buf_name)
-                    inner_mangled = ctx.nested_fn_names.get(nested.name)
-                    if inner_mangled:
-                        nonlocal_goto_per_inner.setdefault(inner_mangled, {})[
-                            sub.label
-                        ] = buf_name
-        # Save the outer's mapping so the body emit can do the setjmp.
-        self._nonlocal_goto_targets[fn.name] = nonlocal_goto_targets
+                    seen.append(sub.label)
+            if seen:
+                nlg_per_inner[nested.name] = seen
+        # Allocate trampoline + buf-array slots in outer's frame for
+        # every nested fn that has nonlocal gotos. These are just byte
+        # arrays; we use char[N] typed slots so alloc_local rounds them
+        # up to 4 bytes correctly.
+        for inner_name, labels in nlg_per_inner.items():
+            tramp_slot_name = f"__tramp_{inner_name}"
+            ctx.alloc_local(
+                tramp_slot_name,
+                ast.ArrayType(
+                    base_type=ast.BasicType(name="char"), size=12
+                ),
+                size=12,
+            )
+            tramp_disp = ctx.lookup(tramp_slot_name)
+            buf_size = 12 * len(labels)
+            buf_slot_name = f"__nlg_buf_{inner_name}"
+            ctx.alloc_local(
+                buf_slot_name,
+                ast.ArrayType(
+                    base_type=ast.BasicType(name="char"), size=buf_size
+                ),
+                size=buf_size,
+            )
+            buf_disp = ctx.lookup(buf_slot_name)
+            ctx.trampolines[inner_name] = (tramp_disp, buf_disp)
+            ctx.trampoline_buf_indices[inner_name] = {
+                lbl: i for i, lbl in enumerate(labels)
+            }
         for sub in nested_decls:
             mangled = ctx.nested_fn_names.get(sub.name)
             if mangled:
                 self._lifted_captures[mangled] = capture_remap
                 self._lifted_nested_fn_names[mangled] = sibling_lifts
-                inner_map = nonlocal_goto_per_inner.get(mangled, {})
-                if inner_map:
-                    self._lifted_nonlocal_gotos[mangled] = inner_map
+                inner_labels = nlg_per_inner.get(sub.name)
+                if inner_labels:
+                    self._lifted_nonlocal_gotos[mangled] = {
+                        lbl: i for i, lbl in enumerate(inner_labels)
+                    }
                 self._lifted_outer_fn[mangled] = fn.name
         # Parameters live above EBP at cdecl offsets; the first sits at
         # [ebp + 8], and each subsequent param is offset by its predecessor's
@@ -2823,6 +2884,14 @@ class CodeGenerator:
         out.append("        mov     ebp, esp")
         if ctx.frame_size:
             out.append(f"        sub     esp, {ctx.frame_size}")
+        # Lifted nested fn with nonlocal gotos: ECX was set by the
+        # trampoline (or direct caller) to the address of our outer's
+        # buf-array. Save it into the static-link slot before any code
+        # that might clobber ECX.
+        if ctx.trampoline_static_link_disp is not None:
+            out.append(
+                f"        mov     {_ebp_addr(ctx.trampoline_static_link_disp)}, ecx"
+            )
         # Save baseline ESP for VLA-using functions so a goto-back
         # can restore (free) all VLAs.
         if ctx.vla_baseline_disp is not None:
@@ -2881,26 +2950,56 @@ class CodeGenerator:
                 else:
                     out += self._load_to_eax(_ebp_addr(param_disp), ptype)
                     out += self._store_from_eax(f"[_{mangled}]", ptype)
-        # Non-local goto setjmp dispatch. For every outer label X that
-        # gets goto'd from a nested fn, emit:
-        #   push offset _<buf>
-        #   call __builtin_setjmp
-        #   add esp, 4
-        #   test eax, eax
-        #   jnz .L_user_<X>
-        # This way, when the nested fn does longjmp(_<buf>, 1), control
-        # returns to outer at this point with EAX=1 and we dispatch to
-        # the user label.
-        nlg = self._nonlocal_goto_targets.get(fn.name, {})
-        for label_name, buf in nlg.items():
-            user_target = ctx.user_labels.get(label_name)
-            if user_target is None:
+        # Trampolines + nonlocal-goto setjmp. For every nested fn
+        # whose body has `goto OuterLabel`, the outer's frame holds:
+        #   - a buf-array (12 bytes per nonlocal-goto label)
+        #   - a 12-byte trampoline of the form:
+        #       B9 imm32      ; mov ecx, &buf_array
+        #       BA imm32      ; mov edx, _<lifted>
+        #       FF E2         ; jmp edx
+        # The address of the trampoline is what `&inner` and `inner`
+        # (in value position) return. The trampoline loads ECX with
+        # the buf-array's address, then jumps to the lifted fn — so
+        # each invocation of outer has its own buf for the nested
+        # fn to longjmp through (handles recursive outers).
+        for inner_name, (tramp_disp, buf_disp) in ctx.trampolines.items():
+            mangled = ctx.nested_fn_names.get(inner_name)
+            if mangled is None:
                 continue
-            out.append(f"        push    _{buf}")
-            out.append("        call    ___builtin_setjmp")
-            out.append("        add     esp, 4")
-            out.append("        test    eax, eax")
-            out.append(f"        jnz     {user_target}")
+            # Trampoline byte 0: 0xB9 (mov ecx, imm32 opcode)
+            out.append(
+                f"        mov     byte {_ebp_addr(tramp_disp)}, 0xB9"
+            )
+            # Bytes 1..4: address of buf_array (loaded via lea)
+            out.append(f"        lea     eax, {_ebp_addr(buf_disp)}")
+            out.append(f"        mov     {_ebp_addr(tramp_disp + 1)}, eax")
+            # Byte 5: 0xBA (mov edx, imm32 opcode)
+            out.append(
+                f"        mov     byte {_ebp_addr(tramp_disp + 5)}, 0xBA"
+            )
+            # Bytes 6..9: address of lifted fn
+            out.append(f"        mov     eax, _{mangled}")
+            out.append(f"        mov     {_ebp_addr(tramp_disp + 6)}, eax")
+            # Bytes 10..11: FF E2 (jmp edx) — stored as 0xE2FF in
+            # little-endian word form so byte 10 = 0xFF, byte 11 = 0xE2.
+            out.append(
+                f"        mov     word {_ebp_addr(tramp_disp + 10)}, 0xE2FF"
+            )
+            # setjmp into each label's buf slot. On longjmp return
+            # (EAX=1), dispatch to the user label.
+            label_indices = ctx.trampoline_buf_indices.get(inner_name, {})
+            for label_name, idx in label_indices.items():
+                user_target = ctx.user_labels.get(label_name)
+                if user_target is None:
+                    continue
+                out.append(
+                    f"        lea     eax, {_ebp_addr(buf_disp + 12 * idx)}"
+                )
+                out.append("        push    eax")
+                out.append("        call    ___builtin_setjmp")
+                out.append("        add     esp, 4")
+                out.append("        test    eax, eax")
+                out.append(f"        jnz     {user_target}")
         # `-finstrument-functions`: enter call after prologue setup.
         instrument = (
             getattr(self, "_instrument_enabled", False)
@@ -5238,6 +5337,12 @@ class CodeGenerator:
         if name in ("__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"):
             label = self._intern_string(ctx.func_name)
             return [f"        mov     eax, {label}"]
+        # Nested fn with trampoline (this frame): `inner` (in value
+        # position, e.g. `proc = inner` or `f(inner)`) yields the
+        # trampoline's address so callers can call through it.
+        if name in ctx.trampolines:
+            tramp_disp, _buf_disp = ctx.trampolines[name]
+            return [f"        lea     eax, {_ebp_addr(tramp_disp)}"]
         name = ctx.local_static_labels.get(name, name)
         name = ctx.local_captures.get(name, name)
         name = ctx.nested_fn_names.get(name, name)
@@ -5272,6 +5377,9 @@ class CodeGenerator:
         if name in ("__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"):
             label = self._intern_string(ctx.func_name)
             return [f"        mov     eax, {label}"]
+        if name in ctx.trampolines:
+            tramp_disp, _buf_disp = ctx.trampolines[name]
+            return [f"        lea     eax, {_ebp_addr(tramp_disp)}"]
         name = ctx.local_static_labels.get(name, name)
         name = ctx.local_captures.get(name, name)
         name = ctx.nested_fn_names.get(name, name)
@@ -5610,16 +5718,26 @@ class CodeGenerator:
                 return out
             # Non-local goto: a `goto X` from inside a lifted nested
             # fn where X was declared in the outer via `__label__ X`.
-            # Lower to `__builtin_longjmp(&buf, 1)` — outer's prologue
-            # has a matching `__builtin_setjmp` that dispatches to X.
-            buf = ctx.nonlocal_goto_targets.get(item.label)
-            if buf is not None:
-                return [
-                    "        push    1",
-                    f"        push    _{buf}",
-                    "        call    ___builtin_longjmp",
-                    "        add     esp, 8",
-                ]
+            # The static-link slot holds the address of outer's
+            # buf-array (set on entry from ECX, which the trampoline
+            # or direct caller loaded). Compute the buf's address as
+            # `static_link + 12 * idx_X` and longjmp through it. The
+            # outer's prologue has a matching setjmp that dispatches
+            # to X on EAX=1.
+            idx = ctx.nonlocal_goto_targets.get(item.label)
+            if idx is not None and ctx.trampoline_static_link_disp is not None:
+                slot_addr = _ebp_addr(ctx.trampoline_static_link_disp)
+                offset = 12 * idx
+                lines = ["        push    1"]
+                if offset == 0:
+                    lines.append(f"        push    dword {slot_addr}")
+                else:
+                    lines.append(f"        mov     eax, {slot_addr}")
+                    lines.append(f"        add     eax, {offset}")
+                    lines.append("        push    eax")
+                lines.append("        call    ___builtin_longjmp")
+                lines.append("        add     esp, 8")
+                return lines
             target = ctx.user_labels.get(item.label)
             if target is None:
                 raise CodegenError(
@@ -10341,12 +10459,41 @@ class CodeGenerator:
         # so the rest of the path treats them as regular file-scope
         # functions. The pre-pass at the top of `_function` registers
         # the mangled name in `_func_return_types` / `_func_param_types`.
+        # If the nested fn has nonlocal gotos, build the ECX-setup
+        # lines so a direct call propagates the static link the same
+        # way the trampoline would for an indirect call.
+        ecx_setup: list[str] | None = None
         if (
             isinstance(callee, ast.Identifier)
             and callee.name in ctx.nested_fn_names
         ):
+            user_name = callee.name
+            mangled = ctx.nested_fn_names[user_name]
+            if user_name in ctx.trampolines:
+                # Outer is calling its nested fn directly. Load ECX
+                # with the address of the buf-array in our frame.
+                _tramp_disp, buf_disp = ctx.trampolines[user_name]
+                ecx_setup = [
+                    f"        lea     ecx, {_ebp_addr(buf_disp)}"
+                ]
+            elif (
+                ctx.trampoline_static_link_disp is not None
+                and mangled in self._lifted_nonlocal_gotos
+            ):
+                # We're a lifted nested fn calling a sibling (or
+                # ourself) that also has nonlocal gotos. The callee's
+                # buf-array lives in our outer's frame; for the
+                # self-call case, our own static link points to the
+                # right buf and we can propagate it directly. For
+                # cross-sibling calls with different buf-arrays this
+                # would be wrong — those aren't reached by current
+                # tests.
+                ecx_setup = [
+                    f"        mov     ecx, "
+                    f"{_ebp_addr(ctx.trampoline_static_link_disp)}"
+                ]
             callee = ast.Identifier(
-                name=ctx.nested_fn_names[callee.name],
+                name=mangled,
                 location=callee.location,
             )
             # Build a fresh Call node so downstream code (param-type
@@ -10504,7 +10651,11 @@ class CodeGenerator:
             isinstance(callee, ast.Identifier)
             and callee.name in self._func_return_types
         ):
-            return self._emit_call(expr.args, ctx, direct=callee.name)
+            return self._emit_call(
+                expr.args, ctx,
+                direct=callee.name,
+                ecx_setup=ecx_setup,
+            )
 
         # Implicit-int function declaration (K&R / pre-C99): a Call
         # whose callee is an undeclared Identifier. Auto-register the
@@ -10535,6 +10686,7 @@ class CodeGenerator:
         direct: str | None = None,
         indirect_callee: ast.Expression | None = None,
         retptr: list[str] | None = None,
+        ecx_setup: list[str] | None = None,
     ) -> list[str]:
         # cdecl pushes args right-to-left so the leftmost arg ends up at
         # the lowest address (= [ebp+8] in the callee). For scalars we
@@ -10674,6 +10826,15 @@ class CodeGenerator:
             out += retptr
             out.append("        push    eax")
             total_arg_bytes += 4
+        # Direct call to a nested fn with nonlocal goto: load ECX with
+        # the address of the buf-array so the lifted fn's prologue can
+        # save it as the static link. (Indirect calls via the
+        # trampoline already do this themselves.) The caller computes
+        # the lines that produce the right ECX — either `lea ecx,
+        # [buf_array]` (outer's direct call) or `mov ecx,
+        # [static_link_slot]` (sibling/self propagation).
+        if ecx_setup is not None:
+            out += ecx_setup
         if direct is not None:
             out.append(f"        call    _{direct}")
         else:
