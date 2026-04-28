@@ -534,3 +534,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **uc386 _start re-zero**: emits `cld; xor eax, eax; mov edi, _bss_zero_start; mov ecx, _bss_zero_end; sub ecx, edi; rep stosb` after FPU init. Recursive `_start()` calls (noinit-attribute test idiom) re-zero scratch state but preserve noinit globals' values across the call. First-time entry is a no-op (DOS loader already zeroed BSS). Closes noinit-attribute.
 
   **Result: 1506/1514 gcc-c-torture** (+1 test). Combined with c-testsuite 218/220, the pipeline now passes 1724/1734 (99.42%).
+- **2026-04-28 — torture sweep: gnu_inline + __builtin_va_arg_pack (1506 → 1507)**:
+  - **gnu_inline detection**: identify `extern inline` functions whose body uses `__builtin_va_arg_pack`. These represent GCC's "inline-only" pattern — inlined at every call site, no out-of-line copy generated. Excluded from the `functions` list and from the externs set.
+  - **Call-site inlining**: at each call to a gnu_inline function, allocate a fresh frame slot for each named param, evaluate the call's arg into the slot, then build a substituted body via deepcopy + walker. The walker replaces `Identifier(param.name)` with `Identifier(slot_name)` and splices `Call(__builtin_va_arg_pack)` in nested Call args with the call's variadic arg expressions. Two body shapes are supported: `{ return E; }` and `{ if (cond) return E1; return E2; }`. Lowered with jump labels: eval cond, test/jz, eval E1, jmp end, .else: eval E2, .end:.
+  - **Variadic args evaluated once**: each variadic arg substitutes by reference (deepcopied) into the chosen branch's foo args list, so it's evaluated exactly once when its containing Call is lowered. The named param's arg evaluates once into the slot regardless of body branches. Closes va-arg-pack-1.
+
+  **Result: 1507/1514 gcc-c-torture** (+1 test). Combined with c-testsuite 218/220, the pipeline now passes 1725/1734 (99.48%).

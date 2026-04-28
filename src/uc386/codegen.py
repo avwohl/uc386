@@ -377,9 +377,26 @@ class CodeGenerator:
         # the rest of `generate()` can iterate uniformly.
         top_decls = list(self._flatten_decls(unit.declarations))
 
+        # Identify `extern inline` functions whose body uses
+        # `__builtin_va_arg_pack`. These are GCC's gnu_inline pattern:
+        # the function is inlined at every call site, with the va_arg_pack
+        # expanding to the variadic args of the surrounding call. We
+        # don't generate a standalone body for them.
+        self._gnu_inline_funcs: dict[str, ast.FunctionDecl] = {}
+        for d in top_decls:
+            if not (isinstance(d, ast.FunctionDecl) and d.body is not None):
+                continue
+            if not (getattr(d, "storage_class", None) == "extern"
+                    and getattr(d, "is_inline", False)):
+                continue
+            if not self._body_uses_va_arg_pack(d.body):
+                continue
+            self._gnu_inline_funcs[d.name] = d
+
         functions = [
             d for d in top_decls
             if isinstance(d, ast.FunctionDecl) and d.body is not None
+            and d.name not in self._gnu_inline_funcs
         ]
         if not any(fn.name == "main" for fn in functions):
             raise CodegenError("uc386 requires a `main` function definition")
@@ -396,6 +413,9 @@ class CodeGenerator:
             elif isinstance(d, ast.VarDecl) and isinstance(d.var_type, ast.FunctionType):
                 externs.add(d.name)
         externs -= defined_names
+        # gnu_inline functions are never extern symbols — they're
+        # inlined at every call site, so the linker shouldn't see them.
+        externs -= set(self._gnu_inline_funcs.keys())
         # Drop `_start` — we always define it (and its `__start` alias)
         # as the program entry stub. The user's `extern void _start(void)`
         # would otherwise conflict with our self-defined entry symbol.
@@ -3066,6 +3086,167 @@ class CodeGenerator:
                 length = 0
             return ((length * self._size_of(ty.base_type)) + 3) & ~3
         return (self._size_of(ty) + 3) & ~3
+
+    @staticmethod
+    def _body_uses_va_arg_pack(body) -> bool:
+        for n in CodeGenerator._walk_ast(body):
+            if (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Identifier)
+                and n.func.name == "__builtin_va_arg_pack"
+            ):
+                return True
+        return False
+
+    def _substitute_inline(self, node, param_map, va_args):
+        """Walk a deepcopied AST replacing param-Identifier refs and
+        splicing __builtin_va_arg_pack() in Call args. Returns the
+        (possibly new) node. Mutates leaf containers in place."""
+        import copy
+        if node is None:
+            return None
+        if (isinstance(node, ast.Identifier)
+                and node.name in param_map):
+            return ast.Identifier(
+                name=param_map[node.name],
+                location=node.location,
+            )
+        if isinstance(node, ast.Call):
+            node.func = self._substitute_inline(
+                node.func, param_map, va_args
+            )
+            new_args = []
+            for a in node.args:
+                if (isinstance(a, ast.Call)
+                        and isinstance(a.func, ast.Identifier)
+                        and a.func.name == "__builtin_va_arg_pack"):
+                    for va in va_args:
+                        new_args.append(self._substitute_inline(
+                            copy.deepcopy(va), param_map, va_args
+                        ))
+                else:
+                    new_args.append(self._substitute_inline(
+                        a, param_map, va_args
+                    ))
+            node.args = new_args
+            return node
+        if dataclasses.is_dataclass(node):
+            for f in dataclasses.fields(node):
+                child = getattr(node, f.name, None)
+                if child is None:
+                    continue
+                if isinstance(child, list):
+                    new_list = [
+                        self._substitute_inline(c, param_map, va_args)
+                        if dataclasses.is_dataclass(c) or isinstance(c, list)
+                        else c
+                        for c in child
+                    ]
+                    setattr(node, f.name, new_list)
+                elif dataclasses.is_dataclass(child):
+                    setattr(node, f.name,
+                            self._substitute_inline(child, param_map, va_args))
+        return node
+
+    def _call_inline_gnu(
+        self,
+        expr: ast.Call,
+        fn: ast.FunctionDecl,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Inline a gnu_inline function at the call site.
+
+        Supports two body shapes:
+          { return E; }
+          { if (cond) return E1; return E2; }
+
+        Each named param gets a fresh int slot; the call's arg evaluates
+        once into the slot, and the slot's Identifier substitutes for
+        the param in the body. `__builtin_va_arg_pack()` in nested Call
+        args expands to the call's variadic args (each evaluated once
+        in its containing call).
+        """
+        import copy
+        body = fn.body
+        if not isinstance(body, ast.CompoundStmt):
+            raise CodegenError(
+                f"gnu_inline {fn.name}: body must be a compound stmt"
+            )
+        # Detect body shape.
+        items = body.items
+        cond_expr = None
+        e1_expr = None
+        e2_expr = None
+        if len(items) == 1 and isinstance(items[0], ast.ReturnStmt):
+            e1_expr = items[0].value
+        elif (len(items) == 2
+                and isinstance(items[0], ast.IfStmt)
+                and items[0].else_branch is None
+                and isinstance(items[1], ast.ReturnStmt)):
+            then_branch = items[0].then_branch
+            if (isinstance(then_branch, ast.CompoundStmt)
+                    and len(then_branch.items) == 1):
+                then_branch = then_branch.items[0]
+            if not isinstance(then_branch, ast.ReturnStmt):
+                raise CodegenError(
+                    f"gnu_inline {fn.name}: unsupported body shape"
+                )
+            cond_expr = items[0].condition
+            e1_expr = then_branch.value
+            e2_expr = items[1].value
+        else:
+            raise CodegenError(
+                f"gnu_inline {fn.name}: unsupported body shape"
+            )
+        # Allocate temp slots for named params; eval args into temps.
+        n_params = len(fn.params)
+        args = expr.args
+        if len(args) < n_params:
+            raise CodegenError(
+                f"gnu_inline {fn.name}: too few args"
+            )
+        param_args = args[:n_params]
+        var_args = args[n_params:]
+        out: list[str] = []
+        param_map: dict[str, str] = {}
+        # Use a stable per-call-site key for slot names so multiple
+        # call sites get distinct slots.
+        site_key = f"{id(expr):x}"
+        for p, arg in zip(fn.params, param_args):
+            slot_name = f"__inline_{fn.name}_{site_key}_{p.name}"
+            ptype = p.param_type
+            size = (self._size_of(ptype) + 3) & ~3
+            ctx.alloc_local(slot_name, ptype, size=size)
+            disp = ctx.lookup(slot_name)
+            # Eval and store. For simplicity assume int-family (4 bytes).
+            # Float / struct / long-long params via gnu_inline aren't
+            # exercised by the torture suite va_arg_pack tests.
+            out += self._eval_expr_to_eax(arg, ctx)
+            out.append(
+                f"        mov     {_ebp_addr(disp)}, eax"
+            )
+            param_map[p.name] = slot_name
+        # Build substituted expressions.
+        def subst(e):
+            return self._substitute_inline(
+                copy.deepcopy(e), param_map, var_args
+            )
+        # Lower as if/else, returning result in EAX.
+        if cond_expr is None:
+            # Single-return body.
+            out += self._eval_expr_to_eax(subst(e1_expr), ctx)
+            return out
+        else_lbl = ctx.label(f"inline_{fn.name}_else")
+        end_lbl = ctx.label(f"inline_{fn.name}_end")
+        out += self._eval_expr_to_eax(subst(cond_expr), ctx)
+        out.append("        test    eax, eax")
+        out.append(f"        jz      {else_lbl}")
+        out += self._eval_expr_to_eax(subst(e1_expr), ctx)
+        out.append(f"        jmp     {end_lbl}")
+        out.append(f"{else_lbl}:")
+        out += self._eval_expr_to_eax(subst(e2_expr), ctx)
+        out.append(f"{end_lbl}:")
+        return out
 
     @staticmethod
     def _walk_ast(node):
@@ -10037,6 +10218,17 @@ class CodeGenerator:
         # Struct-returning calls are handled in `_eval_expr_to_eax` (via
         # the per-call temp) before reaching here.
         callee = self._stripped_callee(expr)
+        # gnu_inline functions get inlined at every call site instead of
+        # generating a regular `call _name`. The body uses
+        # `__builtin_va_arg_pack()` which requires the caller's variadic
+        # args at compile time.
+        if (
+            isinstance(callee, ast.Identifier)
+            and callee.name in self._gnu_inline_funcs
+        ):
+            return self._call_inline_gnu(
+                expr, self._gnu_inline_funcs[callee.name], ctx,
+            )
         # Rebind nested-fn names to their lifted top-level mangled name
         # so the rest of the path treats them as regular file-scope
         # functions. The pre-pass at the top of `_function` registers
