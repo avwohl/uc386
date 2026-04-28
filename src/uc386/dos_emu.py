@@ -300,18 +300,31 @@ def run(
                     elif val >= 0x80000000:
                         val -= 0x100000000
                 if val >= 0:
-                    if plus_flag:
-                        s = b"+" + str(val).encode()
-                    elif space_flag:
-                        s = b" " + str(val).encode()
-                    else:
-                        s = str(val).encode()
+                    digits = str(val).encode()
+                    sign = b"+" if plus_flag else (b" " if space_flag else b"")
                 else:
-                    s = str(val).encode()
-                pad = b"0" if zero_pad else b" "
+                    digits = str(-val).encode()
+                    sign = b"-"
+                # Per C99 7.21.6.1#5: "The result of converting a zero
+                # value with a precision of zero is no characters."
+                if val == 0 and precision == 0:
+                    digits = b""
+                # Precision = minimum digit count (zero-pad digits).
+                # Per C99 7.21.6.1#5: when precision is given, the
+                # `0` flag is ignored.
+                if precision >= 0 and len(digits) < precision:
+                    digits = b"0" * (precision - len(digits)) + digits
+                s = sign + digits
+                if precision >= 0:
+                    pad = b" "
+                else:
+                    pad = b"0" if zero_pad else b" "
                 if width > len(s):
                     if left_align:
                         s = s + b" " * (width - len(s))
+                    elif pad == b"0" and sign:
+                        # Zero pad goes between the sign and the digits.
+                        s = sign + b"0" * (width - len(s)) + digits
                     else:
                         s = pad * (width - len(s)) + s
                 out += s
@@ -325,23 +338,36 @@ def run(
                     elif length_short:
                         val &= 0xFFFF
                 if conv == b"u":
-                    s = str(val).encode()
+                    digits = str(val).encode()
+                    prefix = b""
                 elif conv == b"x":
-                    s = f"{val:x}".encode()
-                    if hash_flag and val != 0:
-                        s = b"0x" + s
+                    digits = f"{val:x}".encode()
+                    prefix = b"0x" if (hash_flag and val != 0) else b""
                 elif conv == b"X":
-                    s = f"{val:X}".encode()
-                    if hash_flag and val != 0:
-                        s = b"0X" + s
+                    digits = f"{val:X}".encode()
+                    prefix = b"0X" if (hash_flag and val != 0) else b""
                 else:  # o
-                    s = f"{val:o}".encode()
-                    if hash_flag and not s.startswith(b"0"):
-                        s = b"0" + s
-                pad = b"0" if zero_pad else b" "
+                    digits = f"{val:o}".encode()
+                    prefix = b"" if digits.startswith(b"0") else (b"0" if hash_flag else b"")
+                # Per C99: zero value with precision 0 produces no
+                # characters (except for `o` with `#` flag, which
+                # still gets the leading `0`).
+                if val == 0 and precision == 0:
+                    digits = b""
+                # Precision = minimum digit count.
+                if precision >= 0 and len(digits) < precision:
+                    digits = b"0" * (precision - len(digits)) + digits
+                s = prefix + digits
+                if precision >= 0:
+                    pad = b" "
+                else:
+                    pad = b"0" if zero_pad else b" "
                 if width > len(s):
                     if left_align:
                         s = s + b" " * (width - len(s))
+                    elif pad == b"0" and prefix:
+                        # Zero pad goes between prefix and digits.
+                        s = prefix + b"0" * (width - len(s)) + digits
                     else:
                         s = pad * (width - len(s)) + s
                 out += s
