@@ -2081,7 +2081,16 @@ class CodeGenerator:
             sb = True if b.is_signed is None else b.is_signed
             return sa == sb
         if isinstance(a, ast.PointerType):
-            return self._types_equal(a.base_type, b.base_type)
+            # Pointee qualifiers matter for _Generic — `int *` and
+            # `const int *` are distinct types. Compare with strict
+            # qualifier equality on the pointee.
+            if not self._types_equal(a.base_type, b.base_type):
+                return False
+            ac = getattr(a.base_type, "is_const", False)
+            bc = getattr(b.base_type, "is_const", False)
+            av = getattr(a.base_type, "is_volatile", False)
+            bv = getattr(b.base_type, "is_volatile", False)
+            return ac == bc and av == bv
         if isinstance(a, ast.ArrayType):
             if not self._types_equal(a.base_type, b.base_type):
                 return False
@@ -7418,6 +7427,9 @@ class CodeGenerator:
                     unsigned = True
             elif is_long:
                 # `L` suffix: walk (signed) long → (unsigned) long → ll → ull.
+                # Default name is "long" so _Generic distinguishes it
+                # from "int" even though both are 32 bits on i386.
+                name = "long"
                 if v > 0xFFFFFFFFFFFFFFFF:
                     name = "long long"   # shouldn't happen, but be safe
                 elif v > 0xFFFFFFFF:
@@ -7425,16 +7437,12 @@ class CodeGenerator:
                     if is_hex:
                         unsigned = unsigned or v > 0x7FFFFFFFFFFFFFFF
                 elif v > 0x7FFFFFFF:
-                    # On i386 long is 32-bit, so this is unsigned long
-                    # (which is just unsigned int, same width).
                     if not unsigned and is_hex:
                         unsigned = True
                     elif not unsigned and not is_hex:
                         # decimal with `L` suffix: skip unsigned long,
                         # promote directly to long long.
                         name = "long long"
-                # name stays "int" / "long" otherwise; we treat them as
-                # the same width here.
             else:
                 # No L suffix: walk int → unsigned int → long → unsigned
                 # long → long long → unsigned long long.
@@ -7474,14 +7482,16 @@ class CodeGenerator:
                 return ast.ComplexType(base_type=base)
             return ast.BasicType(name=base)
         if isinstance(expr, ast.StringLiteral):
+            # Per C99 6.4.5#6 string literals are `char[N+1]` (non-const).
+            # The implicit array-to-pointer decay gives `char *`. C++
+            # would mark them `const char[N+1]` but C does not, and
+            # `_Generic("...", char *: ..., const char *: ...)` must
+            # match the non-const arm to be C-conformant.
             if getattr(expr, "is_wide", False):
-                # Wide: pointer to unsigned short (our wchar_t typedef).
                 return ast.PointerType(
-                    base_type=ast.BasicType(
-                        name="short", is_signed=False, is_const=True,
-                    )
+                    base_type=ast.BasicType(name="short", is_signed=False)
                 )
-            return ast.PointerType(base_type=ast.BasicType(name="char", is_const=True))
+            return ast.PointerType(base_type=ast.BasicType(name="char"))
         if isinstance(expr, ast.UnaryOp):
             if expr.op == "&":
                 return ast.PointerType(base_type=self._type_of(expr.operand, ctx))
@@ -7684,6 +7694,18 @@ class CodeGenerator:
             if self._is_long_long(lt) or self._is_long_long(rt):
                 return ast.BasicType(
                     name="long long",
+                    is_signed=(False if (
+                        self._is_unsigned(lt) or self._is_unsigned(rt)
+                    ) else None),
+                )
+            # Long propagation: per C usual arithmetic conversions, the
+            # higher-ranked type wins. On i386 long and int have the
+            # same width, but they're distinct types for _Generic.
+            l_long = isinstance(lt, ast.BasicType) and lt.name == "long"
+            r_long = isinstance(rt, ast.BasicType) and rt.name == "long"
+            if l_long or r_long:
+                return ast.BasicType(
+                    name="long",
                     is_signed=(False if (
                         self._is_unsigned(lt) or self._is_unsigned(rt)
                     ) else None),
