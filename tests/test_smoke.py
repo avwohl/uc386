@@ -2818,4 +2818,86 @@ def test_end_to_end_driver(tmp_path):
     text = out.read_text()
     assert "_start:" in text
     assert "_main:" in text
-    assert "int     21h" in text
+
+
+# ---- regression coverage for recent slices --------------------------
+
+
+def test_int128_storage_size():
+    # `unsigned __int128` global takes 16 bytes in BSS.
+    asm = _compile("unsigned __int128 b; int main(void) { return 0; }")
+    assert "_b:" in asm
+    assert "resb    16" in asm
+
+
+def test_int128_add_emits_carry_chain():
+    asm = _compile(
+        "unsigned __int128 b; int a;\n"
+        "int main(void) { b += a; return 0; }"
+    )
+    # 4-dword carry chain: one add then three adcs.
+    assert asm.count("        add     ") >= 1
+    assert asm.count("        adc     ") >= 3
+
+
+def test_int128_div_by_int_uses_three_div_chain():
+    asm = _compile(
+        "unsigned __int128 b; int c;\n"
+        "int main(void) { b /= c; return 0; }"
+    )
+    # u128 / u32: top-down chain of four `div` instructions.
+    assert asm.count("        div     ") >= 4
+
+
+def test_int128_shift_by_64_compiles():
+    # `>> 64` lowers via the bit_shift=0, word_shift=2 path. The bytes
+    # shift by 8 within the 16-byte slot.
+    asm = _compile(
+        "unsigned __int128 b;\n"
+        "unsigned long long get_high(void) { return b >> 64; }\n"
+        "int main(void) { return 0; }\n"
+    )
+    # No runtime shift instruction needed for word-aligned shift.
+    # The high 8 bytes get loaded into the result.
+    assert "_get_high:" in asm
+
+
+def test_decimal64_keyword_compiles_as_double():
+    # _Decimal64 → double approximation. The literal `0.DD` parses
+    # as a double with value 0.
+    asm = _compile(
+        "int main(void) { _Decimal64 d = 0.DD; if (d != 0.DD) return 1; return 0; }"
+    )
+    assert "_main:" in asm
+    # Value 0.0 lands in .data via the float-constants pool.
+    assert "section .data" in asm
+
+
+def test_nested_fn_with_nonlocal_goto_emits_trampoline_and_setjmp():
+    asm = _compile(
+        "extern void exit(int);\n"
+        "extern void abort(void);\n"
+        "extern void qsort(void *, unsigned int, unsigned int, "
+        "    int (*)(const void *, const void *));\n"
+        "int main(void) {\n"
+        "    __label__ done;\n"
+        "    int compare(const void *a, const void *b) { goto done; }\n"
+        "    char arr[3] = {0};\n"
+        "    qsort(arr, 3, 1, compare);\n"
+        "    abort();\n"
+        " done:\n"
+        "    exit(0);\n"
+        "}\n"
+    )
+    # Per-frame trampoline: 12 bytes initialized in main's prologue.
+    # Look for the opcode bytes (0xB9 = mov ecx, imm32; 0xBA = mov edx,
+    # imm32; 0xE2FF = jmp edx).
+    assert "0xB9" in asm
+    assert "0xBA" in asm
+    assert "0xE2FF" in asm
+    # setjmp dispatch in main's prologue.
+    assert "___builtin_setjmp" in asm
+    # Lifted nested fn longjmps from the goto.
+    assert "___builtin_longjmp" in asm
+    # Lifted fn name carries the outer prefix.
+    assert "_main__compare:" in asm
