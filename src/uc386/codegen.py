@@ -2939,6 +2939,12 @@ class CodeGenerator:
                 "__vla_baseline", ast.BasicType(name="int"),
             )
             ctx.vla_baseline_disp = ctx.lookup("__vla_baseline")
+        # Resolve `typeof(expr)` references in the body BEFORE
+        # `_collect_locals`. Replaces `TypeofType(operand=X)` with
+        # the result of looking X up in a flat name→type map built
+        # from VarDecl AST fields. Required because `_check_supported_type`
+        # rejects bare TypeofType.
+        self._resolve_typeof_in_body(fn.body, ctx)
         # First pass: allocate every local up front so the prologue knows
         # the frame size before we emit body code.
         self._collect_locals(fn.body, ctx)
@@ -2955,11 +2961,6 @@ class CodeGenerator:
         # struct assignment rhs, return chain) and don't actually use the
         # temp — wasting a few bytes of frame is simpler than tracking
         # parent context here.
-        # Resolve `typeof(expr)` references in the body. Replaces
-        # `TypeofType(operand=X)` with the result of `_type_of(X,
-        # ctx)`. Done before `_collect_call_temps` so size queries
-        # see concrete types.
-        self._resolve_typeof_in_body(fn.body, ctx)
         self._collect_call_temps(fn.body, ctx)
         # Third pass: assign a NASM label to every user `label:`. Done
         # ahead of body emission so a forward `goto` can resolve.
@@ -3174,23 +3175,26 @@ class CodeGenerator:
         """Walk `node` recursively and replace any `TypeofType` field
         with the concrete type.
 
-        `_collect_locals` already exited its scope chain by the time
-        we run, so `_type_of(Identifier)` would fail for body locals.
-        Pre-build a flat name→type map by re-walking the body for
-        VarDecls / ParamDecls and consult that here. Mutates the
-        AST in place.
+        Runs BEFORE `_collect_locals` so that `_check_supported_type`
+        sees concrete types in VarDecls. Builds a flat name→type map
+        from the AST directly: function params (already on ctx via
+        alloc_param) plus a pre-walk of all VarDecls in the body
+        (using each decl's `var_type` field — pre-`_collect_locals`).
+        Mutates the AST in place.
         """
         flat_types: dict[str, ast.TypeNode] = {}
         # Function params live on ctx via alloc_param.
         for scope in ctx.types:
             flat_types.update(scope)
-        # Walk the body for VarDecls — their decl_types entry is the
-        # resolved type from `_collect_locals`.
+        # Walk the body for VarDecls — use each decl's declared
+        # var_type field (set by the parser). `_collect_locals`
+        # hasn't run yet, so `ctx.decl_types` is empty.
         for sub in self._walk_ast(node):
-            if isinstance(sub, ast.VarDecl):
-                t = ctx.decl_types.get(id(sub))
-                if t is not None:
-                    flat_types[sub.name] = t
+            if isinstance(sub, ast.VarDecl) and sub.var_type is not None:
+                # Skip if the var's type is itself a TypeofType (would
+                # need recursive resolution; handle as a second pass).
+                if not isinstance(sub.var_type, ast.TypeofType):
+                    flat_types[sub.name] = sub.var_type
 
         def resolve_inner(operand: ast.Expression) -> ast.TypeNode | None:
             # For an Identifier, look in flat_types first.
@@ -3198,7 +3202,79 @@ class CodeGenerator:
                 t = flat_types.get(operand.name)
                 if t is not None:
                     return t
-            # Fall back to live _type_of (may fail).
+                # Globals / extern vars / function names — fall through
+                # to live _type_of which can resolve those without
+                # needing the function-scope chain.
+                try:
+                    return self._type_of(operand, ctx)
+                except CodegenError:
+                    return None
+            # Index: arr[i] → element type of arr's type.
+            if isinstance(operand, ast.Index):
+                arr_ty = resolve_inner(operand.array)
+                if isinstance(arr_ty, (ast.ArrayType, ast.PointerType)):
+                    return arr_ty.base_type
+                return None
+            # Member: s.m → member's type from struct layout.
+            if isinstance(operand, ast.Member):
+                obj_ty = resolve_inner(operand.obj)
+                if operand.is_arrow and isinstance(obj_ty, ast.PointerType):
+                    obj_ty = obj_ty.base_type
+                if isinstance(obj_ty, ast.StructType):
+                    sname = self._resolve_struct_name(obj_ty)
+                    if sname in self._structs:
+                        for m_name, m_ty, _m_off in self._structs[sname]:
+                            if m_name == operand.member:
+                                return m_ty
+                return None
+            # *p → pointee.
+            if isinstance(operand, ast.UnaryOp) and operand.op == "*":
+                ptr_ty = resolve_inner(operand.operand)
+                if isinstance(ptr_ty, (ast.PointerType, ast.ArrayType)):
+                    return ptr_ty.base_type
+                return None
+            # &x → pointer-to.
+            if isinstance(operand, ast.UnaryOp) and operand.op == "&":
+                inner_ty = resolve_inner(operand.operand)
+                if inner_ty is not None:
+                    return ast.PointerType(base_type=inner_ty)
+                return None
+            # Cast → target type.
+            if isinstance(operand, ast.Cast):
+                return operand.target_type
+            # BinaryOp — usual arithmetic conversion approximation.
+            # For most C arithmetic ops, the result type is the
+            # "wider" of the two operands' types. We approximate by
+            # taking the type of the wider operand. Comparison and
+            # logical ops yield int.
+            if isinstance(operand, ast.BinaryOp):
+                if operand.op in ("==", "!=", "<", ">", "<=", ">=",
+                                  "&&", "||"):
+                    return ast.BasicType(name="int")
+                lt = resolve_inner(operand.left)
+                rt = resolve_inner(operand.right)
+                if lt is None and rt is None:
+                    return None
+                if lt is None:
+                    return rt
+                if rt is None:
+                    return lt
+                # Pick the wider type. Prefer LL > int, float > int,
+                # int128 > LL.
+                lsize = self._size_of(lt) if isinstance(
+                    lt, ast.BasicType
+                ) else 4
+                rsize = self._size_of(rt) if isinstance(
+                    rt, ast.BasicType
+                ) else 4
+                return lt if lsize >= rsize else rt
+            # UnaryOp other — propagate the operand's type.
+            if isinstance(operand, ast.UnaryOp):
+                return resolve_inner(operand.operand)
+            # Ternary — pick true branch.
+            if isinstance(operand, ast.TernaryOp):
+                return resolve_inner(operand.true_expr)
+            # Literals: rely on live _type_of which handles them.
             try:
                 return self._type_of(operand, ctx)
             except CodegenError:
@@ -9541,12 +9617,10 @@ class CodeGenerator:
         self, call: ast.Call, ctx: _FuncCtx,
     ) -> bool:
         """Does `call` invoke a function whose declared return type is
-        `_Complex T`?"""
-        target = self._call_target(call)
-        if target is None:
-            return False
-        ret_ty = self._func_return_types.get(target)
-        return isinstance(ret_ty, ast.ComplexType)
+        `_Complex T`? Recognizes both direct calls (lookup by name)
+        and indirect calls (walk the function pointer's type)."""
+        rt = self._call_return_type(call, ctx)
+        return isinstance(rt, ast.ComplexType)
 
     def _complex_copy_assign(
         self, expr: ast.BinaryOp, ty: ast.ComplexType, ctx: _FuncCtx,

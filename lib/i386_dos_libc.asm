@@ -824,6 +824,60 @@ _strrchr:
         pop     ebp
         ret
 
+; ---- strstr ----------------------------------------------------------------
+; char *strstr(const char *haystack, const char *needle)
+; Naive O(n*m) search. Returns pointer to first occurrence of needle in
+; haystack, or NULL. Empty needle returns haystack.
+_strstr:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        push    edi
+        push    ebx
+        mov     esi, [ebp + 8]       ; haystack
+        mov     edi, [ebp + 12]      ; needle
+        ; Empty needle case: return haystack.
+        movzx   eax, byte [edi]
+        test    eax, eax
+        jz      .ret_haystack
+.outer:
+        movzx   eax, byte [esi]
+        test    eax, eax
+        jz      .not_found
+        ; Try match at esi.
+        mov     ebx, esi             ; ebx = current haystack pos
+        mov     edx, edi             ; edx = needle reset
+.inner:
+        movzx   eax, byte [edx]
+        test    eax, eax
+        jz      .found               ; needle exhausted = match
+        movzx   ecx, byte [ebx]
+        test    ecx, ecx
+        jz      .not_found           ; haystack ran out
+        cmp     al, cl
+        jne     .next_outer
+        inc     ebx
+        inc     edx
+        jmp     .inner
+.next_outer:
+        inc     esi
+        jmp     .outer
+.found:
+        mov     eax, esi
+        jmp     .d
+.ret_haystack:
+        mov     eax, esi
+        jmp     .d
+.not_found:
+        xor     eax, eax
+.d:
+        pop     ebx
+        pop     edi
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
 ; ---- memcmp ----------------------------------------------------------------
 _memcmp:
         push    ebp
