@@ -6252,6 +6252,18 @@ class CodeGenerator:
                             f"{name}[{idx}]",
                         )
                     elif (
+                        isinstance(elem_type, ast.StructType)
+                        and isinstance(actual, ast.Compound)
+                        and isinstance(actual.target_type, ast.StructType)
+                        and isinstance(actual.init, ast.InitializerList)
+                    ):
+                        # `((struct T){...})` as a struct array element:
+                        # treat the compound's init as the field list.
+                        out += self._struct_init(
+                            elem_type, actual.init, elem_disp, ctx,
+                            f"{name}[{idx}]",
+                        )
+                    elif (
                         isinstance(elem_type, ast.ArrayType)
                         and isinstance(actual, (ast.InitializerList, ast.StringLiteral))
                     ):
