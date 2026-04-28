@@ -511,3 +511,7 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`abs(int)` / `labs(long)` / `llabs(long long)` (and `__builtin_*` forms) inline at the call site.** Per gcc convention, these are recognized as builtins and inlined regardless of any user redefinition. abs/labs use `cdq; xor eax, edx; sub eax, edx`. llabs (in LL eval context) does `test edx, edx; jns skip; neg eax; adc edx, 0; neg edx`. Closes 20021127-1 (test that redefines `llabs` to abort and expects builtin inlining).
 
   **Result: 1500/1514 gcc-c-torture** (+1 test). Combined with c-testsuite 218/220, the pipeline now passes 1718/1734 (99.08%).
+- **2026-04-28 — torture sweep: FPU asm template recognition (1500 → 1501)**:
+  - **Single-instruction FPU asm templates** (`fsqrt`, `fpatan`, `fsin`, `fcos`, `fabs`, `fchs`, `f2xm1`, `fyl2x`, `fyl2xp1`, `fptan`, `fscale`, `frndint`, `fsincos`) now lower with proper FPU stack semantics. `_normalize_fpu_template` strips whitespace/comments and matches against the recognized set; `_asm_fpu_eligible` checks that operand constraints are the FPU subset (`=t`/`=u` outputs, `0`/`t`/`u`/`f` inputs). Inputs evaluate to st(0) in REVERSE order so the first input ends up on top — matches gcc's "input 0 binds to st(0) when constraint is `0` matching `=t` output". Outputs `fstp` to lvalues (Identifier/Member/Index/*p). Closes 990413-2 (asin via fpatan + fsqrt).
+
+  **Result: 1501/1514 gcc-c-torture** (+1 test). Combined with c-testsuite 218/220, the pipeline now passes 1719/1734 (99.13%).

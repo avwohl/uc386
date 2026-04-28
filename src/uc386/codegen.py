@@ -6668,6 +6668,10 @@ class CodeGenerator:
           a register-allocation barrier in many tests.
         - Empty template with no outputs and just inputs is a memory /
           compiler barrier — emit nothing.
+        - Single FPU instruction templates (`fsqrt`, `fpatan`, `fsin`,
+          `fcos`, `fabs`, `fchs`, `f2xm1`, etc.) with `=t`/`0`/`u`
+          constraints: load inputs to FPU stack, run instruction,
+          store outputs.
 
         Anything else: evaluate the operand expressions for side
         effects (matching gcc semantics where the operand expressions
@@ -6699,6 +6703,11 @@ class CodeGenerator:
                     out += self._asm_emit_assign(lvalue, rhs, ctx)
                 return out
 
+        # Recognized FPU asm templates.
+        fpu_template = self._normalize_fpu_template(template)
+        if fpu_template is not None and self._asm_fpu_eligible(outputs, inputs):
+            return self._emit_fpu_asm(fpu_template, outputs, inputs, ctx)
+
         # Fallback: evaluate every operand for side effects.
         out: list[str] = []
         for op in operands:
@@ -6709,6 +6718,107 @@ class CodeGenerator:
                 # variable) may not lower cleanly; skip silently.
                 pass
         return out
+
+    @staticmethod
+    def _normalize_fpu_template(template: str) -> str | None:
+        """Strip whitespace/newlines from an asm template and check if
+        it's a single FPU instruction we recognize. Returns the
+        canonical instruction name, or None if not recognized."""
+        cleaned = template.replace("\n", " ").replace("\t", " ").strip()
+        # Strip trailing semicolons and "  ;" comment markers.
+        cleaned = cleaned.split(";")[0].strip()
+        # Tolerate leading-tab/space variants that don't strip cleanly.
+        cleaned = " ".join(cleaned.split())
+        if cleaned in (
+            "fsqrt", "fpatan", "fsin", "fcos", "fabs", "fchs",
+            "f2xm1", "fyl2x", "fyl2xp1", "fptan", "fscale",
+            "frndint", "fsincos",
+        ):
+            return cleaned
+        return None
+
+    @staticmethod
+    def _asm_fpu_eligible(outputs, inputs) -> bool:
+        """Constraints must be the FPU subset we understand: outputs
+        use `=t` (st(0)) or `=u` (st(1)); inputs use `0` (match output
+        0), `1` (match output 1), `t`, `u`, or `f` (any FPU)."""
+        for c, _ in outputs:
+            base = c.lstrip("=+&!%@")
+            if base[0] not in "tuf":
+                return False
+        for c, _ in inputs:
+            base = c.lstrip("&!%@")
+            if not base:
+                return False
+            if base[0] not in "tuf0123456789":
+                return False
+        return True
+
+    def _emit_fpu_asm(
+        self,
+        template: str,
+        outputs,
+        inputs,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Lower a recognized FPU asm template.
+
+        Inputs are loaded to the FPU stack in reverse order so the
+        first input ends up on top (st(0)). The instruction executes.
+        Outputs are popped off the stack in declaration order.
+
+        Stack-position constraints:
+          input  "0"  → matches output 0 (typically st(0))
+          input  "t"  → st(0)
+          input  "u"  → st(1)
+          input  "f"  → any FPU register (we use st(0))
+          output "=t" → st(0)
+          output "=u" → st(1) (rare)
+        """
+        out: list[str] = []
+        # Reverse-order load: last input pushed first so the first
+        # input ends up at st(0).
+        for constraint, expr in reversed(inputs):
+            out += self._eval_float_to_st0(expr, ctx)
+        # The asm instruction itself.
+        out.append(f"        {template}")
+        # Some FPU instructions consume two stack slots and leave one
+        # (e.g. fpatan, fyl2x, fyl2xp1, fscale). Others leave the
+        # input count unchanged (fsqrt, fsin, fcos, fabs, fchs,
+        # f2xm1, frndint). fsincos consumes one and produces two.
+        # We don't need to track this explicitly — after the
+        # instruction, st(0) is the (or first) output.
+        # Pop outputs — `=t` lvalues take st(0) (each fstp pops it).
+        for constraint, lvalue in outputs:
+            out += self._asm_fpu_store_output(lvalue, ctx)
+        return out
+
+    def _asm_fpu_store_output(
+        self, lvalue: ast.Expression, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Store st(0) into the lvalue. Mirrors `_eval_float_to_st0`
+        + fstp pattern used elsewhere; supports Identifier/Member/
+        Index/`*p` lvalues."""
+        ty = self._type_of(lvalue, ctx)
+        size = self._size_of(ty) if self._is_float_type(ty) else 8
+        width = "dword" if size == 4 else "qword"
+        if isinstance(lvalue, ast.Identifier):
+            addr = self._float_lvalue_addr(lvalue.name, ctx)
+            return [f"        fstp    {width} {addr}"]
+        # General lvalue: compute address, fstp through it.
+        if isinstance(lvalue, ast.Index):
+            addr_lines = self._index_address(lvalue, ctx)
+        elif isinstance(lvalue, ast.Member):
+            addr_lines = self._member_address(lvalue, ctx)
+        elif isinstance(lvalue, ast.UnaryOp) and lvalue.op == "*":
+            addr_lines = self._eval_expr_to_eax(lvalue.operand, ctx)
+        else:
+            # Fallback: fstp into a scratch slot, drop.
+            return [f"        fstp    {width} [esp - 8]"]
+        return addr_lines + [
+            "        mov     ecx, eax",
+            f"        fstp    {width} [ecx]",
+        ]
 
     @staticmethod
     def _asm_identity_eligible(outputs, inputs) -> bool:
