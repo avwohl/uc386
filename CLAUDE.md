@@ -700,3 +700,6 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Complex array element init**: `_Complex double arr[2] = {1.0+2.0i, 3.0+4.0i};` — same pattern in `_array_init`.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (349 total).
+- **2026-04-28 — clear error for ++/-- on _Complex Identifier**: previously crashed with `KeyError: 16` because `_inc_dec`'s width-table only has entries for 1/2/4 bytes. Now raises a clear "++ on _Complex operand X not supported" with a hint to use `__real__ x ++`. The behavior was never well-defined (gcc accepts `++ complex` and increments the real part — non-standard and rarely used) and properly supporting it would need more plumbing than the test suites need.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. (No new smoke; this is an error-path improvement only.)

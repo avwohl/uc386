@@ -12499,6 +12499,15 @@ class CodeGenerator:
         # the 8-byte RMW with carry/borrow propagation.
         if self._is_long_long(ty):
             return self._inc_dec_ll(expr, ctx)
+        # _Complex / __int128 / vector: not standard C for ++/-- but
+        # gcc accepts them. Raise a clearer error than "KeyError: 16"
+        # for now — extending these is straightforward but rarely
+        # needed.
+        if isinstance(ty, ast.ComplexType):
+            raise CodegenError(
+                f"`{expr.op}` on _Complex operand `{expr.operand.name}` "
+                f"not supported (use `__real__ x {expr.op}` instead)"
+            )
         addr = self._identifier_addr_text(expr.operand.name, ctx)
         # On a pointer, ++/-- step by sizeof(*ptr) instead of 1. We still
         # mutate the slot in place — the slot stores the pointer value —
