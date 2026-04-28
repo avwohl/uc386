@@ -1502,6 +1502,15 @@ class CodeGenerator:
                     chosen = k
                     break
             cm_name, cm_ty, cm_off = members[chosen]
+            cm_size = self._size_of(cm_ty)
+            # A member whose entire span lies BEFORE the current
+            # emit_cursor was already covered by an earlier
+            # anonymous-union alternative (e.g. `b` at offset 5
+            # within an anon struct that doesn't overlap an already-
+            # emitted member). Skip rather than emit duplicate bytes.
+            if cm_off + cm_size <= emit_cursor and chosen not in slot_values:
+                i = j
+                continue
             if cm_off > emit_cursor:
                 out.append(f"        times {cm_off - emit_cursor} db 0")
                 emit_cursor = cm_off
@@ -1510,12 +1519,45 @@ class CodeGenerator:
                     cm_ty, slot_values[chosen], f"{name}.{cm_name}",
                 )
             else:
-                m_size = self._size_of(cm_ty)
-                out.append(f"        times {m_size} db 0")
-            # Advance the cursor by the *largest* member at this offset
-            # (anonymous unions: bytes spanned = max-member-size).
-            span = max(self._size_of(members[k][1]) for k in range(i, j))
-            emit_cursor = cm_off + span
+                out.append(f"        times {cm_size} db 0")
+            # Span advance: usually we advance by max(member size at
+            # this offset) so a union picks the largest alternative's
+            # storage. But if the chosen member is part of an
+            # anonymous-struct group whose other members live at
+            # HIGHER offsets (e.g. `union { int i; struct{char a,b;}; }`
+            # — picking `a` at offset 4 means `b` still needs to emit
+            # at offset 5), only advance by the chosen member's own
+            # size. The next iteration handles the sibling.
+            chosen_group = self._struct_member_groups.get(sname, [])
+            chosen_grp = (
+                chosen_group[chosen]
+                if chosen < len(chosen_group)
+                else None
+            )
+            extends = False
+            if chosen_grp is not None:
+                # Does any later member share this group AND start at a
+                # higher offset within this run's union span?
+                run_end_off = cm_off + max(
+                    self._size_of(members[k][1]) for k in range(i, j)
+                )
+                for k_idx in range(j, len(members)):
+                    k_off = members[k_idx][2]
+                    if k_off >= run_end_off:
+                        break
+                    if (
+                        k_idx < len(chosen_group)
+                        and chosen_group[k_idx] == chosen_grp
+                    ):
+                        extends = True
+                        break
+            if extends:
+                emit_cursor = cm_off + cm_size
+            else:
+                # Advance by the *largest* member at this offset
+                # (anonymous unions: bytes spanned = max-member-size).
+                span = max(self._size_of(members[k][1]) for k in range(i, j))
+                emit_cursor = cm_off + span
             i = j
         if total > emit_cursor:
             out.append(f"        times {total - emit_cursor} db 0")
@@ -2460,7 +2502,30 @@ class CodeGenerator:
         matches, the `default:` association is used (None type-key).
         Falls back to the first arm if neither match nor default.
         """
-        ctrl_ty = self._type_of(expr.controlling_expr, ctx)
+        # A bare function-name Identifier has no real `_type_of`
+        # representation in this codegen — it's represented as a
+        # placeholder `void *` to dodge pointer-arithmetic scaling.
+        # That breaks _Generic matching against `int (*)(int)`-style
+        # arms. Detect the function name directly and synthesize the
+        # proper function-pointer type for matching.
+        ctrl_expr = expr.controlling_expr
+        ctrl_ty: ast.TypeNode | None = None
+        if (
+            isinstance(ctrl_expr, ast.Identifier)
+            and ctrl_expr.name in self._func_return_types
+            and not ctx.has_local(ctrl_expr.name)
+            and ctrl_expr.name not in self._globals
+        ):
+            ret_ty = self._func_return_types[ctrl_expr.name]
+            param_tys = self._func_param_types.get(ctrl_expr.name, [])
+            ctrl_ty = ast.PointerType(
+                base_type=ast.FunctionType(
+                    return_type=ret_ty,
+                    param_types=list(param_tys),
+                )
+            )
+        if ctrl_ty is None:
+            ctrl_ty = self._type_of(ctrl_expr, ctx)
         ctrl_ty = self._strip_qualifiers(ctrl_ty)
         # Decay arrays to pointers and functions to pointers, the way
         # _Generic sees the controlling expression.
@@ -2502,7 +2567,14 @@ class CodeGenerator:
         if isinstance(a, ast.BasicType):
             if a.name != b.name:
                 return False
-            # Treat default-int signedness as equal to explicit signed.
+            # Per C11 6.2.5#15, `char`, `signed char`, and `unsigned
+            # char` are three distinct types — even though `char` may
+            # be signed or unsigned per implementation. So for `char`
+            # specifically, None / True / False are all distinct.
+            if a.name == "char":
+                return a.is_signed == b.is_signed
+            # For other integer types, default-int signedness equals
+            # explicit signed.
             sa = True if a.is_signed is None else a.is_signed
             sb = True if b.is_signed is None else b.is_signed
             return sa == sb
@@ -2529,6 +2601,8 @@ class CodeGenerator:
             return self._resolve_struct_name(a) == self._resolve_struct_name(b)
         if isinstance(a, ast.EnumType):
             return (a.name or "") == (b.name or "")
+        if isinstance(a, ast.ComplexType):
+            return a.base_type == b.base_type
         if isinstance(a, ast.FunctionType):
             if not self._types_equal(a.return_type, b.return_type):
                 return False
@@ -8528,11 +8602,38 @@ class CodeGenerator:
         # order. (Bit-fields and unions are already zeroed by the
         # up-front whole-struct zero-fill above.)
         if not bitfields and not is_union:
+            # Track byte ranges already covered by initialized members,
+            # so we don't overwrite them when zero-filling unfilled
+            # peers that share storage. A struct with anonymous union
+            # members has multiple promoted members overlapping the
+            # same bytes; initializing one (e.g. `i` covering bytes
+            # 4..7) and zero-filling another (`b` at byte 5) would
+            # corrupt the value otherwise.
+            filled_bytes: set[int] = set()
+            for i in filled:
+                _, m_ty_f, m_off_f = members[i]
+                fsize = self._size_of(m_ty_f)
+                for b in range(m_off_f, m_off_f + fsize):
+                    filled_bytes.add(b)
             for i, (m_name_i, m_ty, m_off) in enumerate(members):
-                if i not in filled:
-                    out += self._zero_fill_at(
-                        base_disp + m_off, self._size_of(m_ty)
-                    )
+                if i in filled:
+                    continue
+                m_size = self._size_of(m_ty)
+                # Skip the member if any byte of its range is already
+                # covered by an initialized peer (anonymous-union
+                # overlap). Per C, the unfilled bytes of a partially
+                # initialized member with overlapping storage are
+                # implementation-defined; gcc leaves them as zero
+                # implicitly via the surrounding initializer's
+                # default-zero, which we don't disturb.
+                if any(
+                    b in filled_bytes
+                    for b in range(m_off, m_off + m_size)
+                ):
+                    continue
+                out += self._zero_fill_at(
+                    base_disp + m_off, m_size
+                )
         return out
 
     def _merge_nested_designators(
@@ -10450,11 +10551,51 @@ class CodeGenerator:
         out.append(f"        add     dword [ebx], {advance}")
         return out
 
-    def _stripped_callee(self, call: ast.Call) -> ast.Expression:
-        """Strip leading `*`s on a Call's callee (function-typed `*` is idempotent)."""
+    def _stripped_callee(
+        self, call: ast.Call, ctx: _FuncCtx | None = None,
+    ) -> ast.Expression:
+        """Strip leading `*`s on a Call's callee.
+
+        Per C 6.3.2.1, `*f` on a function-pointer-typed value is
+        idempotent — it produces the function which immediately
+        decays back to the same pointer. So `(*fp)()`, `(**fp)()`,
+        etc. all call the same function.
+
+        Only peel the `*` when the operand's type is a function
+        pointer (or function) — otherwise the `*` is a real load
+        (e.g. `**ppfp` first loads through `ppfp` to get the
+        function pointer, then idempotent on that). Without the
+        type check we'd silently call the wrong address for
+        `(**(&ops[0]))()` patterns.
+        """
         callee = call.func
         while isinstance(callee, ast.UnaryOp) and callee.op == "*":
-            callee = callee.operand
+            # Without ctx we fall back to the old aggressive peel.
+            # All real call sites pass ctx, so this should be rare.
+            if ctx is None:
+                callee = callee.operand
+                continue
+            try:
+                inner_ty = self._type_of(callee.operand, ctx)
+            except CodegenError:
+                break
+            # Function-typed: stripping is the function-decay
+            # idempotent rule.
+            if isinstance(inner_ty, ast.FunctionType):
+                callee = callee.operand
+                continue
+            # Function-pointer-typed: the `*` is idempotent because
+            # the dereferenced function value re-decays to a fn-ptr.
+            if (
+                isinstance(inner_ty, ast.PointerType)
+                and isinstance(inner_ty.base_type, ast.FunctionType)
+            ):
+                callee = callee.operand
+                continue
+            # Pointer-to-pointer-to-function and other shapes: the
+            # `*` does a real load. Stop peeling; let `_eval_expr_to_eax`
+            # run the deref.
+            break
         return callee
 
     def _call_target(self, call: ast.Call, ctx=None) -> str | None:
@@ -10465,7 +10606,7 @@ class CodeGenerator:
         outer fn resolves to `_outer__Foo` (which is what's registered
         in `_func_return_types`).
         """
-        callee = self._stripped_callee(call)
+        callee = self._stripped_callee(call, ctx)
         if isinstance(callee, ast.Identifier):
             name = callee.name
             if ctx is not None:
@@ -10487,14 +10628,14 @@ class CodeGenerator:
         `_var_init`, `_assign`, and `_return` (for chained struct
         returns).
         """
-        target = self._call_target(call)
+        target = self._call_target(call, ctx)
         if target is not None:
             return self._emit_call(
                 call.args, ctx, direct=target, retptr=retptr_lines,
             )
         return self._emit_call(
             call.args, ctx,
-            indirect_callee=self._stripped_callee(call),
+            indirect_callee=self._stripped_callee(call, ctx),
             retptr=retptr_lines,
         )
 
@@ -11615,6 +11756,18 @@ class CodeGenerator:
                 # ++/-- on a long-long lvalue.
                 return self._inc_dec_ll(expr, ctx)
         if isinstance(expr, ast.BinaryOp):
+            # If the BinaryOp's result type isn't long-long (e.g.
+            # ptr-ptr returns int, comparison ops return int), eval
+            # in 32-bit mode and extend per the result type's
+            # signedness. Otherwise the LL ladder is correct.
+            res_ty = self._type_of(expr, ctx)
+            if not self._is_long_long(res_ty):
+                out = self._eval_expr_to_eax(expr, ctx)
+                if self._is_unsigned(res_ty):
+                    out.append("        xor     edx, edx")
+                else:
+                    out.append("        cdq")
+                return out
             return self._binary_ll(expr, ctx)
         if isinstance(expr, ast.TernaryOp):
             cond_label = ctx.label("ll_ter_else")
@@ -12897,7 +13050,7 @@ class CodeGenerator:
         #
         # Struct-returning calls are handled in `_eval_expr_to_eax` (via
         # the per-call temp) before reaching here.
-        callee = self._stripped_callee(expr)
+        callee = self._stripped_callee(expr, ctx)
         # gnu_inline functions get inlined at every call site instead of
         # generating a regular `call _name`. The body uses
         # `__builtin_va_arg_pack()` which requires the caller's variadic
@@ -13990,6 +14143,20 @@ class CodeGenerator:
             return self._assign(expr, ctx)
         if expr.op in self._COMPOUND_OPS:
             return self._compound_assign(expr, ctx)
+        # Pointer arithmetic short-circuit: `ptr + ll` and `ll + ptr`
+        # should NOT route through `_binary_ll` (which would do a
+        # 64-bit add ignoring the pointee's size). Per C, the integer
+        # operand of `ptr + integer` is converted to ptrdiff_t and
+        # then scaled — on i386 that means narrowing to 32 bits.
+        # Same for `ptr - integer`. `ptr - ptr` already covered by
+        # `_add_sub` since pointers aren't long-long-typed.
+        lt_for_ptr = self._type_of(expr.left, ctx)
+        rt_for_ptr = self._type_of(expr.right, ctx)
+        if expr.op in ("+", "-") and (
+            self._is_pointer_like(lt_for_ptr)
+            or self._is_pointer_like(rt_for_ptr)
+        ):
+            return self._add_sub(expr, ctx)
         # Long-long short-circuit: any non-assignment binary op where at
         # least one operand is long-long-typed routes through
         # `_binary_ll` (the 64-bit ladder). Comparisons return bool in
@@ -13998,8 +14165,8 @@ class CodeGenerator:
         # the surrounding context is 32-bit — that matches C's "narrow
         # on assign".
         if (
-            self._is_long_long(self._type_of(expr.left, ctx))
-            or self._is_long_long(self._type_of(expr.right, ctx))
+            self._is_long_long(lt_for_ptr)
+            or self._is_long_long(rt_for_ptr)
         ):
             return self._binary_ll(expr, ctx)
         if expr.op == ",":
