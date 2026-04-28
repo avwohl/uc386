@@ -3352,6 +3352,27 @@ def test_decimal64_keyword_compiles_as_double():
     assert "section .data" in asm
 
 
+def test_sizeof_double_returns_8():
+    # `sizeof(double)` returned 4 because uc_core's `WATCOM_FLAT32`
+    # TypeConfig didn't override `double_size`, so it took the
+    # TypeConfig default of 4. The codegen's `_BASIC_SIZES["double"]
+    # = 8` was correct, but the optimizer's `_sizeof_type` looked up
+    # via `type_config.sizeof_basic("double")` which returned the
+    # default 4 — and the constant-folded value landed in the asm
+    # as `mov eax, 4`. `sizeof(double_var)` (via `_type_of(expr)`)
+    # used the codegen path and was correct.
+    # Fix: WATCOM_FLAT32 explicitly sets float_size/double_size/
+    # long_double_size to match uc386's codegen.
+    asm = _compile(
+        "int main(void) {\n"
+        "    return sizeof(double) - 8;\n"
+        "}\n"
+    )
+    # The constant-fold should produce `mov eax, 8` not `mov eax, 4`.
+    assert "mov     eax, 8" in asm
+    assert "mov     eax, 4" not in asm or "sub     esp, 4" in asm
+
+
 def test_bare_int128_keyword_parses_as_type():
     # `__int128` as a bare type name (not preceded by signed/unsigned)
     # used to fail with "Expected SEMICOLON" because uc_core's parser
