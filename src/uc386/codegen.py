@@ -1152,6 +1152,60 @@ class CodeGenerator:
             # total size.
             if not init.values:
                 return [f"        times {total} db 0"]
+            # Multiple designated initializers writing to non-overlapping
+            # member offsets (common with anonymous-struct union members:
+            # `union { struct {u8 a, b;}; ... } u = {.b = 8, .a = 7};`).
+            # Walk each designator and emit at its offset; non-overlapping
+            # writes accumulate in the byte image. Non-designated leading
+            # values fall through to the legacy single-init path.
+            if (
+                all(isinstance(v, ast.DesignatedInit)
+                    and len(v.designators) == 1
+                    and isinstance(v.designators[0], str)
+                    and v.designators[0] in member_index
+                    for v in init.values)
+                and len(init.values) > 1
+            ):
+                placed: dict[int, tuple] = {}
+                for v in init.values:
+                    target = v.designators[0]
+                    idx = member_index[target]
+                    m_name, m_ty, m_off = members[idx]
+                    placed[m_off] = (
+                        self._size_of(m_ty), v.value, m_name, m_ty,
+                    )
+                # Emit by sorted offset; overlapping writes ignored
+                # (last designator wins on overlap, but we only handle
+                # non-overlapping here).
+                sorted_offs = sorted(placed.keys())
+                # Check for overlap: skip the case if any overlap.
+                ok = True
+                for i_off in range(len(sorted_offs) - 1):
+                    cur = sorted_offs[i_off]
+                    cur_sz = placed[cur][0]
+                    nxt = sorted_offs[i_off + 1]
+                    if cur + cur_sz > nxt:
+                        ok = False
+                        break
+                if ok:
+                    sub_out: list[str] = []
+                    cursor = 0
+                    for off in sorted_offs:
+                        size, val, m_name, m_ty = placed[off]
+                        if off > cursor:
+                            sub_out.append(
+                                f"        times {off - cursor} db 0"
+                            )
+                            cursor = off
+                        sub_out += self._emit_global_init(
+                            m_ty, val, f"{name}.{m_name}",
+                        )
+                        cursor = off + size
+                    if total > cursor:
+                        sub_out.append(
+                            f"        times {total - cursor} db 0"
+                        )
+                    return sub_out
             first_value = init.values[0]
             # If the first conceptual member is an anonymous nested
             # struct (multiple promoted members share group 0), and the
@@ -4402,8 +4456,22 @@ class CodeGenerator:
         if isinstance(expr, ast.Cast) and isinstance(
             expr.target_type, ast.StructType
         ):
-            # `(struct T) value` — type-pun the value into the
-            # pre-allocated struct temp slot, then return its address.
+            # `(struct T) value` — if the source is already a struct of
+            # the same type, the cast is a no-op (GCC ext): just return
+            # the source's address. Otherwise, type-pun via temp slot.
+            try:
+                src_ty = self._type_of(expr.expr, ctx)
+            except CodegenError:
+                src_ty = None
+            if isinstance(src_ty, ast.StructType):
+                try:
+                    if (
+                        self._resolve_struct_name(src_ty)
+                        == self._resolve_struct_name(expr.target_type)
+                    ):
+                        return self._struct_address(expr.expr, ctx)
+                except CodegenError:
+                    pass
             return self._cast_to_struct(expr, ctx)
         raise CodegenError(
             f"can't take address of {type(expr).__name__} for `.member`"
