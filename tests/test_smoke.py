@@ -3310,6 +3310,21 @@ def test_int128_compound_arr_index_side_effect_evals_once():
     assert inc_count == 1
 
 
+def test_vector_compound_arr_index_side_effect_evals_once():
+    # Same shape for vectors.
+    asm = _compile(
+        "typedef int v4 __attribute__((vector_size(16)));\n"
+        "int main(void) {\n"
+        "    v4 arr[3] = {{0,0,0,0}, {0,0,0,0}, {0,0,0,0}};\n"
+        "    int i = 0;\n"
+        "    arr[i++] += (v4){1,2,3,4};\n"
+        "    return i == 1 ? 0 : 1;\n"
+        "}\n"
+    )
+    inc_count = asm.count("        inc     dword [ebp -")
+    assert inc_count == 1
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.

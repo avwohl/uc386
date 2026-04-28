@@ -5438,6 +5438,63 @@ class CodeGenerator:
             return out
         raise CodegenError(f"__int128 unary op `{op}` not supported")
 
+    def _compound_assign_vector_lvalue(
+        self,
+        expr: ast.BinaryOp,
+        op: str,
+        vec_ty: ast.ArrayType,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """`vec_lvalue OP= rhs` for non-Identifier vector lvalues
+        (Index/Member/*p). Address-once via hidden snapshot slot."""
+        addr_slot_name = f"__compvec_addr_{id(expr)}"
+        snap_slot_name = f"__compvec_snap_{id(expr)}"
+        size = (self._size_of(vec_ty) + 3) & ~3
+        addr_disp = ctx.alloc_local(
+            addr_slot_name,
+            ast.PointerType(base_type=vec_ty),
+            size=4,
+        )
+        snap_disp = ctx.alloc_local(snap_slot_name, vec_ty, size=size)
+        out: list[str] = []
+        # 1. Compute &lvalue once into addr_slot.
+        if isinstance(expr.left, ast.Index):
+            out += self._index_address(expr.left, ctx)
+        elif (
+            isinstance(expr.left, ast.UnaryOp)
+            and expr.left.op == "*"
+        ):
+            out += self._eval_expr_to_eax(expr.left.operand, ctx)
+        elif isinstance(expr.left, ast.Member):
+            out += self._member_address(expr.left, ctx)
+        else:
+            raise CodegenError(
+                f"vector compound assign target not supported: "
+                f"{type(expr.left).__name__}"
+            )
+        out.append(f"        mov     {_ebp_addr(addr_disp)}, eax")
+        # 2. Copy `size` bytes from *addr_slot to snap_slot.
+        out.append("        mov     esi, eax")
+        out.append(f"        lea     edi, {_ebp_addr(snap_disp)}")
+        for off in range(0, size, 4):
+            out.append(f"        mov     eax, [esi + {off}]")
+            out.append(f"        mov     [edi + {off}], eax")
+        # 3. Synthesize `snapshot OP rhs` and assign into *addr_slot.
+        snap_id = ast.Identifier(name=snap_slot_name)
+        inner = ast.BinaryOp(op=op, left=snap_id, right=expr.right)
+        ctx.alloc_call_temp(inner, size)
+        # Evaluate inner into a vector temp via _vector_value_address
+        # (which uses the call_temps slot).
+        out += self._vector_value_address(inner, ctx)
+        # 4. Copy from temp into *addr_slot.
+        out.append("        mov     esi, eax")
+        out.append(f"        mov     edi, {_ebp_addr(addr_disp)}")
+        for off in range(0, size, 4):
+            out.append(f"        mov     eax, [esi + {off}]")
+            out.append(f"        mov     [edi + {off}], eax")
+        out.append(f"        mov     eax, {_ebp_addr(addr_disp)}")
+        return out
+
     def _compound_assign_int128_lvalue(
         self, expr: ast.BinaryOp, op: str, ctx: _FuncCtx,
     ) -> list[str]:
@@ -13812,6 +13869,19 @@ class CodeGenerator:
         # side-effect-free, which is the common case.
         if self._is_long_long(target_ty_check):
             return self._compound_assign_ll(expr, ctx)
+        # Vector compound assign on non-Identifier lvalue: snapshot
+        # pattern. Compute &lvalue once, copy to a hidden snapshot
+        # slot, evaluate `Identifier(snap) OP rhs` into a result
+        # temp, copy result back to *addr_slot. Side effects in the
+        # lvalue's sub-expressions fire exactly once.
+        if (
+            isinstance(target_ty_check, ast.ArrayType)
+            and getattr(target_ty_check, "is_vector", False)
+            and not isinstance(expr.left, ast.Identifier)
+        ):
+            return self._compound_assign_vector_lvalue(
+                expr, op, target_ty_check, ctx,
+            )
 
         if isinstance(expr.left, ast.Identifier):
             ty = self._identifier_type(expr.left.name, ctx)
