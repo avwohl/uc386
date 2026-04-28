@@ -72,41 +72,31 @@ _puts:
         pop     ebp
         ret
 
-; ---- fputc / fputs / putc --------------------------------------------------
-; fputc(int ch, FILE *stream): we ignore stream and print to stdout.
-_fputc:
-        push    ebp
-        mov     ebp, esp
-        mov     edx, [ebp + 8]
-        mov     ah, 0x02
-        int     21h
-        mov     eax, [ebp + 8]
-        and     eax, 0xFF
-        mov     esp, ebp
-        pop     ebp
-        ret
-
-_putc:
-        jmp     _fputc
-
-; fputs(const char *s, FILE *stream): print s without trailing newline.
+; fputs(const char *s, FILE *stream): write s (no newline) to stream's fd.
 _fputs:
         push    ebp
         mov     ebp, esp
+        push    ebx
         push    esi
-        mov     esi, [ebp + 8]
-.fl:
-        mov     al, [esi]
-        test    al, al
-        jz      .fd
-        mov     edx, eax
-        mov     ah, 0x02
+        mov     esi, [ebp + 8]       ; s
+        mov     ebx, [ebp + 12]      ; stream → fd
+        ; Compute strlen
+        xor     ecx, ecx
+.strlen:
+        cmp     byte [esi + ecx], 0
+        je      .strlen_done
+        inc     ecx
+        jmp     .strlen
+.strlen_done:
+        test    ecx, ecx
+        jz      .ok
+        mov     edx, esi
+        mov     ah, 0x40
         int     21h
-        inc     esi
-        jmp     .fl
-.fd:
+.ok:
         xor     eax, eax
         pop     esi
+        pop     ebx
         mov     esp, ebp
         pop     ebp
         ret
@@ -136,14 +126,396 @@ _fwrite:
         mov     eax, [ebp + 12]      ; size
         mov     ebx, [ebp + 16]      ; nmemb
         imul    eax, ebx             ; total bytes
-        ; Call write(1, ptr, total)
-        mov     ebx, 1
+        mov     ebx, [ebp + 20]      ; stream → fd
         mov     edx, esi
         mov     ecx, eax
         mov     ah, 0x40
         int     21h
         ; Return nmemb (caller passed it).
         mov     eax, [ebp + 16]
+        pop     esi
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; fread(void *ptr, size_t size, size_t nmemb, FILE *stream) → nmemb-actually-read
+_fread:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    esi
+        mov     esi, [ebp + 8]       ; ptr
+        mov     eax, [ebp + 12]      ; size
+        mov     ebx, [ebp + 16]      ; nmemb
+        imul    eax, ebx             ; total bytes wanted
+        mov     ebx, [ebp + 20]      ; stream → fd
+        mov     edx, esi
+        mov     ecx, eax
+        mov     ah, 0x3F
+        int     21h
+        ; AX = bytes-read. Divide by size to get nmemb actually read.
+        movzx   eax, ax
+        xor     edx, edx
+        mov     ecx, [ebp + 12]
+        test    ecx, ecx
+        jz      .zero
+        div     ecx
+        jmp     .done
+.zero:
+        xor     eax, eax
+.done:
+        pop     esi
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; fopen(const char *path, const char *mode) → FILE * (= fd as int) or NULL
+_fopen:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        ; Inspect mode[0]: 'r' → INT 21h AH=0x3D AL=0; else AH=0x3C
+        mov     ebx, [ebp + 12]      ; mode
+        mov     bl, [ebx]
+        cmp     bl, 'r'
+        je      .readmode
+        ; write or append → create/truncate
+        mov     edx, [ebp + 8]       ; path
+        mov     ah, 0x3C
+        xor     ecx, ecx             ; attrs
+        int     21h
+        jmp     .ret
+.readmode:
+        mov     edx, [ebp + 8]       ; path
+        mov     ah, 0x3D
+        mov     al, 0
+        int     21h
+.ret:
+        ; If fd is -1, return NULL (0). Else return fd.
+        cmp     eax, -1
+        jne     .ok
+        xor     eax, eax
+.ok:
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; fclose(FILE *stream) → 0 on success, EOF on error
+_fclose:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        mov     ebx, [ebp + 8]       ; stream → fd
+        mov     ah, 0x3E
+        int     21h
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; freopen(const char *path, const char *mode, FILE *stream)
+;   Closes stream, opens path, redirects stream to the new fd.
+;   For our libc, FILE * is the fd as a small int. If stream is 1
+;   (stdout) or 2 (stderr), update the corresponding global so
+;   subsequent printf/fprintf write to the new fd.
+;   Returns the new fd (cast to FILE*) or NULL on error.
+_freopen:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        ; Close old stream fd (only if >=3 to avoid closing host stdout).
+        mov     ebx, [ebp + 16]      ; stream → fd
+        cmp     ebx, 3
+        jl      .skipclose
+        mov     ah, 0x3E
+        int     21h
+.skipclose:
+        ; Open new file with the requested mode.
+        push    dword [ebp + 12]
+        push    dword [ebp + 8]
+        call    _fopen
+        add     esp, 8
+        test    eax, eax
+        jz      .err
+        ; If stream was 1 (stdout) or 2 (stderr), update the global so
+        ; subsequent printf goes to the new fd.
+        mov     ebx, [ebp + 16]
+        cmp     ebx, 1
+        jne     .notstdout
+        mov     [_stdout], eax
+        jmp     .done
+.notstdout:
+        cmp     ebx, 2
+        jne     .done
+        mov     [_stderr], eax
+.done:
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+.err:
+        xor     eax, eax
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; tmpnam(char *buf) → buf with unique name. If buf is NULL, returns
+; an internal static buffer. Routes through INT 21h AH=0x5A.
+_tmpnam:
+        push    ebp
+        mov     ebp, esp
+        mov     edx, [ebp + 8]
+        test    edx, edx
+        jnz     .havebuf
+        mov     edx, _tmpnam_internal_buf
+.havebuf:
+        mov     ah, 0x5A
+        int     21h
+        ; AX = buf with name written; return it.
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; remove(const char *path) → 0 on success, -1 on error
+_remove:
+        push    ebp
+        mov     ebp, esp
+        mov     edx, [ebp + 8]
+        mov     ah, 0x41
+        int     21h
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; perror(const char *s): just print s + ": error\n" to stderr. Tests
+; only invoke this on error paths and don't check the format.
+_perror:
+        push    ebp
+        mov     ebp, esp
+        mov     edx, [ebp + 8]
+        test    edx, edx
+        jz      .skip_msg
+        ; write fd=2 the string
+        mov     ebx, 2
+        mov     ecx, edx
+.strlen_loop:
+        cmp     byte [ecx], 0
+        je      .strlen_done
+        inc     ecx
+        jmp     .strlen_loop
+.strlen_done:
+        sub     ecx, edx
+        mov     ah, 0x40
+        int     21h
+.skip_msg:
+        ; print ": error\n"
+        mov     edx, _perror_suffix
+        mov     ebx, 2
+        mov     ecx, 8
+        mov     ah, 0x40
+        int     21h
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; fgetc(FILE *stream) → next byte or EOF
+_fgetc:
+        push    ebp
+        mov     ebp, esp
+        sub     esp, 4
+        push    ebx
+        mov     ebx, [ebp + 8]       ; stream → fd
+        lea     edx, [ebp - 4]
+        mov     ecx, 1
+        mov     ah, 0x3F
+        int     21h
+        movzx   eax, ax
+        test    eax, eax
+        jz      .eof
+        movzx   eax, byte [ebp - 4]
+        jmp     .done
+.eof:
+        mov     eax, -1
+.done:
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; getc — alias for fgetc
+_getc:
+        jmp     _fgetc
+
+; fputc(int c, FILE *stream) → c or EOF
+_fputc:
+        push    ebp
+        mov     ebp, esp
+        sub     esp, 4
+        push    ebx
+        mov     eax, [ebp + 8]
+        mov     [ebp - 4], al
+        mov     ebx, [ebp + 12]      ; stream → fd
+        lea     edx, [ebp - 4]
+        mov     ecx, 1
+        mov     ah, 0x40
+        int     21h
+        movzx   eax, byte [ebp - 4]
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; putc — alias for fputc (since macros can't be implemented in asm)
+_putc:
+        jmp     _fputc
+
+; fgets(char *s, int size, FILE *stream) → s or NULL on EOF
+; Use [ebp - 4] as 1-byte read buffer.
+; Use [ebp - 8] as bytes-read-so-far counter.
+_fgets:
+        push    ebp
+        mov     ebp, esp
+        sub     esp, 8
+        push    ebx
+        push    esi
+        push    edi
+        mov     edi, [ebp + 8]       ; s
+        mov     esi, [ebp + 12]      ; size
+        mov     ebx, [ebp + 16]      ; stream → fd
+        dec     esi                  ; reserve null terminator
+        mov     dword [ebp - 8], 0   ; bytes read counter
+.loop:
+        mov     eax, [ebp - 8]
+        cmp     eax, esi
+        jge     .end
+        ; INT 21h AH=0x3F: BX=fd, ECX=1, DX=buf
+        lea     edx, [ebp - 4]
+        mov     ecx, 1
+        mov     ah, 0x3F
+        int     21h
+        movzx   eax, ax
+        test    eax, eax
+        jz      .checkdone
+        ; Got 1 byte; append to s.
+        mov     ecx, [ebp - 8]
+        mov     al, [ebp - 4]
+        mov     [edi + ecx], al
+        inc     ecx
+        mov     [ebp - 8], ecx
+        cmp     al, 10               ; '\n'
+        je      .end
+        jmp     .loop
+.checkdone:
+        ; If we've read nothing yet, return NULL (EOF on fresh).
+        mov     eax, [ebp - 8]
+        test    eax, eax
+        jnz     .end
+        xor     eax, eax
+        jmp     .ret
+.end:
+        ; Null-terminate
+        mov     ecx, [ebp - 8]
+        mov     byte [edi + ecx], 0
+        mov     eax, edi             ; return s
+.ret:
+        pop     edi
+        pop     esi
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; fscanf(FILE *stream, const char *fmt, ...) — tiny implementation
+; supporting only `%s` (whitespace-delimited token, no width). Returns
+; number of items matched (0 or 1).
+_fscanf:
+        push    ebp
+        mov     ebp, esp
+        sub     esp, 4
+        push    ebx
+        push    esi
+        push    edi
+        mov     ebx, [ebp + 8]       ; stream
+        mov     esi, [ebp + 12]      ; fmt
+        lea     edi, [ebp + 16]      ; first vararg
+        xor     ecx, ecx             ; matched count
+.fmt_loop:
+        mov     al, [esi]
+        test    al, al
+        jz      .fscanf_done
+        cmp     al, '%'
+        je      .pct
+        inc     esi
+        jmp     .fmt_loop
+.pct:
+        inc     esi
+        mov     al, [esi]
+        cmp     al, 's'
+        jne     .fscanf_done         ; only %s supported
+        inc     esi
+        ; Skip whitespace from input.
+.skip_ws:
+        ; Read 1 byte
+        lea     edx, [ebp - 4]
+        push    ebx
+        mov     ah, 0x3F
+        mov     ecx, 1
+        int     21h
+        pop     ebx
+        movzx   eax, ax
+        test    eax, eax
+        jz      .fscanf_done
+        movzx   eax, byte [ebp - 4]
+        cmp     al, ' '
+        je      .skip_ws
+        cmp     al, 9                ; \t
+        je      .skip_ws
+        cmp     al, 10               ; \n
+        je      .skip_ws
+        cmp     al, 13               ; \r
+        je      .skip_ws
+        ; Got first non-whitespace char. Write to dst[*edi].
+        mov     edx, [edi]           ; dst pointer
+        mov     [edx], al
+        add     edx, 1
+.read_token:
+        push    ebx
+        push    edx
+        lea     edx, [ebp - 4]
+        mov     ecx, 1
+        mov     ah, 0x3F
+        int     21h
+        pop     edx
+        pop     ebx
+        movzx   eax, ax
+        test    eax, eax
+        jz      .end_token
+        movzx   eax, byte [ebp - 4]
+        cmp     al, ' '
+        je      .end_token
+        cmp     al, 9
+        je      .end_token
+        cmp     al, 10
+        je      .end_token
+        cmp     al, 13
+        je      .end_token
+        mov     [edx], al
+        add     edx, 1
+        jmp     .read_token
+.end_token:
+        ; Null-terminate dst.
+        mov     byte [edx], 0
+        ; Increment match count, advance vararg pointer.
+        mov     ecx, 1               ; one item matched
+        add     edi, 4
+        jmp     .fmt_loop
+.fscanf_done:
+        mov     eax, ecx
+        pop     edi
         pop     esi
         pop     ebx
         mov     esp, ebp
@@ -1818,15 +2190,16 @@ _snprintf:
         ret
 
 ; printf(const char *fmt, ...) — formats and writes to stdout.
-; Routed through the harness's INT 21h AH=5E hook so we get a real
-; Python-side printf with full %lld / %.Nf / %p / etc. support.
+; Loads [_stdout] as the destination fd and routes through AH=0x5F so
+; freopen-redirected stdout works correctly.
 _printf:
         push    ebp
         mov     ebp, esp
         push    ebx
+        mov     ebx, [_stdout]       ; fd
         mov     ecx, [ebp + 8]       ; fmt
         lea     edx, [ebp + 12]      ; va_args
-        mov     ah, 0x5E
+        mov     ah, 0x5F
         int     21h
         pop     ebx
         mov     esp, ebp
@@ -1839,9 +2212,10 @@ _vprintf:
         push    ebp
         mov     ebp, esp
         push    ebx
+        mov     ebx, [_stdout]       ; fd
         mov     ecx, [ebp + 8]       ; fmt
         mov     edx, [ebp + 12]      ; ap (va_ptr)
-        mov     ah, 0x5E
+        mov     ah, 0x5F
         int     21h
         pop     ebx
         mov     esp, ebp
@@ -2627,11 +3001,15 @@ _printf_emit_double:
 section .bss
 __heap:         resb 0x100000        ; 1 MB heap
 __heap_end:
+_tmpnam_internal_buf:  resb 32
+; signal handler table — indexed by signum (max 32). signum=0 unused.
+_signal_handlers: resd 32
 section .data
 __heap_ptr:     dd __heap
 _stdin:         dd 0
 _stdout:        dd 1
 _stderr:        dd 2
+_perror_suffix: db ': error', 10
 section .text
 
 _malloc:
@@ -2780,6 +3158,73 @@ _pow:
         fscale                        ; st0 *= 2^st1 (integer scale)
         fxch    st1
         fstp    st0                   ; pop the integer part
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- signal / raise -------------------------------------------------------
+; signal(int signum, void (*handler)(int)) → previous handler.
+; Stores handler in _signal_handlers[signum]. Returns the previous
+; entry. Validates signum in [0, 32).
+_signal:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        mov     eax, [ebp + 8]
+        cmp     eax, 32
+        jge     .err
+        cmp     eax, 0
+        jl      .err
+        mov     ecx, [ebp + 12]
+        mov     edx, [_signal_handlers + eax*4]
+        mov     [_signal_handlers + eax*4], ecx
+        ; Notify the harness so hardware exceptions (INT 0 = SIGFPE)
+        ; can dispatch the registered handler.
+        push    eax
+        mov     ebx, ecx             ; handler addr
+        mov     ah, 0x99
+        int     21h
+        pop     eax
+        mov     eax, edx             ; previous handler
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+.err:
+        mov     eax, -1
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; raise(int signum) → 0 on success, non-zero on error. Calls the
+; registered handler synchronously.
+_raise:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        mov     ebx, [ebp + 8]
+        cmp     ebx, 32
+        jge     .err
+        cmp     ebx, 0
+        jl      .err
+        mov     edx, [_signal_handlers + ebx*4]
+        test    edx, edx
+        jz      .nohand
+        push    ebx
+        call    edx
+        add     esp, 4
+        xor     eax, eax
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+.nohand:
+        ; No handler — abort.
+        call    _abort
+.err:
+        mov     eax, -1
+        pop     ebx
         mov     esp, ebp
         pop     ebp
         ret

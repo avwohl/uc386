@@ -99,6 +99,82 @@ def run(
 
     res = Result()
     stdin_pos = [0]
+    # Signal handler table: signum → handler addr. Populated by
+    # libc's signal() via INT 21h AH=0x99. On hardware exceptions
+    # (currently INT 0 / divide-by-zero → SIGFPE) we look up the
+    # handler and dispatch by setting EIP to it.
+    signal_handlers: dict[int, int] = {}
+    # Virtual file system: name → bytearray. Persists for the lifetime
+    # of the run, so a `fopen` for read after a `fopen`+`fclose` for
+    # write returns the previously-written bytes.
+    vfiles: dict[bytes, bytearray] = {}
+    # Open-file table: fd → {"name": bytes, "pos": int, "mode": str}.
+    # Modes: "r" (read), "w" (write/truncate), "a" (append).
+    vfd_table: dict[int, dict] = {}
+    next_vfd = [3]
+    tmpnam_seq = [0]
+
+    def _vfile_open(name: bytes, mode: str) -> int:
+        """Open or create a virtual file. Returns fd or -1 on error."""
+        if mode == "w":
+            vfiles[name] = bytearray()
+        elif mode == "a":
+            if name not in vfiles:
+                vfiles[name] = bytearray()
+        elif mode == "r":
+            if name not in vfiles:
+                return -1
+        else:
+            return -1
+        fd = next_vfd[0]
+        next_vfd[0] += 1
+        pos = len(vfiles[name]) if mode == "a" else 0
+        vfd_table[fd] = {"name": name, "pos": pos, "mode": mode}
+        return fd
+
+    def _vfile_close(fd: int) -> int:
+        if fd in vfd_table:
+            del vfd_table[fd]
+            return 0
+        return -1
+
+    def _vfile_read(fd: int, addr: int, count: int) -> int:
+        e = vfd_table.get(fd)
+        if e is None or e["mode"] not in ("r",):
+            return -1
+        buf = vfiles.get(e["name"])
+        if buf is None:
+            return 0
+        start = e["pos"]
+        end = min(start + count, len(buf))
+        chunk = bytes(buf[start:end])
+        if chunk:
+            mu.mem_write(addr, chunk)
+        e["pos"] = end
+        return len(chunk)
+
+    def _vfile_write(fd: int, addr: int, count: int) -> int:
+        e = vfd_table.get(fd)
+        if e is None or e["mode"] not in ("w", "a"):
+            return -1
+        buf = vfiles.setdefault(e["name"], bytearray())
+        data = bytes(mu.mem_read(addr, count))
+        # Extend buf if pos > len
+        while len(buf) < e["pos"]:
+            buf.append(0)
+        # Replace bytes at pos, extending as needed
+        end = e["pos"] + len(data)
+        if len(buf) < end:
+            buf.extend(b"\x00" * (end - len(buf)))
+        buf[e["pos"]:end] = data
+        e["pos"] = end
+        return count
+
+    def _vfile_delete(name: bytes) -> int:
+        if name in vfiles:
+            del vfiles[name]
+            return 0
+        return -1
 
     def _write_stdout(s: bytes) -> None:
         # Translate '\r\n' to '\n' (DOS line endings → POSIX) so test diffs
@@ -350,6 +426,24 @@ def run(
             uc.reg_write(UC_X86_REG_EAX, result_64 & 0xFFFFFFFF)
             uc.reg_write(UC_X86_REG_EDX, (result_64 >> 32) & 0xFFFFFFFF)
             return
+        if intno == 0:
+            # x86 #DE (divide error). Map to SIGFPE (signum=2 per our
+            # libc's signal.h) and dispatch the registered handler if
+            # any. Without a handler, abort.
+            handler = signal_handlers.get(2)
+            if handler:
+                # Call handler(signum=2). Push fake retaddr and arg.
+                esp = uc.reg_read(UC_X86_REG_ESP)
+                esp -= 4
+                uc.mem_write(esp, struct.pack("<I", 2))  # signum
+                esp -= 4
+                uc.mem_write(esp, struct.pack("<I", 0xFFFFFFFF))  # ret
+                uc.reg_write(UC_X86_REG_ESP, esp)
+                uc.reg_write(UC_X86_REG_EIP, handler)
+                return
+            res.error = "SIGFPE: no handler"
+            uc.emu_stop()
+            return
         if intno != 0x21:
             res.error = f"unexpected interrupt {intno:#x}"
             uc.emu_stop()
@@ -376,17 +470,32 @@ def run(
             uc.reg_write(UC_X86_REG_EAX, new_eax)
             return
         if ah == 0x5F:
-            # fprintf via harness: EBX=stream(fd 1=stdout, 2=stderr),
-            # ECX=fmt, EDX=va_ptr.
+            # fprintf via harness: EBX=stream(fd 1=stdout, 2=stderr,
+            # 3+ = virtual file), ECX=fmt, EDX=va_ptr.
             ebx = uc.reg_read(UC_X86_REG_EBX)
             ecx = uc.reg_read(UC_X86_REG_ECX)
             edx = uc.reg_read(UC_X86_REG_EDX)
             fmt = _read_cstr_local(ecx)
             formatted = _printf_format(fmt, edx)
-            if (ebx & 0xFFFF) == 2:
+            fd = ebx & 0xFFFFFFFF
+            if fd == 2:
                 _write_stderr(formatted)
-            else:
+            elif fd == 1:
                 _write_stdout(formatted)
+            elif fd >= 3 and fd in vfd_table:
+                # Append formatted bytes to the virtual file. We can't
+                # use _vfile_write directly because the bytes are a
+                # Python bytes, not in emulator memory.
+                e = vfd_table[fd]
+                if e["mode"] in ("w", "a"):
+                    buf = vfiles.setdefault(e["name"], bytearray())
+                    while len(buf) < e["pos"]:
+                        buf.append(0)
+                    end = e["pos"] + len(formatted)
+                    if len(buf) < end:
+                        buf.extend(b"\x00" * (end - len(buf)))
+                    buf[e["pos"]:end] = formatted
+                    e["pos"] = end
             new_eax = (eax & ~0xFFFFFFFF) | (len(formatted) & 0xFFFFFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
             return
@@ -433,19 +542,27 @@ def run(
             ecx = uc.reg_read(UC_X86_REG_ECX)
             edx = uc.reg_read(UC_X86_REG_EDX)
             count = ecx & 0xFFFF  # spec is 16-bit count, but tolerate larger
-            data = bytes(uc.mem_read(edx, count))
             fd = ebx & 0xFFFF
             if fd == 1:
+                data = bytes(uc.mem_read(edx, count))
                 _write_stdout(data)
+                actual = count
             elif fd == 2:
+                data = bytes(uc.mem_read(edx, count))
                 _write_stderr(data)
+                actual = count
+            elif fd >= 3:
+                actual = _vfile_write(fd, edx, count)
+                if actual < 0:
+                    actual = 0
+            else:
+                actual = 0
             # Return bytes-written in AX; CF clear on success.
-            new_eax = (eax & ~0xFFFF) | (count & 0xFFFF)
+            new_eax = (eax & ~0xFFFF) | (actual & 0xFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
             return
         if ah == 0x3F:
-            # read(fd, buf, count): BX=fd, CX=count, DS:EDX=buf. Only fd=0
-            # (stdin) handled.
+            # read(fd, buf, count): BX=fd, CX=count, DS:EDX=buf.
             ebx = uc.reg_read(UC_X86_REG_EBX)
             ecx = uc.reg_read(UC_X86_REG_ECX)
             edx = uc.reg_read(UC_X86_REG_EDX)
@@ -459,9 +576,73 @@ def run(
                     uc.mem_write(edx, chunk)
                 stdin_pos[0] = end
                 actual = len(chunk)
+            elif fd >= 3:
+                actual = _vfile_read(fd, edx, count)
+                if actual < 0:
+                    actual = 0
             else:
                 actual = 0
             new_eax = (eax & ~0xFFFF) | (actual & 0xFFFF)
+            uc.reg_write(UC_X86_REG_EAX, new_eax)
+            return
+        if ah == 0x3C:
+            # creat(name, mode): create or truncate. DS:EDX=name. Returns fd.
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            name = bytes(_read_cstr_local(edx))
+            fd = _vfile_open(name, "w")
+            new_eax = (eax & ~0xFFFFFFFF) | (fd & 0xFFFFFFFF)
+            uc.reg_write(UC_X86_REG_EAX, new_eax)
+            return
+        if ah == 0x3D:
+            # open(name, mode): DS:EDX=name, AL=mode (0=r, 1=w, 2=rw).
+            # We support 0 (read) and 1/2 (write — truncate).
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            name = bytes(_read_cstr_local(edx))
+            mode_byte = al
+            if mode_byte == 0:
+                fd = _vfile_open(name, "r")
+            elif mode_byte in (1, 2):
+                fd = _vfile_open(name, "w")
+            else:
+                fd = -1
+            new_eax = (eax & ~0xFFFFFFFF) | (fd & 0xFFFFFFFF)
+            uc.reg_write(UC_X86_REG_EAX, new_eax)
+            return
+        if ah == 0x3E:
+            # close(fd): BX=fd. Returns 0 on success.
+            ebx = uc.reg_read(UC_X86_REG_EBX)
+            fd = ebx & 0xFFFFFFFF
+            rc = _vfile_close(fd)
+            new_eax = (eax & ~0xFFFFFFFF) | (rc & 0xFFFFFFFF)
+            uc.reg_write(UC_X86_REG_EAX, new_eax)
+            return
+        if ah == 0x41:
+            # unlink(name): DS:EDX=name. Returns 0 on success, -1 on error.
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            name = bytes(_read_cstr_local(edx))
+            rc = _vfile_delete(name)
+            new_eax = (eax & ~0xFFFFFFFF) | (rc & 0xFFFFFFFF)
+            uc.reg_write(UC_X86_REG_EAX, new_eax)
+            return
+        if ah == 0x5A:
+            # tmpnam: DS:EDX=buf (output). Writes a unique name. Returns
+            # buf in AX.
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            seq = tmpnam_seq[0]
+            tmpnam_seq[0] += 1
+            name = f"/tmp/uctmp_{seq:04d}".encode("ascii")
+            uc.mem_write(edx, name + b"\x00")
+            new_eax = (eax & ~0xFFFFFFFF) | (edx & 0xFFFFFFFF)
+            uc.reg_write(UC_X86_REG_EAX, new_eax)
+            return
+        if ah == 0x99:
+            # signal(signum, handler): AL=signum, EBX=handler.
+            # Returns prev handler in EAX.
+            ebx = uc.reg_read(UC_X86_REG_EBX)
+            signum = al
+            prev = signal_handlers.get(signum, 0)
+            signal_handlers[signum] = ebx
+            new_eax = (eax & ~0xFFFFFFFF) | (prev & 0xFFFFFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
             return
         # Unimplemented — record and exit.
