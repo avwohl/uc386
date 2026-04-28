@@ -4968,14 +4968,17 @@ class CodeGenerator:
             out.append(f"{done}:")
             return out
         if op in ("/", "%"):
-            if not (self._is_int128(lt) and not self._is_int128(rt)):
-                raise CodegenError(
-                    "__int128 / int128 division not supported"
-                )
+            # Signed int128 / non-int128: widen rhs to int128 and
+            # recurse through the (signed) int128/int128 path so the
+            # result-sign machinery applies correctly.
             if not self._is_unsigned(lt):
-                raise CodegenError(
-                    "signed __int128 division not supported"
+                synth_cast = ast.Cast(target_type=lt, expr=expr.right)
+                ctx.alloc_call_temp(synth_cast, 16)
+                synth_binop = ast.BinaryOp(
+                    op=op, left=expr.left, right=synth_cast,
                 )
+                return self._binary_int128(synth_binop, dest_disp, ctx)
+            # u128 / non-u128: 32-bit divisor fast path below.
             # Evaluate the divisor into ECX (32-bit). Signedness handled
             # by the existing eval; we treat ECX as unsigned.
             out: list[str] = []

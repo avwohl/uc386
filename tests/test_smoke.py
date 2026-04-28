@@ -3162,6 +3162,19 @@ def test_stmt_expr_with_int128_trailing_value():
     assert "_main:" in asm
 
 
+def test_signed_int128_div_by_int_widens_rhs():
+    # `i128 / int` (signed) widens rhs to i128 and routes through the
+    # int128/int128 path (which has the sign-handling machinery).
+    asm = _compile(
+        "__int128 sd(__int128 a, int b) { return a / b; }\n"
+        "int main(void) { return 0; }\n"
+    )
+    assert "_sd:" in asm
+    # The int128/int128 path uses the unsigned helper after sign
+    # extraction.
+    assert "___uc386_udiv128" in asm
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.

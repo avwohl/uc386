@@ -646,3 +646,8 @@ See `README.md` for the public roadmap (Phase 0–6).
   - The integer / struct StmtExpr paths in `_eval_expr_to_eax` were already in place.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +2 smoke tests (338 total).
+- **2026-04-28 — signed __int128 / int**: completes the signed-int128 division coverage.
+  - **`i128 / int` (signed lhs, non-int128 rhs)** used to raise "signed __int128 division not supported". Now widens the rhs to int128 via a synthetic Cast and recurses through the int128/int128 path (which has the abs-value extraction + sign-fixup machinery). Same for `i128 % int`.
+  - The previous error site was misleading anyway: when `lt is int128 and rt is int128`, the earlier i128/i128 branch handles it; when `lt is int128 and rt is non-int128`, we fall through to the divisor-fast path. Signed lhs with non-int128 rhs was the only case left raising.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (339 total).
