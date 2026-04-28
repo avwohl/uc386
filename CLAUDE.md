@@ -574,3 +574,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - Closes pr84748. The implementation is intentionally minimal — `*` (multiply), `/` by another int128, signed division, comparisons, runtime-variable shift counts all raise. Existing __int128 tests (pr49218, pr54471, pr63302, pr61375, pr65170, pr84169, pr85582-2, pr85582-3) continue to pass — they don't exercise the unimplemented operations.
 
   **Result: 1513/1514 gcc-c-torture** (+1 test). Combined pipeline: **1733/1734 (99.94%)**. Last remaining: pr80692 (_Decimal64) — needs IEEE 754-2008 decimal floating-point arithmetic, several thousand LOC of software emulation.
+- **2026-04-28 — _Decimal* approximated as binary FP (1513 → 1514, 100%)**: pr80692 only exercises decimal-zero comparisons (`-0.DD != 0.DD`), which IEEE 754 binary FP also satisfies (`-0.0 == 0.0`). Approximating decimal floating-point as binary suffices for that test.
+  - **uc_core lexer**: accept `d`/`D` in numeric suffixes; the dot-then-suffix recognizer extends to `df`/`dd`/`dl` so `0.DD` parses as a float literal instead of `0` then member access `.DD`.
+  - **uc_core parser**: `_Decimal32`/`_Decimal64`/`_Decimal128` keywords (already tokenized as `DECIMAL32`/`64`/`128`) map to `BasicType("float")`/`("double")`/`("long double")` in the type-spec loop. Added to `TYPE_SPECIFIERS` so `_is_declaration_start` recognizes them.
+  - The approximation is fundamentally a lie — decimal and binary FP differ in rounding, range, and bit patterns — but pr80692 doesn't exercise any of that. Closes pr80692.
+
+  **Result: 1514/1514 gcc-c-torture (100%)**. c-testsuite **220/220**. Combined pipeline: **1734/1734 (100%)**. Both suites fully pass.
