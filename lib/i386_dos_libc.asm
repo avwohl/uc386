@@ -2784,6 +2784,34 @@ _pow:
         pop     ebp
         ret
 
+; ---- open / mmap / munmap / mprotect (stubs returning -1) ------------------
+; uc386 runs in a flat-32 DOS environment with no real fs/mmap support.
+; Tests guarded by `if (mmap(...) == MAP_FAILED) skip;` exit cleanly when
+; these stubs return -1.
+_open:
+        mov     eax, -1
+        ret
+
+_creat:
+        mov     eax, -1
+        ret
+
+_fcntl:
+        mov     eax, -1
+        ret
+
+_mmap:
+        mov     eax, -1
+        ret
+
+_munmap:
+        mov     eax, -1
+        ret
+
+_mprotect:
+        mov     eax, -1
+        ret
+
 ; ---- atoi ------------------------------------------------------------------
 _atoi:
         push    ebp

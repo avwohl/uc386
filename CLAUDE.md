@@ -524,3 +524,7 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **uc386 codegen**: pre-scan top_decls building `_instrument_no_skip` (names of fns where any decl/def has the attr) and `_instrument_enabled` (True iff both `__cyg_profile_func_enter` and `__cyg_profile_func_exit` are defined in this TU). When both conditions are met, every other function gets `push retaddr; push fnaddr; call ___cyg_profile_func_enter; add esp, 8` after prologue setup, and the same for `__cyg_profile_func_exit` at `.epilogue:` (with EAX/EDX/st(0) saved across the call to preserve the return value). Skips main if it's marked NOCHK (eeprof-1's pattern).
 
   **Result: 1503/1514 gcc-c-torture** (+1 test). Combined with c-testsuite 218/220, the pipeline now passes 1721/1734 (99.25%).
+- **2026-04-28 — torture sweep: open / mmap / munmap stubs (1503 → 1505)**:
+  - **`open` / `creat` / `fcntl` / `mmap` / `munmap` / `mprotect` stubs** in libc returning -1. uc386 runs in a flat-32 DOS environment with no real fs/mmap support; tests guarded by `if (mmap(...) == MAP_FAILED) skip;` exit cleanly when these stubs return -1. Closes loop-2f, loop-2g.
+
+  **Result: 1505/1514 gcc-c-torture** (+2 tests). Combined with c-testsuite 218/220, the pipeline now passes 1723/1734 (99.37%).
