@@ -663,3 +663,8 @@ See `README.md` for the public roadmap (Phase 0–6).
   - Like the previous LL inc/dec carry bug, this was masked because the torture suite's long-long compound-assign sites use values well below 2^32.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (342 total).
+- **2026-04-28 — long-long comma drops left side (real bug)**: `_binary_ll`'s comma branch was `return _eval_expr_to_edx_eax(expr.right) if not False else out` — a literal dead `if not False else out` pattern that always returned right's value with no eval of left. So `(a += 5, a *= 2)` for long-long `a` only emitted `a *= 2`; the `+= 5` was dropped entirely.
+  - **Fix**: type-aware eval of lhs for its side effects, then yield right's value as long-long. Float lhs uses `_eval_float_to_st0` + `fstp st0` to drop the result; LL lhs uses `_eval_expr_to_edx_eax`; int128 lhs uses `_int128_value_address`; everything else uses `_eval_expr_to_eax`.
+  - Found by spot-checking `(ll_lvalue += 5, ll_lvalue *= 2)`.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (343 total).

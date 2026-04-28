@@ -10845,8 +10845,20 @@ class CodeGenerator:
                 "        int     0x80",
             ]
         if op == ",":
-            # Comma: discard left's value, keep right.
-            return self._eval_expr_to_edx_eax(expr.right, ctx) if not False else out
+            # Comma: evaluate left for its side effects (its value is
+            # discarded), then yield right's value as long-long.
+            lhs_ty = self._type_of(expr.left, ctx)
+            if self._is_float_type(lhs_ty):
+                out_lhs = self._eval_float_to_st0(expr.left, ctx)
+                # Drop the float result.
+                out_lhs.append("        fstp    st0")
+            elif self._is_long_long(lhs_ty):
+                out_lhs = self._eval_expr_to_edx_eax(expr.left, ctx)
+            elif self._is_int128(lhs_ty):
+                out_lhs = self._int128_value_address(expr.left, ctx)
+            else:
+                out_lhs = self._eval_expr_to_eax(expr.left, ctx)
+            return out_lhs + self._eval_expr_to_edx_eax(expr.right, ctx)
         if op == "&&":
             return self._logical_and_ll(expr, ctx)
         if op == "||":

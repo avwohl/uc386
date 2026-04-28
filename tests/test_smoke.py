@@ -3220,6 +3220,24 @@ def test_long_long_compound_assign_array_element_routes_to_ll_path():
     assert "adc     edx, ebx" in asm
 
 
+def test_long_long_comma_evaluates_lhs_for_side_effects():
+    # `(a += 5, a *= 2)` where a is long-long: was dropping the
+    # `a += 5` and only emitting `a *= 2`. Now evaluates lhs through
+    # _eval_expr_to_edx_eax so both side effects fire.
+    asm = _compile(
+        "int main(void) {\n"
+        "    long long a = 10LL;\n"
+        "    (a += 5, a *= 2);\n"
+        "    return a == 30LL ? 0 : 1;\n"
+        "}\n"
+    )
+    # Both compound assigns should emit add (for +=) and a multiply
+    # sequence (for *=).
+    assert asm.count("adc     edx, ebx") >= 1
+    # And the LL multiply (`mul ecx` followed by partial products).
+    assert "        mul     ecx" in asm
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.
