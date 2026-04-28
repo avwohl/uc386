@@ -3175,6 +3175,36 @@ def test_signed_int128_div_by_int_widens_rhs():
     assert "___uc386_udiv128" in asm
 
 
+def test_long_long_inc_dec_propagates_carry():
+    # `ll++` on an Identifier whose value is at the 32-bit boundary
+    # should produce 0x1_00000000, not 0x0. Was using `inc dword` which
+    # only bumps low 32 bits.
+    asm = _compile(
+        "int main(void) {\n"
+        "    long long x = 0xFFFFFFFFLL;\n"
+        "    x++;\n"
+        "    return x == 0x100000000LL ? 0 : 1;\n"
+        "}\n"
+    )
+    # Long long ++/-- now goes through `_inc_dec_ll` which does an
+    # add dword + adc dword 0 chain.
+    assert "add     dword [ebp - " in asm and "adc     dword [ebp - " in asm
+
+
+def test_long_long_inc_dec_array_element_propagates_carry():
+    # Same for array elements (non-Identifier path).
+    asm = _compile(
+        "int main(void) {\n"
+        "    long long arr[1] = {0xFFFFFFFFLL};\n"
+        "    arr[0]++;\n"
+        "    return arr[0] == 0x100000000LL ? 0 : 1;\n"
+        "}\n"
+    )
+    # The lvalue path should emit add dword [ecx] / adc dword [ecx+4].
+    assert "add     dword [ecx], 1" in asm
+    assert "adc     dword [ecx + 4], 0" in asm
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.

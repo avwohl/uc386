@@ -651,3 +651,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - The previous error site was misleading anyway: when `lt is int128 and rt is int128`, the earlier i128/i128 branch handles it; when `lt is int128 and rt is non-int128`, we fall through to the divisor-fast path. Signed lhs with non-int128 rhs was the only case left raising.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (339 total).
+- **2026-04-28 — long-long ++/-- carry propagation (real bug)**: a latent correctness bug found by spot-checking. `_inc_dec` and `_inc_dec_lvalue` both treated long-long slots as size-8 width "dword" — emitting `inc dword [...]` (or `add/sub dword`) which only mutates the low 32 bits. Carry never propagates to the high dword, so `(long long)0xFFFFFFFF + 1` produced `0` instead of `0x100000000`.
+  - **Identifier path**: `_inc_dec` now dispatches long-long Identifier operands to `_inc_dec_ll` (which already does `add/adc` of low and high dwords with the right pre/post value semantics).
+  - **Lvalue path** (`arr[i]`, `s.m`, `*p`, `p->m`): `_inc_dec_lvalue` gained a long-long branch that computes `&lvalue` once into ECX, then RMWs `[ecx]` (low) with `add 1` and `[ecx + 4]` (high) with `adc 0` (or `sub`/`sbb` for `--`). Pre-form returns the new value in EDX:EAX; post-form returns the old value before the bump. Removed the `8: "dword"` entry from the width-table since LL is now handled separately (only char/short/int reach the dword-width fallback).
+  - The torture suite never tripped on this because most LL inc/dec sites were on values well below 2^32. Found via direct probing of `(ll)0xFFFFFFFF + 1`.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +2 smoke tests (341 total).

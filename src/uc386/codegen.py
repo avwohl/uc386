@@ -12152,6 +12152,10 @@ class CodeGenerator:
             raise CodegenError(
                 f"cannot {expr.op} array `{expr.operand.name}`"
             )
+        # Long-long Identifier: route through `_inc_dec_ll` which does
+        # the 8-byte RMW with carry/borrow propagation.
+        if self._is_long_long(ty):
+            return self._inc_dec_ll(expr, ctx)
         addr = self._identifier_addr_text(expr.operand.name, ctx)
         # On a pointer, ++/-- step by sizeof(*ptr) instead of 1. We still
         # mutate the slot in place — the slot stores the pointer value —
@@ -12165,7 +12169,7 @@ class CodeGenerator:
             # bytes are at the same `[ebp - N]` regardless of width because
             # x86 is little-endian.
             size = self._size_of(ty)
-            width = {1: "byte", 2: "word", 4: "dword", 8: "dword"}[size]
+            width = {1: "byte", 2: "word", 4: "dword"}[size]
             instr = "inc" if expr.op == "++" else "dec"
             bump = [f"        {instr}     {width} {addr}"]
         load = self._load_to_eax(addr, ty)
@@ -12204,13 +12208,35 @@ class CodeGenerator:
         target_ty = self._type_of(expr.operand, ctx)
         if isinstance(target_ty, ast.ArrayType):
             raise CodegenError(f"cannot {expr.op} an array")
+        # Long-long lvalue: RMW the 8-byte slot with carry/borrow
+        # propagating through the high dword. The eval is for value;
+        # callers that ignore the result (statement context) can drop
+        # the load.
+        if self._is_long_long(target_ty):
+            instr0 = "add" if expr.op == "++" else "sub"
+            instrN = "adc" if expr.op == "++" else "sbb"
+            out = list(addr_lines)  # eax = &lvalue
+            out.append("        mov     ecx, eax")
+            if expr.is_prefix:
+                # ++lvalue: bump in place via low add, high adc 0.
+                out.append(f"        {instr0}     dword [ecx], 1")
+                out.append(f"        {instrN}     dword [ecx + 4], 0")
+                out.append("        mov     eax, [ecx]")
+                out.append("        mov     edx, [ecx + 4]")
+                return out
+            # lvalue++: load OLD value into EDX:EAX, then bump.
+            out.append("        mov     eax, [ecx]")
+            out.append("        mov     edx, [ecx + 4]")
+            out.append(f"        {instr0}     dword [ecx], 1")
+            out.append(f"        {instrN}     dword [ecx + 4], 0")
+            return out
         if isinstance(target_ty, ast.PointerType):
             step = self._size_of(target_ty.base_type)
             width = "dword"
         else:
             step = 1
             size = self._size_of(target_ty)
-            width = {1: "byte", 2: "word", 4: "dword", 8: "dword"}[size]
+            width = {1: "byte", 2: "word", 4: "dword"}[size]
         op_mnem = "add" if expr.op == "++" else "sub"
 
         out = list(addr_lines)  # eax = &lvalue
