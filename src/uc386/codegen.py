@@ -564,6 +564,11 @@ class CodeGenerator:
         # `_name equ _target` in the output. Both names refer to the
         # same address.
         self._global_aliases: dict[str, str] = {}
+        # `__attribute__((noinit))` — uninitialized globals NOT zeroed
+        # by the _start re-init loop. (Initial program load still zeros
+        # these because DOS loader fills BSS with zeros, but recursive
+        # _start calls preserve their values.)
+        self._noinit_globals: set[str] = set()
         for d in top_decls:
             if isinstance(d, ast.VarDecl) and not isinstance(d.var_type, ast.FunctionType):
                 target = getattr(d, "alias_target", None)
@@ -584,6 +589,8 @@ class CodeGenerator:
                 align = getattr(d, "alignment", None)
                 if align is not None:
                     self._global_alignments[d.name] = align
+                if getattr(d, "is_noinit", False):
+                    self._noinit_globals.add(d.name)
                 if d.init is not None:
                     if d.name in self._global_inits:
                         raise CodegenError(
@@ -793,13 +800,19 @@ class CodeGenerator:
         return ast.BasicType(name="float")
 
     def _bss_section(self) -> list[str]:
-        uninit = sorted(
+        uninit_all = sorted(
             name for name in self._globals if name not in self._global_inits
         )
-        if not uninit and not self._nonlocal_goto_bufs:
-            return []
-        out = ["        section .bss"]
-        for name in uninit:
+        # Group non-noinit globals first so a single `_bss_zero_start` /
+        # `_bss_zero_end` range covers everything that the _start
+        # re-init loop should zero.
+        zero_globals = [n for n in uninit_all if n not in self._noinit_globals]
+        noinit_globals = [n for n in uninit_all if n in self._noinit_globals]
+        # Always emit the section + zero-range labels — `_start`'s
+        # re-init loop unconditionally references them. Even an empty
+        # BSS produces a no-op `rep stosb` (count 0).
+        out = ["        section .bss", "_bss_zero_start:"]
+        for name in zero_globals:
             ty = self._globals[name]
             size = self._size_of(ty)
             align = self._global_alignments.get(name)
@@ -811,11 +824,29 @@ class CodeGenerator:
                 out.append(f"        alignb {align}")
             out.append(f"_{name}:")
             out.append(f"        resb    {size}")
-        # Non-local goto buffers — 12 bytes per __builtin_setjmp.
+        # Non-local goto buffers — 12 bytes per __builtin_setjmp. These
+        # also fall in the zero range so a recursive _start re-runs
+        # the setjmp dispatch cleanly.
         for buf in sorted(self._nonlocal_goto_bufs):
             out.append("        alignb 4")
             out.append(f"_{buf}:")
             out.append("        resb    12")
+        out.append("_bss_zero_end:")
+        # noinit globals: not zeroed by _start, so they retain their
+        # values across recursive _start calls. (DOS loader still zero-
+        # fills BSS at program load, so first-time access reads 0.)
+        for name in noinit_globals:
+            ty = self._globals[name]
+            size = self._size_of(ty)
+            align = self._global_alignments.get(name)
+            if align is None:
+                ta = self._alignment_of(ty)
+                if ta > 1:
+                    align = ta
+            if align and align > 1:
+                out.append(f"        alignb {align}")
+            out.append(f"_{name}:")
+            out.append(f"        resb    {size}")
         return out
 
     def _emit_global_init(
@@ -2325,6 +2356,9 @@ class CodeGenerator:
         # `__start` aliases `_start` so a user `extern void _start(void)`
         # / `_start()` call (which our naming convention prefixes to
         # `__start`) reaches the entry stub.
+        # _start also re-zeroes the non-noinit BSS range so a recursive
+        # `_start()` call from main (`__attribute__((noinit))` test
+        # idiom) re-runs main with a clean slate.
         return [
             "_start:",
             "__start:",
@@ -2332,6 +2366,12 @@ class CodeGenerator:
             "        mov     word [esp], 0x027F",
             "        fldcw   [esp]",
             "        add     esp, 4",
+            "        cld",
+            "        xor     eax, eax",
+            "        mov     edi, _bss_zero_start",
+            "        mov     ecx, _bss_zero_end",
+            "        sub     ecx, edi",
+            "        rep     stosb",
             "        call    _main",
             "        mov     ah, 4Ch",
             "        int     21h",

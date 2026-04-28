@@ -528,3 +528,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`open` / `creat` / `fcntl` / `mmap` / `munmap` / `mprotect` stubs** in libc returning -1. uc386 runs in a flat-32 DOS environment with no real fs/mmap support; tests guarded by `if (mmap(...) == MAP_FAILED) skip;` exit cleanly when these stubs return -1. Closes loop-2f, loop-2g.
 
   **Result: 1505/1514 gcc-c-torture** (+2 tests). Combined with c-testsuite 218/220, the pipeline now passes 1723/1734 (99.37%).
+- **2026-04-28 — torture sweep: __attribute__((noinit)) + BSS re-zero (1505 → 1506)**:
+  - **uc_core**: parses `noinit` attribute via `_pending_noinit` flag, threads through to `VarDecl.is_noinit`.
+  - **uc386 BSS layout**: groups non-noinit globals first under `_bss_zero_start:` / `_bss_zero_end:` labels, noinit globals follow after the end label. Always emits the labels (even when BSS is empty) since `_start` references them unconditionally.
+  - **uc386 _start re-zero**: emits `cld; xor eax, eax; mov edi, _bss_zero_start; mov ecx, _bss_zero_end; sub ecx, edi; rep stosb` after FPU init. Recursive `_start()` calls (noinit-attribute test idiom) re-zero scratch state but preserve noinit globals' values across the call. First-time entry is a no-op (DOS loader already zeroed BSS). Closes noinit-attribute.
+
+  **Result: 1506/1514 gcc-c-torture** (+1 test). Combined with c-testsuite 218/220, the pipeline now passes 1724/1734 (99.42%).
