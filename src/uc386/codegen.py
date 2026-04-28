@@ -681,15 +681,14 @@ class CodeGenerator:
         # may call sibling nested fns that share the same outer; this
         # maps `t0` → `_outer__t0` etc.
         self._lifted_nested_fn_names: dict[str, dict[str, str]] = {}
-        # Non-local goto bookkeeping. `_nonlocal_goto_targets` maps
-        # outer-fn name → (label name → buf-global-name) for labels in
-        # outer that get goto'd from nested fns. `_lifted_nonlocal_gotos`
-        # mirrors that on the inner side: lifted-mangled-name → (label
-        # → buf). `_nonlocal_goto_bufs` is the set of buf labels we
-        # need to emit in `.bss` (12 bytes each per __builtin_setjmp).
-        self._nonlocal_goto_targets: dict[str, dict[str, str]] = {}
-        self._lifted_nonlocal_gotos: dict[str, dict[str, str]] = {}
-        self._nonlocal_goto_bufs: set[str] = set()
+        # Non-local goto bookkeeping. `_lifted_nonlocal_gotos`
+        # mirrors the outer-side trampoline data on the inner side:
+        # lifted-mangled-name → (label → idx_in_buf_array) so the
+        # lifted fn's `goto X` knows which 12-byte slot to longjmp.
+        # The bufs themselves live in the outer's frame; the static-
+        # link slot in the lifted fn holds the buf-array's address,
+        # set on entry from ECX.
+        self._lifted_nonlocal_gotos: dict[str, dict[str, int]] = {}
         # Lifted-mangled-name → outer-fn-name. Used by `&&label` and
         # the goto-fallback to resolve labels declared in the outer.
         self._lifted_outer_fn: dict[str, str] = {}
@@ -862,13 +861,6 @@ class CodeGenerator:
                 out.append(f"        alignb {align}")
             out.append(f"_{name}:")
             out.append(f"        resb    {size}")
-        # Non-local goto buffers — 12 bytes per __builtin_setjmp. These
-        # also fall in the zero range so a recursive _start re-runs
-        # the setjmp dispatch cleanly.
-        for buf in sorted(self._nonlocal_goto_bufs):
-            out.append("        alignb 4")
-            out.append(f"_{buf}:")
-            out.append("        resb    12")
         out.append("_bss_zero_end:")
         # noinit globals: not zeroed by _start, so they retain their
         # values across recursive _start calls. (DOS loader still zero-
