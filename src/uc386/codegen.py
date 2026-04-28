@@ -10523,8 +10523,56 @@ class CodeGenerator:
                 return ast.BasicType(name="int", is_signed=False)
             return ast.BasicType(name="int")
         if isinstance(expr, ast.TernaryOp):
-            # Both arms should agree in well-formed C; pick the true arm.
-            return self._type_of(expr.true_expr, ctx)
+            # Per C99 6.5.15, if both arms have arithmetic type, the
+            # result type is determined by the usual arithmetic
+            # conversions of the two arms (regardless of which arm
+            # the runtime selects). For pointer arms, prefer a
+            # non-null pointee. Fall back to the true arm's type when
+            # both arms have the same kind.
+            try:
+                lt = self._type_of(expr.true_expr, ctx)
+                rt = self._type_of(expr.false_expr, ctx)
+            except CodegenError:
+                return self._type_of(expr.true_expr, ctx)
+            # Both float-family: pick the wider via _float_promotion.
+            if self._is_float_type(lt) or self._is_float_type(rt):
+                return self._float_promotion(lt, rt)
+            # __int128 dominates.
+            if self._is_int128(lt) or self._is_int128(rt):
+                return ast.BasicType(
+                    name="int128",
+                    is_signed=(False if (
+                        self._is_unsigned(lt) or self._is_unsigned(rt)
+                    ) else None),
+                )
+            # Long long beats long/int.
+            if self._is_long_long(lt) or self._is_long_long(rt):
+                return ast.BasicType(
+                    name="long long",
+                    is_signed=(False if (
+                        self._is_unsigned(lt) or self._is_unsigned(rt)
+                    ) else None),
+                )
+            # Pointer wins over arithmetic.
+            l_ptr = self._is_pointer_like(lt)
+            r_ptr = self._is_pointer_like(rt)
+            if l_ptr and not r_ptr:
+                return lt
+            if r_ptr and not l_ptr:
+                return rt
+            if l_ptr and r_ptr:
+                # Both pointer — pick the one with non-void pointee.
+                lp = lt.base_type if isinstance(lt, ast.PointerType) else None
+                if lp is not None and not (
+                    isinstance(lp, ast.BasicType) and lp.name == "void"
+                ):
+                    return lt
+                return rt
+            # Both arithmetic ints (post-promotion): unsigned wins.
+            if self._is_unsigned(lt) or self._is_unsigned(rt):
+                return ast.BasicType(name="int", is_signed=False)
+            # Default to int (after default int promotion of char/short).
+            return ast.BasicType(name="int")
         if isinstance(expr, (ast.SizeofExpr, ast.SizeofType)):
             # `sizeof` returns size_t; treat it as int for our flat-32 ABI.
             return ast.BasicType(name="int")

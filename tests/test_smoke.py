@@ -3713,3 +3713,49 @@ def test_nested_fn_with_nonlocal_goto_emits_trampoline_and_setjmp():
     assert "___builtin_longjmp" in asm
     # Lifted fn name carries the outer prefix.
     assert "_main__compare:" in asm
+
+
+def test_sizeof_ternary_uses_usual_arithmetic_conversions():
+    # Per C99 6.5.15, the result type of `cond ? a : b` is
+    # determined by the usual arithmetic conversions of the two
+    # arms — regardless of which arm runtime selects. Previously
+    # `_type_of(TernaryOp)` just returned `_type_of(true_expr)`,
+    # so `sizeof(1 ? (char)1 : (int)1)` returned 1 instead of 4.
+    asm = _compile(
+        "int main(void) {\n"
+        "    if (sizeof(1 ? (char)1 : (int)1) != sizeof(int)) return 1;\n"
+        "    if (sizeof(1 ? 1 : 2.5) != sizeof(double)) return 2;\n"
+        "    if (sizeof(1 ? 1LL : 2) != sizeof(long long)) return 3;\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    # All three sizeof's fold to literals via _const_eval, which calls
+    # _type_of(TernaryOp). The asm should contain `mov eax, 4`,
+    # `mov eax, 8`, `mov eax, 8` (and four/eight-byte cmp values).
+    # Just check no `mov eax, 1` outside the trivial returns —
+    # absence of the wrong-size sizeof.
+    assert ", 4" in asm  # sizeof(int) and the int constant 4
+    assert ", 8" in asm  # sizeof(double) / sizeof(long long)
+
+
+def test_int128_function_pointer_typedef():
+    # `__int128` is tokenized as IDENTIFIER (not a keyword). The
+    # implicit-int K&R extension in `_parse_declaration` peeks past
+    # any IDENTIFIER followed by `(`/`;`/`=`/`,` and treats it as a
+    # declarator with implicit-int. So `typedef __int128 (*ifn_t)(int);`
+    # was parsing as `typedef int __int128 (*ifn_t)(int)` — declaring
+    # `__int128` as a function name. Fix: exclude `__int128` /
+    # `__int128_t` / `__uint128_t` from the implicit-int peek.
+    asm = _compile(
+        "typedef __int128 (*ifn_t)(int);\n"
+        "__int128 helper(int x) { return (__int128)x * 1000; }\n"
+        "int main(void) {\n"
+        "    ifn_t fn = helper;\n"
+        "    __int128 r = fn(5);\n"
+        "    if (r != 5000) return 1;\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    assert "_helper:" in asm
+    # The typedef should NOT register `__int128` as a function name.
+    assert "___int128:" not in asm
