@@ -3216,11 +3216,11 @@ def test_long_long_compound_assign_array_element_routes_to_ll_path():
         "    return arr[0] == 0x100000000LL ? 0 : 1;\n"
         "}\n"
     )
-    # Look for the LL add: `add eax, ebx` followed by `adc edx, esi`
-    # (or any LL add+adc pair, since address-once compound uses
-    # different temp registers from the desugared lhs+rhs path).
-    assert "        add     eax, ebx" in asm
-    assert "        adc     edx, esi" in asm
+    # Look for the LL add: `add eax, ecx` followed by `adc edx, ebx`
+    # (the snapshot-Identifier path now flows through _binary_ll's
+    # standard add+adc with ECX/EBX as right operands).
+    assert "        add     eax, ecx" in asm
+    assert "        adc     edx, ebx" in asm
 
 
 def test_long_long_comma_evaluates_lhs_for_side_effects():

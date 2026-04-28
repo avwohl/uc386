@@ -11009,9 +11009,11 @@ class CodeGenerator:
         For Identifier lvalues, desugar to `lvalue = lvalue OP rhs`
         — re-reading an Identifier is side-effect-free. For
         non-Identifier lvalues (Index / *p / Member), compute the
-        address once into ECX, evaluate rhs, then RMW [ecx]/[ecx+4]
-        with the LL op so any side effects in the lvalue
-        sub-expressions fire exactly once.
+        address once, snapshot the value into a hidden LL slot,
+        compute `snapshot OP rhs` via the standard 64-bit ladder,
+        and store the result back through the saved address. This
+        guarantees side effects in the lvalue's sub-expressions fire
+        exactly once.
         """
         op = self._COMPOUND_OPS[expr.op]
         if isinstance(expr.left, ast.Identifier):
@@ -11019,79 +11021,57 @@ class CodeGenerator:
             return self._binary_ll(
                 ast.BinaryOp(op="=", left=expr.left, right=inner), ctx,
             )
-        # Non-Identifier lvalue: address-once dance.
+        # Bit-field LL compound assign goes through the bit-field
+        # RMW path which already handles address-once.
+        if isinstance(expr.left, ast.Member):
+            bf = self._bitfield_info(expr.left, ctx)
+            if bf is not None:
+                if len(bf) == 4 and bf[3] == 8:
+                    return self._compound_assign_bitfield_ll(expr, bf, ctx)
+                return self._compound_assign_bitfield(expr, bf, ctx)
+        # Non-Identifier lvalue: address-once via hidden snapshot slot.
+        addr_slot_name = f"__compll_addr_{id(expr)}"
+        snap_slot_name = f"__compll_snap_{id(expr)}"
+        addr_disp = ctx.alloc_local(
+            addr_slot_name,
+            ast.PointerType(base_type=ast.BasicType(name="long long")),
+            size=4,
+        )
+        snap_disp = ctx.alloc_local(
+            snap_slot_name,
+            ast.BasicType(name="long long"),
+            size=8,
+        )
+        out: list[str] = []
+        # 1. Compute &lvalue once into addr_slot.
         if isinstance(expr.left, ast.Index):
-            addr_lines = self._index_address(expr.left, ctx)
+            out += self._index_address(expr.left, ctx)
         elif (
             isinstance(expr.left, ast.UnaryOp)
             and expr.left.op == "*"
         ):
-            addr_lines = self._eval_expr_to_eax(expr.left.operand, ctx)
+            out += self._eval_expr_to_eax(expr.left.operand, ctx)
         elif isinstance(expr.left, ast.Member):
-            # Bit-field LL compound assign: route through the bit-field
-            # RMW path.
-            bf = self._bitfield_info(expr.left, ctx)
-            if bf is not None:
-                # Pre-existing _compound_assign_bitfield handles 4-byte
-                # bit-fields; for 8-byte LL bit-fields we have
-                # _compound_assign_bitfield_ll.
-                if len(bf) == 4 and bf[3] == 8:
-                    return self._compound_assign_bitfield_ll(expr, bf, ctx)
-                return self._compound_assign_bitfield(expr, bf, ctx)
-            addr_lines = self._member_address(expr.left, ctx)
+            out += self._member_address(expr.left, ctx)
         else:
             raise CodegenError(
                 f"long-long compound assign target must be an "
                 f"identifier, `*ptr`, `arr[i]`, or `s.m` "
                 f"(got {type(expr.left).__name__})"
             )
-        # &lvalue → eax, save on stack
-        out = list(addr_lines)
-        out.append("        push    eax")
-        # Evaluate rhs to EDX:EAX
-        out += self._eval_expr_to_edx_eax(expr.right, ctx)
-        # Now eax = rhs_low, edx = rhs_high.  Save and load lvalue.
-        out.append("        push    edx")
-        out.append("        push    eax")
-        out.append("        mov     ecx, [esp + 8]")    # ecx = &lvalue
-        out.append("        mov     eax, [ecx]")         # eax = lvalue_low
-        out.append("        mov     edx, [ecx + 4]")     # edx = lvalue_high
-        out.append("        pop     ebx")                  # ebx = rhs_low
-        out.append("        pop     esi")                  # esi = rhs_high
-        # Apply op: edx:eax = lvalue, esi:ebx = rhs.
-        if op == "+":
-            out.append("        add     eax, ebx")
-            out.append("        adc     edx, esi")
-        elif op == "-":
-            out.append("        sub     eax, ebx")
-            out.append("        sbb     edx, esi")
-        elif op == "&":
-            out.append("        and     eax, ebx")
-            out.append("        and     edx, esi")
-        elif op == "|":
-            out.append("        or      eax, ebx")
-            out.append("        or      edx, esi")
-        elif op == "^":
-            out.append("        xor     eax, ebx")
-            out.append("        xor     edx, esi")
-        else:
-            # For *, /, %, <<, >>: fall back to the generic desugar.
-            # Re-evaluating non-Identifier lvalue is risky but these
-            # are uncommon enough in compound-assign that the simpler
-            # fix is to drop back to the desugar.
-            out.append("        add     esp, 4")           # discard saved address
-            return self._binary_ll(
-                ast.BinaryOp(
-                    op="=",
-                    left=expr.left,
-                    right=ast.BinaryOp(
-                        op=op, left=expr.left, right=expr.right,
-                    ),
-                ),
-                ctx,
-            )
-        # Store result back through the saved address.
-        out.append("        pop     ecx")                  # ecx = &lvalue
+        out.append(f"        mov     {_ebp_addr(addr_disp)}, eax")
+        # 2. Snapshot the current value into snap_slot.
+        out.append("        mov     ecx, eax")
+        out.append("        mov     eax, [ecx]")
+        out.append("        mov     edx, [ecx + 4]")
+        out.append(f"        mov     {_ebp_addr(snap_disp)}, eax")
+        out.append(f"        mov     {_ebp_addr(snap_disp + 4)}, edx")
+        # 3. Compute `snap OP rhs` into EDX:EAX via the full LL ladder.
+        snap_id = ast.Identifier(name=snap_slot_name)
+        inner = ast.BinaryOp(op=op, left=snap_id, right=expr.right)
+        out += self._eval_expr_to_edx_eax(inner, ctx)
+        # 4. Store result back at *addr_slot.
+        out.append(f"        mov     ecx, {_ebp_addr(addr_disp)}")
         out.append("        mov     [ecx], eax")
         out.append("        mov     [ecx + 4], edx")
         return out
