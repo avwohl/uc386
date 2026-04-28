@@ -9145,7 +9145,11 @@ class CodeGenerator:
         out.append(f"        fld     {width} [edx + {size + half_size}]")
         out.append("        fmulp   st1, st0")                   # ar*bi
         out.append("        fsubp   st1, st0")                   # ai*br - ar*bi
-        out.append("        fdivp   st1, st0")                   # / denom
+        # st: numer_imag, denom. We want numer_imag / denom.
+        # `fdivrp st1, st0` computes st1 = st0 / st1, then pops —
+        # leaving (numer_imag / denom) on top. (Plain `fdivp st1,
+        # st0` would compute denom / numer_imag — the wrong way.)
+        out.append("        fdivrp  st1, st0")                   # numer_imag / denom
         out.append(f"        fstp    {width} [ecx + {half_size}]")
         out.append(f"        add     esp, {2 * size}")
         return out

@@ -3352,6 +3352,25 @@ def test_decimal64_keyword_compiles_as_double():
     assert "section .data" in asm
 
 
+def test_complex_division_imag_part_correct_direction():
+    # `_complex_div_into_top` was emitting `fdivp st1, st0` for the
+    # imag part, which computes `denom / numer_imag` — the wrong
+    # direction. The real part used `fdiv st0, st1` (no pop),
+    # so it was correct. With the bug, `1.0/(1.0+1.0i)` produced
+    # imag=-2.0 instead of imag=-0.5.
+    # Fix: use `fdivrp st1, st0` to compute `numer_imag / denom`
+    # (note the `r` for reverse).
+    asm = _compile(
+        "int main(void) {\n"
+        "    _Complex double d = (1.0 + 0.0i) / (1.0 + 1.0i);\n"
+        "    return (__real__ d == 0.5 && __imag__ d == -0.5)\n"
+        "        ? 0 : 1;\n"
+        "}\n"
+    )
+    # The fix uses fdivrp (reverse) for the imag computation.
+    assert "fdivrp  st1, st0" in asm
+
+
 def test_ll_bitfield_inc_dec_arr_index_side_effect_evals_once():
     # `arr[i++].bf++` for a long-long-storage bit-field used to
     # error out with "long-long bit-field ++/-- not yet supported"
