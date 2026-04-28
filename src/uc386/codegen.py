@@ -4488,6 +4488,77 @@ class CodeGenerator:
             )
         return False
 
+    def _emit_runtime_offsetof(
+        self, expr: ast.OffsetofExpr, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Compute `__builtin_offsetof(T, designator)` at runtime when
+        the designator has non-constant indices and/or T contains VLA.
+
+        Walks the designator inside-out, emitting code to compute
+        each contribution and accumulating into a frame-local total.
+        """
+        # Use ESI as the running offset accumulator. Save EBX (used as
+        # scratch by the inner expressions).
+        out: list[str] = ["        push    esi", "        push    ebx"]
+        out.append("        xor     esi, esi")
+        # Walk the designator chain from the outer (member of root) down.
+        # Convert into a list of (kind, payload) pairs.
+        steps: list = []
+        n = expr.designator
+        while not isinstance(n, ast.Identifier):
+            steps.append(n)
+            if isinstance(n, ast.Member):
+                n = n.obj
+            elif isinstance(n, ast.Index):
+                n = n.array
+            else:
+                raise CodegenError(
+                    f"offsetof: unsupported designator {type(n).__name__}"
+                )
+        steps.reverse()
+        # Walk steps. Track the current type (starting at root_ty) so
+        # we know each Index's element size.
+        cur_ty = expr.target_type
+        for step in steps:
+            if isinstance(step, ast.Member):
+                if isinstance(cur_ty, ast.PointerType):
+                    cur_ty = cur_ty.base_type
+                if not isinstance(cur_ty, ast.StructType):
+                    raise CodegenError(
+                        f"offsetof: `.{step.member}` of non-struct"
+                    )
+                sname = self._resolve_struct_name(cur_ty)
+                m_ty, m_off = self._member_layout(sname, step.member)
+                out.append(f"        add     esi, {m_off}")
+                cur_ty = m_ty
+            elif isinstance(step, ast.Index):
+                if isinstance(cur_ty, (ast.ArrayType, ast.PointerType)):
+                    elem_ty = cur_ty.base_type
+                else:
+                    raise CodegenError(
+                        f"offsetof: index of {type(cur_ty).__name__}"
+                    )
+                # Compute idx into EAX.
+                out += self._eval_expr_to_eax(step.index, ctx)
+                # Compute sizeof(elem) into ECX (may be runtime for
+                # VLA-shaped element).
+                out.append("        push    eax")
+                out += self._emit_runtime_size_of(elem_ty, ctx)
+                out.append("        mov     ecx, eax")
+                out.append("        pop     eax")
+                # ESI += idx * sizeof(elem).
+                out.append("        imul    eax, ecx")
+                out.append("        add     esi, eax")
+                cur_ty = elem_ty
+            else:
+                raise CodegenError(
+                    f"offsetof: unsupported designator {type(step).__name__}"
+                )
+        out.append("        mov     eax, esi")
+        out.append("        pop     ebx")
+        out.append("        pop     esi")
+        return out
+
     def _offsetof_value(self, expr: ast.OffsetofExpr) -> int:
         """Walk a `__builtin_offsetof(T, designator)` designator chain
         and return the byte offset within `T`.
@@ -8222,7 +8293,11 @@ class CodeGenerator:
                 return [f"        mov     eax, {value}"]
             return self._emit_runtime_size_of(expr.target_type, ctx)
         if isinstance(expr, ast.OffsetofExpr):
-            return [f"        mov     eax, {self._offsetof_value(expr)}"]
+            try:
+                value = self._offsetof_value(expr)
+                return [f"        mov     eax, {value}"]
+            except CodegenError:
+                return self._emit_runtime_offsetof(expr, ctx)
         if isinstance(expr, ast.TypesCompatibleP):
             v = 1 if self._types_compatible(expr.t1, expr.t2) else 0
             return [f"        mov     eax, {v}"]

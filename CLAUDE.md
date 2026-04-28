@@ -497,3 +497,7 @@ See `README.md` for the public roadmap (Phase 0–6).
   Closes 920929-1, 20040811-1, pr43220, vla-dealloc-1.
 
   **Result: 1498/1514 gcc-c-torture** (+4 tests). Combined with c-testsuite 218/220, the pipeline now passes 1716/1734 (98.96%).
+- **2026-04-27 — torture sweep: runtime __builtin_offsetof (1498 → 1499)**:
+  - **`__builtin_offsetof(T, designator)` falls back to runtime when constant evaluation fails.** Per gcc, offsetof accepts non-constant indices when T contains a VLA member (because the offset can be different per call). New `_emit_runtime_offsetof` walks the designator chain inside-out, emitting per-step code: Member adds the constant member offset; Index evaluates the index, multiplies by `_emit_runtime_size_of(elem_ty)` (which may itself be runtime for VLA-shaped elements), and adds. Uses ESI as the running accumulator. Closes pr41935.
+
+  **Result: 1499/1514 gcc-c-torture** (+1 test). Combined with c-testsuite 218/220, the pipeline now passes 1717/1734 (99.0%).
