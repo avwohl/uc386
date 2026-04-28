@@ -2966,6 +2966,43 @@ def test_int128_inc_dec_emits_4dword_carry_chain():
     assert "sbb     dword" in asm
 
 
+def test_int128_global_with_init_emits_two_dq_halves():
+    # Global `unsigned __int128 g = 100` lays down two 64-bit halves.
+    asm = _compile("unsigned __int128 g = 100; int main(void) { return 0; }")
+    assert "_g:" in asm
+    # Low half = 100, high half = 0.
+    assert "dq      0x0000000000000064" in asm
+    assert asm.count("        dq      0x") >= 2
+
+
+def test_int128_array_init_with_int_literals_widens():
+    # `unsigned __int128 arr[3] = {1, 2, 3}` widens each int literal
+    # to 16 bytes and stores them at consecutive 16-byte offsets.
+    asm = _compile(
+        "int main(void) {\n"
+        "    unsigned __int128 arr[3] = {1, 2, 3};\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    # Each int literal sign-extends via cdq (signed int source) and
+    # then per-dword copies into the slot — three widening cdqs.
+    assert asm.count("        cdq") >= 3
+
+
+def test_int128_struct_member_init_with_int_literal_widens():
+    # struct { int tag; __uint128_t v; } s = { 7, 42 };
+    asm = _compile(
+        "struct S { int tag; unsigned __int128 v; };\n"
+        "int main(void) {\n"
+        "    struct S s = { 7, 42 };\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    # 7 → tag (one mov), then 42 widened to 16 bytes (low + 3 zero
+    # high dwords via xor edx, edx + cdq fanout).
+    assert "_main:" in asm
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.

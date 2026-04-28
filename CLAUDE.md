@@ -608,3 +608,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - Verified end-to-end: `add128(100, 200) == 300` with full int128 by-value pass; `if (u128)` true/false; `++u128`/`u128++`/`--u128`/`u128--` all yield correct pre/post values; cast `(char)/(short)/(int)/(unsigned long long)` of a 128-bit big-endian-pattern value extracts the right low N bits; cast `(int128)int` sign-extends.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +3 smoke tests (324 total).
+- **2026-04-28 — __int128: array/struct/global init**: more completeness — the gaps a real-world program would hit when initializing aggregates of __int128.
+  - **Array element init** (`unsigned __int128 arr[3] = {1, 2, 3}`). `_array_init` now has an int128-element branch that widens smaller-integer initializers via a synthetic Cast (matches `_var_init`'s pattern), then uses `_int128_value_address` + per-dword copy to the element slot.
+  - **Struct member init** (`struct S { int tag; __uint128_t v; } s = {7, 42}`). Same idea in `_struct_init`: when the member type is __int128 and the rhs is a smaller integer, wrap in a synthetic Cast, allocate a 16-byte temp via `alloc_call_temp`, then per-dword copy through `_int128_value_address` to the member slot.
+  - **`_int128_copy_assign` widens smaller-integer rhs.** `b.v = 2000` (where `b.v` is __int128) used to fail with "can't take address of __int128 IntLiteral" because the rhs is a bare IntLiteral. Now wraps in a synthetic Cast(__int128, IntLiteral), allocates the temp, and routes through the regular int128 copy path.
+  - **Global int128 init.** `unsigned __int128 g = 100` lays down two `dq` halves (low 64 bits, then high 64 bits). `_emit_global_init` recognizes int128 BasicType, masks the value to 128 bits (handling negative values via 2's complement), and emits both halves. Works for arrays of int128 and struct members of int128 because they recurse through the same emitter.
+  - Verified end-to-end: global int128 with init, array of int128 with int-literal init, struct with mixed int + int128 members initialized, `b.v = 2000` updating int128 member, pointer-to-int128 deref + store.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +3 smoke tests (327 total).

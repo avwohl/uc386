@@ -928,6 +928,17 @@ class CodeGenerator:
                 directive = self._DATA_DIRECTIVE[self._size_of(ty)]
                 return [f"        {directive}      {label_diff}"]
             value = self._const_eval(init, name)
+            # __int128 globals: lay down two 64-bit halves (low, high)
+            # honoring the value's signedness.
+            if self._is_int128(ty):
+                if value < 0:
+                    value &= (1 << 128) - 1
+                lo = value & 0xFFFFFFFFFFFFFFFF
+                hi = (value >> 64) & 0xFFFFFFFFFFFFFFFF
+                return [
+                    f"        dq      0x{lo:016X}",
+                    f"        dq      0x{hi:016X}",
+                ]
             directive = self._DATA_DIRECTIVE[self._size_of(ty)]
             return [f"        {directive}      {value}"]
         if isinstance(ty, ast.PointerType):
@@ -5272,7 +5283,15 @@ class CodeGenerator:
                 f"can't assign __int128 to `{type(lhs).__name__}`"
             )
         out.append("        push    eax")
-        # Evaluate rhs into a slot and copy.
+        # Evaluate rhs into a slot and copy. Smaller-integer rhs is
+        # widened via a synthetic Cast (matches `_var_init`).
+        rhs_ty = self._type_of(rhs, ctx)
+        if not self._is_int128(rhs_ty):
+            synth_cast = ast.Cast(
+                target_type=ast.BasicType(name="int128"), expr=rhs,
+            )
+            ctx.alloc_call_temp(synth_cast, 16)
+            rhs = synth_cast
         out += self._int128_value_address(rhs, ctx)
         out.append("        mov     esi, eax")
         out.append("        pop     edi")
@@ -7314,6 +7333,32 @@ class CodeGenerator:
                     elif self._is_long_long(elem_type):
                         out += self._eval_expr_to_edx_eax(actual, ctx)
                         out += self._store_from_edx_eax(_ebp_addr(elem_disp))
+                    elif self._is_int128(elem_type):
+                        # int128 element: get the value's address and
+                        # per-dword copy to the element slot. Smaller
+                        # integer initializers are widened via a
+                        # synthetic Cast (matches `_var_init`).
+                        actual_ty = self._type_of(actual, ctx)
+                        if not self._is_int128(actual_ty):
+                            synth_cast = ast.Cast(
+                                target_type=elem_type, expr=actual,
+                            )
+                            ctx.alloc_call_temp(synth_cast, 16)
+                            value_expr = synth_cast
+                        else:
+                            value_expr = actual
+                        out += self._int128_value_address(value_expr, ctx)
+                        out.append("        mov     esi, eax")
+                        out.append(
+                            f"        lea     edi, {_ebp_addr(elem_disp)}"
+                        )
+                        for byte_off in (0, 4, 8, 12):
+                            out.append(
+                                f"        mov     eax, [esi + {byte_off}]"
+                            )
+                            out.append(
+                                f"        mov     [edi + {byte_off}], eax"
+                            )
                     else:
                         out += self._eval_expr_to_eax(actual, ctx)
                         out += self._store_from_eax(_ebp_addr(elem_disp), elem_type)
@@ -7465,6 +7510,22 @@ class CodeGenerator:
                         else "        cdq"
                     )
                 out += self._store_from_edx_eax(_ebp_addr(m_disp))
+            elif self._is_int128(m_ty) and m_name_i not in bitfields:
+                # int128 member: get 16-byte value's address and copy.
+                # Smaller integer initializers widen via synthetic Cast.
+                value_ty = self._type_of(actual, ctx)
+                if not self._is_int128(value_ty):
+                    synth_cast = ast.Cast(target_type=m_ty, expr=actual)
+                    ctx.alloc_call_temp(synth_cast, 16)
+                    value_expr = synth_cast
+                else:
+                    value_expr = actual
+                out += self._int128_value_address(value_expr, ctx)
+                out.append("        mov     esi, eax")
+                out.append(f"        lea     edi, {_ebp_addr(m_disp)}")
+                for byte_off in (0, 4, 8, 12):
+                    out.append(f"        mov     eax, [esi + {byte_off}]")
+                    out.append(f"        mov     [edi + {byte_off}], eax")
             elif m_name_i in bitfields:
                 # Bit-field: synthesize a fake Member node so _bitfield_store
                 # can compute the storage-unit address. We can't pass the
