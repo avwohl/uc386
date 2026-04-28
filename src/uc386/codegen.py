@@ -13604,6 +13604,14 @@ class CodeGenerator:
             )
             ctx.alloc_call_temp(inner, 16)
             return self._int128_copy_assign(expr.left, inner, ctx)
+        # Long-long compound assign: route through the LL path so
+        # arithmetic uses the 64-bit ladder and stores write both
+        # halves with proper carry propagation. The LL path desugars
+        # to `lhs = lhs OP rhs`; for non-Identifier lvalues this is
+        # safe iff the address-computing sub-expressions are
+        # side-effect-free, which is the common case.
+        if self._is_long_long(target_ty_check):
+            return self._compound_assign_ll(expr, ctx)
 
         if isinstance(expr.left, ast.Identifier):
             ty = self._identifier_type(expr.left.name, ctx)

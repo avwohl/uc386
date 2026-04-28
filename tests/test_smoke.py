@@ -3205,6 +3205,21 @@ def test_long_long_inc_dec_array_element_propagates_carry():
     assert "adc     dword [ecx + 4], 0" in asm
 
 
+def test_long_long_compound_assign_array_element_routes_to_ll_path():
+    # `arr[i] += rhs` where arr is long-long must route through the
+    # LL ladder so the high half participates with carry. Was using
+    # the 32-bit path and storing cdq-extended low into high.
+    asm = _compile(
+        "int main(void) {\n"
+        "    long long arr[1] = {0xFFFFFFFFLL};\n"
+        "    arr[0] += 1;\n"
+        "    return arr[0] == 0x100000000LL ? 0 : 1;\n"
+        "}\n"
+    )
+    # Look for the LL add: `add eax, ecx` followed by `adc edx, ebx`.
+    assert "adc     edx, ebx" in asm
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.

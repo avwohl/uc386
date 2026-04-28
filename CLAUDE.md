@@ -657,3 +657,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - The torture suite never tripped on this because most LL inc/dec sites were on values well below 2^32. Found via direct probing of `(ll)0xFFFFFFFF + 1`.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +2 smoke tests (341 total).
+- **2026-04-28 — long-long compound assign on non-Identifier lvalues (real bug)**: another carry-propagation bug. `arr[i] += 1`, `s.m += 1`, `*p += 1` for long-long lvalues was going through `_compound_assign`'s generic 32-bit path, which loaded only the low 32 bits, did a 32-bit add, stored the low result, then `cdq`+stored EDX as the high half. So `(long long)0xFFFFFFFF + 1` produced `0x0` (low=0 from overflow, high=0 from cdq of 0).
+  - **Fix**: `_compound_assign` now dispatches long-long-typed lvalues to `_compound_assign_ll` (which desugars to `lvalue = lvalue OP rhs` and routes through `_binary_ll`'s 64-bit ladder). Mirrors the existing __int128 dispatch at the top of the function.
+  - The Identifier path was already going through `_assign`'s `op == "="` branch which dispatches LL correctly via `_assign_ll`. Only non-Identifier lvalues had the bug.
+  - Like the previous LL inc/dec carry bug, this was masked because the torture suite's long-long compound-assign sites use values well below 2^32.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (342 total).
