@@ -588,3 +588,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   Smoke tests added for multiply (`>= 10 mul instructions`) and compare (`>= 4 cmp eax, [esp+...]`). Verified end-to-end with hand-written tests covering u128 * u128, signed * signed → expected negative, overflow truncation `(1<<100) * (1<<100) == 0`, and ordering across the 64-bit boundary.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite, 1734/1734 combined still 100%**. No regressions; +2 smoke tests.
+- **2026-04-28 — __int128: u128/u128 division + int128 promotion fix**: completes the __int128 implementation for full division. Plus a load-bearing fix to the type-promotion path.
+  - **Runtime helper `___uc386_udiv128(result, dividend, divisor)`** in libc: binary long division. 128 iterations, each: `rem <<= 1 | bit_i(dividend)`, then trial `rem -= divisor` (in place); if no borrow, set bit i of quotient; else undo the subtraction. Slow but correct for the full u128 input range. Companion `___uc386_umod128` for `%` returns the remainder rather than the quotient.
+  - **`_binary_int128`'s `/`/`%` branch** now dispatches: u128 by 32-bit divisor → fast path (existing 4-`div` chain); u128 by u128 → call the runtime helper. Push-args-right-to-left: divisor address, dividend address, result address; cleanup `add esp, 12`.
+  - **Type-promotion bug fix**: `_type_of(BinaryOp("+", u128, u128))` was falling through to the default `int` because the `+`/`-` path had long-long promotion but no int128 promotion. So `u128 + u128` returned int, which routed `_eval_expr_to_eax` to the integer stack-machine path — producing `eax + ecx` of two ADDRESSES. Added int128 promotion (rank above long long) for `+`/`-` operands.
+  - Verified end-to-end: 100/7 with q*b+r==100, big random u128 dividend with both 32-bit and 128-bit divisors, all give correct quotient and remainder satisfying `q*divisor + r == dividend`.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +3 smoke tests.

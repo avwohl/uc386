@@ -4690,9 +4690,32 @@ class CodeGenerator:
                 out.append(f"        {instrN}     [edi + {off}], eax")
             out.append("        add     esp, 16")
             return out
-        # `/` and `%` for unsigned int128 by a 32-bit divisor: chain
-        # of three `div` instructions. Signed division and divisor of
-        # int128 width are unimplemented.
+        # `/` and `%`. Two paths:
+        #   - u128 by 32-bit divisor: chain of four `div` instructions
+        #     (top-down). Fast path.
+        #   - u128 by u128: call the runtime helper
+        #     `___uc386_udiv128` (or `___uc386_umod128`) — binary
+        #     long division, slow but correct.
+        # Signed __int128 division still raises.
+        if op in ("/", "%") and self._is_int128(lt) and self._is_int128(rt):
+            if not self._is_unsigned(lt) or not self._is_unsigned(rt):
+                raise CodegenError(
+                    "signed __int128 division not supported"
+                )
+            helper = "___uc386_udiv128" if op == "/" else "___uc386_umod128"
+            out: list[str] = []
+            # Push divisor address (3rd arg in cdecl right-to-left).
+            out += self._int128_value_address(expr.right, ctx)
+            out.append("        push    eax")
+            # Push dividend address (2nd arg).
+            out += self._int128_value_address(expr.left, ctx)
+            out.append("        push    eax")
+            # Push result address (1st arg).
+            out.append(f"        lea     eax, {_ebp_addr(dest_disp)}")
+            out.append("        push    eax")
+            out.append(f"        call    {helper}")
+            out.append("        add     esp, 12")
+            return out
         if op in ("/", "%"):
             if not (self._is_int128(lt) and not self._is_int128(rt)):
                 raise CodegenError(
@@ -9379,6 +9402,15 @@ class CodeGenerator:
             # float (or double if either is double).
             if self._is_float_type(lt) or self._is_float_type(rt):
                 return self._float_promotion(lt, rt)
+            # __int128 promotion: if either operand is int128, the
+            # result is int128 (rank above long long).
+            if self._is_int128(lt) or self._is_int128(rt):
+                return ast.BasicType(
+                    name="int128",
+                    is_signed=(False if (
+                        self._is_unsigned(lt) or self._is_unsigned(rt)
+                    ) else None),
+                )
             # Long-long promotion: if either operand is long long, the
             # result is long long.
             if self._is_long_long(lt) or self._is_long_long(rt):

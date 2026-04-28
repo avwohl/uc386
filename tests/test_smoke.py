@@ -2885,6 +2885,30 @@ def test_int128_compare_emits_dword_chain():
     assert "jb " in asm or "ja " in asm
 
 
+def test_int128_div_by_int128_calls_runtime_helper():
+    # u128 / u128 routes to the libc helper since the int-divisor
+    # fast path doesn't apply.
+    asm = _compile(
+        "unsigned __int128 a, b, c;\n"
+        "int main(void) { c = a / b; return 0; }\n"
+    )
+    assert "___uc386_udiv128" in asm
+
+
+def test_int128_add_promotes_via_type_of():
+    # `u128 + u128` should produce a value of type int128 (so the
+    # codegen routes through the carry chain rather than 32-bit add).
+    asm = _compile(
+        "unsigned __int128 a, b, c;\n"
+        "int main(void) { c = a + b; return 0; }\n"
+    )
+    # 4-dword carry chain (one add, three adcs).
+    assert asm.count("        add     ") >= 1
+    assert asm.count("        adc     ") >= 3
+    # And no spurious "add eax, ecx" that would indicate 32-bit add.
+    assert "add     eax, ecx" not in asm
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.

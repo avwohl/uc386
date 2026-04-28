@@ -3307,3 +3307,187 @@ _atoi:
         mov     esp, ebp
         pop     ebp
         ret
+
+; ___uc386_udiv128(uint128 *result, uint128 *dividend, uint128 *divisor)
+;
+; Unsigned 128-bit division via binary long division. Stores the
+; quotient at *result. The remainder is computed but not returned —
+; callers that need it should use the umod helper.
+;
+; Algorithm:
+;   rem = 0
+;   quo = 0
+;   for i = 127 downto 0:
+;     rem = (rem << 1) | bit_i(dividend)
+;     trial = rem - divisor
+;     if no borrow:
+;       rem = trial
+;       quo |= 1 << i
+;   *result = quo
+;
+; 128 iterations of shift + sub + maybe-undo. Slow but correct.
+___uc386_udiv128:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    esi
+        push    edi
+        sub     esp, 16              ; remainder buffer
+        ; remainder layout: [ebp - 28] = b0 (low) ... [ebp - 16] = b3 (high)
+        ; Save args
+        mov     edi, [ebp + 8]       ; result ptr
+        mov     esi, [ebp + 12]      ; dividend ptr
+        ; divisor at [ebp + 16] — used as memory operand each iteration
+        ; Zero remainder
+        xor     eax, eax
+        mov     [ebp - 28], eax
+        mov     [ebp - 24], eax
+        mov     [ebp - 20], eax
+        mov     [ebp - 16], eax
+        ; Zero result
+        mov     [edi], eax
+        mov     [edi + 4], eax
+        mov     [edi + 8], eax
+        mov     [edi + 12], eax
+        mov     ecx, 128
+.loop:
+        dec     ecx
+        js      .done
+        ; rem <<= 1, propagating MSBs upward from b2->b3, b1->b2, b0->b1.
+        mov     eax, [ebp - 20]
+        shld    [ebp - 16], eax, 1
+        mov     eax, [ebp - 24]
+        shld    [ebp - 20], eax, 1
+        mov     eax, [ebp - 28]
+        shld    [ebp - 24], eax, 1
+        shl     dword [ebp - 28], 1
+        ; Set bit 0 of remainder to bit `ecx` of dividend.
+        mov     eax, ecx
+        shr     eax, 5               ; idx_word = ecx / 32 (0..3)
+        mov     edx, [esi + eax*4]
+        push    ecx
+        and     ecx, 31
+        shr     edx, cl
+        and     edx, 1
+        pop     ecx
+        or      [ebp - 28], edx
+        ; Try rem -= divisor (in place). CF=1 if borrow (rem<divisor).
+        mov     edx, [ebp + 16]
+        mov     eax, [edx]
+        sub     [ebp - 28], eax
+        mov     eax, [edx + 4]
+        sbb     [ebp - 24], eax
+        mov     eax, [edx + 8]
+        sbb     [ebp - 20], eax
+        mov     eax, [edx + 12]
+        sbb     [ebp - 16], eax
+        jc      .undo
+        ; rem >= divisor: subtraction was correct; set quotient bit.
+        mov     eax, ecx
+        shr     eax, 5
+        push    ecx
+        and     ecx, 31
+        mov     edx, 1
+        shl     edx, cl
+        or      [edi + eax*4], edx
+        pop     ecx
+        jmp     .loop
+.undo:
+        ; rem += divisor (restore the in-place subtraction).
+        mov     edx, [ebp + 16]
+        mov     eax, [edx]
+        add     [ebp - 28], eax
+        mov     eax, [edx + 4]
+        adc     [ebp - 24], eax
+        mov     eax, [edx + 8]
+        adc     [ebp - 20], eax
+        mov     eax, [edx + 12]
+        adc     [ebp - 16], eax
+        jmp     .loop
+.done:
+        add     esp, 16
+        pop     edi
+        pop     esi
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ___uc386_umod128(uint128 *result, uint128 *dividend, uint128 *divisor)
+;
+; Unsigned 128-bit modulo. Same long-division algorithm as udiv128
+; but the result is the remainder (not the quotient). Implemented as
+; a separate function rather than a single divmod helper to keep
+; the calling convention simple.
+___uc386_umod128:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    esi
+        push    edi
+        sub     esp, 16
+        mov     edi, [ebp + 8]       ; result ptr
+        mov     esi, [ebp + 12]      ; dividend
+        xor     eax, eax
+        mov     [ebp - 28], eax
+        mov     [ebp - 24], eax
+        mov     [ebp - 20], eax
+        mov     [ebp - 16], eax
+        mov     ecx, 128
+.loop:
+        dec     ecx
+        js      .done
+        mov     eax, [ebp - 20]
+        shld    [ebp - 16], eax, 1
+        mov     eax, [ebp - 24]
+        shld    [ebp - 20], eax, 1
+        mov     eax, [ebp - 28]
+        shld    [ebp - 24], eax, 1
+        shl     dword [ebp - 28], 1
+        mov     eax, ecx
+        shr     eax, 5
+        mov     edx, [esi + eax*4]
+        push    ecx
+        and     ecx, 31
+        shr     edx, cl
+        and     edx, 1
+        pop     ecx
+        or      [ebp - 28], edx
+        mov     edx, [ebp + 16]
+        mov     eax, [edx]
+        sub     [ebp - 28], eax
+        mov     eax, [edx + 4]
+        sbb     [ebp - 24], eax
+        mov     eax, [edx + 8]
+        sbb     [ebp - 20], eax
+        mov     eax, [edx + 12]
+        sbb     [ebp - 16], eax
+        jnc     .loop
+        ; Borrow: rem += divisor (undo).
+        mov     edx, [ebp + 16]
+        mov     eax, [edx]
+        add     [ebp - 28], eax
+        mov     eax, [edx + 4]
+        adc     [ebp - 24], eax
+        mov     eax, [edx + 8]
+        adc     [ebp - 20], eax
+        mov     eax, [edx + 12]
+        adc     [ebp - 16], eax
+        jmp     .loop
+.done:
+        ; Copy remainder to result.
+        mov     eax, [ebp - 28]
+        mov     [edi], eax
+        mov     eax, [ebp - 24]
+        mov     [edi + 4], eax
+        mov     eax, [ebp - 20]
+        mov     [edi + 8], eax
+        mov     eax, [ebp - 16]
+        mov     [edi + 12], eax
+        add     esp, 16
+        pop     edi
+        pop     esi
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
