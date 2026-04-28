@@ -515,3 +515,7 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Single-instruction FPU asm templates** (`fsqrt`, `fpatan`, `fsin`, `fcos`, `fabs`, `fchs`, `f2xm1`, `fyl2x`, `fyl2xp1`, `fptan`, `fscale`, `frndint`, `fsincos`) now lower with proper FPU stack semantics. `_normalize_fpu_template` strips whitespace/comments and matches against the recognized set; `_asm_fpu_eligible` checks that operand constraints are the FPU subset (`=t`/`=u` outputs, `0`/`t`/`u`/`f` inputs). Inputs evaluate to st(0) in REVERSE order so the first input ends up on top — matches gcc's "input 0 binds to st(0) when constraint is `0` matching `=t` output". Outputs `fstp` to lvalues (Identifier/Member/Index/*p). Closes 990413-2 (asin via fpatan + fsqrt).
 
   **Result: 1501/1514 gcc-c-torture** (+1 test). Combined with c-testsuite 218/220, the pipeline now passes 1719/1734 (99.13%).
+- **2026-04-28 — torture sweep: `mull` asm template (1501 → 1502)**:
+  - **`asm("mull %N" : "=a"(...), "=d"(...) : "0"(a), "rm"(b))`** lowers to `mul ecx; store EDX; store EAX`. Used by glibc-style fixed-point helpers — `unsigned mul → (low, high)` returned through two pointers. Source operand evaluates to ECX; the matching-output input goes to EAX; the `mul ecx` instruction does the multiply; outputs store EAX (low) and EDX (high) to their respective lvalues. Closes 960830-1.
+
+  **Result: 1502/1514 gcc-c-torture** (+1 test). Combined with c-testsuite 218/220, the pipeline now passes 1720/1734 (99.19%).

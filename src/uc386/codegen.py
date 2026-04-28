@@ -6708,6 +6708,43 @@ class CodeGenerator:
         if fpu_template is not None and self._asm_fpu_eligible(outputs, inputs):
             return self._emit_fpu_asm(fpu_template, outputs, inputs, ctx)
 
+        # Recognized integer-multiply asm template:
+        #   `mull %N` with `=a`/`=d` outputs and `0`/`rm` inputs is the
+        #   x86 MUL instruction (EAX * source → EDX:EAX). Used by
+        #   glibc-style fixed-point multiply helpers.
+        if (
+            template.replace("\n", " ").strip().startswith("mull ")
+            and len(outputs) == 2 and len(inputs) == 2
+        ):
+            ocs = [c.lstrip("=+&!%@")[:1] for c, _ in outputs]
+            ics = [c.lstrip("&!%@")[:1] for c, _ in inputs]
+            if (
+                "a" in ocs and "d" in ocs
+                and "0" in ics and ics[1] in ("r", "g", "m")
+            ):
+                # Find which output is =a (eax) and which is =d (edx).
+                a_out = next(lv for c, lv in outputs if "a" in c)
+                d_out = next(lv for c, lv in outputs if "d" in c)
+                # Find the "0"-matching input (value for EAX) and the rm input.
+                eax_in = next(e for c, e in inputs if c.lstrip("&!%@").startswith("0"))
+                src_in = next(e for c, e in inputs if not c.lstrip("&!%@").startswith("0"))
+                out: list[str] = []
+                # Eval src to ECX (scratch).
+                out += self._eval_expr_to_eax(src_in, ctx)
+                out.append("        mov     ecx, eax")
+                # Eval EAX value.
+                out += self._eval_expr_to_eax(eax_in, ctx)
+                # Multiply: EDX:EAX = EAX * ECX.
+                out.append("        mul     ecx")
+                # Store outputs. EDX first (to preserve EAX for later),
+                # then EAX.
+                out.append("        push    eax")
+                out.append("        mov     eax, edx")
+                out += self._asm_emit_assign_from_eax(d_out, ctx)
+                out.append("        pop     eax")
+                out += self._asm_emit_assign_from_eax(a_out, ctx)
+                return out
+
         # Fallback: evaluate every operand for side effects.
         out: list[str] = []
         for op in operands:
@@ -6717,6 +6754,30 @@ class CodeGenerator:
                 # Some operands (e.g. taking address of a register
                 # variable) may not lower cleanly; skip silently.
                 pass
+        return out
+
+    def _asm_emit_assign_from_eax(
+        self, lvalue: ast.Expression, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Store EAX into an lvalue (Identifier/Index/Member/`*p`).
+        Used by the asm-output-store path. Preserves EAX semantics —
+        we don't try to read EAX afterward."""
+        ty = self._type_of(lvalue, ctx)
+        if isinstance(lvalue, ast.Identifier):
+            return self._identifier_store(lvalue.name, ctx)
+        if isinstance(lvalue, ast.Index):
+            addr_lines = self._index_address(lvalue, ctx)
+        elif isinstance(lvalue, ast.Member):
+            addr_lines = self._member_address(lvalue, ctx)
+        elif isinstance(lvalue, ast.UnaryOp) and lvalue.op == "*":
+            addr_lines = self._eval_expr_to_eax(lvalue.operand, ctx)
+        else:
+            return []
+        out = ["        push    eax"]
+        out += addr_lines
+        out.append("        mov     ecx, eax")
+        out.append("        pop     eax")
+        out += self._store_from_eax("[ecx]", ty)
         return out
 
     @staticmethod
