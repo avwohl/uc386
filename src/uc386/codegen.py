@@ -4641,21 +4641,32 @@ class CodeGenerator:
         self, expr: ast.TernaryOp, dest_disp: int, ctx: _FuncCtx,
     ) -> list[str]:
         """Lower `cond ? T : F` where T/F are __int128 expressions.
-        Evaluates the chosen branch into the dest slot via an
-        int128 copy."""
+        Evaluates the chosen branch into the dest slot via an int128
+        copy. Smaller-integer arms widen via synthetic Cast."""
+        def widen(arm):
+            arm_ty = self._type_of(arm, ctx)
+            if not self._is_int128(arm_ty):
+                synth_cast = ast.Cast(
+                    target_type=ast.BasicType(name="int128"), expr=arm,
+                )
+                ctx.alloc_call_temp(synth_cast, 16)
+                return synth_cast
+            return arm
+        true_arm = widen(expr.true_expr)
+        false_arm = widen(expr.false_expr)
         false_label = ctx.label("i128_tern_false")
         end_label = ctx.label("i128_tern_end")
         out = self._eval_to_bool_eax(expr.condition, ctx)
         out.append("        test    eax, eax")
         out.append(f"        jz      {false_label}")
         # True branch: copy its value into dest.
-        out += self._int128_value_address(expr.true_expr, ctx)
+        out += self._int128_value_address(true_arm, ctx)
         out.append("        mov     esi, eax")
         out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
         out += self._emit_int128_copy("esi", "edi")
         out.append(f"        jmp     {end_label}")
         out.append(f"{false_label}:")
-        out += self._int128_value_address(expr.false_expr, ctx)
+        out += self._int128_value_address(false_arm, ctx)
         out.append("        mov     esi, eax")
         out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
         out += self._emit_int128_copy("esi", "edi")

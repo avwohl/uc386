@@ -635,3 +635,7 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`_type_of(BinaryOp(","))` returns right arm's type.** Was falling through to the general arithmetic-promotion path, which would (now that int128 propagates through `+`/`-`) sometimes return int128 even when the right arm was an `(int)` cast. The miscalculation made `int r = (u128 += 5, (int)y);` route the rhs through `_binary_int128`'s comma branch (incorrectly trying to materialize an int128). Per C the comma's value type is the right side's type — added a direct dispatch.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +2 smoke tests (335 total).
+- **2026-04-28 — __int128: ternary arm widening**: more completeness for int128 expressions.
+  - **`cond ? expr : 0` with int128 result** now widens each arm. `_int128_ternary` wraps any non-int128 arm in a synthetic `Cast(target=int128, expr=arm)` and pre-allocates the 16-byte temp. Was raising "can't take address of __int128 IntLiteral" when an arm was a plain `0` or `1`.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (336 total).

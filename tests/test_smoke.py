@@ -3122,6 +3122,21 @@ def test_int128_comma_type_of_returns_right_arm():
     assert "_main:" in asm
 
 
+def test_int128_ternary_with_int_literal_arm_widens():
+    # `cond ? f() : 0` where f returns u128 — the `0` arm needs
+    # widening via synthetic Cast (matches _var_init / _return).
+    asm = _compile(
+        "unsigned __int128 f(unsigned __int128 x) { return x * 2; }\n"
+        "int main(void) {\n"
+        "    int c = 1;\n"
+        "    unsigned __int128 a = c ? f(100) : 0;\n"
+        "    return (int)a;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+    assert "_f:" in asm
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.
