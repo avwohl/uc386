@@ -1415,7 +1415,13 @@ class CodeGenerator:
             # Zero-size members (empty struct) take no storage and aren't
             # part of any union-alternation group. Skip past, but still
             # invoke their init for side effects' sake (no-op for empty).
-            if self._size_of(m_ty) == 0:
+            # Flex array members (ArrayType, size=None) report 0 from
+            # `_size_of` but their length is derived from the initializer
+            # — don't skip those.
+            is_flex_array = (
+                isinstance(m_ty, ast.ArrayType) and m_ty.size is None
+            )
+            if self._size_of(m_ty) == 0 and not is_flex_array:
                 i += 1
                 continue
             # Find the run of NON-ZERO members sharing this offset.
