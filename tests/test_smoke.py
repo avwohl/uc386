@@ -3294,6 +3294,22 @@ def test_long_long_compound_arr_index_side_effect_evals_once():
     )
 
 
+def test_int128_compound_arr_index_side_effect_evals_once():
+    # Same: `u128 arr[i++] += 1` fires i++ exactly once. Was firing
+    # twice through the synthesized BinaryOp(arr[i++] OP rhs) which
+    # caused _int128_value_address(arr[i++]) to be called twice.
+    asm = _compile(
+        "int main(void) {\n"
+        "    unsigned __int128 arr[3] = {0, 0, 0};\n"
+        "    int i = 0;\n"
+        "    arr[i++] += 1;\n"
+        "    return (arr[0] == 1 && i == 1) ? 0 : 1;\n"
+        "}\n"
+    )
+    inc_count = asm.count("        inc     dword [ebp -")
+    assert inc_count == 1
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.

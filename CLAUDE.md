@@ -682,3 +682,7 @@ See `README.md` for the public roadmap (Phase 0–6).
   - For `*=`, `/=`, `%=`, `<<=`, `>>=` we still fall back to the desugar (these operations need extra scratch on the LL ladder; address-once with two-input ops on a single source pair gets complicated). These ops on non-Identifier LL with side-effect lvalue evaluation are uncommon in practice.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (346 total).
+- **2026-04-28 — int128 compound assign on non-Identifier: address-once (real bug)**: same shape as the LL fix above. The int128 compound-assign branch in `_compound_assign` synthesized `BinaryOp(op, lhs, rhs)` and called `_int128_copy_assign(lhs, inner)`, which calls `_int128_value_address(lhs)` once for the destination AND once for the inner BinaryOp's left operand — firing side effects twice.
+  - **Fix**: new `_compound_assign_int128_lvalue` for non-Identifier int128 lvalues. Allocates a hidden 4-byte addr slot and a hidden 16-byte snapshot slot, computes &lhs once into the addr slot, copies the current value into the snapshot, synthesizes `Identifier(snap_slot) OP rhs` and evaluates into a result temp, then copies the result back to *addr_slot. The snapshot slot is registered as a real local so `Identifier` references resolve via the normal slot-lookup path.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (347 total).

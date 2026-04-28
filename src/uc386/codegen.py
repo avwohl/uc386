@@ -5438,6 +5438,67 @@ class CodeGenerator:
             return out
         raise CodegenError(f"__int128 unary op `{op}` not supported")
 
+    def _compound_assign_int128_lvalue(
+        self, expr: ast.BinaryOp, op: str, ctx: _FuncCtx,
+    ) -> list[str]:
+        """`lhs OP= rhs` for non-Identifier int128 lvalues.
+
+        Address-once: compute &lhs into a hidden 4-byte slot, snapshot
+        the current value into a hidden int128 slot via a synthesized
+        Identifier, evaluate `snapshot OP rhs` into a result temp, then
+        copy the result back to *&lhs.
+        """
+        # Allocate a hidden 4-byte slot for the saved address and a
+        # 16-byte slot for the snapshot value. We synthesize a unique
+        # name keyed by id(expr) so multiple compound-assigns in the
+        # same function don't collide.
+        addr_slot_name = f"__compi128_addr_{id(expr)}"
+        snap_slot_name = f"__compi128_snap_{id(expr)}"
+        addr_disp = ctx.alloc_local(
+            addr_slot_name,
+            ast.PointerType(base_type=ast.BasicType(name="int128")),
+            size=4,
+        )
+        snap_disp = ctx.alloc_local(
+            snap_slot_name,
+            ast.BasicType(name="int128"),
+            size=16,
+        )
+        out: list[str] = []
+        # 1. Compute &lhs once into the addr slot.
+        if isinstance(expr.left, ast.Index):
+            out += self._index_address(expr.left, ctx)
+        elif (
+            isinstance(expr.left, ast.UnaryOp)
+            and expr.left.op == "*"
+        ):
+            out += self._eval_expr_to_eax(expr.left.operand, ctx)
+        elif isinstance(expr.left, ast.Member):
+            out += self._member_address(expr.left, ctx)
+        else:
+            raise CodegenError(
+                f"int128 compound assign target not supported: "
+                f"{type(expr.left).__name__}"
+            )
+        out.append(f"        mov     {_ebp_addr(addr_disp)}, eax")
+        # 2. Copy 16 bytes from *addr_slot to snap_slot.
+        out.append("        mov     esi, eax")
+        out.append(f"        lea     edi, {_ebp_addr(snap_disp)}")
+        out += self._emit_int128_copy("esi", "edi")
+        # 3. Synthesize `snapshot OP rhs` and evaluate into a temp.
+        snap_id = ast.Identifier(name=snap_slot_name)
+        inner = ast.BinaryOp(op=op, left=snap_id, right=expr.right)
+        ctx.alloc_call_temp(inner, 16)
+        result_disp = ctx.call_temps[id(inner)]
+        out += self._eval_int128_into_temp(inner, result_disp, ctx)
+        # 4. Copy result back to *addr_slot.
+        out.append(f"        mov     edi, {_ebp_addr(addr_disp)}")
+        out.append(f"        lea     esi, {_ebp_addr(result_disp)}")
+        out += self._emit_int128_copy("esi", "edi")
+        # Return the dest address in EAX (matches assign semantics).
+        out.append(f"        mov     eax, {_ebp_addr(addr_disp)}")
+        return out
+
     def _int128_copy_assign(
         self, lhs: ast.Expression, rhs: ast.Expression, ctx: _FuncCtx,
     ) -> list[str]:
@@ -13751,6 +13812,13 @@ class CodeGenerator:
         # `_collect_call_temps` already ran.
         target_ty_check = self._type_of(expr.left, ctx)
         if self._is_int128(target_ty_check):
+            # For non-Identifier lvalues, address-once: compute &lhs
+            # once, snapshot the value into a hidden int128 slot,
+            # synthesize the op against the snapshot, then store
+            # the result back at the saved address. This avoids
+            # firing side effects in `expr.left` twice.
+            if not isinstance(expr.left, ast.Identifier):
+                return self._compound_assign_int128_lvalue(expr, op, ctx)
             inner = ast.BinaryOp(
                 op=op, left=expr.left, right=expr.right,
             )
