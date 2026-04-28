@@ -3715,6 +3715,146 @@ def test_nested_fn_with_nonlocal_goto_emits_trampoline_and_setjmp():
     assert "_main__compare:" in asm
 
 
+def test_bool_assignment_normalizes_to_zero_or_one():
+    # Per C 6.3.1.2, conversion to `_Bool` yields 0 if the source
+    # compares equal to 0, and 1 otherwise. Previously `_Bool b = 5;`
+    # stored 5 in the byte slot — so `if (b != 1)` saw 5 and went
+    # the wrong way. `_store_from_eax` for bool now emits
+    # `test eax, eax; setne al; movzx eax, al; mov [...], al`.
+    asm = _compile(
+        "int main(void) {\n"
+        "    _Bool b = 5;\n"
+        "    if (b != 1) return 1;\n"
+        "    b = 0;\n"
+        "    if (b != 0) return 2;\n"
+        "    b = 257;\n"
+        "    if (b != 1) return 3;\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    # The bool store sequence appears for each of the three assignments.
+    # Look for the `setne` + byte-store pattern.
+    assert "setne   al" in asm
+    # Verify three stores' worth of normalization (one per assignment).
+    assert asm.count("setne   al") >= 3
+
+
+def test_bool_global_init_normalizes():
+    # Global `_Bool g = 5;` was emitting `db 5` directly. NASM
+    # accepts `db 256` and silently truncates to 0, so `_Bool g = 256`
+    # was stored as 0 instead of the expected 1. Now constant-fold
+    # the value at .data emission time.
+    asm = _compile(
+        "_Bool g1 = 5;\n"
+        "_Bool g2 = -1;\n"
+        "_Bool g3 = 256;\n"
+        "_Bool g4 = 0;\n"
+        "int main(void) { return 0; }\n"
+    )
+    assert "_g1:" in asm
+    # Find each global's `db` line.
+    lines = asm.splitlines()
+    for i, l in enumerate(lines):
+        if l.startswith("_g1:"):
+            assert "db      1" in lines[i + 1]
+        elif l.startswith("_g2:"):
+            assert "db      1" in lines[i + 1]
+        elif l.startswith("_g3:"):
+            assert "db      1" in lines[i + 1]
+        elif l.startswith("_g4:"):
+            assert "db      0" in lines[i + 1]
+
+
+def test_bool_inc_dec_normalizes():
+    # `_Bool b; b++` was emitting `inc byte [...]` which from b=1
+    # leaves 2 in the slot — wrong per C 6.3.1.2 (any non-zero
+    # should remain 1). The Identifier path now does load + add 1
+    # + bool-store; the lvalue path does the same address-once.
+    asm = _compile(
+        "int main(void) {\n"
+        "    _Bool b = 0;\n"
+        "    b++;\n"
+        "    if (b != 1) return 1;\n"
+        "    b++;\n"
+        "    if (b != 1) return 2;\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    # The Identifier-bool inc path uses setne (via _store_from_eax(bool)).
+    # Look for the load-add-bool-store sequence.
+    assert "setne   al" in asm
+
+
+def test_bool_param_at_call_site_normalizes():
+    # `_Bool fn(_Bool); fn(5);` — the call site needs to push a
+    # normalized value because the callee reads only the byte.
+    # Was pushing 5 directly, then callee saw 5 in its byte slot.
+    asm = _compile(
+        "int check(_Bool b) { return b == 1 ? 100 : 200; }\n"
+        "int main(void) {\n"
+        "    return check(5) == 100 ? 0 : 1;\n"
+        "}\n"
+    )
+    # The call-site coercion adds setne before push for bool params.
+    # Find the sequence in the call site preceding `call _check`.
+    lines = asm.splitlines()
+    # Find call to check.
+    for i, l in enumerate(lines):
+        if "call    _check" in l:
+            # Walk backwards to find the setne before the push.
+            for j in range(i - 1, max(i - 20, 0), -1):
+                if "setne   al" in lines[j]:
+                    return  # found
+            assert False, f"no setne before call _check found"
+
+
+def test_bool_return_normalizes():
+    # `_Bool fn() { return 5; }` should produce 1 (any non-zero
+    # → 1). Was returning the literal 5 in EAX. Routes through
+    # `_eval_to_bool_eax` plus explicit setne.
+    asm = _compile(
+        "_Bool make_5(void) { return 5; }\n"
+        "int main(void) {\n"
+        "    return make_5() == 1 ? 0 : 1;\n"
+        "}\n"
+    )
+    # Check make_5's body has the bool normalization.
+    lines = asm.splitlines()
+    in_make = False
+    for l in lines:
+        if l.startswith("_make_5:"):
+            in_make = True
+            continue
+        if in_make and l.startswith("_") and l.endswith(":"):
+            break
+        if in_make and "setne" in l:
+            return  # found
+    assert False, "no setne in _make_5 body"
+
+
+def test_bool_cast_normalizes_long_long_and_float_sources():
+    # `(_Bool)0x100000000LL` (only the high dword non-zero) used to
+    # reach _cast via the int path which loaded only the low dword
+    # and stored 0 — wrong. Similarly `(_Bool)0.5` truncated to int
+    # 0 first, then setne saw 0. Both now route through source-aware
+    # paths: long-long ORs both halves; float compares against 0.0
+    # on the FPU before any int truncation.
+    asm = _compile(
+        "int main(void) {\n"
+        "    long long ll = 0x100000000LL;\n"
+        "    if ((_Bool)ll != 1) return 1;\n"
+        "    double d = 0.5;\n"
+        "    if ((_Bool)d != 1) return 2;\n"
+        "    if ((_Bool)0.0 != 0) return 3;\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    # LL→bool path emits an `or eax, edx` to fold both halves.
+    assert "or      eax, edx" in asm
+    # Float→bool path uses `fldz` + `fucompp` to compare against 0.
+    assert "fldz" in asm
+
+
 def test_sizeof_ternary_uses_usual_arithmetic_conversions():
     # Per C99 6.5.15, the result type of `cond ? a : b` is
     # determined by the usual arithmetic conversions of the two

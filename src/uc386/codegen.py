@@ -939,6 +939,12 @@ class CodeGenerator:
                     f"        dq      0x{lo:016X}",
                     f"        dq      0x{hi:016X}",
                 ]
+            # `_Bool` globals: normalize to 0 / 1 per C 6.3.1.2 so a
+            # value like `5` lays down `db 1`, not `db 5`. Without
+            # this, `_Bool g = 256;` even produces `db 0` (NASM
+            # truncates to 8 bits).
+            if ty.name == "bool":
+                value = 1 if value != 0 else 0
             directive = self._DATA_DIRECTIVE[self._size_of(ty)]
             return [f"        {directive}      {value}"]
         if isinstance(ty, ast.PointerType):
@@ -2036,7 +2042,12 @@ class CodeGenerator:
                                 )
                             ):
                                 slot = slot.values[0]
-                            values.append(str(self._const_eval(slot, name)))
+                            v = self._const_eval(slot, name)
+                            # `_Bool` array element: normalize per
+                            # C 6.3.1.2 — any non-zero → 1, zero → 0.
+                            if elem_type.name == "bool":
+                                v = 1 if v != 0 else 0
+                            values.append(str(v))
                         else:
                             values.append("0")
                     return [f"        {directive}      {', '.join(values)}"]
@@ -6986,6 +6997,18 @@ class CodeGenerator:
         """
         target = expr.target_type
         src_ty = self._type_of(expr.expr, ctx)
+        # Cast to `_Bool` short-circuits all the source-aware paths
+        # via `_eval_to_bool_eax` (handles long-long / float / int128
+        # / complex / int / pointer). For float/LL/int128/complex
+        # paths it already leaves EAX = 0/1. For int sources it just
+        # leaves EAX = value, so add the explicit normalization to
+        # make the cast's result a true 0/1. Per C 6.3.1.2.
+        if isinstance(target, ast.BasicType) and target.name == "bool":
+            out = self._eval_to_bool_eax(expr.expr, ctx)
+            out.append("        test    eax, eax")
+            out.append("        setne   al")
+            out.append("        movzx   eax, al")
+            return out
         # Float → unsigned int: fistp only does signed conversion, so
         # for values >= 2^31 we need a bias subtract / re-add. Detect
         # the case here so `_eval_expr_to_eax(expr.expr)` (which would
@@ -7168,8 +7191,21 @@ class CodeGenerator:
         goes through `_store_from_edx_eax`; this path is the
         narrow-on-store fallback when callers happen to be in 32-bit
         eval mode.
+
+        For `_Bool` destinations, normalize per C 6.3.1.2 — any non-zero
+        value becomes 1, zero stays zero — before storing.
         """
         size = self._size_of(ty)
+        if (
+            isinstance(ty, ast.BasicType)
+            and ty.name == "bool"
+        ):
+            return [
+                "        test    eax, eax",
+                "        setne   al",
+                "        movzx   eax, al",
+                f"        mov     byte {addr}, al",
+            ]
         if size == 4:
             return [f"        mov     {addr}, eax"]
         if size == 2:
@@ -8560,8 +8596,22 @@ class CodeGenerator:
         # For sub-word return types (char / short), narrow EAX to the
         # type's width and re-extend per signedness — matches C's
         # "value narrows to the return type on return".
-        out = self._eval_expr_to_eax(stmt.value, ctx)
         rt = ctx.return_type
+        # `_Bool` return type: normalize the return value to 0/1 per
+        # C 6.3.1.2. Use the source-aware `_eval_to_bool_eax` so a
+        # long-long / float / int128 / complex return value also
+        # works correctly.
+        if (
+            isinstance(rt, ast.BasicType)
+            and rt.name == "bool"
+        ):
+            out = self._eval_to_bool_eax(stmt.value, ctx)
+            out.append("        test    eax, eax")
+            out.append("        setne   al")
+            out.append("        movzx   eax, al")
+            out.append("        jmp     .epilogue")
+            return out
+        out = self._eval_expr_to_eax(stmt.value, ctx)
         if isinstance(rt, ast.BasicType):
             size = self._size_of(rt)
             if size == 1:
@@ -12883,6 +12933,24 @@ class CodeGenerator:
                     out.append("        push    edx")
                     out.append("        push    eax")
                     total_arg_bytes += 8
+                # `_Bool` expected param with non-bool int arg:
+                # normalize per C 6.3.1.2 before pushing so the
+                # callee's byte-load reads 0 or 1.
+                elif (
+                    expected_ty is not None
+                    and isinstance(expected_ty, ast.BasicType)
+                    and expected_ty.name == "bool"
+                    and not (
+                        isinstance(arg_ty, ast.BasicType)
+                        and arg_ty.name == "bool"
+                    )
+                ):
+                    out += self._eval_to_bool_eax(arg, ctx)
+                    out.append("        test    eax, eax")
+                    out.append("        setne   al")
+                    out.append("        movzx   eax, al")
+                    out.append("        push    eax")
+                    total_arg_bytes += 4
                 else:
                     out += self._eval_expr_to_eax(arg, ctx)
                     out.append("        push    eax")
@@ -13030,6 +13098,28 @@ class CodeGenerator:
             step = self._size_of(ty.base_type)
             instr = "add" if expr.op == "++" else "sub"
             bump = [f"        {instr}     dword {addr}, {step}"]
+        elif isinstance(ty, ast.BasicType) and ty.name == "bool":
+            # `_Bool` ++/--: normalize the post-bump value to 0/1 per
+            # C 6.3.1.2. Route through load + add 1 / sub 1 + bool-store.
+            # Pre/post handled by remembering the load before the bump.
+            load_pre = self._load_to_eax(addr, ty)
+            delta = "1" if expr.op == "++" else "-1"
+            if expr.is_prefix:
+                # Bump in EAX, normalize-store, leave new value in EAX.
+                return (
+                    load_pre
+                    + [f"        add     eax, {delta}"]
+                    + self._store_from_eax(addr, ty)
+                )
+            # Postfix: keep old value, bump a copy, normalize-store, then
+            # restore old value to EAX.
+            return (
+                load_pre
+                + ["        push    eax"]
+                + [f"        add     eax, {delta}"]
+                + self._store_from_eax(addr, ty)
+                + ["        pop     eax"]
+            )
         else:
             # `inc byte/word/dword` for char/short/int. The slot's payload
             # bytes are at the same `[ebp - N]` regardless of width because
@@ -13114,6 +13204,27 @@ class CodeGenerator:
             out.append("        mov     edx, [ecx + 4]")
             out.append(f"        {instr0}     dword [ecx], 1")
             out.append(f"        {instrN}     dword [ecx + 4], 0")
+            return out
+        # `_Bool` lvalue: bump and normalize per C 6.3.1.2.
+        if (
+            isinstance(target_ty, ast.BasicType)
+            and target_ty.name == "bool"
+        ):
+            delta = "1" if expr.op == "++" else "-1"
+            out = list(addr_lines)  # eax = &lvalue
+            out.append("        mov     ecx, eax")
+            # Load current value into EAX.
+            out += self._load_to_eax("[ecx]", target_ty)
+            if expr.is_prefix:
+                # New value: cur + delta, then bool-store, EAX = new.
+                out.append(f"        add     eax, {delta}")
+                out += self._store_from_eax("[ecx]", target_ty)
+                return out
+            # Postfix: keep old value, compute new, bool-store, restore old.
+            out.append("        push    eax")
+            out.append(f"        add     eax, {delta}")
+            out += self._store_from_eax("[ecx]", target_ty)
+            out.append("        pop     eax")
             return out
         if isinstance(target_ty, ast.PointerType):
             step = self._size_of(target_ty.base_type)
