@@ -672,3 +672,7 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Fix**: extended `_inc_dec_ll` to handle Index, Member, and `*p` lvalues. Compute `&lvalue` once into ECX, RMW [ecx] (low) with `add 1` and [ecx+4] (high) with `adc 0` (or sub/sbb for `--`). For prefix, return new value in EDX:EAX after the bump; for postfix, return old value before the bump.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (344 total).
+- **2026-04-28 — float ++/-- on non-Identifier lvalues**: `++arr[i]` / `++(*p)` / `++s.m` for float types used to raise "`++` on a float requires an identifier". `_float_inc_dec` only handled Identifier operands.
+  - **Fix**: extended `_float_inc_dec` to handle Index, Member, and `*p` lvalues. Compute `&lvalue` once into EAX, push it on the stack, then `fld` through it, `fld1`, `faddp`/`fsubp`, and either `fst` (prefix) or `fstp` (postfix) through the popped address. Pre returns the new value on st(0); post keeps the old value on st(0) before the bump (using two `fld`s + `fstp`). Mirrors the existing pattern in `_float_compound_assign` for non-Identifier lvalues.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (345 total).

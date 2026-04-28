@@ -3256,6 +3256,21 @@ def test_long_long_inc_on_array_element_in_value_position():
     assert "adc     dword [ecx + 4], 0" in asm
 
 
+def test_float_inc_on_array_element():
+    # `++arr[i]` for float arr — was raising "++ on a float requires
+    # an identifier".
+    asm = _compile(
+        "int main(void) {\n"
+        "    float arr[1] = {1.0f};\n"
+        "    ++arr[0];\n"
+        "    return arr[0] == 2.0f ? 0 : 1;\n"
+        "}\n"
+    )
+    # The non-Identifier float inc/dec emits fld + fld1 + faddp + fst.
+    assert "fld     dword [eax]" in asm or "fld     qword [eax]" in asm
+    assert "faddp" in asm
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.

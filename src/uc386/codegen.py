@@ -11414,37 +11414,72 @@ class CodeGenerator:
         return out
 
     def _float_inc_dec(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
-        """`++f` / `--f` / `f++` / `f--` for a float Identifier.
+        """`++f` / `--f` / `f++` / `f--` for a float Identifier or any
+        float lvalue (Index, Member, *p).
 
         Pre-form: bump the slot, leaving the new value on st(0).
         Post-form: load the slot twice, bump one copy, store it, leaving
         the original value on st(0) so the expression yields the old.
         """
-        if not isinstance(expr.operand, ast.Identifier):
+        op_mnem = "faddp" if expr.op == "++" else "fsubp"
+        if isinstance(expr.operand, ast.Identifier):
+            name = expr.operand.name
+            ty = self._identifier_type(name, ctx)
+            addr = self._float_lvalue_addr(name, ctx)
+            size = self._size_of(ty)
+            width = "dword" if size == 4 else "qword"
+            if expr.is_prefix:
+                return [
+                    f"        fld     {width} {addr}",
+                    "        fld1",
+                    f"        {op_mnem}   st1, st0",
+                    f"        fst     {width} {addr}",
+                ]
+            # Post-form: keep the old value on st(0) after storing the new.
+            return [
+                f"        fld     {width} {addr}",   # st0 = old
+                f"        fld     {width} {addr}",   # st0 = old, st1 = old
+                "        fld1",                       # st0 = 1, st1 = old, st2 = old
+                f"        {op_mnem}   st1, st0",      # pops, st1 = old±1
+                f"        fstp    {width} {addr}",   # store new, pop. st0 = old
+            ]
+        # Non-Identifier lvalue: compute &lvalue once into EAX, hold
+        # in stack, then fld through it. Same shape as
+        # _float_compound_assign's general-lvalue path.
+        if isinstance(expr.operand, ast.Index):
+            addr_lines = self._index_address(expr.operand, ctx)
+        elif (
+            isinstance(expr.operand, ast.UnaryOp)
+            and expr.operand.op == "*"
+        ):
+            addr_lines = self._eval_expr_to_eax(expr.operand.operand, ctx)
+        elif isinstance(expr.operand, ast.Member):
+            addr_lines = self._member_address(expr.operand, ctx)
+        else:
             raise CodegenError(
-                f"`{expr.op}` on a float requires an identifier"
+                f"`{expr.op}` on a float operand of type "
+                f"{type(expr.operand).__name__} not supported"
             )
-        name = expr.operand.name
-        ty = self._identifier_type(name, ctx)
-        addr = self._float_lvalue_addr(name, ctx)
+        ty = self._type_of(expr.operand, ctx)
         size = self._size_of(ty)
         width = "dword" if size == 4 else "qword"
-        op_mnem = "faddp" if expr.op == "++" else "fsubp"
+        out = list(addr_lines)
+        out.append("        push    eax")
         if expr.is_prefix:
-            return [
-                f"        fld     {width} {addr}",
-                "        fld1",
-                f"        {op_mnem}   st1, st0",
-                f"        fst     {width} {addr}",
-            ]
-        # Post-form: keep the old value on st(0) after storing the new.
-        return [
-            f"        fld     {width} {addr}",   # st0 = old (the value we yield)
-            f"        fld     {width} {addr}",   # st0 = old, st1 = old
-            "        fld1",                       # st0 = 1, st1 = old, st2 = old
-            f"        {op_mnem}   st1, st0",      # pops, st1 = old±1. Now st0 = old±1, st1 = old.
-            f"        fstp    {width} {addr}",   # store new, pop. st0 = old.
-        ]
+            out.append(f"        fld     {width} [eax]")
+            out.append("        fld1")
+            out.append(f"        {op_mnem}   st1, st0")
+            out.append("        pop     ecx")
+            out.append(f"        fst     {width} [ecx]")
+            return out
+        # Postfix: keep old on st(0) after storing new through ECX.
+        out.append(f"        fld     {width} [eax]")    # st0 = old
+        out.append(f"        fld     {width} [eax]")    # st0 = old, st1 = old
+        out.append("        fld1")                       # st0 = 1
+        out.append(f"        {op_mnem}   st1, st0")      # st0 = old±1, st1 = old
+        out.append("        pop     ecx")
+        out.append(f"        fstp    {width} [ecx]")    # store new, pop. st0 = old
+        return out
 
     def _float_compound_assign(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
         """Lower `lvalue op= rhs` where the value is float-typed.
