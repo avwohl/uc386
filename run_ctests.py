@@ -7,25 +7,16 @@ the upstream tests cloned at `../external/c-testsuite` (sibling to
 
     git clone https://github.com/c-testsuite/c-testsuite.git ../external/c-testsuite
 
-The full pipeline is compile → assemble → link → run → diff:
+The full pipeline is compile → assemble → run → diff (all wired):
 
-  1. compile:  python -m uc386.main file.c -o file.asm  (works today)
-  2. assemble: nasm -f bin file.asm -o file.com         (works today)
-  3. link:     n/a (the .asm contains its own _start and DOS exit stub)
-  4. run:      dosbox / dosemu / qemu-system-i386       (NOT WIRED YET)
-  5. diff:     compare stdout to <test>.c.expected      (waits on 4)
+  1. compile:  python -m uc386.main file.c -o file.asm
+  2. assemble: NASM via uc386.dos_emu (in-process)
+  3. run:      unicorn-engine emulator with INT 21h handlers
+  4. diff:     compare stdout to <test>.c.expected
 
-Until step 4 is wired, the runner defaults to `--compile-only` and
-just checks that uc386 accepts each source. The remaining stages
-print "skip" with a clear reason.
-
-Notes shared with uc80 (most are still relevant for i386):
-- 00040: 8-queens. Slow; skip in --compile-only since it doesn't apply
-        to compile-only timing, but listed for the runtime stage.
-- 00174 / 00178 / 00195: float tests; uc386 has full FPU codegen so
-        these should compile.
-- 00216: range designators [1...5] — not supported by uc_core's parser.
-- 00220: wide characters (wchar_t, L"...") — partial uc_core support.
+The default mode is `--compile-only`; pass `--full` for the
+end-to-end pipeline. As of 2026-04-28 all 220 tests pass under
+`--full`. Slow tests get extended timeouts (see SLOW_TESTS).
 """
 
 import argparse
