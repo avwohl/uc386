@@ -3899,3 +3899,78 @@ def test_int128_function_pointer_typedef():
     assert "_helper:" in asm
     # The typedef should NOT register `__int128` as a function name.
     assert "___int128:" not in asm
+
+
+def test_struct_ternary_lowers_to_branched_copy():
+    # `cond ? struct_a : struct_b` was rejected with "can't take
+    # address of TernaryOp for `.member`" because `_struct_address`
+    # had no TernaryOp branch. Now allocates a per-ternary temp and
+    # emits a conditional memcpy via `_struct_ternary_into`.
+    asm = _compile(
+        "struct P { int x; int y; };\n"
+        "struct P make_a(void) { struct P r = {1, 2}; return r; }\n"
+        "struct P make_b(void) { struct P r = {10, 20}; return r; }\n"
+        "int main(void) {\n"
+        "    int n = 5;\n"
+        "    struct P p = (n > 0) ? make_a() : make_b();\n"
+        "    if (p.x != 1 || p.y != 2) return 1;\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    assert "struct_tern_false" in asm
+    assert "struct_tern_end" in asm
+
+
+def test_complex_ternary_lowers_to_branched_eval():
+    # `cond ? complex_a : complex_b` was rejected at
+    # `_complex_value_address` (no TernaryOp branch). Now allocates
+    # a per-ternary temp and conditionally evaluates each arm into
+    # the dest via `_complex_ternary_into`.
+    asm = _compile(
+        "int main(void) {\n"
+        "    int n = 5;\n"
+        "    _Complex double a = 1.0 + 2.0i;\n"
+        "    _Complex double b = 10.0 + 20.0i;\n"
+        "    _Complex double r = (n > 0) ? a : b;\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    assert "cplx_tern_false" in asm
+    assert "cplx_tern_end" in asm
+
+
+def test_complex_ternary_arm_with_arithmetic():
+    # Each arm may itself be a complex BinaryOp/UnaryOp/Cast/Compound.
+    # `_eval_complex_into_top` previously had no TernaryOp branch and
+    # fell through to scalar promotion, breaking nested ternaries.
+    asm = _compile(
+        "int main(void) {\n"
+        "    int n = 5;\n"
+        "    _Complex double r = (n > 10)\n"
+        "        ? (1.0 + 1.0i)\n"
+        "        : ((n > 0) ? (2.0 + 2.0i) : (3.0 + 3.0i));\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    # Outer ternary uses _complex_ternary_into; inner ternary uses
+    # the _eval_complex_into_top TernaryOp branch (different label).
+    assert "cplx_tern_false" in asm
+    assert "cplx_into_tern_false" in asm
+
+
+def test_vector_ternary_lowers_to_branched_copy():
+    # `cond ? vec_a : vec_b` for `__attribute__((vector_size))` types
+    # used to raise "vector value: unsupported expression TernaryOp".
+    # Now allocates a per-ternary temp and conditionally memcpys.
+    asm = _compile(
+        "typedef int v4si __attribute__((vector_size(16)));\n"
+        "int main(void) {\n"
+        "    int n = 5;\n"
+        "    v4si a = {1, 2, 3, 4};\n"
+        "    v4si b = {10, 20, 30, 40};\n"
+        "    v4si r = (n > 0) ? a : b;\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    assert "vec_tern_false" in asm
+    assert "vec_tern_end" in asm

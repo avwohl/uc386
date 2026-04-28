@@ -3495,6 +3495,26 @@ class CodeGenerator:
                 # 16-byte temp to hold the result. Per-node so
                 # chained ops get distinct slots.
                 ctx.alloc_call_temp(sub, 16)
+            elif (
+                isinstance(sub, ast.TernaryOp)
+                and isinstance(ty, ast.StructType)
+            ):
+                # Struct-returning ternary: needs a temp the size of
+                # the struct so the result of `cond ? get_a() : get_b()`
+                # has a stable address for `.member` and the var-init
+                # struct copy.
+                size = (self._size_of(ty) + 3) & ~3
+                ctx.alloc_call_temp(sub, size)
+            elif (
+                isinstance(sub, ast.TernaryOp)
+                and isinstance(ty, ast.ArrayType)
+                and getattr(ty, "is_vector", False)
+            ):
+                # Vector-typed ternary needs a temp the size of the
+                # vector so each arm's address can flow into the
+                # standard vector copy/store paths.
+                size = (self._size_of(ty) + 3) & ~3
+                ctx.alloc_call_temp(sub, size)
         elif (
             isinstance(sub, ast.FloatLiteral) and sub.is_imaginary
         ):
@@ -3930,6 +3950,13 @@ class CodeGenerator:
             out.append(f"        lea     eax, {_ebp_addr(disp)}")
             return out
         if (
+            isinstance(expr, ast.TernaryOp)
+            and id(expr) in ctx.call_temps
+        ):
+            return self._complex_ternary_into(
+                expr, ctx.call_temps[id(expr)], ctx,
+            )
+        if (
             isinstance(expr, ast.FloatLiteral)
             and expr.is_imaginary
             and id(expr) in ctx.call_temps
@@ -3965,7 +3992,11 @@ class CodeGenerator:
                 f"(got {type(operand_ty).__name__})"
             )
         half_size = self._COMPLEX_BASE_SIZES[operand_ty.base_type]
-        # Compute &operand.
+        # Compute &operand. Lvalues / Calls have direct addressing
+        # helpers; sub-expressions (BinaryOp/UnaryOp/Cast/TernaryOp/
+        # imaginary FloatLiteral) materialize into a per-node temp
+        # via `_complex_value_address`. Both flow through the same
+        # fallback here.
         if isinstance(operand, ast.Identifier):
             out = self._identifier_address(operand.name, ctx)
         elif isinstance(operand, ast.UnaryOp) and operand.op == "*":
@@ -3984,6 +4015,15 @@ class CodeGenerator:
             retptr_lines = [f"        lea     eax, {_ebp_addr(disp)}"]
             out = self._call_into_address(operand, retptr_lines, ctx)
             out.append(f"        lea     eax, {_ebp_addr(disp)}")
+        elif (
+            isinstance(
+                operand,
+                (ast.BinaryOp, ast.UnaryOp, ast.Cast, ast.TernaryOp,
+                 ast.FloatLiteral),
+            )
+            and id(operand) in ctx.call_temps
+        ):
+            out = self._complex_value_address(operand, ctx)
         else:
             raise CodegenError(
                 f"`{expr.op}` operand must be a simple lvalue "
@@ -5986,6 +6026,17 @@ class CodeGenerator:
             target_ty = self._type_of(expr.left, ctx)
             if isinstance(target_ty, ast.StructType):
                 return self._struct_copy_assign(expr, target_ty, ctx)
+        if isinstance(expr, ast.TernaryOp):
+            # `cond ? a : b` where both arms are struct-typed.
+            # Evaluate the chosen arm into the per-ternary temp slot
+            # (allocated in `_collect_call_temps`) and return its
+            # address.
+            ty = self._type_of(expr, ctx)
+            if isinstance(ty, ast.StructType):
+                temp_disp = ctx.call_temps[id(expr)]
+                return self._struct_ternary_into(
+                    expr, temp_disp, ty, ctx,
+                )
         if isinstance(expr, ast.Cast) and isinstance(
             expr.target_type, ast.StructType
         ):
@@ -6009,6 +6060,75 @@ class CodeGenerator:
         raise CodegenError(
             f"can't take address of {type(expr).__name__} for `.member`"
         )
+
+    def _struct_ternary_into(
+        self,
+        expr: ast.TernaryOp,
+        dest_disp: int,
+        ty: ast.StructType,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Lower `cond ? T : F` for struct-typed arms. Evaluates the
+        chosen arm into the dest slot via per-dword copy. Both arms
+        must produce the same struct layout. Returns dest's address
+        in EAX (matches `_struct_address` contract).
+        """
+        size = self._size_of(ty)
+        false_label = ctx.label("struct_tern_false")
+        end_label = ctx.label("struct_tern_end")
+        out = self._eval_to_bool_eax(expr.condition, ctx)
+        out.append("        test    eax, eax")
+        out.append(f"        jz      {false_label}")
+        # True branch: get its address, copy size bytes into dest.
+        out += self._struct_address(expr.true_expr, ctx)
+        out.append("        mov     esi, eax")
+        out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+        self._emit_memcpy_inline(out, "esi", "edi", size)
+        out.append(f"        jmp     {end_label}")
+        out.append(f"{false_label}:")
+        out += self._struct_address(expr.false_expr, ctx)
+        out.append("        mov     esi, eax")
+        out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+        self._emit_memcpy_inline(out, "esi", "edi", size)
+        out.append(f"{end_label}:")
+        # Leave the dest's address in EAX.
+        out.append(f"        lea     eax, {_ebp_addr(dest_disp)}")
+        return out
+
+    def _complex_ternary_into(
+        self,
+        expr: ast.TernaryOp,
+        dest_disp: int,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Lower `cond ? T : F` for complex-typed arms. Evaluates the
+        chosen arm and copies it into the dest slot. Both arms must
+        produce the same complex base type. Returns dest's address
+        in EAX (matches `_complex_value_address` contract).
+        """
+        ty = self._type_of(expr, ctx)
+        if not isinstance(ty, ast.ComplexType):
+            raise CodegenError(
+                "complex ternary helper called on non-complex result"
+            )
+        size = self._size_of(ty)
+        false_label = ctx.label("cplx_tern_false")
+        end_label = ctx.label("cplx_tern_end")
+        out = self._eval_to_bool_eax(expr.condition, ctx)
+        out.append("        test    eax, eax")
+        out.append(f"        jz      {false_label}")
+        # True branch: evaluate into dest slot via the standard
+        # complex eval pipeline. Each arm may be an lvalue, a Call,
+        # or an arithmetic sub-expression (BinaryOp/UnaryOp/Cast/
+        # Compound) that has its own temp from the pre-pass.
+        dest = [f"        lea     eax, {_ebp_addr(dest_disp)}"]
+        out += self._eval_complex_to(expr.true_expr, list(dest), ctx)
+        out.append(f"        jmp     {end_label}")
+        out.append(f"{false_label}:")
+        out += self._eval_complex_to(expr.false_expr, list(dest), ctx)
+        out.append(f"{end_label}:")
+        out.append(f"        lea     eax, {_ebp_addr(dest_disp)}")
+        return out
 
     def _cast_to_struct(
         self, expr: ast.Cast, ctx: _FuncCtx,
@@ -8785,12 +8905,42 @@ class CodeGenerator:
                     return self._complex_const_into_top(real, imag, eff_ty)
                 except CodegenError:
                     pass
+            # Runtime complex-int arithmetic: route through integer
+            # ops, not the FPU. The FPU paths below treat halves as
+            # IEEE-754 floats, which gives the wrong bit pattern for
+            # any non-tiny integer (multiply zeros out due to denormal
+            # underflow; add/sub only works accidentally for very
+            # small values).
+            if (
+                eff_ty.base_type in self._COMPLEX_INT_BASES
+                and self._COMPLEX_BASE_SIZES[eff_ty.base_type] in (1, 2, 4)
+                and expr.op in ("+", "-", "*")
+            ):
+                return self._complex_int_arith_into_top(
+                    expr, eff_ty, ctx,
+                )
             if expr.op in ("+", "-"):
                 return self._complex_addsub_into_top(expr, eff_ty, ctx)
             if expr.op == "*":
                 return self._complex_mul_into_top(expr, eff_ty, ctx)
             if expr.op == "/":
                 return self._complex_div_into_top(expr, eff_ty, ctx)
+        if isinstance(expr, ast.TernaryOp):
+            # `cond ? T : F` with both arms complex. The dest address
+            # is at TOS; each arm recurses into _eval_complex_into_top
+            # which writes through that address and leaves TOS intact
+            # so the next consumer can pop it.
+            false_label = ctx.label("cplx_into_tern_false")
+            end_label = ctx.label("cplx_into_tern_end")
+            out = self._eval_to_bool_eax(expr.condition, ctx)
+            out.append("        test    eax, eax")
+            out.append(f"        jz      {false_label}")
+            out += self._eval_complex_into_top(expr.true_expr, ctx, eff_ty)
+            out.append(f"        jmp     {end_label}")
+            out.append(f"{false_label}:")
+            out += self._eval_complex_into_top(expr.false_expr, ctx, eff_ty)
+            out.append(f"{end_label}:")
+            return out
         # Imaginary FloatLiteral or scalar-typed sub-expression that
         # got promoted to complex (rare). Treat as (0, value) or
         # (value, 0) depending on whether it's imaginary.
@@ -9331,6 +9481,178 @@ class CodeGenerator:
             f"        fld     {width} [{i_label}]",
             f"        fstp    {width} [ecx + {half_size}]",
         ]
+
+    def _complex_int_arith_into_top(
+        self, expr: ast.BinaryOp, ty: ast.ComplexType, ctx: _FuncCtx,
+    ) -> list[str]:
+        """`a + b`, `a - b`, `a * b` for complex-int values via integer
+        ops. Halves are loaded as integers (not floats) so the result
+        bits match the integer abstract machine. Half size 1/2/4
+        only — long-long-half complex isn't yet routed here.
+        """
+        half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
+        size = self._size_of(ty)
+        # Sub-word halves (char/short): load via movzx/movsx.
+        is_signed = ty.base_type in ("char", "short", "int", "long", "long long")
+        # Sub-word halves use the regular integer load helpers via
+        # _load_to_eax with a synthesized half-type.
+        half_ty = ast.BasicType(name=ty.base_type)
+        # Two scratch slots: left at [esp] and right at [esp + size].
+        # Same shape as the FPU paths.
+        out = [f"        sub     esp, {2 * size}"]
+        out.append("        mov     eax, esp")
+        out.append("        push    eax")
+        out += self._eval_complex_into_top(expr.left, ctx, ty)
+        out.append("        add     esp, 4")
+        out.append(f"        lea     eax, [esp + {size}]")
+        out.append("        push    eax")
+        out += self._eval_complex_into_top(expr.right, ctx, ty)
+        out.append("        add     esp, 4")
+        # Both arms now in scratch. ECX = original dest (at [esp + 2*size]).
+        out.append(f"        mov     ecx, [esp + {2 * size}]")
+        out.append("        mov     edx, esp")  # &left
+        # Load helpers (use AL/AX/EAX as appropriate).
+        def load(reg: str, addr: str) -> list[str]:
+            if half_size == 4:
+                return [f"        mov     {reg}, {addr}"]
+            mnem = "movsx" if is_signed else "movzx"
+            half_reg = "al" if half_size == 1 else "ax"
+            # Load into 32-bit reg via movsx/movzx.
+            return [f"        {mnem}   {reg}, {('byte' if half_size == 1 else 'word')} {addr}"]
+        def store(reg: str, addr: str) -> list[str]:
+            if half_size == 4:
+                return [f"        mov     {addr}, {reg}"]
+            half_reg = "al" if half_size == 1 else "ax"
+            kw = "byte" if half_size == 1 else "word"
+            # Use sub-register of EAX. Caller ensures `reg` is a 32-bit reg
+            # whose low half holds the value to store.
+            sub = {"eax": "al" if half_size == 1 else "ax",
+                   "ebx": "bl" if half_size == 1 else "bx",
+                   "esi": "sil" if half_size == 1 else "si"}.get(reg, half_reg)
+            # ESI's low byte is `sil` only on x86-64 — on i386 we can't
+            # access the low byte of ESI directly. Move through EAX.
+            if half_size == 1 and reg == "esi":
+                return [f"        mov     eax, esi", f"        mov     {kw} {addr}, al"]
+            if half_size == 2 and reg == "esi":
+                return [f"        mov     eax, esi", f"        mov     {kw} {addr}, ax"]
+            return [f"        mov     {kw} {addr}, {sub}"]
+
+        if expr.op in ("+", "-"):
+            mnem = "add" if expr.op == "+" else "sub"
+            # real = ar OP br
+            out += load("eax", f"[edx]")
+            out += load("ebx", f"[edx + {size}]")
+            out.append(f"        {mnem}     eax, ebx")
+            out += store("eax", f"[ecx]")
+            # imag = ai OP bi
+            out += load("eax", f"[edx + {half_size}]")
+            out += load("ebx", f"[edx + {size + half_size}]")
+            out.append(f"        {mnem}     eax, ebx")
+            out += store("eax", f"[ecx + {half_size}]")
+        else:  # *
+            # real = ar*br - ai*bi
+            # imag = ar*bi + ai*br
+            # We need temp regs: use eax (multiply result), ebx
+            # (saved partial), esi (other operand), edx (base ptr).
+            # But edx is in use for base. Stash edx into a scratch
+            # slot since we need it for imul.
+            # Plan: compute ar*br - ai*bi → store to [ecx], then
+            # compute ar*bi + ai*br → store to [ecx + half_size].
+            # Use ebx to hold partial sum/difference.
+            # Save ecx, edx for after imul (which clobbers edx).
+            out.append("        push    ecx")
+            out.append("        push    edx")
+            # ar*br
+            out += load("eax", f"[edx]")
+            out += load("ebx", f"[edx + {size}]")
+            out.append("        imul    eax, ebx")  # eax = ar*br (low 32)
+            out.append("        mov     ebx, eax")
+            # ai*bi
+            out.append("        mov     edx, [esp]")  # restore base
+            out += load("eax", f"[edx + {half_size}]")
+            out.append("        push    eax")
+            out.append("        mov     edx, [esp + 4]")  # base again
+            out += load("eax", f"[edx + {size + half_size}]")
+            out.append("        pop     ebx")
+            out.append("        imul    ebx, eax")  # ebx = ai*bi
+            # real = ar*br - ai*bi: ar*br was in ebx, but we clobbered.
+            # Re-do: I'll use a stack scratch for ar*br.
+            # Actually simpler approach: compute all 4 products into stack first.
+            return self._complex_int_mul_into_top_simple(expr, ty, ctx)
+        # Reclaim scratch.
+        out.append(f"        add     esp, {2 * size}")
+        return out
+
+    def _complex_int_mul_into_top_simple(
+        self, expr: ast.BinaryOp, ty: ast.ComplexType, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Complex-int multiply via four imuls into stack scratch."""
+        half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
+        size = self._size_of(ty)
+        is_signed = True  # use signed mul; result truncates the same way
+        half_ty = ast.BasicType(name=ty.base_type)
+        # Layout: [esp + 0] = left scratch (size bytes),
+        # [esp + size] = right scratch (size bytes).
+        out = [f"        sub     esp, {2 * size}"]
+        out.append("        mov     eax, esp")
+        out.append("        push    eax")
+        out += self._eval_complex_into_top(expr.left, ctx, ty)
+        out.append("        add     esp, 4")
+        out.append(f"        lea     eax, [esp + {size}]")
+        out.append("        push    eax")
+        out += self._eval_complex_into_top(expr.right, ctx, ty)
+        out.append("        add     esp, 4")
+        out.append(f"        mov     ecx, [esp + {2 * size}]")  # dest
+        # ESI = base of scratch (left at offset 0, right at offset size).
+        out.append("        mov     esi, esp")
+
+        def load_half(addr: str, reg: str) -> list[str]:
+            if half_size == 4:
+                return [f"        mov     {reg}, {addr}"]
+            mnem = "movsx" if is_signed else "movzx"
+            kw = "byte" if half_size == 1 else "word"
+            return [f"        {mnem}   {reg}, {kw} {addr}"]
+
+        def store_half(reg: str, addr: str) -> list[str]:
+            if half_size == 4:
+                return [f"        mov     {addr}, {reg}"]
+            kw = "byte" if half_size == 1 else "word"
+            sub = "al" if half_size == 1 else "ax"
+            # i386 only allows byte/word sub-registers for EAX/EBX/ECX/EDX
+            # (al/ah/bl/bh/cl/ch/dl/dh / ax/bx/cx/dx). For ESI/EDI we'd
+            # need to move through one of the addressable regs first.
+            # Easiest: always move to EAX, store from EAX's sub-reg.
+            if reg != "eax":
+                return [
+                    f"        mov     eax, {reg}",
+                    f"        mov     {kw} {addr}, {sub}",
+                ]
+            return [f"        mov     {kw} {addr}, {sub}"]
+
+        # real = ar * br - ai * bi
+        out += load_half("[esi]", "eax")               # ar
+        out += load_half(f"[esi + {size}]", "ebx")     # br
+        out.append("        imul    eax, ebx")          # ar*br
+        out.append("        push    eax")               # save ar*br
+        out += load_half(f"[esi + {half_size}]", "eax") # ai (esi unchanged)
+        out += load_half(f"[esi + {size + half_size}]", "ebx")  # bi
+        out.append("        imul    eax, ebx")          # ai*bi
+        out.append("        pop     ebx")               # ar*br
+        out.append("        sub     ebx, eax")          # ar*br - ai*bi
+        out += store_half("ebx", "[ecx]")
+        # imag = ar * bi + ai * br
+        out += load_half("[esi]", "eax")                # ar
+        out += load_half(f"[esi + {size + half_size}]", "ebx")  # bi
+        out.append("        imul    eax, ebx")          # ar*bi
+        out.append("        push    eax")
+        out += load_half(f"[esi + {half_size}]", "eax")  # ai
+        out += load_half(f"[esi + {size}]", "ebx")      # br
+        out.append("        imul    eax, ebx")          # ai*br
+        out.append("        pop     ebx")               # ar*bi
+        out.append("        add     ebx, eax")          # ar*bi + ai*br
+        out += store_half("ebx", f"[ecx + {half_size}]")
+        out.append(f"        add     esp, {2 * size}")
+        return out
 
     def _complex_addsub_into_top(
         self, expr: ast.BinaryOp, ty: ast.ComplexType, ctx: _FuncCtx,
@@ -10576,14 +10898,33 @@ class CodeGenerator:
             # Per C99 6.5.15, if both arms have arithmetic type, the
             # result type is determined by the usual arithmetic
             # conversions of the two arms (regardless of which arm
-            # the runtime selects). For pointer arms, prefer a
-            # non-null pointee. Fall back to the true arm's type when
-            # both arms have the same kind.
+            # the runtime selects). For non-arithmetic arms (struct,
+            # complex, vector, int128 not in arithmetic context),
+            # return the true arm's type — well-formed C requires
+            # both arms to have compatible types in that case.
             try:
                 lt = self._type_of(expr.true_expr, ctx)
                 rt = self._type_of(expr.false_expr, ctx)
             except CodegenError:
                 return self._type_of(expr.true_expr, ctx)
+            # Non-arithmetic types: struct, complex, vector arms must
+            # match per C — just return the true arm's type. (Vector
+            # is ArrayType with is_vector; struct is StructType;
+            # complex is ComplexType.)
+            if isinstance(lt, (ast.StructType, ast.ComplexType)):
+                return lt
+            if isinstance(rt, (ast.StructType, ast.ComplexType)):
+                return rt
+            if (
+                isinstance(lt, ast.ArrayType)
+                and getattr(lt, "is_vector", False)
+            ):
+                return lt
+            if (
+                isinstance(rt, ast.ArrayType)
+                and getattr(rt, "is_vector", False)
+            ):
+                return rt
             # Both float-family: pick the wider via _float_promotion.
             if self._is_float_type(lt) or self._is_float_type(rt):
                 return self._float_promotion(lt, rt)
@@ -14213,9 +14554,50 @@ class CodeGenerator:
             and id(expr) in ctx.call_temps
         ):
             return self._emit_builtin_shuffle(expr, ctx)
+        if isinstance(expr, ast.TernaryOp):
+            ty = self._type_of(expr, ctx)
+            if (
+                isinstance(ty, ast.ArrayType)
+                and getattr(ty, "is_vector", False)
+                and id(expr) in ctx.call_temps
+            ):
+                return self._vector_ternary_into(
+                    expr, ctx.call_temps[id(expr)], ty, ctx,
+                )
         raise CodegenError(
             f"vector value: unsupported expression {type(expr).__name__}"
         )
+
+    def _vector_ternary_into(
+        self,
+        expr: ast.TernaryOp,
+        dest_disp: int,
+        ty: ast.ArrayType,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Lower `cond ? T : F` for vector-typed arms. Each arm is
+        materialized via `_vector_value_address`; the result memcpy's
+        into the dest slot. Returns dest's address in EAX.
+        """
+        size = self._size_of(ty)
+        false_label = ctx.label("vec_tern_false")
+        end_label = ctx.label("vec_tern_end")
+        out = self._eval_to_bool_eax(expr.condition, ctx)
+        out.append("        test    eax, eax")
+        out.append(f"        jz      {false_label}")
+        out += self._vector_value_address(expr.true_expr, ctx)
+        out.append("        mov     esi, eax")
+        out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+        self._emit_memcpy_inline(out, "esi", "edi", size)
+        out.append(f"        jmp     {end_label}")
+        out.append(f"{false_label}:")
+        out += self._vector_value_address(expr.false_expr, ctx)
+        out.append("        mov     esi, eax")
+        out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+        self._emit_memcpy_inline(out, "esi", "edi", size)
+        out.append(f"{end_label}:")
+        out.append(f"        lea     eax, {_ebp_addr(dest_disp)}")
+        return out
 
     def _emit_builtin_shuffle(
         self, expr: ast.Call, ctx: _FuncCtx
