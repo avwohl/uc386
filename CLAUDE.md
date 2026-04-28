@@ -484,3 +484,7 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Zero-sized member is not a union alternative.** The struct init walker's "skip past anonymous-union alternatives" logic shouldn't fire for zero-sized members (e.g. an empty struct). They share the next member's offset by virtue of having no width — they're not actually union alts. Now gated on `_size_of(this_ty) > 0`.
 
   No new test wins yet (these are individually small, shared-fate with other init bugs). Foundation for future wins.
+- **2026-04-27 — torture sweep: FPU init to 53-bit precision (1493 → 1494)**:
+  - **`_start` initializes FPU control word to 0x027F.** PC=10 (53-bit double precision), round-to-nearest, all exceptions masked. Matches glibc's _start convention on x86 Linux. Default x87 reset state is PC=11 (80-bit extended), which gives extra precision in intermediates and diverges from gcc-test expected values that were computed assuming 53-bit. The `fldcw` runs once at program start, before `call _main`. Closes pr59643.
+
+  **Result: 1494/1514 gcc-c-torture** (+1 test). Combined with c-testsuite 218/220, the pipeline now passes 1712/1734 (98.7%).

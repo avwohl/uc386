@@ -2175,7 +2175,13 @@ class CodeGenerator:
         return label
 
     def _start_stub(self) -> list[str]:
-        # _start: call user main, take its int return in EAX, exit DOS via
+        # _start: initialize FPU control word to 53-bit precision (PC=10,
+        # round-to-nearest, all exceptions masked) — 0x027F. This matches
+        # what glibc's _start sets on x86 Linux. Without this, the FPU
+        # defaults to 80-bit (PC=11) which produces extra precision in
+        # intermediate computations and diverges from gcc-emitted-test
+        # expected values.
+        # Then call user main, take its int return in EAX, exit DOS via
         # INT 21h/4Ch with AL = exit code. AH=4Ch leaves AL untouched.
         # `__start` aliases `_start` so a user `extern void _start(void)`
         # / `_start()` call (which our naming convention prefixes to
@@ -2183,6 +2189,10 @@ class CodeGenerator:
         return [
             "_start:",
             "__start:",
+            "        sub     esp, 4",
+            "        mov     word [esp], 0x027F",
+            "        fldcw   [esp]",
+            "        add     esp, 4",
             "        call    _main",
             "        mov     ah, 4Ch",
             "        int     21h",
