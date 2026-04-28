@@ -1596,6 +1596,16 @@ class CodeGenerator:
                 return v, i + 1
             if not inner_members:
                 return v, i + 1
+            # For unions, only the first member receives the initializer
+            # — consume one value, wrap it in InitializerList. Without
+            # this, a struct containing a union followed by another
+            # member would over-consume into the union and shift
+            # subsequent members off by one.
+            if sname in self._struct_unions:
+                taken, new_i = self._consume_one_member(
+                    values, i, inner_members[0][1],
+                )
+                return ast.InitializerList(values=[taken]), new_i
             inner_vals, new_i = self._consume_for_members(
                 values, i, inner_members,
             )
