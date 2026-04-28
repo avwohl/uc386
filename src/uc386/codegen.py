@@ -12710,10 +12710,14 @@ class CodeGenerator:
         """
         # Bit-field ++/--: read-modify-write the bit-field via load/store
         # helpers since width-aware RMW on the storage unit can't be a
-        # simple `add dword [...]`.
+        # simple `add dword [...]`. Long-long-storage bit-fields go
+        # through the LL variant since the storage RMW spans 8 bytes
+        # with carry/shift across the dword boundary.
         if isinstance(expr.operand, ast.Member):
             bf = self._bitfield_info(expr.operand, ctx)
             if bf is not None:
+                if len(bf) == 4 and bf[3] == 8:
+                    return self._inc_dec_bitfield_ll(expr, bf, ctx)
                 return self._inc_dec_bitfield(expr, bf, ctx)
         if isinstance(expr.operand, ast.Index):
             addr_lines = self._index_address(expr.operand, ctx)
@@ -12848,43 +12852,169 @@ class CodeGenerator:
         bf: tuple[int, int, ast.TypeNode, int],
         ctx: _FuncCtx,
     ) -> list[str]:
-        """`++` / `--` on a long-long bit-field. Lowers to
-        `lhs = lhs +/- 1` via the existing LL bitfield store, with
-        the right pre/postfix value semantics."""
-        # Delta as an IntLiteral; the synthesized BinaryOp takes the
-        # bit-field value and adds/subtracts 1.
-        synth_one = ast.IntLiteral(
-            value=1, is_long=False, is_long_long=True, is_unsigned=False,
+        """`++` / `--` on a long-long-storage bit-field.
+
+        Address-once: compute &storage_unit and the current bit-field
+        value into hidden slots, then RMW [addr_slot] with new value
+        +/- 1. Returns EDX:EAX as the (pre or post) value per C
+        semantics. Without the snapshot, the previous implementation
+        evaluated `expr.operand` up to three times — once via
+        `_bitfield_load_ll` and twice via `_bitfield_store_ll_simple`
+        (which itself called `_member_address` for the store address
+        and `_eval_expr_to_edx_eax(inner)` for the rhs read).
+        """
+        bit_offset, bit_width, member_ty, _unit_size = bf
+        op_text = "+" if expr.op == "++" else "-"
+        is_unsigned = self._is_unsigned(member_ty)
+        mask = (1 << bit_width) - 1
+        low_m = mask & 0xFFFFFFFF
+        high_m = (mask >> 32) & 0xFFFFFFFF
+        positioned_mask = (mask << bit_offset) & ((1 << 64) - 1)
+        clear_low = (~positioned_mask) & 0xFFFFFFFF
+        clear_high = ((~positioned_mask) >> 32) & 0xFFFFFFFF
+        # Hidden slots: address (4 B) and current value (8 B).
+        addr_slot_name = f"__incdec_bf_addr_{id(expr)}"
+        snap_slot_name = f"__incdec_bf_snap_{id(expr)}"
+        addr_disp = ctx.alloc_local(
+            addr_slot_name,
+            ast.PointerType(base_type=ast.BasicType(name="long long")),
+            size=4,
         )
-        op = "+" if expr.op == "++" else "-"
-        # For prefix, the result is the new value; for postfix, the
-        # old value. We use _bitfield_load_ll + _bitfield_store_ll_simple
-        # to avoid re-evaluating the bitfield address and the increment.
-        # Postfix: load old, then bump.
-        if not expr.is_prefix:
-            out = self._bitfield_load_ll(expr.operand, bf, ctx)
-            # Save old.
-            out.append("        push    edx")
-            out.append("        push    eax")
-            # Compute new = old + delta. The bit-field address still
-            # needs to be re-evaluated (we lost it). Build a synthetic
-            # `lhs op= 1`.
-            new_rhs = ast.BinaryOp(op=op, left=expr.operand, right=synth_one)
-            out += self._bitfield_store_ll_simple(
-                expr.operand, bf, new_rhs, ctx,
-            )
-            out.append("        pop     eax")
-            out.append("        pop     edx")
-            return out
-        # Prefix: store first, then load the new value.
-        new_rhs = ast.BinaryOp(op=op, left=expr.operand, right=synth_one)
-        out = self._bitfield_store_ll_simple(
-            expr.operand, bf, new_rhs, ctx,
+        snap_ty = ast.BasicType(
+            name="long long",
+            is_signed=False if is_unsigned else None,
         )
-        # _bitfield_store_ll_simple leaves a positioned-then-shifted-
-        # back value in EAX (low 32 bits) without sign extension.
-        # Reload via _bitfield_load_ll for correct semantics.
-        out += self._bitfield_load_ll(expr.operand, bf, ctx)
+        snap_disp = ctx.alloc_local(snap_slot_name, snap_ty, size=8)
+
+        out: list[str] = []
+        # 1. Compute &storage_unit ONCE.
+        out += self._member_address(expr.operand, ctx)
+        out.append(f"        mov     {_ebp_addr(addr_disp)}, eax")
+        # 2. Read current 8-byte unit, extract bit-field value into
+        #    EDX:EAX, then snapshot.
+        out.append("        mov     ebx, eax")
+        out.append("        mov     eax, [ebx]")
+        out.append("        mov     edx, [ebx + 4]")
+        if bit_offset >= 32:
+            shift = bit_offset - 32
+            out.append("        mov     eax, edx")
+            out.append("        xor     edx, edx")
+            if shift:
+                out.append(f"        shr     eax, {shift}")
+        elif bit_offset > 0:
+            out.append(f"        shrd    eax, edx, {bit_offset}")
+            out.append(f"        shr     edx, {bit_offset}")
+        if low_m != 0xFFFFFFFF:
+            out.append(f"        and     eax, {low_m}")
+        if bit_width <= 32:
+            out.append("        xor     edx, edx")
+        else:
+            out.append(f"        and     edx, {high_m}")
+        # Sign-extend if signed and width < 64.
+        if not is_unsigned and bit_width < 64:
+            if bit_width <= 32:
+                shift = 32 - bit_width
+                if shift:
+                    out.append(f"        shl     eax, {shift}")
+                    out.append(f"        sar     eax, {shift}")
+                out.append("        cdq")
+            else:
+                shift = 64 - bit_width
+                out.append(f"        shl     edx, {shift}")
+                out.append(f"        sar     edx, {shift}")
+        # Save snapshot (= old value).
+        out.append(f"        mov     {_ebp_addr(snap_disp)}, eax")
+        out.append(f"        mov     {_ebp_addr(snap_disp + 4)}, edx")
+        # 3. Compute `snap + 1` (or - 1) into EDX:EAX.
+        if op_text == "+":
+            out.append("        add     eax, 1")
+            out.append("        adc     edx, 0")
+        else:
+            out.append("        sub     eax, 1")
+            out.append("        sbb     edx, 0")
+        # 4. Mask + position the new value, RMW [addr_slot].
+        if low_m != 0xFFFFFFFF:
+            out.append(f"        and     eax, {low_m}")
+        if bit_width <= 32:
+            out.append("        xor     edx, edx")
+        else:
+            out.append(f"        and     edx, {high_m}")
+        if bit_offset >= 32:
+            shift = bit_offset - 32
+            out.append("        mov     edx, eax")
+            out.append("        xor     eax, eax")
+            if shift:
+                out.append(f"        shl     edx, {shift}")
+        elif bit_offset > 0:
+            out.append(f"        shld    edx, eax, {bit_offset}")
+            out.append(f"        shl     eax, {bit_offset}")
+        out.append(f"        mov     ecx, {_ebp_addr(addr_disp)}")
+        out.append("        push    esi")
+        out.append("        push    edi")
+        out.append("        mov     esi, [ecx]")
+        out.append("        mov     edi, [ecx + 4]")
+        out.append(f"        and     esi, {clear_low}")
+        out.append(f"        and     edi, {clear_high}")
+        out.append("        or      esi, eax")
+        out.append("        or      edi, edx")
+        out.append("        mov     [ecx], esi")
+        out.append("        mov     [ecx + 4], edi")
+        out.append("        pop     edi")
+        out.append("        pop     esi")
+        # 5. Yield the right value: prefix → new (re-extract from
+        #    storage so sign-ext semantics match _bitfield_load_ll);
+        #    postfix → old (snapshot we already have).
+        if expr.is_prefix:
+            out += self._bitfield_load_ll_via_addr(addr_disp, bf)
+        else:
+            out.append(f"        mov     eax, {_ebp_addr(snap_disp)}")
+            out.append(f"        mov     edx, {_ebp_addr(snap_disp + 4)}")
+        return out
+
+    def _bitfield_load_ll_via_addr(
+        self,
+        addr_disp: int,
+        bf: tuple[int, int, ast.TypeNode, int],
+    ) -> list[str]:
+        """Same as `_bitfield_load_ll` but the storage-unit address
+        is already saved in `[ebp - addr_disp]`. Returns EDX:EAX with
+        the bit-field value sign- or zero-extended to 64 bits.
+        """
+        bit_offset, bit_width, member_ty, _ = bf
+        is_unsigned = self._is_unsigned(member_ty)
+        mask = (1 << bit_width) - 1
+        low_m = mask & 0xFFFFFFFF
+        high_m = (mask >> 32) & 0xFFFFFFFF
+        out: list[str] = []
+        out.append(f"        mov     ecx, {_ebp_addr(addr_disp)}")
+        out.append("        mov     eax, [ecx]")
+        out.append("        mov     edx, [ecx + 4]")
+        if bit_offset >= 32:
+            shift = bit_offset - 32
+            out.append("        mov     eax, edx")
+            out.append("        xor     edx, edx")
+            if shift:
+                out.append(f"        shr     eax, {shift}")
+        elif bit_offset > 0:
+            out.append(f"        shrd    eax, edx, {bit_offset}")
+            out.append(f"        shr     edx, {bit_offset}")
+        if low_m != 0xFFFFFFFF:
+            out.append(f"        and     eax, {low_m}")
+        if bit_width <= 32:
+            out.append("        xor     edx, edx")
+        else:
+            out.append(f"        and     edx, {high_m}")
+        if not is_unsigned and bit_width < 64:
+            if bit_width <= 32:
+                shift = 32 - bit_width
+                if shift:
+                    out.append(f"        shl     eax, {shift}")
+                    out.append(f"        sar     eax, {shift}")
+                out.append("        cdq")
+            else:
+                shift = 64 - bit_width
+                out.append(f"        shl     edx, {shift}")
+                out.append(f"        sar     edx, {shift}")
         return out
 
     def _compound_assign_bitfield(

@@ -3352,6 +3352,33 @@ def test_decimal64_keyword_compiles_as_double():
     assert "section .data" in asm
 
 
+def test_ll_bitfield_inc_dec_arr_index_side_effect_evals_once():
+    # `arr[i++].bf++` for a long-long-storage bit-field used to
+    # error out with "long-long bit-field ++/-- not yet supported"
+    # because `_inc_dec_lvalue` always called `_inc_dec_bitfield`,
+    # never dispatching to `_inc_dec_bitfield_ll`. Even after
+    # wiring the dispatch, the latter desugared via
+    # `_bitfield_store_ll_simple(expr.operand, bf, BinaryOp(+,
+    # expr.operand, 1))` and re-evaluated the operand up to three
+    # times. Now: address-once snapshot pattern — compute
+    # &storage_unit, save in addr_slot; extract current value into
+    # snap_slot; bump (add 1 / sub 1); mask + RMW [addr_slot];
+    # yield snap_slot (postfix) or re-load via addr_slot (prefix).
+    asm = _compile(
+        "int main(void) {\n"
+        "    struct S { unsigned long long a:40; };\n"
+        "    struct S arr[3] = {{0}, {0}, {0}};\n"
+        "    int i = 0;\n"
+        "    arr[i++].a++;\n"
+        "    return (arr[0].a == 1 && i == 1) ? 0 : 1;\n"
+        "}\n"
+    )
+    inc_count = asm.count("        inc     dword [ebp -")
+    assert inc_count == 1, (
+        f"i++ should evaluate exactly once; found {inc_count}"
+    )
+
+
 def test_ll_bitfield_compound_arr_index_side_effect_evals_once():
     # `arr[i++].bf += rhs` for a long-long-storage bit-field used to
     # fire `i++` twice: `_compound_assign_bitfield_ll` desugared to
