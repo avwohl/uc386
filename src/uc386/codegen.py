@@ -3232,6 +3232,11 @@ class CodeGenerator:
                     # ArrayType-flavored result type.
                     size = (self._size_of(ty) + 3) & ~3
                     ctx.alloc_call_temp(sub, size)
+                elif self._is_int128(ty):
+                    # __int128 arithmetic / cast: needs a 16-byte temp
+                    # to hold the result. Per-node so chained ops get
+                    # distinct slots.
+                    ctx.alloc_call_temp(sub, 16)
             elif (
                 isinstance(sub, ast.FloatLiteral) and sub.is_imaginary
             ):
@@ -3614,7 +3619,7 @@ class CodeGenerator:
     # transparently for `long *` etc.) but full slot codegen waits on a
     # 64-bit value-tracking pass.
     _SLOT_BASIC_NAMES = frozenset(
-        {"bool", "char", "short", "int", "long", "long long",
+        {"bool", "char", "short", "int", "long", "long long", "int128",
          "float", "double", "long double"}
     )
 
@@ -3987,6 +3992,7 @@ class CodeGenerator:
         "int": 4,
         "long": 4,          # i386: long is 32-bit
         "long long": 8,
+        "int128": 16,       # GCC extension: __int128 / unsigned __int128
         "float": 4,         # x87 single precision
         "double": 8,        # x87 double precision
         "long double": 8,   # x87 has 80-bit, but we approximate as 8
@@ -4464,6 +4470,458 @@ class CodeGenerator:
     @staticmethod
     def _is_long_long(t: ast.TypeNode) -> bool:
         return isinstance(t, ast.BasicType) and t.name == "long long"
+
+    @staticmethod
+    def _is_int128(t: ast.TypeNode) -> bool:
+        return isinstance(t, ast.BasicType) and t.name == "int128"
+
+    # ---- __int128 lowering --------------------------------------------
+    #
+    # `__int128` and `unsigned __int128` are GCC extensions for 128-bit
+    # integer arithmetic. We treat them as 16-byte memory values, with
+    # all operations going through addresses (analogous to structs and
+    # `_Complex T`). The value is represented as four little-endian
+    # dwords: byte 0 = LSB.
+    #
+    # `_eval_expr_to_eax` short-circuits int128 expressions to
+    # `_int128_value_address` so callers always see an address, never
+    # a register-held value (no register pair is wide enough). Storage
+    # for sub-expression results comes from per-node `call_temps`
+    # slots reserved by `_collect_call_temps`.
+    #
+    # Coverage: this is intentionally minimal — enough to compile
+    # pr84748.c (`b += int`, `b /= int`, copy assign, `>> 0`, `>> 64`,
+    # cast to ULL). Many ops (multiply, divide by int128, shifts by
+    # arbitrary constant, comparisons) raise; extending those follows
+    # the same pattern as long-long arithmetic.
+
+    def _int128_value_address(
+        self, expr: ast.Expression, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Lines that produce the address of an `__int128` value in EAX."""
+        if isinstance(expr, ast.Identifier):
+            return self._identifier_address(expr.name, ctx)
+        if isinstance(expr, ast.UnaryOp) and expr.op == "*":
+            return self._eval_expr_to_eax(expr.operand, ctx)
+        if isinstance(expr, ast.Member):
+            return self._member_address(expr, ctx)
+        if isinstance(expr, ast.Index):
+            return self._index_address(expr, ctx)
+        # Sub-expressions evaluate into a per-node temp slot.
+        if (
+            isinstance(expr, (ast.BinaryOp, ast.UnaryOp, ast.Cast))
+            and id(expr) in ctx.call_temps
+        ):
+            disp = ctx.call_temps[id(expr)]
+            out = self._eval_int128_into_temp(expr, disp, ctx)
+            out.append(f"        lea     eax, {_ebp_addr(disp)}")
+            return out
+        raise CodegenError(
+            f"can't take address of __int128 `{type(expr).__name__}`"
+        )
+
+    def _emit_int128_copy(
+        self, src_addr_reg: str, dst_addr_reg: str,
+    ) -> list[str]:
+        """Emit a 16-byte copy from `[src_addr_reg]` to `[dst_addr_reg]`."""
+        out: list[str] = []
+        for off in (0, 4, 8, 12):
+            out.append(f"        mov     eax, [{src_addr_reg} + {off}]")
+            out.append(f"        mov     [{dst_addr_reg} + {off}], eax")
+        return out
+
+    def _emit_int128_zero(self, dst_addr_reg: str) -> list[str]:
+        out = ["        xor     eax, eax"]
+        for off in (0, 4, 8, 12):
+            out.append(f"        mov     [{dst_addr_reg} + {off}], eax")
+        return out
+
+    def _eval_int128_into_temp(
+        self, expr: ast.Expression, dest_disp: int, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Evaluate `expr` (BinaryOp / UnaryOp / Cast) into the 16-byte
+        slot at `[ebp - dest_disp]`."""
+        if isinstance(expr, ast.Cast):
+            return self._cast_to_int128(expr, dest_disp, ctx)
+        if isinstance(expr, ast.BinaryOp):
+            return self._binary_int128(expr, dest_disp, ctx)
+        if isinstance(expr, ast.UnaryOp):
+            return self._unary_int128(expr, dest_disp, ctx)
+        raise CodegenError(
+            f"can't evaluate `{type(expr).__name__}` as __int128"
+        )
+
+    def _cast_to_int128(
+        self, expr: ast.Cast, dest_disp: int, ctx: _FuncCtx,
+    ) -> list[str]:
+        src_ty = self._type_of(expr.expr, ctx)
+        # Cast int128 → int128: just copy.
+        if self._is_int128(src_ty):
+            out = self._int128_value_address(expr.expr, ctx)
+            out.append("        mov     esi, eax")
+            out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+            out += self._emit_int128_copy("esi", "edi")
+            return out
+        # Cast LL → int128: zero/sign-extend EDX:EAX to 16 bytes.
+        if self._is_long_long(src_ty):
+            out = self._eval_expr_to_edx_eax(expr.expr, ctx)
+            out.append(f"        mov     {_ebp_addr(dest_disp)}, eax")
+            out.append(f"        mov     {_ebp_addr(dest_disp + 4)}, edx")
+            if self._is_unsigned(src_ty):
+                out.append("        xor     eax, eax")
+                out.append(f"        mov     {_ebp_addr(dest_disp + 8)}, eax")
+                out.append(f"        mov     {_ebp_addr(dest_disp + 12)}, eax")
+            else:
+                # Sign-extend: replicate sign bit of EDX through high 8 bytes.
+                out.append("        mov     eax, edx")
+                out.append("        sar     eax, 31")
+                out.append(f"        mov     {_ebp_addr(dest_disp + 8)}, eax")
+                out.append(f"        mov     {_ebp_addr(dest_disp + 12)}, eax")
+            return out
+        # Cast int → int128: zero/sign-extend EAX to 16 bytes.
+        out = self._eval_expr_to_eax(expr.expr, ctx)
+        out.append(f"        mov     {_ebp_addr(dest_disp)}, eax")
+        if self._is_unsigned(src_ty):
+            out.append("        xor     eax, eax")
+            for off in (4, 8, 12):
+                out.append(f"        mov     {_ebp_addr(dest_disp + off)}, eax")
+        else:
+            # Sign-extend.
+            out.append("        cdq")
+            for off in (4, 8, 12):
+                out.append(f"        mov     {_ebp_addr(dest_disp + off)}, edx")
+        return out
+
+    def _emit_int_widened_to_int128_on_stack(
+        self, expr: ast.Expression, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Push `expr` (an int-typed value) widened to 16 bytes onto
+        the stack. After this, [esp..esp+15] holds the int128. The
+        caller is responsible for adjusting `esp` back."""
+        ty = self._type_of(expr, ctx)
+        out: list[str] = []
+        if self._is_long_long(ty):
+            out += self._eval_expr_to_edx_eax(expr, ctx)
+            # Push high 8 bytes (sign-extended from edx if signed).
+            if self._is_unsigned(ty):
+                out.append("        push    0")
+                out.append("        push    0")
+            else:
+                out.append("        mov     ecx, edx")
+                out.append("        sar     ecx, 31")
+                out.append("        push    ecx")
+                out.append("        push    ecx")
+            out.append("        push    edx")
+            out.append("        push    eax")
+        else:
+            out += self._eval_expr_to_eax(expr, ctx)
+            if self._is_unsigned(ty):
+                out.append("        push    0")
+                out.append("        push    0")
+                out.append("        push    0")
+            else:
+                out.append("        cdq")
+                out.append("        push    edx")
+                out.append("        push    edx")
+                out.append("        push    edx")
+            out.append("        push    eax")
+        return out
+
+    def _binary_int128(
+        self, expr: ast.BinaryOp, dest_disp: int, ctx: _FuncCtx,
+    ) -> list[str]:
+        op = expr.op
+        lt = self._type_of(expr.left, ctx)
+        rt = self._type_of(expr.right, ctx)
+        # Comma operator: evaluate left for side effects, then right.
+        if op == ",":
+            out = self._eval_expr_to_eax(expr.left, ctx)
+            out += self._eval_int128_into_temp(expr.right, dest_disp, ctx)
+            return out
+        # Helper: copy left's int128 value into dest_disp slot.
+        def copy_left_into_dest() -> list[str]:
+            o = self._int128_value_address(expr.left, ctx)
+            o.append("        mov     esi, eax")
+            o.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+            o += self._emit_int128_copy("esi", "edi")
+            return o
+        # `>>` and `<<` by a constant integer.
+        if op in (">>", "<<"):
+            if not self._is_int128(lt):
+                raise CodegenError(
+                    f"__int128 shift requires int128 LHS"
+                )
+            try:
+                shift_n = self._const_eval(expr.right, "<int128-shift>")
+            except CodegenError:
+                raise CodegenError(
+                    "__int128 shift by non-constant not supported"
+                )
+            shift_n = shift_n & 127
+            return self._int128_shift(expr.left, dest_disp, shift_n, op, lt, ctx)
+        # `+` `-`: 4-dword carry/borrow chain. Either operand may be
+        # a smaller integer; widen it to 16 bytes on the stack.
+        if op in ("+", "-"):
+            out = copy_left_into_dest()
+            if self._is_int128(rt):
+                # Right is also int128: load its address and chain.
+                out += self._int128_value_address(expr.right, ctx)
+                out.append("        mov     esi, eax")
+                out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+                instr0 = "add" if op == "+" else "sub"
+                instrN = "adc" if op == "+" else "sbb"
+                out.append(f"        mov     eax, [esi]")
+                out.append(f"        {instr0}     [edi], eax")
+                for off in (4, 8, 12):
+                    out.append(f"        mov     eax, [esi + {off}]")
+                    out.append(f"        {instrN}     [edi + {off}], eax")
+                return out
+            # Right is a smaller int — widen on stack and chain.
+            out += self._emit_int_widened_to_int128_on_stack(
+                expr.right, ctx,
+            )
+            out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+            instr0 = "add" if op == "+" else "sub"
+            instrN = "adc" if op == "+" else "sbb"
+            out.append(f"        mov     eax, [esp]")
+            out.append(f"        {instr0}     [edi], eax")
+            for off in (4, 8, 12):
+                out.append(f"        mov     eax, [esp + {off}]")
+                out.append(f"        {instrN}     [edi + {off}], eax")
+            out.append("        add     esp, 16")
+            return out
+        # `/` and `%` for unsigned int128 by a 32-bit divisor: chain
+        # of three `div` instructions. Signed division and divisor of
+        # int128 width are unimplemented.
+        if op in ("/", "%"):
+            if not (self._is_int128(lt) and not self._is_int128(rt)):
+                raise CodegenError(
+                    "__int128 / int128 division not supported"
+                )
+            if not self._is_unsigned(lt):
+                raise CodegenError(
+                    "signed __int128 division not supported"
+                )
+            # Evaluate the divisor into ECX (32-bit). Signedness handled
+            # by the existing eval; we treat ECX as unsigned.
+            out: list[str] = []
+            out += self._eval_expr_to_eax(expr.right, ctx)
+            out.append("        mov     ecx, eax")
+            # Load left into ESI (address).
+            out += self._int128_value_address(expr.left, ctx)
+            out.append("        mov     esi, eax")
+            out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+            # Divide top-down: edx:eax = high pair, divide, etc.
+            # u128 quotient = (a3:a2:a1:a0) / d
+            # Step 1: 0:a3 / d -> q3 (= eax), r3 (= edx)
+            out.append("        xor     edx, edx")
+            out.append("        mov     eax, [esi + 12]")
+            out.append("        div     ecx")
+            out.append("        mov     [edi + 12], eax")
+            # Step 2: r3:a2 / d -> q2, r2
+            out.append("        mov     eax, [esi + 8]")
+            out.append("        div     ecx")
+            out.append("        mov     [edi + 8], eax")
+            # Step 3: r2:a1 / d -> q1, r1
+            out.append("        mov     eax, [esi + 4]")
+            out.append("        div     ecx")
+            out.append("        mov     [edi + 4], eax")
+            # Step 4: r1:a0 / d -> q0, r0
+            out.append("        mov     eax, [esi]")
+            out.append("        div     ecx")
+            out.append("        mov     [edi], eax")
+            if op == "%":
+                # Modulo: remainder is in EDX (32-bit). Store into
+                # the low dword and zero the rest.
+                out.append("        mov     [edi], edx")
+                out.append("        xor     eax, eax")
+                for off in (4, 8, 12):
+                    out.append(f"        mov     [edi + {off}], eax")
+            return out
+        if op in ("&", "|", "^"):
+            out = copy_left_into_dest()
+            instr = {"&": "and", "|": "or", "^": "xor"}[op]
+            if self._is_int128(rt):
+                out += self._int128_value_address(expr.right, ctx)
+                out.append("        mov     esi, eax")
+                out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+                for off in (0, 4, 8, 12):
+                    out.append(f"        mov     eax, [esi + {off}]")
+                    out.append(f"        {instr}     [edi + {off}], eax")
+                return out
+            # Bitwise with smaller int: widen and apply.
+            out += self._emit_int_widened_to_int128_on_stack(
+                expr.right, ctx,
+            )
+            out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+            for off in (0, 4, 8, 12):
+                out.append(f"        mov     eax, [esp + {off}]")
+                out.append(f"        {instr}     [edi + {off}], eax")
+            out.append("        add     esp, 16")
+            return out
+        raise CodegenError(f"__int128 binary op `{op}` not supported")
+
+    def _int128_shift(
+        self,
+        left_expr: ast.Expression,
+        dest_disp: int,
+        n: int,
+        op: str,
+        lt: ast.TypeNode,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """Lower `int128_value op N` (op is `<<` or `>>`) into dest."""
+        out = self._int128_value_address(left_expr, ctx)
+        out.append("        mov     esi, eax")
+        out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+        if n == 0:
+            out += self._emit_int128_copy("esi", "edi")
+            return out
+        signed = not self._is_unsigned(lt)
+        # Read 4 dwords as integers a0/a1/a2/a3 (LSB to MSB).
+        # For `>> N`: if N >= 64, high bits to low; etc.
+        # Implement via dword-aligned shift.
+        word_shift = n // 32
+        bit_shift = n % 32
+        if op == ">>":
+            # `(a3:a2:a1:a0) >> n`: result_i = a_{i+word_shift} (with
+            # carry from a_{i+word_shift+1}) — for unsigned. Sign-fill
+            # for signed.
+            # Simplified path for n in {0, 32, 64, 96}.
+            if bit_shift == 0:
+                dwords_in = ["[esi]", "[esi + 4]", "[esi + 8]", "[esi + 12]"]
+                fill = "0" if not signed else None
+                for i in range(4):
+                    src_idx = i + word_shift
+                    if src_idx < 4:
+                        out.append(f"        mov     eax, {dwords_in[src_idx]}")
+                    else:
+                        if signed:
+                            # Sign-extend from highest dword.
+                            out.append("        mov     eax, [esi + 12]")
+                            out.append("        sar     eax, 31")
+                        else:
+                            out.append("        xor     eax, eax")
+                    out.append(f"        mov     [edi + {i*4}], eax")
+                return out
+            # Bit-shift within dwords using shrd. Walk from low to high.
+            # For r = x >> n where 0 < n < 32 and word_shift = 0:
+            # r0 = (a1:a0) >> n  (shrd of a0 with a1, take low 32)
+            # r1 = (a2:a1) >> n
+            # r2 = (a3:a2) >> n
+            # r3 = a3 >> n        (shr or sar)
+            # Generalize for word_shift > 0 by offsetting source dwords.
+            for i in range(4):
+                src_idx = i + word_shift
+                if src_idx >= 4:
+                    if signed:
+                        out.append("        mov     eax, [esi + 12]")
+                        out.append("        sar     eax, 31")
+                    else:
+                        out.append("        xor     eax, eax")
+                    out.append(f"        mov     [edi + {i*4}], eax")
+                    continue
+                out.append(f"        mov     eax, [esi + {src_idx*4}]")
+                if src_idx + 1 < 4:
+                    out.append(f"        mov     edx, [esi + {(src_idx+1)*4}]")
+                    out.append(f"        shrd    eax, edx, {bit_shift}")
+                else:
+                    instr = "sar" if signed else "shr"
+                    out.append(f"        {instr}     eax, {bit_shift}")
+                out.append(f"        mov     [edi + {i*4}], eax")
+            return out
+        # op == "<<"
+        if bit_shift == 0:
+            dwords_in = ["[esi]", "[esi + 4]", "[esi + 8]", "[esi + 12]"]
+            for i in range(4):
+                src_idx = i - word_shift
+                if 0 <= src_idx < 4:
+                    out.append(f"        mov     eax, {dwords_in[src_idx]}")
+                else:
+                    out.append("        xor     eax, eax")
+                out.append(f"        mov     [edi + {i*4}], eax")
+            return out
+        # General `<< n` (0 < n < 128, bit_shift != 0).
+        # Walk from high to low so we can shld with carry from below.
+        # r3 = (a3:a2) << n  (shld of a3 with a2, take high 32 -> low 32 of result)
+        for i in range(3, -1, -1):
+            src_idx = i - word_shift
+            if src_idx < 0:
+                out.append("        xor     eax, eax")
+                out.append(f"        mov     [edi + {i*4}], eax")
+                continue
+            out.append(f"        mov     eax, [esi + {src_idx*4}]")
+            if src_idx - 1 >= 0:
+                out.append(f"        mov     edx, [esi + {(src_idx-1)*4}]")
+                out.append(f"        shld    eax, edx, {bit_shift}")
+            else:
+                out.append(f"        shl     eax, {bit_shift}")
+            out.append(f"        mov     [edi + {i*4}], eax")
+        return out
+
+    def _unary_int128(
+        self, expr: ast.UnaryOp, dest_disp: int, ctx: _FuncCtx,
+    ) -> list[str]:
+        op = expr.op
+        if op == "+":
+            # Identity: just copy.
+            out = self._int128_value_address(expr.operand, ctx)
+            out.append("        mov     esi, eax")
+            out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+            out += self._emit_int128_copy("esi", "edi")
+            return out
+        if op == "-":
+            # Negation: 0 - x via 4-dword sub.
+            out = self._int128_value_address(expr.operand, ctx)
+            out.append("        mov     esi, eax")
+            out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+            out.append("        xor     eax, eax")
+            out.append("        sub     eax, [esi]")
+            out.append("        mov     [edi], eax")
+            for off in (4, 8, 12):
+                out.append("        xor     eax, eax")
+                out.append(f"        sbb     eax, [esi + {off}]")
+                out.append(f"        mov     [edi + {off}], eax")
+            return out
+        if op == "~":
+            out = self._int128_value_address(expr.operand, ctx)
+            out.append("        mov     esi, eax")
+            out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+            for off in (0, 4, 8, 12):
+                out.append(f"        mov     eax, [esi + {off}]")
+                out.append("        not     eax")
+                out.append(f"        mov     [edi + {off}], eax")
+            return out
+        raise CodegenError(f"__int128 unary op `{op}` not supported")
+
+    def _int128_copy_assign(
+        self, lhs: ast.Expression, rhs: ast.Expression, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Lower `lhs = rhs` where both are __int128. Returns lines that
+        leave EAX = &lhs (matching `_assign`'s contract)."""
+        # Compute &lhs first; hold in stack so the rhs eval doesn't
+        # clobber it.
+        out: list[str] = []
+        if isinstance(lhs, ast.Identifier):
+            out += self._identifier_address(lhs.name, ctx)
+        elif isinstance(lhs, ast.Member):
+            out += self._member_address(lhs, ctx)
+        elif isinstance(lhs, ast.Index):
+            out += self._index_address(lhs, ctx)
+        elif isinstance(lhs, ast.UnaryOp) and lhs.op == "*":
+            out += self._eval_expr_to_eax(lhs.operand, ctx)
+        else:
+            raise CodegenError(
+                f"can't assign __int128 to `{type(lhs).__name__}`"
+            )
+        out.append("        push    eax")
+        # Evaluate rhs into a slot and copy.
+        out += self._int128_value_address(rhs, ctx)
+        out.append("        mov     esi, eax")
+        out.append("        pop     edi")
+        out += self._emit_int128_copy("esi", "edi")
+        out.append("        mov     eax, edi")
+        return out
 
     # ---- struct member lowering ---------------------------------------
 
@@ -6252,6 +6710,20 @@ class CodeGenerator:
             return self._eval_expr_to_edx_eax(
                 decl.init, ctx,
             ) + self._store_from_edx_eax(_ebp_addr(disp))
+        if self._is_int128(var_type):
+            # 128-bit local init via copy. The rhs is either int128
+            # (Identifier / BinaryOp / Cast) or a smaller integer that
+            # we widen via a synthetic Cast.
+            init_ty = self._type_of(decl.init, ctx)
+            if not self._is_int128(init_ty):
+                synth_cast = ast.Cast(target_type=var_type, expr=decl.init)
+                ctx.alloc_call_temp(synth_cast, 16)
+                rhs = synth_cast
+            else:
+                rhs = decl.init
+            return self._int128_copy_assign(
+                ast.Identifier(name=decl.name), rhs, ctx,
+            )
         if isinstance(var_type, ast.ComplexType):
             # Complex local init — `__complex__ T r = expr` lowers via
             # the complex-eval engine, which writes (real, imag) into
@@ -8669,6 +9141,11 @@ class CodeGenerator:
                 # doesn't matter. Other int-result ops follow the usual
                 # arithmetic conversions (unsigned wins).
                 if expr.op in ("<<", ">>"):
+                    if self._is_int128(lt):
+                        return ast.BasicType(
+                            name="int128",
+                            is_signed=(False if self._is_unsigned(lt) else None),
+                        )
                     if self._is_long_long(lt):
                         return ast.BasicType(
                             name="long long",
@@ -8677,6 +9154,13 @@ class CodeGenerator:
                     if self._is_unsigned(lt):
                         return ast.BasicType(name="int", is_signed=False)
                     return ast.BasicType(name="int")
+                if self._is_int128(lt) or self._is_int128(rt):
+                    return ast.BasicType(
+                        name="int128",
+                        is_signed=(False if (
+                            self._is_unsigned(lt) or self._is_unsigned(rt)
+                        ) else None),
+                    )
                 if self._is_long_long(lt) or self._is_long_long(rt):
                     return ast.BasicType(
                         name="long long",
@@ -8968,6 +9452,18 @@ class CodeGenerator:
             out = self._eval_float_to_st0(expr, ctx)
             out += self._fistp_truncate_dword_to_eax()
             return out
+        # __int128 — produces an address (16 bytes don't fit in a
+        # register pair). Callers that consume the value know it's
+        # int128 and use the address; callers that want a narrower
+        # value should go through a Cast.  Assignment ops (=, +=, ...)
+        # need to route through `_binary` first so `_assign` /
+        # `_compound_assign` apply their own type-based dispatch.
+        if self._is_int128(self._type_of(expr, ctx)):
+            if isinstance(expr, ast.BinaryOp) and (
+                expr.op == "=" or expr.op in self._COMPOUND_OPS
+            ):
+                return self._binary(expr, ctx)
+            return self._int128_value_address(expr, ctx)
         if isinstance(expr, ast.IntLiteral):
             return [f"        mov     eax, {expr.value}"]
         if isinstance(expr, ast.CharLiteral):
@@ -9142,6 +9638,16 @@ class CodeGenerator:
         (high:low). Mirrors `_eval_expr_to_eax` but maintains the full
         64-bit value through every node.
         """
+        # __int128 expression in LL context: evaluate to a 16-byte
+        # temp, then load the low 8 bytes into EDX:EAX (truncation
+        # per C's standard conversion rules).
+        if self._is_int128(self._type_of(expr, ctx)):
+            out = self._int128_value_address(expr, ctx)
+            return out + [
+                "        mov     ecx, eax",
+                "        mov     eax, [ecx]",
+                "        mov     edx, [ecx + 4]",
+            ]
         # Direct loads.
         if isinstance(expr, ast.IntLiteral):
             v = expr.value
@@ -11522,6 +12028,10 @@ class CodeGenerator:
         # struct-returning call, we route the call straight into &dst
         # so there's no intermediate copy.
         target_ty = self._type_of(expr.left, ctx)
+        # __int128 assignment: 16-byte copy. The rhs may be smaller —
+        # cast wraps narrowing/widening at the type level.
+        if self._is_int128(target_ty):
+            return self._int128_copy_assign(expr.left, expr.right, ctx)
         if isinstance(target_ty, ast.StructType):
             if (
                 isinstance(expr.right, ast.Call)
@@ -12338,6 +12848,18 @@ class CodeGenerator:
         # address (and any side effects in `i` or `p`) twice — we instead
         # compute it once and keep it on the stack while we read, op, store.
         op = self._COMPOUND_OPS[expr.op]
+
+        # __int128 compound assign: synthesize a BinaryOp for the
+        # `lhs OP rhs` and route through `_int128_copy_assign`. The
+        # synthesized op needs a temp slot — pre-allocate now since
+        # `_collect_call_temps` already ran.
+        target_ty_check = self._type_of(expr.left, ctx)
+        if self._is_int128(target_ty_check):
+            inner = ast.BinaryOp(
+                op=op, left=expr.left, right=expr.right,
+            )
+            ctx.alloc_call_temp(inner, 16)
+            return self._int128_copy_assign(expr.left, inner, ctx)
 
         if isinstance(expr.left, ast.Identifier):
             ty = self._identifier_type(expr.left.name, ctx)
