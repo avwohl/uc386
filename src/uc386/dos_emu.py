@@ -388,18 +388,33 @@ def run(
             elif conv == b"p":
                 val = read32_le(ap_box) & 0xFFFFFFFF
                 out += f"0x{val:x}".encode()
-            elif conv in (b"f", b"g", b"e"):
+            elif conv in (b"f", b"g", b"e", b"E", b"G"):
                 bs = bytes(mu.mem_read(ap_box[0], 8))
                 ap_box[0] += 8
                 import struct as _st
                 val = _st.unpack("<d", bs)[0]
                 if precision < 0:
                     precision = 6
+                # Apply +/space sign flags via Python format ourselves
+                # since `%` doesn't have a leading-space flag.
                 fmt_py = f"%.{precision}{conv.decode()}"
                 s = (fmt_py % val).encode()
+                # Determine sign prefix (already in `s` for negative).
+                # For positive values with `+` or space flag, prepend.
+                if val >= 0 and not (s and s[:1] in b"+-"):
+                    if plus_flag:
+                        s = b"+" + s
+                    elif space_flag:
+                        s = b" " + s
                 if width > len(s):
                     if left_align:
                         s = s + b" " * (width - len(s))
+                    elif zero_pad:
+                        # Zero pad goes between sign and digits.
+                        if s and s[:1] in b"+- ":
+                            s = s[:1] + b"0" * (width - len(s)) + s[1:]
+                        else:
+                            s = b"0" * (width - len(s)) + s
                     else:
                         s = b" " * (width - len(s)) + s
                 out += s
