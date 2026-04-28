@@ -12732,7 +12732,22 @@ class CodeGenerator:
             )
         target_ty = self._type_of(expr.operand, ctx)
         if isinstance(target_ty, ast.ArrayType):
+            # Vector lvalue: not standard C; not yet supported.
+            if getattr(target_ty, "is_vector", False):
+                raise CodegenError(
+                    f"`{expr.op}` on vector operand not supported "
+                    f"(componentwise ++/-- isn't standard C)"
+                )
             raise CodegenError(f"cannot {expr.op} an array")
+        # _Complex lvalue: ++/-- isn't standard C, and the size-16
+        # storage doesn't fit any of the byte/word/dword RMW shapes
+        # below. Mirror the Identifier-complex error so the previous
+        # KeyError(16) doesn't leak through.
+        if isinstance(target_ty, ast.ComplexType):
+            raise CodegenError(
+                f"`{expr.op}` on _Complex lvalue not supported "
+                f"(use `__real__ ... {expr.op}` instead)"
+            )
         # Long-long lvalue: RMW the 8-byte slot with carry/borrow
         # propagating through the high dword. The eval is for value;
         # callers that ignore the result (statement context) can drop
