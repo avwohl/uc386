@@ -4232,6 +4232,49 @@ def test_anon_struct_init_multi_value_brace():
     assert "_main:" in asm
 
 
+def test_typeof_double_underscore_alias():
+    # `__typeof__(x)` and `__typeof(x)` are GCC aliases for `typeof(x)`.
+    # Previously only `typeof` was a recognized keyword, so the GCC
+    # convention forms produced "Expected SEMICOLON". Added to the
+    # tokens table.
+    asm = _compile(
+        "int main(void) {\n"
+        "    int a = 5;\n"
+        "    __typeof__(a) b = a;\n"
+        "    __typeof(a) c = a;\n"
+        "    return b == 5 && c == 5 ? 0 : 1;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
+def test_typeof_chain_through_stmt_expr():
+    # `__typeof__(stmt-expr)` previously failed: the outer typeof of a
+    # stmt-expr couldn't resolve through inner `_a` whose type was
+    # itself a TypeofType. Three fixes:
+    # (1) `_resolve_typeof_in_body` includes TypeofType-typed VarDecls
+    # in `flat_types` so the outer can chase the chain.
+    # (2) `resolve_inner(StmtExpr)` returns the trailing expression's
+    # type so the typeof of a stmt-expr can be resolved.
+    # (3) `resolve_inner(Identifier)` unwraps a TypeofType found in
+    # flat_types via a while-loop until a concrete type or cycle.
+    # Test by manually expanding the canonical MAX(MAX(...), MAX(...))
+    # pattern (preprocessor isn't reachable from `_compile`).
+    asm = _compile(
+        "int main(void) {\n"
+        "    int x = ({\n"
+        "        __typeof__(({ __typeof__(1) _a = 1; __typeof__(2) _b = 2; _a > _b ? _a : _b; })) _a =\n"
+        "            ({ __typeof__(1) _a = 1; __typeof__(2) _b = 2; _a > _b ? _a : _b; });\n"
+        "        __typeof__(({ __typeof__(3) _a = 3; __typeof__(4) _b = 4; _a > _b ? _a : _b; })) _b =\n"
+        "            ({ __typeof__(3) _a = 3; __typeof__(4) _b = 4; _a > _b ? _a : _b; });\n"
+        "        _a > _b ? _a : _b;\n"
+        "    });\n"
+        "    return x == 4 ? 0 : 1;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
 def test_anon_union_designator_advance_past_group():
     # `struct B { int n; union { int i; float f; }; int extra; }`
     # initialized with `{1, {.i = 42}, 99}`: after the inner
@@ -4275,3 +4318,294 @@ def test_static_assert_in_struct_member():
     # Should compile cleanly; struct layout should still be 8 bytes
     # (int + padded char), with .x at +0 and .y at +4.
     assert "_main:" in asm
+
+
+def test_dos_specifier_huge_as_variable_name():
+    # `huge` (and `near`, `far`) are short, lowercase, un-prefixed
+    # DOS-era pointer/segment specifiers in `_DOS_IGNORED_IDENTS`
+    # that doubly serve as plausible C identifier names. Previously
+    # `_skip_noise` ate them unconditionally — so `int huge = 5;`
+    # parsed as `int = 5;` (with `huge` consumed as a specifier and
+    # the parser then expecting a declarator name at `=`). Fix:
+    # restrict the lookahead-discriminated set (now only the bare
+    # `near`/`far`/`huge` triple) and peek the next token — only
+    # skip when followed by a token that suggests we're still in
+    # declarator-prefix position. Prefixed forms (`__cdecl`,
+    # `__extension__`) are always skipped since they're never used
+    # as variable names. Verify both directions still work.
+    asm = _compile(
+        "int main(void) {\n"
+        "    int huge = 5;\n"
+        "    int near = 7;\n"
+        "    return huge + near;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+    # `__extension__` always-skip — was broken when we initially
+    # widened the lookahead-discrimination. `__extension__ typedef T x;`
+    # / `__extension__ static int x = 5;` / `__extension__ 1i`
+    # (imaginary literal in expression) all need to keep working.
+    asm = _compile(
+        "int main(void) {\n"
+        "    __extension__ static int s = 7;\n"
+        "    return s;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
+def test_nested_anon_brace_init_peels_layers():
+    # `struct Nested { union { struct {x,y}; ll packed; }; trailing; }`
+    # initialized as `{ { {1, 2} }, 3 }` was hitting "InitializerList
+    # not implemented" in the struct-init scalar dispatch. Root cause:
+    # the pre-pass that spreads an InitializerList across an anon-
+    # promoted member group walked the OUTER list's values directly —
+    # so a wrapper layer like `{ {1, 2} }` (with the inner brace
+    # corresponding to the anon-struct nesting level) put the entire
+    # inner `{1, 2}` into the first scalar member's slot. Fix: peel
+    # single-element wrapper layers iteratively when the inner element
+    # is itself an InitializerList. Verifies the values land in the
+    # right scalar members.
+    asm = _compile(
+        "int main(void) {\n"
+        "    struct Nested {\n"
+        "        union {\n"
+        "            struct { int x, y; };\n"
+        "            long long packed;\n"
+        "        };\n"
+        "        int trailing;\n"
+        "    };\n"
+        "    struct Nested n = { { { 1, 2 } }, 3 };\n"
+        "    return n.x + n.y + n.trailing;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
+def test_deep_nested_anon_struct_dfs_walk():
+    # Deep nesting `struct { union { struct { union { struct {xx,yy};
+    # ll }; extra }; buf[20]; }; trailing; }` initialized as
+    # `{{{{1, 2}, 99}}, 100}`. The DFS walk must:
+    # 1) Recurse into nested InitializerList layers when the run
+    #    target is a scalar (peel the brace levels matching anon
+    #    nesting).
+    # 2) Track filled bytes across recursive emits and skip past
+    #    members whose entire byte range is already covered (anon-
+    #    union alts).
+    # The previous one-level peel produced `extra=0, trailing=missing`
+    # because the inner `99` landed on `ll` (a union-alt of xx,yy)
+    # instead of `extra` (which lives at offset 8 past xx,yy).
+    asm = _compile(
+        "int main(void) {\n"
+        "    struct Deep {\n"
+        "        union {\n"
+        "            struct {\n"
+        "                union {\n"
+        "                    struct { int xx, yy; };\n"
+        "                    long long ll;\n"
+        "                };\n"
+        "                int extra;\n"
+        "            };\n"
+        "            char buf[20];\n"
+        "        };\n"
+        "        int trailing;\n"
+        "    };\n"
+        "    struct Deep d = {{{{1, 2}, 99}}, 100};\n"
+        "    return d.xx == 1 && d.yy == 2 && d.extra == 99\n"
+        "        && d.trailing == 100 ? 0 : 1;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
+def test_global_anon_alt_partial_overlap_emit():
+    # Global `struct Deep` (same shape as test above) with init
+    # `{{{{1, 2}, 99}}, 100}` — `_emit_global_struct_init`'s skip
+    # logic only handled "fully behind" overlaps. An anon-union alt
+    # (`buf[20]` at offset 0) whose range PARTIALLY overlaps with
+    # already-emitted bytes (xx, yy, extra at offsets 0..12) needs
+    # to emit only the tail bytes [12..20). Without that, we emit
+    # 20 zeros after the cursor, double-writing the bytes.
+    asm = _compile(
+        "struct Deep {\n"
+        "    union {\n"
+        "        struct {\n"
+        "            union {\n"
+        "                struct { int xx, yy; };\n"
+        "                long long ll;\n"
+        "            };\n"
+        "            int extra;\n"
+        "        };\n"
+        "        char buf[20];\n"
+        "    };\n"
+        "    int trailing;\n"
+        "};\n"
+        "struct Deep g = {{{{1, 2}, 99}}, 100};\n"
+        "int main(void) {\n"
+        "    return g.xx == 1 && g.yy == 2 && g.extra == 99\n"
+        "        && g.trailing == 100 ? 0 : 1;\n"
+        "}\n"
+    )
+    assert "_g:" in asm
+    # Layout sanity: dd 1, dd 2, dd 99 emitted in order, then a
+    # `times N db 0` for buf's tail (not 20 db 0 which would
+    # over-emit).
+    assert "dd      1" in asm
+    assert "dd      2" in asm
+    assert "dd      99" in asm
+
+
+def test_scalar_var_init_with_braces():
+    # Per C99 6.7.8#11, a scalar initializer may be enclosed in
+    # braces — `int x = {42}` is equivalent to `int x = 42`. The
+    # local var-init path was hitting `_eval_expr_to_eax(InitializerList)`
+    # because it routed scalar-target init values through directly.
+    # Fix: at the top of `_var_init_inner`, unwrap a single-value
+    # non-designated InitializerList for non-array/non-struct/non-complex
+    # targets so the scalar dispatch sees the bare value.
+    asm = _compile(
+        "int main(void) {\n"
+        "    int x = {42};\n"
+        "    long long y = {0x100000000LL};\n"
+        "    float f = {3.14f};\n"
+        "    int *p = {0};\n"
+        "    return x + (int)y + (int)f + (long long)p;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
+def test_global_int_init_with_float_cast():
+    # `int g = (int)(1.5 + 2.5);` was raising "FloatLiteral not
+    # implemented" in `_const_eval` because the Cast branch only
+    # called `_const_eval` (int) on its operand — falling through
+    # FloatLiteral. Fix: when the int fold fails, retry with
+    # `_const_eval_float` and truncate toward zero (C float→int
+    # cast semantics). Also the float→long path should fold.
+    asm = _compile(
+        "int g1 = (int)(1.5 + 2.5);\n"           # 4
+        "int g2 = (int)3.7;\n"                   # 3
+        "int g3 = (int)(-2.7);\n"                # -2 (toward zero)
+        "long long g4 = (long long)(1e9 * 2);\n"  # 2000000000
+        "int main(void) {\n"
+        "    return g1 == 4 && g2 == 3 && g3 == -2 && g4 == 2000000000LL ? 0 : 1;\n"
+        "}\n"
+    )
+    assert "_g1:" in asm
+
+
+def test_global_pointer_init_with_braces():
+    # `int *p = {0};` (brace-wrapped scalar pointer init) was raising
+    # in `_const_eval` because the InitializerList wasn't unwrapped
+    # for PointerType targets at the top of `_emit_global_init`.
+    # Existing unwrap was BasicType-only. Fix: extend to PointerType
+    # so `int *p = {0};`, `char *s = {"hi"};`, etc. work.
+    asm = _compile(
+        "int target = 99;\n"
+        "int *g_p = {&target};\n"
+        "int *g_null = {0};\n"
+        "int main(void) {\n"
+        "    return *g_p == 99 && g_null == 0 ? 0 : 1;\n"
+        "}\n"
+    )
+    assert "_g_p:" in asm
+    assert "_g_null:" in asm
+
+
+def test_complex_brace_init_preserves_imag():
+    # `_Complex double g = {1.0 + 2.0i};` was emitting (1.0, 0.0)
+    # instead of (1.0, 2.0). `_const_eval_complex` for a single-value
+    # InitializerList discarded the imaginary part:
+    #     r, _ = self._const_eval_complex(expr.values[0], name)
+    #     return (r, 0.0)
+    # Fix: recurse and return both halves so a single-value brace
+    # init like `{1.0 + 2.0i}` preserves the complex value, while
+    # `{r, i}` (two-value) still works.
+    asm = _compile(
+        "_Complex double g = {1.0 + 2.0i};\n"
+        "int main(void) {\n"
+        "    return __real__ g == 1.0 && __imag__ g == 2.0 ? 0 : 1;\n"
+        "}\n"
+    )
+    assert "_g:" in asm
+    # Verify: the global emit should lay down (1.0, 2.0) — both halves
+    # via dq pairs.
+    assert "1.0" in asm
+    assert "2.0" in asm
+
+
+def test_array_scalar_element_brace_init():
+    # `int arr[5] = {{1}, {2}, ...}` — each scalar element wrapped in
+    # extra braces. `_array_init` was passing the InitializerList
+    # straight to `_eval_expr_to_eax` for scalar elements, which
+    # raises. Per C99 6.7.8#11, single-value brace wrappers around
+    # scalar values are equivalent to the bare value.
+    asm = _compile(
+        "int main(void) {\n"
+        "    int a[5] = {{1}, {2}, {3}, {4}, {5}};\n"
+        "    int x = 1, y = 2, z = 3;\n"
+        "    int *p[3] = {{&x}, {&y}, {&z}};\n"
+        "    float f[3] = {{1.5f}, {2.5f}, {3.5f}};\n"
+        "    long long l[2] = {{0x100000000LL}, {0x200000000LL}};\n"
+        "    return a[4] == 5 && *p[1] == 2 && f[2] == 3.5f\n"
+        "        && l[1] == 0x200000000LL ? 0 : 1;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
+def test_unsized_array_designated_init_length():
+    # `int *p = (int[]){[0] = 1, [3] = 4};` — unsized array compound
+    # literal with designators. Length must come from max designator
+    # index + 1, not len(values). Without the fix, length was 2 and
+    # `[3] = 4` raised "out of range". Same fix in `_array_init`
+    # (locals) and `_emit_global_array_init` (globals).
+    asm = _compile(
+        "int main(void) {\n"
+        "    int *p = (int[]){[0] = 1, [3] = 4};\n"
+        "    int *q = (int[]){[2] = 99};\n"
+        "    int *r = (int[]){1, 2, [5] = 99, 100};\n"
+        "    return p[3] == 4 && q[2] == 99 && r[6] == 100 ? 0 : 1;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
+def test_unsized_local_array_with_range_designator():
+    # `int r[] = {[0 ... 4] = 7};` — `_resolved_var_type`'s array-size
+    # inference for unsized arrays only handled IntLiteral designators,
+    # falling through to "advance cursor by 1" for RangeDesignator.
+    # That sized the array as 1 instead of 5, then `_array_init` raised
+    # "index 1 out of range".
+    asm = _compile(
+        "int main(void) {\n"
+        "    int r[] = {[0 ... 4] = 7};\n"
+        "    int q[] = {1, 2, [10 ... 12] = 99};\n"
+        "    return sizeof(r) == 5 * sizeof(int)\n"
+        "        && sizeof(q) == 13 * sizeof(int)\n"
+        "        && r[0] == 7 && r[4] == 7\n"
+        "        && q[10] == 99 && q[12] == 99 ? 0 : 1;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
+def test_va_args_comma_swallow():
+    # GCC extension `, ## __VA_ARGS__` swallows the comma when
+    # __VA_ARGS__ expands to empty (no variadic args). The smoke
+    # `_compile` helper bypasses the preprocessor, so we exercise
+    # the preprocessor's `_handle_token_pasting` directly.
+    from uc_core.preprocessor import Preprocessor
+    pp = Preprocessor()
+    src = (
+        "#define DBG(fmt, ...) bar(fmt, ##__VA_ARGS__)\n"
+        "DBG(\"x\")\n"
+        "DBG(\"%d\", 5)\n"
+        "DBG(\"%d %d\", 1, 2)\n"
+    )
+    out = pp.preprocess(src, "test.c")
+    # `DBG("x")` → `bar("x")` (comma swallowed since no varargs).
+    assert 'bar("x")' in out
+    # With varargs, comma is kept.
+    assert 'bar("%d", 5)' in out or 'bar("%d",5)' in out
+    assert 'bar("%d %d", 1' in out or 'bar("%d %d",1' in out

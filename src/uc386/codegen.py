@@ -898,7 +898,7 @@ class CodeGenerator:
         # Scalar globals with optional braces around the value:
         # `int x = {1};` is equivalent to `int x = 1;`.
         if (
-            isinstance(ty, ast.BasicType)
+            isinstance(ty, (ast.BasicType, ast.PointerType))
             and isinstance(init, ast.InitializerList)
             and len(init.values) == 1
             and not isinstance(init.values[0], ast.DesignatedInit)
@@ -1146,10 +1146,11 @@ class CodeGenerator:
                         (li * rr - lr * ri) / denom,
                     )
         # InitializerList `{r, i}` — explicit two-value form.
+        # Single-value `{expr}` recurses into expr (which may itself
+        # have an imaginary component, e.g. `{1.0 + 2.0i}`).
         if isinstance(expr, ast.InitializerList):
             if len(expr.values) == 1:
-                r, _ = self._const_eval_complex(expr.values[0], name)
-                return (r, 0.0)
+                return self._const_eval_complex(expr.values[0], name)
             if len(expr.values) == 2:
                 r, _ = self._const_eval_complex(expr.values[0], name)
                 i, _ = self._const_eval_complex(expr.values[1], name)
@@ -1406,86 +1407,12 @@ class CodeGenerator:
             init.values, members, name,
         )
         # Pre-pass: expand `{...}` brace wrappers for anon-promoted-group
-        # scalar members into designated entries (mirror of `_struct_init`
-        # for locals; same rationale).
+        # scalar members into designated entries via the shared DFS
+        # helper.
         groups_pre = self._struct_member_groups.get(sname, [])
-        expanded_pre: list = []
-        cursor_pre = 0
-        for value in elided_values:
-            advance = True
-            if (
-                not isinstance(value, ast.DesignatedInit)
-                and isinstance(value, ast.InitializerList)
-                and cursor_pre < len(members)
-            ):
-                _, m_ty_pre, _ = members[cursor_pre]
-                if not isinstance(m_ty_pre, (
-                    ast.StructType, ast.ArrayType, ast.ComplexType,
-                )) and cursor_pre < len(groups_pre):
-                    my_group = groups_pre[cursor_pre]
-                    run_end = cursor_pre
-                    while (
-                        run_end + 1 < len(members)
-                        and run_end + 1 < len(groups_pre)
-                        and groups_pre[run_end + 1] == my_group
-                    ):
-                        run_end += 1
-                    if run_end > cursor_pre:
-                        sub_cursor = cursor_pre
-                        for inner in value.values:
-                            if isinstance(inner, ast.DesignatedInit):
-                                first = inner.designators[0]
-                                if (
-                                    isinstance(first, str)
-                                    and first in member_index
-                                ):
-                                    target_idx = member_index[first]
-                                    inner_value = (
-                                        ast.InitializerList(values=[
-                                            ast.DesignatedInit(
-                                                designators=inner.designators[1:],
-                                                value=inner.value,
-                                            )
-                                        ])
-                                        if len(inner.designators) > 1
-                                        else inner.value
-                                    )
-                                    target_name = members[target_idx][0]
-                                else:
-                                    expanded_pre.append(inner)
-                                    continue
-                            else:
-                                if sub_cursor > run_end:
-                                    expanded_pre.append(inner)
-                                    continue
-                                target_idx = sub_cursor
-                                target_name = members[target_idx][0]
-                                inner_value = inner
-                                sub_cursor += 1
-                            expanded_pre.append(ast.DesignatedInit(
-                                designators=[target_name],
-                                value=inner_value,
-                            ))
-                        cursor_pre = run_end + 1
-                        advance = False
-            if advance:
-                expanded_pre.append(value)
-                if isinstance(value, ast.DesignatedInit):
-                    first = value.designators[0]
-                    if isinstance(first, str) and first in member_index:
-                        cursor_pre = member_index[first] + 1
-                else:
-                    if cursor_pre < len(members):
-                        next_pre = cursor_pre + 1
-                        _, this_ty_pre, this_off_pre = members[cursor_pre]
-                        if self._size_of(this_ty_pre) > 0:
-                            while (
-                                next_pre < len(members)
-                                and members[next_pre][2] == this_off_pre
-                            ):
-                                next_pre += 1
-                        cursor_pre = next_pre
-        elided_values = expanded_pre
+        elided_values = self._expand_anon_group_braces(
+            elided_values, members, groups_pre, member_index,
+        )
         slot_values: dict[int, ast.Expression] = {}
         cursor = 0
         for value in elided_values:
@@ -1634,6 +1561,19 @@ class CodeGenerator:
             # within an anon struct that doesn't overlap an already-
             # emitted member). Skip rather than emit duplicate bytes.
             if cm_off + cm_size <= emit_cursor and chosen not in slot_values:
+                i = j
+                continue
+            # Partial-overlap case: an unfilled anon-union alt whose
+            # range extends past emit_cursor. We can't seek backward
+            # in NASM, so we only emit the portion past the cursor —
+            # zero-fill from emit_cursor up to cm_off + cm_size. Same
+            # for if the member is fully past the cursor (the existing
+            # `times {gap} db 0` + emit-or-zero path).
+            if cm_off < emit_cursor and chosen not in slot_values:
+                tail = (cm_off + cm_size) - emit_cursor
+                if tail > 0:
+                    out.append(f"        times {tail} db 0")
+                    emit_cursor += tail
                 i = j
                 continue
             if cm_off > emit_cursor:
@@ -2060,12 +2000,13 @@ class CodeGenerator:
         elem_type = arr_ty.base_type
         elem_size = self._size_of(elem_type)
         # Flexible array member or `int arr[] = {...};` — derive length
-        # from the initializer.
+        # from the initializer. With designators, length is
+        # max(designated_index) + 1.
         if arr_ty.size is None:
             if isinstance(init, ast.StringLiteral):
                 length = len(init.value) + 1  # include null terminator
             elif isinstance(init, ast.InitializerList):
-                length = len(init.values)
+                length = self._infer_array_length_from_init(init.values, name)
             else:
                 length = 1
         else:
@@ -2549,7 +2490,18 @@ class CodeGenerator:
             # to the target width and re-extend per signedness so a
             # subsequent widen (to long, etc.) sees the right bit
             # pattern.
-            inner = self._const_eval(expr.expr, name)
+            #
+            # Cast from float-typed source to int target — fold the
+            # operand via the float evaluator, then truncate toward
+            # zero (C semantics for float→int cast).
+            try:
+                inner = self._const_eval(expr.expr, name)
+            except CodegenError:
+                # Try float fold if the int fold fails (operand may
+                # contain FloatLiteral).
+                f_inner = self._const_eval_float(expr.expr, name)
+                # Truncate toward zero for int casts.
+                inner = int(f_inner) if f_inner >= 0 else -int(-f_inner)
             ty = expr.target_type
             if isinstance(ty, ast.BasicType):
                 size = self._size_of(ty)
@@ -3400,25 +3352,71 @@ class CodeGenerator:
         (using each decl's `var_type` field — pre-`_collect_locals`).
         Mutates the AST in place.
         """
+        # Eagerly register any in-body struct/enum definitions so
+        # `resolve_inner` can resolve `typeof(s.x)` against the struct's
+        # layout before `_collect_locals` runs. Skip structs that have
+        # VLA members — those need `_capture_struct_vla_member_sizes`
+        # to run first (in `_collect_locals`), which substitutes the
+        # original size expression with a captured-slot Identifier
+        # before `_register_struct`.
+        def _has_vla_member(decl):
+            for m in getattr(decl, "members", []) or []:
+                mt = getattr(m, "member_type", None)
+                # Walk into ArrayType / nested types looking for non-literal size.
+                stack = [mt]
+                while stack:
+                    t = stack.pop()
+                    if isinstance(t, ast.ArrayType):
+                        if (
+                            t.size is not None
+                            and not isinstance(t.size, ast.IntLiteral)
+                        ):
+                            return True
+                        stack.append(t.base_type)
+                    elif isinstance(t, ast.PointerType):
+                        stack.append(t.base_type)
+            return False
+
+        for sub in self._walk_ast(node):
+            if isinstance(sub, ast.StructDecl) and sub.is_definition:
+                if _has_vla_member(sub):
+                    continue
+                try:
+                    self._register_struct(sub)
+                except CodegenError:
+                    pass
+            elif isinstance(sub, ast.EnumDecl) and getattr(sub, "is_definition", False):
+                try:
+                    self._register_enum(sub)
+                except CodegenError:
+                    pass
         flat_types: dict[str, ast.TypeNode] = {}
         # Function params live on ctx via alloc_param.
         for scope in ctx.types:
             flat_types.update(scope)
         # Walk the body for VarDecls — use each decl's declared
         # var_type field (set by the parser). `_collect_locals`
-        # hasn't run yet, so `ctx.decl_types` is empty.
+        # hasn't run yet, so `ctx.decl_types` is empty. Include
+        # TypeofType-typed VarDecls too so nested `__typeof__` chains
+        # can be resolved transitively (resolve_inner unwraps the
+        # TypeofType when found in flat_types).
         for sub in self._walk_ast(node):
             if isinstance(sub, ast.VarDecl) and sub.var_type is not None:
-                # Skip if the var's type is itself a TypeofType (would
-                # need recursive resolution; handle as a second pass).
-                if not isinstance(sub.var_type, ast.TypeofType):
-                    flat_types[sub.name] = sub.var_type
+                flat_types[sub.name] = sub.var_type
 
         def resolve_inner(operand: ast.Expression) -> ast.TypeNode | None:
             # For an Identifier, look in flat_types first.
             if isinstance(operand, ast.Identifier):
                 t = flat_types.get(operand.name)
                 if t is not None:
+                    # If `t` is itself an unresolved TypeofType (the
+                    # ident's VarDecl hasn't been resolved yet), recurse
+                    # to resolve through the chain.
+                    while isinstance(t, ast.TypeofType):
+                        next_t = resolve_inner(t.operand)
+                        if next_t is None or next_t is t:
+                            return None
+                        t = next_t
                     return t
                 # Globals / extern vars / function names — fall through
                 # to live _type_of which can resolve those without
@@ -3492,6 +3490,15 @@ class CodeGenerator:
             # Ternary — pick true branch.
             if isinstance(operand, ast.TernaryOp):
                 return resolve_inner(operand.true_expr)
+            # Statement expression: type is that of the trailing expr.
+            if isinstance(operand, ast.StmtExpr):
+                items = operand.body.items if operand.body is not None else []
+                # Trailing item should be an ExpressionStmt.
+                if items and isinstance(items[-1], ast.ExpressionStmt):
+                    last_expr = items[-1].expr
+                    if last_expr is not None:
+                        return resolve_inner(last_expr)
+                return None
             # Literals: rely on live _type_of which handles them.
             try:
                 return self._type_of(operand, ctx)
@@ -4381,11 +4388,21 @@ class CodeGenerator:
             max_idx = -1
             for value in decl.init.values:
                 if isinstance(value, ast.DesignatedInit):
-                    if (
-                        len(value.designators) == 1
-                        and isinstance(value.designators[0], ast.IntLiteral)
-                    ):
-                        cursor = value.designators[0].value
+                    if value.designators:
+                        d0 = value.designators[0]
+                        if isinstance(d0, ast.IntLiteral):
+                            cursor = d0.value
+                        elif isinstance(d0, ast.RangeDesignator):
+                            try:
+                                end = self._const_eval(
+                                    d0.end, f"`{decl.name}`",
+                                )
+                                if end > max_idx:
+                                    max_idx = end
+                                cursor = end + 1
+                                continue
+                            except CodegenError:
+                                pass
                     if cursor > max_idx:
                         max_idx = cursor
                     cursor += 1
@@ -4402,12 +4419,6 @@ class CodeGenerator:
                 # Flat value: contributes a fraction of an element.
                 if cursor > max_idx:
                     max_idx = cursor
-                # We approximate by counting flat values against the
-                # current element. Bump cursor only when the element is
-                # filled. Simpler approximation: count all flat values
-                # toward leaves, advance cursor when leaves accumulate.
-                # But mixing ILs and flats requires per-element bookkeeping.
-                # For the common all-flat case, just total / leaves.
                 cursor += 1
             # If all values were flat (no IL/Designators), the value
             # count divided by leaves gives the right element count.
@@ -8123,6 +8134,20 @@ class CodeGenerator:
         # Use the *resolved* type (size filled in for unsized arrays), so
         # `_array_init` and `_store_from_eax` see a concrete shape.
         var_type = ctx.lookup_type(decl.name)
+        # C99 6.7.8#11: a scalar initializer may optionally be enclosed
+        # in braces — `int x = {42}` is equivalent to `int x = 42`. The
+        # array/struct init paths handle InitializerList themselves;
+        # unwrap for scalar targets so the per-type dispatch sees the
+        # bare value. For ComplexType: unwrap a single-value list since
+        # `_Complex T c = {expr};` initializes the complex value to
+        # `expr` (typed-promoted to (val, 0) for scalar rhs).
+        if (
+            isinstance(decl.init, ast.InitializerList)
+            and not isinstance(var_type, (ast.ArrayType, ast.StructType))
+            and len(decl.init.values) == 1
+            and not isinstance(decl.init.values[0], ast.DesignatedInit)
+        ):
+            decl = dataclasses.replace(decl, init=decl.init.values[0])
         if isinstance(var_type, ast.ArrayType):
             # Vector types accept a same-shape vector value (Identifier,
             # BinaryOp, UnaryOp, Call, etc.) as their initializer — copy
@@ -8282,10 +8307,13 @@ class CodeGenerator:
         if isinstance(init, ast.Compound):
             init = init.init
         # Unsized array (`int x[] = {...}` or `(int []){...}` compound
-        # literal): infer length from the initializer.
+        # literal): infer length from the initializer. With
+        # designators, length is max(designated_index) + 1; without,
+        # it's the number of positional values. Mixed forms walk a
+        # cursor that jumps on each designator.
         if arr_type.size is None:
             if isinstance(init, ast.InitializerList):
-                length = len(init.values)
+                length = self._infer_array_length_from_init(init.values, name)
             elif isinstance(init, ast.StringLiteral):
                 length = len(init.value) + 1
             else:
@@ -8440,56 +8468,72 @@ class CodeGenerator:
                         )
                     filled.add(idx)
                     elem_disp = base_disp + idx * elem_size
+                    # C99 6.7.8#11: scalar element wrapped in extra
+                    # braces — `int arr[5] = {{1}, {2}, ...}` — unwrap
+                    # the single-value list for scalar element types so
+                    # the per-type dispatch below sees the bare value.
+                    elem_actual = actual
+                    if (
+                        isinstance(elem_actual, ast.InitializerList)
+                        and not isinstance(elem_type, (
+                            ast.StructType, ast.ArrayType, ast.ComplexType,
+                        ))
+                        and len(elem_actual.values) == 1
+                        and not isinstance(
+                            elem_actual.values[0], ast.DesignatedInit,
+                        )
+                    ):
+                        elem_actual = elem_actual.values[0]
                     if (
                         isinstance(elem_type, ast.StructType)
-                        and isinstance(actual, ast.InitializerList)
+                        and isinstance(elem_actual, ast.InitializerList)
                     ):
                         out += self._struct_init(
-                            elem_type, actual, elem_disp, ctx,
+                            elem_type, elem_actual, elem_disp, ctx,
                             f"{name}[{idx}]",
                         )
                     elif (
                         isinstance(elem_type, ast.StructType)
-                        and isinstance(actual, ast.Compound)
-                        and isinstance(actual.target_type, ast.StructType)
-                        and isinstance(actual.init, ast.InitializerList)
+                        and isinstance(elem_actual, ast.Compound)
+                        and isinstance(elem_actual.target_type, ast.StructType)
+                        and isinstance(elem_actual.init, ast.InitializerList)
                     ):
                         # `((struct T){...})` as a struct array element:
                         # treat the compound's init as the field list.
                         out += self._struct_init(
-                            elem_type, actual.init, elem_disp, ctx,
+                            elem_type, elem_actual.init, elem_disp, ctx,
                             f"{name}[{idx}]",
                         )
                     elif (
                         isinstance(elem_type, ast.ArrayType)
-                        and isinstance(actual, (ast.InitializerList, ast.StringLiteral))
+                        and isinstance(elem_actual, (ast.InitializerList, ast.StringLiteral))
                     ):
                         # Multi-dim array element: recurse.
                         out += self._array_init(
-                            elem_type, actual, elem_disp, ctx,
+                            elem_type, elem_actual, elem_disp, ctx,
                             f"{name}[{idx}]",
                         )
                     elif self._is_float_type(elem_type):
                         # Float element: eval to st(0), then fstp at the slot.
-                        out += self._eval_float_to_st0(actual, ctx)
+                        out += self._eval_float_to_st0(elem_actual, ctx)
                         out += self._store_st0_to(_ebp_addr(elem_disp), elem_type)
                     elif self._is_long_long(elem_type):
-                        out += self._eval_expr_to_edx_eax(actual, ctx)
+                        out += self._eval_expr_to_edx_eax(elem_actual, ctx)
                         out += self._store_from_edx_eax(_ebp_addr(elem_disp))
                     elif self._is_int128(elem_type):
                         # int128 element: get the value's address and
                         # per-dword copy to the element slot. Smaller
                         # integer initializers are widened via a
                         # synthetic Cast (matches `_var_init`).
-                        actual_ty = self._type_of(actual, ctx)
+                        actual_ty = self._type_of(elem_actual, ctx)
                         if not self._is_int128(actual_ty):
                             synth_cast = ast.Cast(
-                                target_type=elem_type, expr=actual,
+                                target_type=elem_type, expr=elem_actual,
                             )
                             ctx.alloc_call_temp(synth_cast, 16)
                             value_expr = synth_cast
                         else:
-                            value_expr = actual
+                            value_expr = elem_actual
                         out += self._int128_value_address(value_expr, ctx)
                         out.append("        mov     esi, eax")
                         out.append(
@@ -8511,11 +8555,11 @@ class CodeGenerator:
                         )
                         out.append("        push    eax")
                         out += self._eval_complex_into_top(
-                            actual, ctx, elem_type,
+                            elem_actual, ctx, elem_type,
                         )
                         out.append("        add     esp, 4")
                     else:
-                        out += self._eval_expr_to_eax(actual, ctx)
+                        out += self._eval_expr_to_eax(elem_actual, ctx)
                         out += self._store_from_eax(_ebp_addr(elem_disp), elem_type)
             # Zero-fill any indices the initializer didn't touch. We emit
             # them in index order so the asm has a predictable shape.
@@ -8576,95 +8620,9 @@ class CodeGenerator:
         # x and y. Convert it to designated entries that target the group's
         # members directly.
         groups = self._struct_member_groups.get(struct_name, [])
-        expanded_values: list = []
-        cursor_pre = 0
-        for value in elided_values:
-            advance = True
-            if (
-                not isinstance(value, ast.DesignatedInit)
-                and isinstance(value, ast.InitializerList)
-                and cursor_pre < len(members)
-            ):
-                _, m_ty_pre, _ = members[cursor_pre]
-                # Only spread for scalar promoted-anon-group members (struct
-                # / array / complex members handle InitializerList natively).
-                if not isinstance(m_ty_pre, (
-                    ast.StructType, ast.ArrayType, ast.ComplexType,
-                )) and cursor_pre < len(groups):
-                    my_group = groups[cursor_pre]
-                    run_start = cursor_pre
-                    while (
-                        run_start > 0
-                        and groups[run_start - 1] == my_group
-                        and members[run_start - 1][2] == members[cursor_pre][2]
-                    ):
-                        run_start -= 1
-                    run_end = cursor_pre
-                    while (
-                        run_end + 1 < len(members)
-                        and run_end + 1 < len(groups)
-                        and groups[run_end + 1] == my_group
-                    ):
-                        run_end += 1
-                    if run_end > cursor_pre:
-                        # Multi-member anon-promoted group: spread the
-                        # InitializerList's values across the run via
-                        # synthesized designated entries.
-                        sub_cursor = cursor_pre
-                        for inner in value.values:
-                            if isinstance(inner, ast.DesignatedInit):
-                                first = inner.designators[0]
-                                if (
-                                    isinstance(first, str)
-                                    and first in member_index
-                                ):
-                                    target_idx = member_index[first]
-                                    inner_value = (
-                                        ast.InitializerList(values=[
-                                            ast.DesignatedInit(
-                                                designators=inner.designators[1:],
-                                                value=inner.value,
-                                            )
-                                        ])
-                                        if len(inner.designators) > 1
-                                        else inner.value
-                                    )
-                                    target_name = members[target_idx][0]
-                                else:
-                                    expanded_values.append(inner)
-                                    continue
-                            else:
-                                if sub_cursor > run_end:
-                                    expanded_values.append(inner)
-                                    continue
-                                target_idx = sub_cursor
-                                target_name = members[target_idx][0]
-                                inner_value = inner
-                                sub_cursor += 1
-                            expanded_values.append(ast.DesignatedInit(
-                                designators=[target_name],
-                                value=inner_value,
-                            ))
-                        cursor_pre = run_end + 1
-                        advance = False
-            if advance:
-                expanded_values.append(value)
-                if isinstance(value, ast.DesignatedInit):
-                    first = value.designators[0]
-                    if isinstance(first, str) and first in member_index:
-                        cursor_pre = member_index[first] + 1
-                else:
-                    if cursor_pre < len(members):
-                        next_pre = cursor_pre + 1
-                        _, this_ty_pre, this_off_pre = members[cursor_pre]
-                        if self._size_of(this_ty_pre) > 0:
-                            while (
-                                next_pre < len(members)
-                                and members[next_pre][2] == this_off_pre
-                            ):
-                                next_pre += 1
-                        cursor_pre = next_pre
-        elided_values = expanded_values
+        elided_values = self._expand_anon_group_braces(
+            elided_values, members, groups, member_index,
+        )
         # Walk source values in order, tracking the implicit cursor. A
         # `.field = expr` sets the cursor to that member's index; the
         # next un-designated value continues from cursor + 1. After the
@@ -8839,16 +8797,21 @@ class CodeGenerator:
             ):
                 # _Complex member: route through `_complex_copy_assign`
                 # with a synthetic *p lvalue so the value lands at
-                # &m_disp.
+                # &m_disp. Unwrap a single-value InitializerList
+                # wrapper (`{2.0+3.0i}`) — C99 brace-init for scalar.
+                cm_actual = actual
+                if (
+                    isinstance(cm_actual, ast.InitializerList)
+                    and len(cm_actual.values) == 1
+                    and not isinstance(
+                        cm_actual.values[0], ast.DesignatedInit,
+                    )
+                ):
+                    cm_actual = cm_actual.values[0]
                 size = self._size_of(m_ty)
-                # Compute &(struct_base + m_disp) as a value, then
-                # use _complex_copy_assign on a synthetic lvalue.
-                # Easiest: copy via _eval_complex_into_top into the
-                # member's slot on the stack. The dest_top dance:
-                # save &dest, eval into &dest, restore.
                 out.append(f"        lea     eax, {_ebp_addr(m_disp)}")
                 out.append("        push    eax")
-                out += self._eval_complex_into_top(actual, ctx, m_ty)
+                out += self._eval_complex_into_top(cm_actual, ctx, m_ty)
                 out.append("        add     esp, 4")
             elif m_name_i in bitfields:
                 # Bit-field: synthesize a fake Member node so _bitfield_store
@@ -8956,6 +8919,200 @@ class CodeGenerator:
                     base_disp + m_off, m_size
                 )
         return out
+
+    def _infer_array_length_from_init(
+        self, values: list, name: str,
+    ) -> int:
+        """Compute the length of an unsized array from its initializer
+        values. Designators (`[N] = expr`) jump the cursor; range
+        designators (`[L ... U] = expr`) advance to U+1. Length is the
+        max index touched + 1, or the number of positional values if
+        no designators.
+        """
+        cursor = 0
+        max_idx = -1
+        for v in values:
+            if isinstance(v, ast.DesignatedInit) and v.designators:
+                first = v.designators[0]
+                if isinstance(first, ast.IntLiteral):
+                    cursor = first.value
+                elif isinstance(first, ast.RangeDesignator):
+                    try:
+                        end = self._const_eval(first.end, name)
+                    except CodegenError:
+                        # Fall back: skip range and continue.
+                        cursor += 1
+                        continue
+                    max_idx = max(max_idx, end)
+                    cursor = end + 1
+                    continue
+                elif first is None:
+                    # Non-array designator (struct field) — shouldn't
+                    # happen for arrays. Just advance cursor.
+                    cursor += 1
+                    continue
+                else:
+                    # Try const-eval (e.g. enum constant, sizeof, etc.)
+                    try:
+                        cursor = self._const_eval(first, name)
+                    except CodegenError:
+                        cursor += 1
+                        continue
+            max_idx = max(max_idx, cursor)
+            cursor += 1
+        return max_idx + 1 if max_idx >= 0 else 0
+
+    def _expand_anon_group_braces(
+        self,
+        elided_values: list,
+        members: list,
+        groups: list,
+        member_index: dict[str, int],
+    ) -> list:
+        """Pre-pass that expands `{...}` brace wrappers across an
+        anon-promoted member group's flat slots.
+
+        The user's source has the brace structure of the un-promoted
+        layout. The flat `members` list collapses all anon-struct/union
+        levels. For runs of multiple flat members sharing the same
+        anon-group id, walk the source tree of InitializerLists in
+        DFS order, producing one designated entry per leaf. After
+        emitting to a member, mark its byte range as filled and skip
+        past any subsequent member whose entire byte range is already
+        covered (anon-union alternative).
+
+        Returns a new list with InitializerList wrappers expanded into
+        designated entries; non-list values pass through.
+        """
+        expanded_values: list = []
+        cursor_pre = 0
+        for value in elided_values:
+            advance = True
+            if (
+                not isinstance(value, ast.DesignatedInit)
+                and isinstance(value, ast.InitializerList)
+                and cursor_pre < len(members)
+            ):
+                _, m_ty_pre, _ = members[cursor_pre]
+                if not isinstance(m_ty_pre, (
+                    ast.StructType, ast.ArrayType, ast.ComplexType,
+                )) and cursor_pre < len(groups):
+                    my_group = groups[cursor_pre]
+                    run_end = cursor_pre
+                    while (
+                        run_end + 1 < len(members)
+                        and run_end + 1 < len(groups)
+                        and groups[run_end + 1] == my_group
+                    ):
+                        run_end += 1
+                    if run_end > cursor_pre:
+                        sub_cursor = [cursor_pre]
+                        filled_bytes_pre: set[int] = set()
+
+                        def advance_past_covered():
+                            while sub_cursor[0] <= run_end:
+                                _, m_t, m_o = members[sub_cursor[0]]
+                                m_sz = self._size_of(m_t)
+                                if m_sz == 0:
+                                    sub_cursor[0] += 1
+                                    continue
+                                if all(
+                                    b in filled_bytes_pre
+                                    for b in range(m_o, m_o + m_sz)
+                                ):
+                                    sub_cursor[0] += 1
+                                    continue
+                                break
+
+                        def emit_one(target_idx, inner_value):
+                            if (
+                                target_idx > run_end
+                                and target_idx >= len(members)
+                            ):
+                                expanded_values.append(inner_value)
+                                return
+                            tname, t_ty, t_off = members[target_idx]
+                            expanded_values.append(ast.DesignatedInit(
+                                designators=[tname],
+                                value=inner_value,
+                            ))
+                            for b in range(
+                                t_off, t_off + self._size_of(t_ty)
+                            ):
+                                filled_bytes_pre.add(b)
+
+                        def walk(node):
+                            if isinstance(node, ast.DesignatedInit):
+                                first = node.designators[0]
+                                if (
+                                    isinstance(first, str)
+                                    and first in member_index
+                                ):
+                                    target_idx = member_index[first]
+                                    inner_value = (
+                                        ast.InitializerList(values=[
+                                            ast.DesignatedInit(
+                                                designators=node.designators[1:],
+                                                value=node.value,
+                                            )
+                                        ])
+                                        if len(node.designators) > 1
+                                        else node.value
+                                    )
+                                    emit_one(target_idx, inner_value)
+                                    sub_cursor[0] = target_idx + 1
+                                    advance_past_covered()
+                                else:
+                                    expanded_values.append(node)
+                                return
+                            if isinstance(node, ast.InitializerList):
+                                for v in node.values:
+                                    advance_past_covered()
+                                    if sub_cursor[0] > run_end:
+                                        expanded_values.append(v)
+                                        continue
+                                    if isinstance(v, ast.DesignatedInit):
+                                        walk(v)
+                                        continue
+                                    cur_ty = members[sub_cursor[0]][1]
+                                    if (
+                                        isinstance(v, ast.InitializerList)
+                                        and not isinstance(cur_ty, (
+                                            ast.StructType, ast.ArrayType,
+                                            ast.ComplexType,
+                                        ))
+                                    ):
+                                        walk(v)
+                                    else:
+                                        emit_one(sub_cursor[0], v)
+                                        sub_cursor[0] += 1
+                                advance_past_covered()
+                                return
+                            emit_one(sub_cursor[0], node)
+                            sub_cursor[0] += 1
+                            advance_past_covered()
+
+                        walk(value)
+                        cursor_pre = run_end + 1
+                        advance = False
+            if advance:
+                expanded_values.append(value)
+                if isinstance(value, ast.DesignatedInit):
+                    first = value.designators[0]
+                    if isinstance(first, str) and first in member_index:
+                        cursor_pre = member_index[first] + 1
+                else:
+                    if cursor_pre < len(members):
+                        next_pre = cursor_pre + 1
+                        _, this_ty_pre, this_off_pre = members[cursor_pre]
+                        if self._size_of(this_ty_pre) > 0:
+                            while (
+                                next_pre < len(members)
+                                and members[next_pre][2] == this_off_pre
+                            ):
+                                next_pre += 1
+                        cursor_pre = next_pre
+        return expanded_values
 
     def _merge_nested_designators(
         self, values: list,
