@@ -668,3 +668,7 @@ See `README.md` for the public roadmap (Phase 0–6).
   - Found by spot-checking `(ll_lvalue += 5, ll_lvalue *= 2)`.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (343 total).
+- **2026-04-28 — long-long ++/-- in value position on non-Identifier**: `long long y = ++arr[0]` (pre-inc on a non-Identifier LL lvalue, value returned via expression context) used to raise "long-long ++/-- on non-Identifier not supported". The previous slice fixed the statement-context path via `_inc_dec_lvalue`; the value-context path goes through `_eval_expr_to_edx_eax` → `_inc_dec_ll`, which still raised.
+  - **Fix**: extended `_inc_dec_ll` to handle Index, Member, and `*p` lvalues. Compute `&lvalue` once into ECX, RMW [ecx] (low) with `add 1` and [ecx+4] (high) with `adc 0` (or sub/sbb for `--`). For prefix, return new value in EDX:EAX after the bump; for postfix, return old value before the bump.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (344 total).

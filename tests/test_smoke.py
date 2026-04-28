@@ -3238,6 +3238,24 @@ def test_long_long_comma_evaluates_lhs_for_side_effects():
     assert "        mul     ecx" in asm
 
 
+def test_long_long_inc_on_array_element_in_value_position():
+    # `long long y = ++arr[0]` — pre-inc as expression, value
+    # returned in EDX:EAX. Was raising "long-long ++/-- on
+    # non-Identifier not supported" because the LL inc path didn't
+    # handle Index/Member/*p.
+    asm = _compile(
+        "int main(void) {\n"
+        "    long long arr[1] = {0xFFFFFFFFLL};\n"
+        "    long long y = ++arr[0];\n"
+        "    return arr[0] == 0x100000000LL && y == 0x100000000LL ? 0 : 1;\n"
+        "}\n"
+    )
+    # LL ++ on non-Identifier now emits add/adc through ECX after
+    # computing &arr[0] once.
+    assert "add     dword [ecx], 1" in asm
+    assert "adc     dword [ecx + 4], 0" in asm
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.

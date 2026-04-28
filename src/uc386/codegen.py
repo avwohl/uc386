@@ -11009,35 +11009,64 @@ class CodeGenerator:
         )
 
     def _inc_dec_ll(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
-        """++/-- on a long-long Identifier or bit-field lvalue."""
+        """++/-- on a long-long Identifier, member, indexed, or *p
+        lvalue. Returns the result (pre or post value) in EDX:EAX."""
         # Long-long bit-field: route through the bit-field-aware path.
         if isinstance(expr.operand, ast.Member):
             bf = self._bitfield_info(expr.operand, ctx)
             if bf is not None and len(bf) == 4 and bf[3] == 8:
                 return self._inc_dec_bitfield_ll(expr, bf, ctx)
-        if not isinstance(expr.operand, ast.Identifier):
-            raise CodegenError("long-long ++/-- on non-Identifier not supported")
-        addr = self._identifier_addr_text(expr.operand.name, ctx)
-        high_addr = self._bump_addr(addr, 4)
-        # Read pre-value if postfix.
-        if expr.is_prefix:
-            out: list[str] = []
+        if isinstance(expr.operand, ast.Identifier):
+            addr = self._identifier_addr_text(expr.operand.name, ctx)
+            high_addr = self._bump_addr(addr, 4)
+            # Read pre-value if postfix.
+            if expr.is_prefix:
+                out: list[str] = []
+                if expr.op == "++":
+                    out.append(f"        add     dword {addr}, 1")
+                    out.append(f"        adc     dword {high_addr}, 0")
+                else:
+                    out.append(f"        sub     dword {addr}, 1")
+                    out.append(f"        sbb     dword {high_addr}, 0")
+                out += self._load_to_edx_eax(addr)
+                return out
+            # Postfix: load first, then bump.
+            out = self._load_to_edx_eax(addr)
             if expr.op == "++":
                 out.append(f"        add     dword {addr}, 1")
                 out.append(f"        adc     dword {high_addr}, 0")
             else:
                 out.append(f"        sub     dword {addr}, 1")
                 out.append(f"        sbb     dword {high_addr}, 0")
-            out += self._load_to_edx_eax(addr)
             return out
-        # Postfix: load first, then bump.
-        out = self._load_to_edx_eax(addr)
-        if expr.op == "++":
-            out.append(f"        add     dword {addr}, 1")
-            out.append(f"        adc     dword {high_addr}, 0")
+        # Non-Identifier lvalue: compute &lvalue once into ECX, then
+        # RMW [ecx] (low) and [ecx+4] (high) with carry/borrow.
+        if isinstance(expr.operand, ast.Index):
+            addr_lines = self._index_address(expr.operand, ctx)
+        elif isinstance(expr.operand, ast.UnaryOp) and expr.operand.op == "*":
+            addr_lines = self._eval_expr_to_eax(expr.operand.operand, ctx)
+        elif isinstance(expr.operand, ast.Member):
+            addr_lines = self._member_address(expr.operand, ctx)
         else:
-            out.append(f"        sub     dword {addr}, 1")
-            out.append(f"        sbb     dword {high_addr}, 0")
+            raise CodegenError(
+                f"long-long ++/-- not supported on "
+                f"{type(expr.operand).__name__}"
+            )
+        instr0 = "add" if expr.op == "++" else "sub"
+        instrN = "adc" if expr.op == "++" else "sbb"
+        out = list(addr_lines)
+        out.append("        mov     ecx, eax")
+        if expr.is_prefix:
+            out.append(f"        {instr0}     dword [ecx], 1")
+            out.append(f"        {instrN}     dword [ecx + 4], 0")
+            out.append("        mov     eax, [ecx]")
+            out.append("        mov     edx, [ecx + 4]")
+            return out
+        # Postfix: load OLD value into EDX:EAX, then bump in place.
+        out.append("        mov     eax, [ecx]")
+        out.append("        mov     edx, [ecx + 4]")
+        out.append(f"        {instr0}     dword [ecx], 1")
+        out.append(f"        {instrN}     dword [ecx + 4], 0")
         return out
 
     def _logical_and_ll(self, expr, ctx):
