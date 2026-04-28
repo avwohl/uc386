@@ -778,6 +778,15 @@ class CodeGenerator:
         Pointer-typed globals with `&other_global` initializers will land
         when there's a clear use case; for now they raise.
         """
+        # Scalar globals with optional braces around the value:
+        # `int x = {1};` is equivalent to `int x = 1;`.
+        if (
+            isinstance(ty, ast.BasicType)
+            and isinstance(init, ast.InitializerList)
+            and len(init.values) == 1
+            and not isinstance(init.values[0], ast.DesignatedInit)
+        ):
+            init = init.values[0]
         # Scalar globals with a literal init.
         if isinstance(ty, ast.BasicType):
             if self._is_float_type(ty):
@@ -1010,6 +1019,13 @@ class CodeGenerator:
         init: ast.Expression,
         name: str,
     ) -> list[str]:
+        # Compound literal `(T){...}` for the same struct type unwraps
+        # to its inner InitializerList — that way `struct S s = (S){1,2}`
+        # is laid out the same as `struct S s = {1,2}`.
+        if isinstance(init, ast.Compound) and isinstance(
+            init.target_type, ast.StructType
+        ):
+            init = init.init
         if not isinstance(init, ast.InitializerList):
             # Brace-elide: a non-list value initializing a struct is
             # like `{ value }` — the value lands in the first member,
@@ -1163,13 +1179,17 @@ class CodeGenerator:
                 actual = value
                 # Skip past anonymous-union alternatives that share this
                 # member's offset — they don't consume a positional value.
+                # But: a zero-sized member (like an empty struct) leaves
+                # the next member at the same byte offset; it's not a
+                # union alt and shouldn't be skipped.
                 next_cursor = cursor + 1
-                _, _, this_off = members[idx]
-                while (
-                    next_cursor < len(members)
-                    and members[next_cursor][2] == this_off
-                ):
-                    next_cursor += 1
+                _, this_ty, this_off = members[idx]
+                if self._size_of(this_ty) > 0:
+                    while (
+                        next_cursor < len(members)
+                        and members[next_cursor][2] == this_off
+                    ):
+                        next_cursor += 1
                 cursor = next_cursor
             slot_values[idx] = actual
 
@@ -1673,7 +1693,19 @@ class CodeGenerator:
                     values = []
                     for i in range(length):
                         if i in slots:
-                            values.append(str(self._const_eval(slots[i], name)))
+                            slot = slots[i]
+                            # Optional braces around scalar element:
+                            # `u8 arr[2] = {{1}, {2}}` is equivalent to
+                            # `u8 arr[2] = {1, 2}`.
+                            if (
+                                isinstance(slot, ast.InitializerList)
+                                and len(slot.values) == 1
+                                and not isinstance(
+                                    slot.values[0], ast.DesignatedInit
+                                )
+                            ):
+                                slot = slot.values[0]
+                            values.append(str(self._const_eval(slot, name)))
                         else:
                             values.append("0")
                     return [f"        {directive}      {', '.join(values)}"]
@@ -5592,56 +5624,81 @@ class CodeGenerator:
             filled: set[int] = set()
             cursor = 0
             for value_expr in iter_values:
+                idx_range: list[int] | None = None
                 if isinstance(value_expr, ast.DesignatedInit):
+                    designator = value_expr.designators[0]
                     if (
+                        len(value_expr.designators) == 1
+                        and isinstance(designator, ast.RangeDesignator)
+                    ):
+                        try:
+                            start = self._const_eval(
+                                designator.start, f"`{name}`"
+                            )
+                            end = self._const_eval(
+                                designator.end, f"`{name}`"
+                            )
+                        except CodegenError:
+                            raise CodegenError(
+                                f"`{name}`: range designator must be "
+                                f"compile-time constants"
+                            )
+                        idx_range = list(range(start, end + 1))
+                        actual = value_expr.value
+                        cursor = end + 1
+                    elif (
                         len(value_expr.designators) != 1
-                        or not isinstance(value_expr.designators[0], ast.IntLiteral)
+                        or not isinstance(designator, ast.IntLiteral)
                     ):
                         raise CodegenError(
                             f"`{name}`: only single-level integer "
                             f"designators supported in array init"
                         )
-                    idx = value_expr.designators[0].value
-                    actual = value_expr.value
-                    cursor = idx + 1
+                    else:
+                        idx = designator.value
+                        actual = value_expr.value
+                        cursor = idx + 1
+                        idx_range = [idx]
                 else:
                     idx = cursor
                     actual = value_expr
                     cursor += 1
-                if idx < 0 or idx >= length:
-                    raise CodegenError(
-                        f"`{name}`: initializer index {idx} out of range "
-                        f"(array size {length})"
-                    )
-                filled.add(idx)
-                elem_disp = base_disp + idx * elem_size
-                if (
-                    isinstance(elem_type, ast.StructType)
-                    and isinstance(actual, ast.InitializerList)
-                ):
-                    out += self._struct_init(
-                        elem_type, actual, elem_disp, ctx,
-                        f"{name}[{idx}]",
-                    )
-                elif (
-                    isinstance(elem_type, ast.ArrayType)
-                    and isinstance(actual, (ast.InitializerList, ast.StringLiteral))
-                ):
-                    # Multi-dim array element: recurse.
-                    out += self._array_init(
-                        elem_type, actual, elem_disp, ctx,
-                        f"{name}[{idx}]",
-                    )
-                elif self._is_float_type(elem_type):
-                    # Float element: eval to st(0), then fstp at the slot.
-                    out += self._eval_float_to_st0(actual, ctx)
-                    out += self._store_st0_to(_ebp_addr(elem_disp), elem_type)
-                elif self._is_long_long(elem_type):
-                    out += self._eval_expr_to_edx_eax(actual, ctx)
-                    out += self._store_from_edx_eax(_ebp_addr(elem_disp))
-                else:
-                    out += self._eval_expr_to_eax(actual, ctx)
-                    out += self._store_from_eax(_ebp_addr(elem_disp), elem_type)
+                    idx_range = [idx]
+                for idx in idx_range:
+                    if idx < 0 or idx >= length:
+                        raise CodegenError(
+                            f"`{name}`: initializer index {idx} out of range "
+                            f"(array size {length})"
+                        )
+                    filled.add(idx)
+                    elem_disp = base_disp + idx * elem_size
+                    if (
+                        isinstance(elem_type, ast.StructType)
+                        and isinstance(actual, ast.InitializerList)
+                    ):
+                        out += self._struct_init(
+                            elem_type, actual, elem_disp, ctx,
+                            f"{name}[{idx}]",
+                        )
+                    elif (
+                        isinstance(elem_type, ast.ArrayType)
+                        and isinstance(actual, (ast.InitializerList, ast.StringLiteral))
+                    ):
+                        # Multi-dim array element: recurse.
+                        out += self._array_init(
+                            elem_type, actual, elem_disp, ctx,
+                            f"{name}[{idx}]",
+                        )
+                    elif self._is_float_type(elem_type):
+                        # Float element: eval to st(0), then fstp at the slot.
+                        out += self._eval_float_to_st0(actual, ctx)
+                        out += self._store_st0_to(_ebp_addr(elem_disp), elem_type)
+                    elif self._is_long_long(elem_type):
+                        out += self._eval_expr_to_edx_eax(actual, ctx)
+                        out += self._store_from_edx_eax(_ebp_addr(elem_disp))
+                    else:
+                        out += self._eval_expr_to_eax(actual, ctx)
+                        out += self._store_from_eax(_ebp_addr(elem_disp), elem_type)
             # Zero-fill any indices the initializer didn't touch. We emit
             # them in index order so the asm has a predictable shape.
             for idx in range(length):

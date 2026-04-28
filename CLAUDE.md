@@ -477,3 +477,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`_type_of(int + long)` propagates "long".** C usual arithmetic conversions take the higher-ranked type. On i386 long and int are both 32-bit, but they're distinct types — and `_Generic` cares. New "long propagation" branch in BinaryOp +/- typing fires when either operand is named "long" (and neither is long long or float). Fixes c-testsuite 00219 line 12.
 
   **Result: 218/220 c-testsuite** (+1). Pipeline 1711/1734 (98.7%).
+- **2026-04-27 — codegen polish: range designators, optional braces around scalar inits, compound-literal struct init, zero-sized member non-union**:
+  - **`[start ... end] = expr` GCC range designator in array init.** `_array_init` now recognizes `RangeDesignator` (alongside `IntLiteral` for single-index designators) and builds an idx_range = list(range(start, end+1)) so each value in the range gets the same expr. Folds at compile time via `_const_eval` so out-of-range or non-const ranges raise.
+  - **Optional braces around scalar globals (C99 6.7.8#11).** `int x = {1};` is equivalent to `int x = 1;`. `_emit_global_init` unwraps a single-value non-designated InitializerList for scalar BasicType targets before const-evaluating. Same unwrap added in the array-element loop so `u8 arr[2] = {{1}, {2}}` works.
+  - **Compound literal as struct init.** `_emit_global_struct_init` unwraps `(T){...}` for the same struct target — the inner InitializerList is laid out the same as if the braces were direct. Lets `struct contains_empty ce = { {1}, (empty_s){}, 022 };` parse the empty compound literal correctly.
+  - **Zero-sized member is not a union alternative.** The struct init walker's "skip past anonymous-union alternatives" logic shouldn't fire for zero-sized members (e.g. an empty struct). They share the next member's offset by virtue of having no width — they're not actually union alts. Now gated on `_size_of(this_ty) > 0`.
+
+  No new test wins yet (these are individually small, shared-fate with other init bugs). Foundation for future wins.
