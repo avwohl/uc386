@@ -7637,6 +7637,19 @@ class CodeGenerator:
                 # operand is long long.
                 if expr.op in ("==", "!=", "<", ">", "<=", ">=", "&&", "||"):
                     return ast.BasicType(name="int")
+                # Per C99 6.5.7#3, shifts use the promoted LEFT operand
+                # type for the result — the right operand's signedness
+                # doesn't matter. Other int-result ops follow the usual
+                # arithmetic conversions (unsigned wins).
+                if expr.op in ("<<", ">>"):
+                    if self._is_long_long(lt):
+                        return ast.BasicType(
+                            name="long long",
+                            is_signed=(False if self._is_unsigned(lt) else None),
+                        )
+                    if self._is_unsigned(lt):
+                        return ast.BasicType(name="int", is_signed=False)
+                    return ast.BasicType(name="int")
                 if self._is_long_long(lt) or self._is_long_long(rt):
                     return ast.BasicType(
                         name="long long",
@@ -8156,8 +8169,10 @@ class CodeGenerator:
                     out.append("        cdq")
                 return out
             if self._is_long_long(target):
-                # int → long long: extend per the SOURCE's signedness
-                # (since the value's bit pattern comes from the source).
+                # int → long long: route through the LL evaluator so
+                # nested operations (shifts, arithmetic) get promoted
+                # consistently rather than computed in 32 bits and then
+                # sign-extended.
                 if self._is_float_type(src_ty):
                     out = self._eval_float_to_st0(expr.expr, ctx)
                     out += self._fistp_truncate_qword_to_edx_eax()
@@ -8175,6 +8190,12 @@ class CodeGenerator:
                         "        mov     edx, [ecx + 4]",
                     ]
                     return out
+                # For BinaryOps that get promoted in LL context (shifts
+                # in particular), recurse to evaluate in 64-bit space.
+                # For other shapes, the 32-bit eval + extend is fine and
+                # cheaper.
+                if isinstance(expr.expr, ast.BinaryOp):
+                    return self._eval_expr_to_edx_eax(expr.expr, ctx)
                 out = self._eval_expr_to_eax(expr.expr, ctx)
                 if self._is_unsigned(src_ty):
                     out.append("        xor     edx, edx")
