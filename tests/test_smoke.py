@@ -3216,8 +3216,11 @@ def test_long_long_compound_assign_array_element_routes_to_ll_path():
         "    return arr[0] == 0x100000000LL ? 0 : 1;\n"
         "}\n"
     )
-    # Look for the LL add: `add eax, ecx` followed by `adc edx, ebx`.
-    assert "adc     edx, ebx" in asm
+    # Look for the LL add: `add eax, ebx` followed by `adc edx, esi`
+    # (or any LL add+adc pair, since address-once compound uses
+    # different temp registers from the desugared lhs+rhs path).
+    assert "        add     eax, ebx" in asm
+    assert "        adc     edx, esi" in asm
 
 
 def test_long_long_comma_evaluates_lhs_for_side_effects():
@@ -3269,6 +3272,26 @@ def test_float_inc_on_array_element():
     # The non-Identifier float inc/dec emits fld + fld1 + faddp + fst.
     assert "fld     dword [eax]" in asm or "fld     qword [eax]" in asm
     assert "faddp" in asm
+
+
+def test_long_long_compound_arr_index_side_effect_evals_once():
+    # `arr[i++] += 1LL`: the i++ side effect must fire EXACTLY ONCE.
+    # Previous desugar `lvalue = lvalue OP rhs` evaluated lvalue twice,
+    # firing i++ twice.
+    asm = _compile(
+        "int main(void) {\n"
+        "    long long arr[3] = {0, 0, 0};\n"
+        "    int i = 0;\n"
+        "    arr[i++] += 1LL;\n"
+        "    return (arr[0] == 1LL && i == 1) ? 0 : 1;\n"
+        "}\n"
+    )
+    # Count `inc dword [ebp - ` to detect a doubled i++; should be
+    # at most one (the i++ inside the compound assign).
+    inc_count = asm.count("        inc     dword [ebp -")
+    assert inc_count == 1, (
+        f"i++ should be evaluated exactly once; found {inc_count} inc"
+    )
 
 
 def test_decimal64_keyword_compiles_as_double():

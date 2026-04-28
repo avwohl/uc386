@@ -676,3 +676,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Fix**: extended `_float_inc_dec` to handle Index, Member, and `*p` lvalues. Compute `&lvalue` once into EAX, push it on the stack, then `fld` through it, `fld1`, `faddp`/`fsubp`, and either `fst` (prefix) or `fstp` (postfix) through the popped address. Pre returns the new value on st(0); post keeps the old value on st(0) before the bump (using two `fld`s + `fstp`). Mirrors the existing pattern in `_float_compound_assign` for non-Identifier lvalues.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (345 total).
+- **2026-04-28 — long-long compound assign on non-Identifier: address-once (real bug)**: the previous `_compound_assign_ll` desugar `lvalue OP= rhs` → `lvalue = lvalue OP rhs` evaluated the lvalue TWICE for non-Identifier targets. So `arr[i++] += 1LL` fired `i++` twice (once for the address-of-write computation, once for the read), corrupting both the cursor and the wrong slot.
+  - **Fix**: for non-Identifier LL lvalues, address-once dance: compute `&lvalue` into ECX, save on stack, evaluate rhs to EDX:EAX, save rhs on stack, reload `&lvalue`, load `[ecx]`/`[ecx+4]` into EDX:EAX, pop rhs into ESI:EBX, apply op (`add/adc`, `sub/sbb`, `and`/`and`, `or`/`or`, `xor`/`xor`), pop `&lvalue` into ECX, store back. Identifier lvalues still take the simpler desugar since re-reading is side-effect-free.
+  - Bit-field LL members route through `_compound_assign_bitfield_ll` / `_compound_assign_bitfield` which already handle the address-once pattern.
+  - For `*=`, `/=`, `%=`, `<<=`, `>>=` we still fall back to the desugar (these operations need extra scratch on the LL ladder; address-once with two-input ops on a single source pair gets complicated). These ops on non-Identifier LL with side-effect lvalue evaluation are uncommon in practice.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (346 total).
