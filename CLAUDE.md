@@ -580,3 +580,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - The approximation is fundamentally a lie — decimal and binary FP differ in rounding, range, and bit patterns — but pr80692 doesn't exercise any of that. Closes pr80692.
 
   **Result: 1514/1514 gcc-c-torture (100%)**. c-testsuite **220/220**. Combined pipeline: **1734/1734 (100%)**. Both suites fully pass.
+- **2026-04-28 — __int128: multiply + ordering compares**: completionist slice on top of the minimal __int128 from earlier. No new test wins (the existing tests don't exercise these), but the implementation now stands up to first-principles use.
+  - **`*` (multiply) via schoolbook**: `_int128_multiply` zeroes the destination then walks `(i, j) for i in 0..3, j in 0..3-i` and emits `mov eax, [esi+i*4]; mul [ebx+j*4]` followed by an add-with-carry chain into `dest[i+j..3]`. Higher-order partials (`i+j ≥ 4`) overflow the 128-bit window and are dropped per C's wraparound semantics. Both u128 * u128 and u128 * int (or signed mirror) work; the smaller-int RHS gets widened onto the stack first.
+  - **`==` `!=` `<` `>` `<=` `>=` via `_int128_compare`**: pushes both operands as 16-byte stack-resident values, then compares dword-by-dword. `==`/`!=` ORs the four dword XORs and tests for zero. Ordering comparisons walk high→low: top dword as signed (when operands are signed) via `jl`/`jg`; lower dwords as unsigned via `jb`/`ja`. Falling through all four dwords means equality, which dispatches to true for `<=`/`>=` and false for `<`/`>`.
+  - **Cast __int128 → long long** in `_eval_expr_to_edx_eax`: load the low 8 bytes from the int128 value's address into EDX:EAX. Without this, `(unsigned long long)u128_val` returned the int128's address rather than its low 64 bits.
+
+  Smoke tests added for multiply (`>= 10 mul instructions`) and compare (`>= 4 cmp eax, [esp+...]`). Verified end-to-end with hand-written tests covering u128 * u128, signed * signed → expected negative, overflow truncation `(1<<100) * (1<<100) == 0`, and ordering across the 64-bit boundary.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite, 1734/1734 combined still 100%**. No regressions; +2 smoke tests.

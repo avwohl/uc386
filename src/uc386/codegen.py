@@ -4759,7 +4759,196 @@ class CodeGenerator:
                 out.append(f"        {instr}     [edi + {off}], eax")
             out.append("        add     esp, 16")
             return out
+        if op == "*":
+            return self._int128_multiply(expr, dest_disp, ctx)
         raise CodegenError(f"__int128 binary op `{op}` not supported")
+
+    def _int128_multiply(
+        self, expr: ast.BinaryOp, dest_disp: int, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Lower `lhs * rhs` (int128 * int128 truncating to 128 bits)."""
+        # Schoolbook 4x4-dword multiply, keeping only the low 128 bits:
+        #   r[i+j] += L[i] * R[j]   (with carry to higher dwords)
+        # We need partials up to i+j = 3. Higher overflows are dropped.
+        # Strategy: zero dest, then for each (i, j) with i+j < 4 (or
+        # i+j == 3 where we only need the low dword of the product),
+        # multiply L[i] * R[j] (32x32 → 64) and add into dest[i+j..i+j+1].
+        # The full algorithm below uses 16 mul instructions worst case;
+        # most are skipped via the i+j >= 4 cutoff.
+        out: list[str] = []
+        # Eval &lhs and &rhs onto the stack (so the temp slot reuse
+        # via _int128_value_address doesn't get clobbered between
+        # the two calls).
+        out += self._int128_value_address(expr.left, ctx)
+        out.append("        push    eax")
+        # If rhs is smaller than int128, widen onto stack so we have
+        # 4 dwords to work with. Otherwise just take its address.
+        if self._is_int128(self._type_of(expr.right, ctx)):
+            out += self._int128_value_address(expr.right, ctx)
+            out.append("        push    eax")
+            rhs_via_stack = False
+        else:
+            out += self._emit_int_widened_to_int128_on_stack(
+                expr.right, ctx,
+            )
+            # Stack now: [esp + 0..15] = rhs as int128, [esp + 16] = &lhs.
+            rhs_via_stack = True
+        # Zero dest first.
+        out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+        out.append("        xor     eax, eax")
+        for off in (0, 4, 8, 12):
+            out.append(f"        mov     [edi + {off}], eax")
+        # Set ESI = &lhs, EBX = &rhs. Stack discipline:
+        if rhs_via_stack:
+            # [esp+0..15] = rhs bytes, [esp+16] = &lhs.
+            out.append("        mov     esi, [esp + 16]")
+            out.append("        mov     ebx, esp")
+        else:
+            # [esp+0] = &rhs, [esp+4] = &lhs.
+            out.append("        mov     ebx, [esp]")
+            out.append("        mov     esi, [esp + 4]")
+        # Walk i=0..3, j=0..(3-i): partial = L[i] * R[j], add into
+        # dest[i+j..i+j+1] with carry chain into higher dwords.
+        # `add` then `adc 0` chain naturally propagates the CF.
+        for i in range(4):
+            for j in range(4 - i):
+                out.append(f"        mov     eax, [esi + {i*4}]")
+                out.append(f"        mul     dword [ebx + {j*4}]")
+                # eax = low, edx = high
+                k = i + j
+                out.append(f"        add     [edi + {k*4}], eax")
+                if k + 1 < 4:
+                    out.append(f"        adc     [edi + {(k+1)*4}], edx")
+                    # Propagate any further carry up through the high
+                    # dwords. Each `adc dword [...], 0` adds the
+                    # previous carry and updates CF for the next.
+                    for kk in range(k + 2, 4):
+                        out.append(f"        adc     dword [edi + {kk*4}], 0")
+        # Pop stack. If rhs went through a temp address, we pushed 8
+        # bytes; if rhs was widened on stack, we pushed 20.
+        if rhs_via_stack:
+            out.append("        add     esp, 20")
+        else:
+            out.append("        add     esp, 8")
+        return out
+
+    def _int128_compare(
+        self, expr: ast.BinaryOp, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Lower an int128 comparison `a OP b`. Result is int (0/1) in EAX.
+
+        Strategy: materialize both operands as 16-byte buffers on the
+        stack, then compare dword-by-dword. For ==/!= the comparison
+        order doesn't matter; for </>/<=/>= we compare from high to
+        low, treating the topmost dword as signed (when the operands
+        are signed) and the rest as unsigned.
+        """
+        op = expr.op
+        lt = self._type_of(expr.left, ctx)
+        rt = self._type_of(expr.right, ctx)
+        unsigned = self._is_unsigned(lt) or self._is_unsigned(rt)
+
+        # Materialize both as 16-byte values on the stack so we can
+        # address them by ESP-offset.
+        def push_as_int128(e: ast.Expression, ty: ast.TypeNode) -> list[str]:
+            o: list[str] = []
+            if self._is_int128(ty):
+                # Copy 16 bytes of the value onto the stack.
+                o += self._int128_value_address(e, ctx)
+                o.append("        mov     esi, eax")
+                o.append("        sub     esp, 16")
+                for off in (0, 4, 8, 12):
+                    o.append(f"        mov     eax, [esi + {off}]")
+                    o.append(f"        mov     [esp + {off}], eax")
+                return o
+            # Smaller integer — widen onto stack.
+            return self._emit_int_widened_to_int128_on_stack(e, ctx)
+
+        out: list[str] = []
+        # Push right first, then left, so [esp]=left, [esp+16]=right.
+        out += push_as_int128(expr.right, rt)
+        out += push_as_int128(expr.left, lt)
+
+        end = ctx.label("int128_cmp_end")
+        true_l = ctx.label("int128_cmp_true")
+        false_l = ctx.label("int128_cmp_false")
+
+        if op in ("==", "!="):
+            # OR all four dword-XORs together; result zero iff equal.
+            out.append("        mov     eax, [esp]")
+            out.append("        xor     eax, [esp + 16]")
+            out.append("        mov     ecx, [esp + 4]")
+            out.append("        xor     ecx, [esp + 20]")
+            out.append("        or      eax, ecx")
+            out.append("        mov     ecx, [esp + 8]")
+            out.append("        xor     ecx, [esp + 24]")
+            out.append("        or      eax, ecx")
+            out.append("        mov     ecx, [esp + 12]")
+            out.append("        xor     ecx, [esp + 28]")
+            out.append("        or      eax, ecx")
+            # eax == 0 iff equal. Set boolean per op.
+            if op == "==":
+                out.append("        test    eax, eax")
+                out.append("        sete    al")
+            else:
+                out.append("        test    eax, eax")
+                out.append("        setne   al")
+            out.append("        movzx   eax, al")
+            out.append("        add     esp, 32")
+            return out
+
+        # Ordering compare. Walk from high to low. The top dword is
+        # signed (if signed compare). Lower dwords are unsigned.
+        # Condition table for "a OP b":
+        #   <   : strictly less than
+        #   <=  : less or equal
+        #   >   : strictly greater
+        #   >=  : greater or equal
+        # We compute strict-less as the primary; equality is handled
+        # by the loop falling through.
+        # Mapping per signedness:
+        signed_lt_jmp = "jl" if not unsigned else "jb"
+        signed_gt_jmp = "jg" if not unsigned else "ja"
+        unsigned_lt_jmp = "jb"
+        unsigned_gt_jmp = "ja"
+
+        # The four dwords in order of significance (high → low):
+        # offsets 12, 8, 4, 0 within each operand's 16-byte block.
+        for k, off in enumerate((12, 8, 4, 0)):
+            l_addr = f"[esp + {off}]"
+            r_addr = f"[esp + {off + 16}]"
+            out.append(f"        mov     eax, {l_addr}")
+            out.append(f"        cmp     eax, {r_addr}")
+            if k == 0:
+                # Top dword: signedness-aware.
+                if op in ("<", "<="):
+                    out.append(f"        {signed_lt_jmp}      {true_l}")
+                    out.append(f"        {signed_gt_jmp}      {false_l}")
+                else:  # > or >=
+                    out.append(f"        {signed_gt_jmp}      {true_l}")
+                    out.append(f"        {signed_lt_jmp}      {false_l}")
+            else:
+                # Lower dwords: unsigned.
+                if op in ("<", "<="):
+                    out.append(f"        {unsigned_lt_jmp}      {true_l}")
+                    out.append(f"        {unsigned_gt_jmp}      {false_l}")
+                else:
+                    out.append(f"        {unsigned_gt_jmp}      {true_l}")
+                    out.append(f"        {unsigned_lt_jmp}      {false_l}")
+        # All 4 dwords equal — fall through to the equality outcome.
+        if op in ("<=", ">="):
+            out.append(f"        jmp     {true_l}")
+        else:
+            out.append(f"        jmp     {false_l}")
+
+        out.append(f"{true_l}:")
+        out.append("        mov     eax, 1")
+        out.append(f"        jmp     {end}")
+        out.append(f"{false_l}:")
+        out.append("        xor     eax, eax")
+        out.append(f"{end}:")
+        out.append("        add     esp, 32")
+        return out
 
     def _int128_shift(
         self,
@@ -9725,6 +9914,15 @@ class CodeGenerator:
         if isinstance(expr, ast.Cast):
             target = expr.target_type
             src_ty = self._type_of(expr.expr, ctx)
+            # __int128 → long long: load low 8 bytes of the int128's
+            # storage into EDX:EAX.
+            if self._is_int128(src_ty) and self._is_long_long(target):
+                out = self._int128_value_address(expr.expr, ctx)
+                return out + [
+                    "        mov     ecx, eax",
+                    "        mov     eax, [ecx]",
+                    "        mov     edx, [ecx + 4]",
+                ]
             if self._is_long_long(src_ty) and self._is_long_long(target):
                 # ll → ll: pass through (signedness-only changes are
                 # bit-identical at the EDX:EAX level).
@@ -11819,6 +12017,12 @@ class CodeGenerator:
             rt = self._type_of(expr.right, ctx)
             if isinstance(lt, ast.ComplexType) or isinstance(rt, ast.ComplexType):
                 return self._complex_compare(expr, ctx)
+        # __int128 comparison: 4-dword chain. Result is int (0 or 1).
+        if expr.op in ("==", "!=", "<", ">", "<=", ">="):
+            lt = self._type_of(expr.left, ctx)
+            rt = self._type_of(expr.right, ctx)
+            if self._is_int128(lt) or self._is_int128(rt):
+                return self._int128_compare(expr, ctx)
         # Float comparisons land here as int-typed expressions (their
         # result fits in EAX), but the operands are floats so the
         # standard "left to eax, right to ecx" path can't compare them.

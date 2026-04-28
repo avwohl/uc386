@@ -2862,6 +2862,29 @@ def test_int128_shift_by_64_compiles():
     assert "_get_high:" in asm
 
 
+def test_int128_multiply_emits_full_schoolbook():
+    # u128 * u128 produces 10 partial products (i+j < 4). Each is a
+    # `mul dword [...]`. With 4 i-values and j running 0..3-i, we get
+    # 4 + 3 + 2 + 1 = 10 mul instructions.
+    asm = _compile(
+        "unsigned __int128 a, b, c;\n"
+        "int main(void) { c = a * b; return 0; }\n"
+    )
+    assert asm.count("        mul     ") >= 10
+
+
+def test_int128_compare_emits_dword_chain():
+    # u128 < u128 walks 4 dwords from high to low.
+    asm = _compile(
+        "unsigned __int128 a, b;\n"
+        "int main(void) { return a < b; }\n"
+    )
+    # Four cmp eax, [esp + ...] comparisons (one per dword pair).
+    assert asm.count("        cmp     eax, ") >= 4
+    # Unsigned: jb / ja
+    assert "jb " in asm or "ja " in asm
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.
