@@ -2909,6 +2909,19 @@ def test_int128_add_promotes_via_type_of():
     assert "add     eax, ecx" not in asm
 
 
+def test_int128_signed_div_emits_sign_handling():
+    # Signed `s128 / s128` should compute |lhs|, |rhs|, divide, then
+    # apply the result sign (sign(lhs) ^ sign(rhs) for /, sign(lhs)
+    # for %). Look for the abs-value extraction (shr eax, 31) and
+    # the unsigned helper call.
+    asm = _compile(
+        "__int128 a, b, c;\n"
+        "int main(void) { c = a / b; return 0; }\n"
+    )
+    assert "shr     eax, 31" in asm
+    assert "___uc386_udiv128" in asm
+
+
 def test_decimal64_keyword_compiles_as_double():
     # _Decimal64 → double approximation. The literal `0.DD` parses
     # as a double with value 0.

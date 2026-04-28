@@ -595,3 +595,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - Verified end-to-end: 100/7 with q*b+r==100, big random u128 dividend with both 32-bit and 128-bit divisors, all give correct quotient and remainder satisfying `q*divisor + r == dividend`.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +3 smoke tests.
+- **2026-04-28 — signed __int128 division**: rounds out the __int128 implementation. The unsigned runtime helper handles the actual division; the codegen wraps it with sign extraction, abs-value computation on stack scratch, and result sign-fixup.
+  - **Algorithm**: For each operand, extract `sign = bit 127 (= [src + 12] >> 31)` and remember in a register. Compute `|src|` as either a copy (sign 0) or `0 - src` via 4-dword sub-with-borrow chain (sign 1) — store at a 16-byte stack slot. Call `___uc386_udiv128` (or `___uc386_umod128`) on the absolute values. Compute result sign: for `/` it's `sign(lhs) ^ sign(rhs)`, for `%` it's `sign(lhs)` (per C99). Negate the result in place if non-zero.
+  - **Stack discipline**: 32 bytes of scratch for the two abs values, plus 8 more bytes to save the saved signs across the call (which clobbers EBX/EDI). Total `add esp, 40` after the call.
+  - Verified: -100/7=-14 r-2; 100/-7=-14 r 2; -100/-7=14 r-2; q*b+r==a invariant holds.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (321 total).

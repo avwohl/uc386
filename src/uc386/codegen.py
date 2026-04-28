@@ -4693,28 +4693,128 @@ class CodeGenerator:
         # `/` and `%`. Two paths:
         #   - u128 by 32-bit divisor: chain of four `div` instructions
         #     (top-down). Fast path.
-        #   - u128 by u128: call the runtime helper
+        #   - int128 by int128: call the unsigned runtime helper
         #     `___uc386_udiv128` (or `___uc386_umod128`) — binary
-        #     long division, slow but correct.
-        # Signed __int128 division still raises.
+        #     long division, slow but correct. For signed inputs we
+        #     compute |lhs|, |rhs|, divide, then re-apply the result
+        #     sign per C semantics: division uses sign(lhs)^sign(rhs);
+        #     modulo follows sign(lhs).
         if op in ("/", "%") and self._is_int128(lt) and self._is_int128(rt):
-            if not self._is_unsigned(lt) or not self._is_unsigned(rt):
-                raise CodegenError(
-                    "signed __int128 division not supported"
-                )
+            signed_op = (
+                not self._is_unsigned(lt) or not self._is_unsigned(rt)
+            )
             helper = "___uc386_udiv128" if op == "/" else "___uc386_umod128"
             out: list[str] = []
-            # Push divisor address (3rd arg in cdecl right-to-left).
-            out += self._int128_value_address(expr.right, ctx)
-            out.append("        push    eax")
-            # Push dividend address (2nd arg).
+            if not signed_op:
+                # Push divisor, dividend, result (right-to-left).
+                out += self._int128_value_address(expr.right, ctx)
+                out.append("        push    eax")
+                out += self._int128_value_address(expr.left, ctx)
+                out.append("        push    eax")
+                out.append(f"        lea     eax, {_ebp_addr(dest_disp)}")
+                out.append("        push    eax")
+                out.append(f"        call    {helper}")
+                out.append("        add     esp, 12")
+                return out
+            # Signed path. Reserve 32 bytes of scratch on the stack
+            # for |lhs| at [esp+0..15] and |rhs| at [esp+16..31].
+            out.append("        sub     esp, 32")
+            # |lhs| → [esp+0..15], remember sign of lhs in the
+            # sign-byte slot we'll allocate below.
             out += self._int128_value_address(expr.left, ctx)
+            out.append("        mov     esi, eax")
+            # Push lhs's sign bit (0 or 1) onto the stack so the
+            # post-division step can find it. Use BL to avoid touching
+            # the operand temps.
+            out.append("        mov     eax, [esi + 12]")
+            out.append("        shr     eax, 31")
+            # Stash sign(lhs) in EBX so we don't lose it.
+            out.append("        mov     ebx, eax")
+            # Copy |lhs| into [esp+0..15]. If sign(lhs)=1, compute
+            # 0 - lhs via 4-dword sub-with-borrow.
+            out.append("        test    ebx, ebx")
+            jz_pos_lhs = ctx.label("int128_sdiv_pos_lhs")
+            done_lhs = ctx.label("int128_sdiv_lhs_done")
+            out.append(f"        jz      {jz_pos_lhs}")
+            # Negate path.
+            out.append("        xor     eax, eax")
+            out.append("        sub     eax, [esi]")
+            out.append("        mov     [esp + 0], eax")
+            for off in (4, 8, 12):
+                out.append("        mov     eax, 0")
+                out.append(f"        sbb     eax, [esi + {off}]")
+                out.append(f"        mov     [esp + {off}], eax")
+            out.append(f"        jmp     {done_lhs}")
+            out.append(f"{jz_pos_lhs}:")
+            for off in (0, 4, 8, 12):
+                out.append(f"        mov     eax, [esi + {off}]")
+                out.append(f"        mov     [esp + {off}], eax")
+            out.append(f"{done_lhs}:")
+            # |rhs| → [esp+16..31], remember sign(rhs) in EDI.
+            out += self._int128_value_address(expr.right, ctx)
+            out.append("        mov     esi, eax")
+            out.append("        mov     eax, [esi + 12]")
+            out.append("        shr     eax, 31")
+            out.append("        mov     edi, eax")
+            out.append("        test    edi, edi")
+            jz_pos_rhs = ctx.label("int128_sdiv_pos_rhs")
+            done_rhs = ctx.label("int128_sdiv_rhs_done")
+            out.append(f"        jz      {jz_pos_rhs}")
+            out.append("        xor     eax, eax")
+            out.append("        sub     eax, [esi]")
+            out.append("        mov     [esp + 16], eax")
+            for off in (4, 8, 12):
+                out.append("        mov     eax, 0")
+                out.append(f"        sbb     eax, [esi + {off}]")
+                out.append(f"        mov     [esp + {off + 16}], eax")
+            out.append(f"        jmp     {done_rhs}")
+            out.append(f"{jz_pos_rhs}:")
+            for off in (0, 4, 8, 12):
+                out.append(f"        mov     eax, [esi + {off}]")
+                out.append(f"        mov     [esp + {off + 16}], eax")
+            out.append(f"{done_rhs}:")
+            # Save signs to known stack offsets so the call doesn't
+            # clobber them. Push 4 bytes for each: at [esp - 4] before
+            # adjusting esp.  Easier: allocate two more slots upfront,
+            # but the cleaner approach is to save before the call.
+            # Use the dest slot temporarily? No — that gets written by
+            # the call. Allocate 8 more bytes for the saved signs.
+            out.append("        sub     esp, 8")
+            out.append("        mov     [esp], ebx")        # sign(lhs)
+            out.append("        mov     [esp + 4], edi")    # sign(rhs)
+            # Now call the unsigned helper:
+            #   helper(result_dest, |lhs|_at_[esp+8], |rhs|_at_[esp+24])
+            # Push args right-to-left.
+            out.append("        lea     eax, [esp + 24]")  # &|rhs|
             out.append("        push    eax")
-            # Push result address (1st arg).
+            out.append("        lea     eax, [esp + 12]")  # &|lhs| (offset shifted by 1 push)
+            out.append("        push    eax")
             out.append(f"        lea     eax, {_ebp_addr(dest_disp)}")
             out.append("        push    eax")
             out.append(f"        call    {helper}")
             out.append("        add     esp, 12")
+            # Restore sign info.
+            out.append("        mov     ebx, [esp]")        # sign(lhs)
+            out.append("        mov     edi, [esp + 4]")    # sign(rhs)
+            out.append("        add     esp, 40")           # 8 (signs) + 32 (scratch)
+            # Apply result sign.
+            if op == "/":
+                # Negate result iff sign(lhs) XOR sign(rhs) == 1.
+                out.append("        xor     ebx, edi")
+            # else op == "%": result sign follows lhs.
+            out.append("        test    ebx, ebx")
+            done = ctx.label("int128_sdiv_done")
+            out.append(f"        jz      {done}")
+            # Negate dest in place: 0 - dest.
+            out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+            out.append("        xor     eax, eax")
+            out.append("        sub     eax, [edi]")
+            out.append("        mov     [edi], eax")
+            for off in (4, 8, 12):
+                out.append("        mov     eax, 0")
+                out.append(f"        sbb     eax, [edi + {off}]")
+                out.append(f"        mov     [edi + {off}], eax")
+            out.append(f"{done}:")
             return out
         if op in ("/", "%"):
             if not (self._is_int128(lt) and not self._is_int128(rt)):
