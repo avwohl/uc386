@@ -488,3 +488,12 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`_start` initializes FPU control word to 0x027F.** PC=10 (53-bit double precision), round-to-nearest, all exceptions masked. Matches glibc's _start convention on x86 Linux. Default x87 reset state is PC=11 (80-bit extended), which gives extra precision in intermediates and diverges from gcc-test expected values that were computed assuming 53-bit. The `fldcw` runs once at program start, before `call _main`. Closes pr59643.
 
   **Result: 1494/1514 gcc-c-torture** (+1 test). Combined with c-testsuite 218/220, the pipeline now passes 1712/1734 (98.7%).
+- **2026-04-27 — torture sweep: real VLA via sub-esp + restore on goto (1494 → 1498)**:
+  - **Sub-esp-backed VLAs.** Top-level VLA arrays (`int v[n]`, `double v[n][m]`) now get a 4-byte pointer slot instead of a fixed-size storage slot. At decl time: `_emit_runtime_size_of` → `add eax, 15; and eax, ~15; sub esp, eax; mov slot, esp`. At Identifier load/decay: `mov eax, [slot]` instead of `lea eax, slot`. Sub-esp gives scope-correct dealloc — `mov esp, ebp` at function epilogue reclaims everything.
+  - **VLA baseline + restore on goto.** For functions containing any VLA, prologue saves ESP-after-fixed-locals into a hidden `__vla_baseline` slot. Each goto emits `mov esp, [baseline]` before jumping. This frees ALL VLAs and prevents per-iteration leaks in the standard "VLA in goto loop" pattern (vla-dealloc-1 etc.).
+  - **`_array_is_directly_vla` predicate.** Distinguishes a true VLA (`int v[n]`) from `struct S s[N]` where S happens to contain a VLA member. The latter keeps static layout to preserve member-offset calculations (which depend on the static-resolved struct layout).
+  - **`_type_has_vla` checks inline struct members.** When a struct is being introduced for the first time and isn't yet registered, walk its `members` list directly instead of bailing on `_resolve_struct_name`.
+
+  Closes 920929-1, 20040811-1, pr43220, vla-dealloc-1.
+
+  **Result: 1498/1514 gcc-c-torture** (+4 tests). Combined with c-testsuite 218/220, the pipeline now passes 1716/1734 (98.96%).

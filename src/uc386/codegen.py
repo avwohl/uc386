@@ -188,6 +188,20 @@ class _FuncCtx:
         # and on lifted nested-fn ctxs (so `goto label` lowers to a
         # longjmp instead of a regular jmp).
         self.nonlocal_goto_targets: dict[str, str] = {}
+        # Names of locals whose storage is heap-allocated (VLA via
+        # malloc). Their frame slot holds a pointer, not the storage
+        # bytes. Identifier load/address paths consult this set to
+        # decide between `mov` and `lea`.
+        self.vla_backed: set[str] = set()
+        # True if any VLA decl in this function has been emitted —
+        # the function epilogue needs to free each VLA pointer.
+        self.has_vla: bool = False
+        # Frame disp of a hidden slot that saves ESP after fixed-size
+        # locals are allocated. VLA tests emit `sub esp, dyn_size`
+        # which extends ESP below the fixed slots; on goto-back-to-
+        # before-decl we restore ESP to this baseline so the VLA
+        # storage gets reclaimed.
+        self.vla_baseline_disp: int | None = None
         # The current function's name. Used to mangle static-local
         # labels so two functions with the same `static int x` don't
         # collide.
@@ -576,10 +590,14 @@ class CodeGenerator:
                             f"global `{d.name}` has multiple initializers"
                         )
                     self._global_inits[d.name] = d.init
-        extern_list = sorted(set(extern_list))
+        # Track externs added on demand by codegen (e.g., malloc/free
+        # for VLA-backed locals). These get merged into extern_list
+        # before header emission.
+        self._auto_externs: set[str] = set()
 
         lines: list[str] = []
-        lines += self._header(extern_list)
+        # Header is emitted last so we can include any auto-collected
+        # externs from the lowering pass below.
         lines += self._start_stub()
         function_blocks: list[list[str]] = []
         # Use a pending queue so nested function definitions discovered
@@ -608,6 +626,16 @@ class CodeGenerator:
         while self._pending_functions:
             fn = self._pending_functions.pop(0)
             function_blocks.append(self._function(fn))
+        # Now we know what externs the body referenced; merge in
+        # auto-collected externs (malloc/free for VLAs, etc.) before
+        # building the header.
+        for name in self._auto_externs:
+            if name not in extern_list:
+                extern_list.append(name)
+        extern_list = sorted(set(extern_list))
+        # Build header now and prepend to lines.
+        header = self._header(extern_list)
+        lines = header + lines
         for block in function_blocks:
             lines.append("")
             lines += block
@@ -2482,6 +2510,26 @@ class CodeGenerator:
                 self._replace_vla_size_with_capture(
                     param.param_type, captured, fn.name,
                 )
+        # Pre-walk the body for directly-VLA-typed VarDecls. If any
+        # are present, reserve a hidden 4-byte slot at the top of the
+        # frame to hold ESP after the fixed-size locals (the VLA
+        # baseline). `_collect_locals` and `_var_init` need this slot
+        # to exist before they run.
+        has_any_vla = False
+        for sub in self._walk_ast(fn.body):
+            if isinstance(sub, ast.VarDecl):
+                vt = self._resolved_var_type(sub)
+                if (
+                    isinstance(vt, ast.ArrayType)
+                    and self._array_is_directly_vla(vt)
+                ):
+                    has_any_vla = True
+                    break
+        if has_any_vla:
+            ctx.alloc_local(
+                "__vla_baseline", ast.BasicType(name="int"),
+            )
+            ctx.vla_baseline_disp = ctx.lookup("__vla_baseline")
         # First pass: allocate every local up front so the prologue knows
         # the frame size before we emit body code.
         self._collect_locals(fn.body, ctx)
@@ -2522,6 +2570,12 @@ class CodeGenerator:
         out.append("        mov     ebp, esp")
         if ctx.frame_size:
             out.append(f"        sub     esp, {ctx.frame_size}")
+        # Save baseline ESP for VLA-using functions so a goto-back
+        # can restore (free) all VLAs.
+        if ctx.vla_baseline_disp is not None:
+            out.append(
+                f"        mov     {_ebp_addr(ctx.vla_baseline_disp)}, esp"
+            )
         # VLA parameter sizes: evaluate side effects + capture sizes.
         # Slots were pre-allocated in `_collect_locals` (or here, after
         # the prologue, but before frame_size was finalized) — we just
@@ -2600,6 +2654,7 @@ class CodeGenerator:
         # leaking whatever EAX held.
         out.append("        xor     eax, eax")
         out.append(".epilogue:")
+        # `mov esp, ebp` reclaims any sub-esp-allocated VLA storage.
         out.append("        mov     esp, ebp")
         out.append("        pop     ebp")
         out.append("        ret")
@@ -2896,13 +2951,29 @@ class CodeGenerator:
                 ctx.local_static_labels[node.name] = key
                 self._static_local_owner[key] = ctx.func_name
                 return
-            # Round slot size up to a 4-byte boundary so a `char`-sized slot
-            # doesn't push subsequent int slots off-alignment. Arrays whose
-            # payload isn't a multiple of 4 (e.g. `char arr[5]`) get padded
-            # the same way.
-            raw = self._size_of(var_type)
-            slot = (raw + 3) & ~3
-            ctx.alloc_local(node.name, var_type, slot, decl=node)
+            # VLA arrays get a 4-byte pointer slot instead of a
+            # fixed-size storage slot. The actual storage is allocated
+            # at decl time via sub-esp; the pointer is stored in the
+            # slot. Identifier accesses load the pointer (not lea
+            # the slot). Only triggers for top-level VLA-shaped arrays
+            # (`int v[n]`, `int v[n][m]`); arrays-of-structs-containing-
+            # VLA (`struct S s[2]` where S has VLA member) keep static
+            # layout to preserve member-offset calculations.
+            is_vla_array = (
+                isinstance(var_type, ast.ArrayType)
+                and self._array_is_directly_vla(var_type)
+            )
+            if is_vla_array:
+                ctx.alloc_local(node.name, var_type, 4, decl=node)
+                ctx.vla_backed.add(node.name)
+            else:
+                # Round slot size up to a 4-byte boundary so a `char`-sized slot
+                # doesn't push subsequent int slots off-alignment. Arrays whose
+                # payload isn't a multiple of 4 (e.g. `char arr[5]`) get padded
+                # the same way.
+                raw = self._size_of(var_type)
+                slot = (raw + 3) & ~3
+                ctx.alloc_local(node.name, var_type, slot, decl=node)
             # For local VLAs, allocate a hidden capture slot per VLA
             # dimension so sizeof reads the size at DECL TIME (not the
             # current value of the size expression). Replace the
@@ -4626,6 +4697,9 @@ class CodeGenerator:
             ty = ctx.lookup_type(name)
             disp = ctx.lookup(name)
             if isinstance(ty, ast.ArrayType):
+                if name in ctx.vla_backed:
+                    # VLA: slot holds a pointer to malloc'd storage.
+                    return [f"        mov     eax, {_ebp_addr(disp)}"]
                 # Array decay: yield the slot's address, not its bytes.
                 return [f"        lea     eax, {_ebp_addr(disp)}"]
             return self._load_to_eax(_ebp_addr(disp), ty)
@@ -4654,7 +4728,12 @@ class CodeGenerator:
         name = ctx.local_captures.get(name, name)
         name = ctx.nested_fn_names.get(name, name)
         if ctx.has_local(name) and not self._is_extern_redirect(name, ctx):
-            return [f"        lea     eax, {_ebp_addr(ctx.lookup(name))}"]
+            disp = ctx.lookup(name)
+            if name in ctx.vla_backed:
+                # VLA: the array's address IS the pointer stored in
+                # the slot. Take/scale uses load the pointer.
+                return [f"        mov     eax, {_ebp_addr(disp)}"]
+            return [f"        lea     eax, {_ebp_addr(disp)}"]
         if name in self._globals or name in self._extern_vars:
             return [f"        mov     eax, _{name}"]
         if name in self._func_return_types:
@@ -4998,7 +5077,19 @@ class CodeGenerator:
                 raise CodegenError(
                     f"goto: unknown label `{item.label}`"
                 )
-            return [f"        jmp     {target}"]
+            # Restore ESP to the post-locals baseline if we have VLAs.
+            # This frees ALL VLAs (sub-esp-allocated). Safe when the
+            # goto target is before all VLA decls (the common pattern).
+            # If the target is INSIDE a VLA's scope, this would lose
+            # the VLA's storage — but per C, jumping into a VLA's scope
+            # from outside is undefined.
+            out: list[str] = []
+            if ctx.vla_baseline_disp is not None:
+                out.append(
+                    f"        mov     esp, {_ebp_addr(ctx.vla_baseline_disp)}"
+                )
+            out.append(f"        jmp     {target}")
+            return out
         if isinstance(item, ast.BreakStmt):
             if not ctx.break_targets:
                 raise CodegenError("`break` outside of a loop or switch")
@@ -5331,6 +5422,24 @@ class CodeGenerator:
                     decl=orig_size,
                 )
         out = self._var_init_inner(decl, ctx)
+        # VLA-backed local: emit `sub esp, runtime_size; mov slot, esp`
+        # at decl point. Sub-esp gives us scope-correct dealloc — at
+        # function return, `mov esp, ebp` reclaims; at goto-back, the
+        # GotoStmt branch restores ESP to a saved baseline.
+        # `ctx.has_vla` triggers the baseline-save in the prologue.
+        if decl.name in ctx.vla_backed and ctx.has_local(decl.name):
+            var_type = ctx.lookup_type(decl.name)
+            disp = ctx.lookup(decl.name)
+            alloc_lines: list[str] = []
+            alloc_lines += self._emit_runtime_size_of(var_type, ctx)
+            alloc_lines += [
+                "        add     eax, 15",
+                "        and     eax, ~15",
+                "        sub     esp, eax",
+                f"        mov     {_ebp_addr(disp)}, esp",
+            ]
+            ctx.has_vla = True
+            out = alloc_lines + out
         # If the decl has VLA captures, prepend the capture stores so
         # `sizeof(decl)` (which reads the captured slot) sees the
         # correct value. Captures evaluate at decl point.
@@ -7863,6 +7972,20 @@ class CodeGenerator:
                 ctx.exit_scope()
         return ast.BasicType(name="int")
 
+    def _array_is_directly_vla(self, t: ast.ArrayType) -> bool:
+        """True if `t` is a VLA-shaped array (size is non-constant or
+        marked via `_vla_size`). Doesn't recurse into struct members.
+        Used by VLA-backing slot allocation to distinguish a true VLA
+        from `struct S s[N]` where S happens to contain a VLA member.
+        """
+        if getattr(t, "_vla_size", None) is not None:
+            return True
+        if t.size is not None and not isinstance(t.size, ast.IntLiteral):
+            return True
+        if isinstance(t.base_type, ast.ArrayType):
+            return self._array_is_directly_vla(t.base_type)
+        return False
+
     def _type_has_vla(self, t: ast.TypeNode) -> bool:
         """Does `t` contain a variable-length array? Recognized via
         either a saved `_vla_size` (set by `_check_supported_type`'s
@@ -7875,7 +7998,15 @@ class CodeGenerator:
                 return True
             return self._type_has_vla(t.base_type)
         if isinstance(t, ast.StructType):
-            sname = self._resolve_struct_name(t)
+            # Check inline members first (when the struct is being
+            # introduced for the first time and isn't yet registered).
+            for m in getattr(t, "members", []) or []:
+                if self._type_has_vla(m.member_type):
+                    return True
+            try:
+                sname = self._resolve_struct_name(t)
+            except CodegenError:
+                return False
             for _name, mt, _off in self._structs.get(sname, []):
                 if self._type_has_vla(mt):
                     return True
