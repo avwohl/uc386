@@ -8651,6 +8651,26 @@ class CodeGenerator:
             out.append(f"{end_label}:")
             return out
         if isinstance(expr, ast.Call):
+            # `llabs(long long)` / `__builtin_llabs`: inline absolute
+            # value. The user may have redefined `llabs` to abort
+            # (gcc-canonical test pattern); gcc treats it as a builtin
+            # and inlines.
+            if (
+                isinstance(expr.func, ast.Identifier)
+                and expr.func.name in ("llabs", "__builtin_llabs")
+                and len(expr.args) == 1
+            ):
+                out = self._eval_expr_to_edx_eax(expr.args[0], ctx)
+                skip = ctx.label("llabs_done")
+                out += [
+                    "        test    edx, edx",
+                    f"        jns     {skip}",
+                    "        neg     eax",
+                    "        adc     edx, 0",
+                    "        neg     edx",
+                    f"{skip}:",
+                ]
+                return out
             # cdecl returns 64-bit values in EDX:EAX. If the callee's
             # return type is sub-LL, the call leaves only EAX defined
             # — extend EDX from EAX per the return type's signedness so
@@ -9816,6 +9836,21 @@ class CodeGenerator:
             # value position are at least defined.
             if callee.name in ("__builtin_unreachable", "__builtin_trap"):
                 return ["        xor     eax, eax"]
+            # `abs(int)` / `labs(long)` / `__builtin_abs` / `__builtin_labs`:
+            # inline as `cdq; xor eax, edx; sub eax, edx`. Avoids the
+            # user redefining `abs` to `abort()` (a gcc-canonical test
+            # pattern) — gcc treats abs/labs/llabs as builtins and inlines.
+            if (
+                callee.name in ("abs", "labs", "__builtin_abs", "__builtin_labs")
+                and len(expr.args) == 1
+            ):
+                out = self._eval_expr_to_eax(expr.args[0], ctx)
+                out += [
+                    "        cdq",
+                    "        xor     eax, edx",
+                    "        sub     eax, edx",
+                ]
+                return out
             # GCC: __builtin_apply_args() — returns a pointer to the
             # caller's argument area. For cdecl with no named params
             # before the variadic part, that's just [ebp+8] (after

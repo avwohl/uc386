@@ -507,3 +507,7 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Range designator `[start ... end] = expr` in global array init.** Mirrors the function-local fix from earlier — `_emit_global_array_init` handles `RangeDesignator` alongside `IntLiteral` for single-index designators.
 
   No new test pass yet (00216 still has runtime issues), but unblocks several compile-time errors. Foundation for future c-testsuite wins.
+- **2026-04-27 — torture sweep: inline llabs/abs/labs builtins (1499 → 1500)**:
+  - **`abs(int)` / `labs(long)` / `llabs(long long)` (and `__builtin_*` forms) inline at the call site.** Per gcc convention, these are recognized as builtins and inlined regardless of any user redefinition. abs/labs use `cdq; xor eax, edx; sub eax, edx`. llabs (in LL eval context) does `test edx, edx; jns skip; neg eax; adc edx, 0; neg edx`. Closes 20021127-1 (test that redefines `llabs` to abort and expects builtin inlining).
+
+  **Result: 1500/1514 gcc-c-torture** (+1 test). Combined with c-testsuite 218/220, the pipeline now passes 1718/1734 (99.08%).
