@@ -1156,6 +1156,13 @@ class CodeGenerator:
             # like `{ value }` — the value lands in the first member,
             # rest of the struct zero-fills.
             init = ast.InitializerList(values=[init])
+        # Merge consecutive multi-level designators targeting the same
+        # outer member into one nested InitializerList. So
+        # `{.s.a=1, .s.c=3, .x=4}` becomes
+        # `{.s={.a=1, .c=3}, .x=4}`.
+        init = ast.InitializerList(
+            values=self._merge_nested_designators(init.values),
+        )
         sname = self._resolve_struct_name(struct_ty)
         members = self._structs[sname]
         total = self._struct_sizes[sname]
@@ -1420,7 +1427,22 @@ class CodeGenerator:
                     ):
                         next_cursor += 1
                 cursor = next_cursor
-            slot_values[idx] = actual
+            # Non-consecutive multi-level designators targeting the same
+            # outer member — e.g. `.s.a = 11, .extra = 99, .s.b = 22` —
+            # arrive here as TWO separate `.s = {...}` slot writes after
+            # `_merge_nested_designators` (which only merges consecutive
+            # runs). Concatenate the inner lists so the recursive emit
+            # for `.s` sees both inner designators and writes both members.
+            if (
+                idx in slot_values
+                and isinstance(slot_values[idx], ast.InitializerList)
+                and isinstance(actual, ast.InitializerList)
+            ):
+                slot_values[idx] = ast.InitializerList(
+                    values=slot_values[idx].values + actual.values,
+                )
+            else:
+                slot_values[idx] = actual
 
         # Emit in declaration order, padding gaps so the byte layout
         # matches the struct's actual offsets. NASM's `times N db 0`
@@ -1912,6 +1934,10 @@ class CodeGenerator:
 
         if isinstance(init, ast.InitializerList):
             values = self._elide_braces_for_array(init.values, elem_type, name)
+            # Merge multi-level designators with array-index outer
+            # (`[0].a = 1, [0].b = 2`) into one `[0] = {.a, .b}` entry
+            # so the recursive emit for `[0]` sees both inner writes.
+            values = self._merge_nested_designators(values)
             # Walk values once, allowing `[N] = expr` to jump the cursor
             # the same way local-array init does. The result is a
             # by-index map from designated-or-positional slots to
@@ -7812,6 +7838,11 @@ class CodeGenerator:
                 )
             finally:
                 self._elision_ctx = prev_ctx
+            # Merge multi-level designators with array-index outer
+            # (`[0].a = 1, [0].b = 2`) into one `[0] = {.a, .b}` entry,
+            # so the recursive emit for `[0]` sees both inner writes
+            # and doesn't zero-fill the prior one.
+            iter_values = self._merge_nested_designators(iter_values)
             # Walk values in source order, allowing `[N] = expr` to jump
             # the cursor. After all source values, any unfilled slots
             # get zero-filled. This handles pure-positional, pure-
@@ -7990,6 +8021,13 @@ class CodeGenerator:
             elided_values = self._elide_braces_for_struct(init.values, members, name)
         finally:
             self._elision_ctx = prev_ctx
+        # Merge multi-level designators that target the same outer
+        # member: `{.s.a = 1, .s.c = 3}` becomes one nested
+        # InitializerList for `s` containing both `.a = 1` and
+        # `.c = 3`. Without merging, each `.s.X` would recurse into
+        # `_struct_init(s, ...)` and the recursion's end-zero-fill
+        # would clobber the previous iteration's writes.
+        elided_values = self._merge_nested_designators(elided_values)
         # Walk source values in order, tracking the implicit cursor. A
         # `.field = expr` sets the cursor to that member's index; the
         # next un-designated value continues from cursor + 1. After the
@@ -8204,6 +8242,75 @@ class CodeGenerator:
                     out += self._zero_fill_at(
                         base_disp + m_off, self._size_of(m_ty)
                     )
+        return out
+
+    def _merge_nested_designators(
+        self, values: list,
+    ) -> list:
+        """Merge multi-level DesignatedInits that target the same outer
+        member/index into a single synthetic InitializerList.
+
+        `[.s.a = 1, .s.c = 3]` → `[.s = {.a = 1, .c = 3}]`. Without
+        merging, the second recursive `_struct_init(s, ...)` call
+        would zero-fill the unfilled members of `s` (including `a`),
+        clobbering the first iteration's write.
+
+        Same treatment for array-index outers: `[[0].a = 1, [0].b = 2]`
+        → `[[0] = {.a = 1, .b = 2}]`.
+
+        Multi-level designators targeting different outer
+        members/indices (`.s.a = 1, .t.b = 2`) and intervening
+        positional/single-designator values are preserved as-is. The
+        merging is single-level on the outer designator; the inner
+        sequence recursively gets the same treatment when the inner
+        emit recurses for the merged member/index. Non-consecutive
+        runs (`.s.a = 1, .extra = 99, .s.b = 2`) consolidate at the
+        first occurrence so all `.s.X` writes share one inner list.
+        """
+        def outer_key(d):
+            if isinstance(d, str):
+                return ("name", d)
+            if isinstance(d, ast.IntLiteral):
+                return ("idx", d.value)
+            return None
+
+        out: list = []
+        for v in values:
+            if (
+                isinstance(v, ast.DesignatedInit)
+                and len(v.designators) > 1
+                and outer_key(v.designators[0]) is not None
+            ):
+                outer = v.designators[0]
+                key = outer_key(outer)
+                inner = ast.DesignatedInit(
+                    designators=v.designators[1:],
+                    value=v.value,
+                )
+                # Find an existing synthesized `outer = {...}` entry —
+                # not just the last position, since `.s.a, .extra, .s.b`
+                # has the second `.s.b` separated from the first by
+                # `.extra`. Consolidating non-consecutive runs prevents
+                # the second write from spawning a fresh emit that
+                # zero-fills `.s.a`.
+                merged = False
+                for prior in out:
+                    if (
+                        isinstance(prior, ast.DesignatedInit)
+                        and len(prior.designators) == 1
+                        and outer_key(prior.designators[0]) == key
+                        and isinstance(prior.value, ast.InitializerList)
+                    ):
+                        prior.value.values.append(inner)
+                        merged = True
+                        break
+                if not merged:
+                    out.append(ast.DesignatedInit(
+                        designators=[outer],
+                        value=ast.InitializerList(values=[inner]),
+                    ))
+            else:
+                out.append(v)
         return out
 
     def _zero_fill_at(self, disp: int, size: int) -> list[str]:

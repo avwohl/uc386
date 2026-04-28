@@ -347,6 +347,25 @@ def test_compound_assign_simple(op, instr):
     assert "mov     [ebp - 4], eax" in asm
 
 
+def test_x_times_2_with_side_effect_not_strength_reduced():
+    """`(n += 5) * 2` must NOT be strength-reduced to `(n += 5) + (n += 5)`,
+    because that would fire the side effect twice. The strength-reduction
+    rule for `x * 2 → x + x` only applies when `x` is side-effect-free."""
+    asm = _compile(
+        "int main(void) { int n = 10; int m = (n += 5) * 2; "
+        "return n * 100 + m; }"
+    )
+    # The compound assign emits a single store to n's slot at [ebp-4].
+    # If the optimizer wrongly duplicated `(n += 5)`, we'd see two stores.
+    n_stores = sum(
+        1 for l in asm.splitlines()
+        if "mov     [ebp - 4], eax" in l
+    )
+    # Expected stores: 1 for the `int n = 10` init, 1 for the `n += 5`.
+    # If the optimizer fired the duplication, we'd see 3 (init + two += 5).
+    assert n_stores == 2, f"Expected 2 stores to n; got {n_stores}"
+
+
 def test_compound_div_uses_idiv():
     asm = _compile("int main(void) { int x = 10; x /= 3; return x; }")
     assert "idiv    ecx" in asm
@@ -2045,6 +2064,78 @@ def test_struct_pointer_arithmetic_scales_by_struct_size():
         "pp = pp + 1; return 0; }"
     )
     assert "shl     eax, 3" in asm
+
+
+def test_global_struct_multi_level_designators_merge():
+    """`struct Outer g = {.s.a=1, .s.c=3, .x=4}` correctly merges the
+    consecutive `.s.*` designators into one nested init for `s` so the
+    earlier `.s.a` write isn't zero-filled when the later `.s.c` recurses
+    into the inner struct."""
+    asm = _compile(
+        "struct Inner { int a; int b; int c; }; "
+        "struct Outer { struct Inner s; int x; }; "
+        "struct Outer g = { .s.a = 11, .s.c = 33, .x = 99 }; "
+        "int main(void) { return 0; }"
+    )
+    # Layout is: a=11, b=0(pad 4), c=33, x=99 — merging keeps a and c.
+    g_idx = asm.find("_g:")
+    assert g_idx >= 0
+    # The init image for g should contain literal 11, 33, 99 in order.
+    g_block = asm[g_idx:g_idx + 400]
+    # Find each in the block and verify ordering: 11 < 33 < 99 by position.
+    pos_11 = g_block.find("dd      11\n")
+    pos_33 = g_block.find("dd      33\n")
+    pos_99 = g_block.find("dd      99\n")
+    assert pos_11 != -1 and pos_33 != -1 and pos_99 != -1
+    assert pos_11 < pos_33 < pos_99
+
+
+def test_global_struct_multi_level_designators_non_consecutive():
+    """`.s.a, .extra, .s.b` (non-consecutive same-outer designators)
+    must consolidate so `.s.b`'s inner emit doesn't zero-fill `.s.a`.
+    The bug was that the second `.s = {...}` slot write replaced the
+    first one rather than appending to it."""
+    asm = _compile(
+        "struct Inner { int a; int b; }; "
+        "struct Outer { struct Inner s; int extra; }; "
+        "struct Outer g = { .s.a = 11, .extra = 99, .s.b = 22 }; "
+        "int main(void) { return 0; }"
+    )
+    g_idx = asm.find("_g:")
+    g_block = asm[g_idx:g_idx + 400]
+    pos_11 = g_block.find("dd      11\n")
+    pos_22 = g_block.find("dd      22\n")
+    pos_99 = g_block.find("dd      99\n")
+    assert pos_11 != -1 and pos_22 != -1 and pos_99 != -1
+
+
+def test_local_array_of_struct_multi_level_designator():
+    """`struct Inner arr[3] = {[0].a=1, [0].b=2}` for an array of
+    struct merges the multi-level designators by their array-index
+    outer so the recursive struct-init for [0] sees both .a and .b."""
+    asm = _compile(
+        "struct Inner { int a; int b; }; "
+        "int main(void) { "
+        "struct Inner arr[3] = { [0].a = 1, [0].b = 2, [2].a = 30 }; "
+        "return arr[0].a + arr[0].b + arr[2].a; }"
+    )
+    # Local code; just confirms it compiles without raising.
+    assert "_main:" in asm
+
+
+def test_global_array_of_struct_multi_level_designator():
+    """Same as above but for a global array of struct."""
+    asm = _compile(
+        "struct Inner { int a; int b; }; "
+        "struct Inner g[3] = { [0].a = 1, [0].b = 2, [2].a = 30 }; "
+        "int main(void) { return 0; }"
+    )
+    g_idx = asm.find("_g:")
+    g_block = asm[g_idx:g_idx + 400]
+    pos_1 = g_block.find("dd      1\n")
+    pos_2 = g_block.find("dd      2\n")
+    pos_30 = g_block.find("dd      30\n")
+    assert pos_1 != -1 and pos_2 != -1 and pos_30 != -1
 
 
 def test_struct_global_uninitialized_in_bss():
