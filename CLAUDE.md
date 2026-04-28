@@ -501,3 +501,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`__builtin_offsetof(T, designator)` falls back to runtime when constant evaluation fails.** Per gcc, offsetof accepts non-constant indices when T contains a VLA member (because the offset can be different per call). New `_emit_runtime_offsetof` walks the designator chain inside-out, emitting per-step code: Member adds the constant member offset; Index evaluates the index, multiplies by `_emit_runtime_size_of(elem_ty)` (which may itself be runtime for VLA-shaped elements), and adds. Uses ESI as the running accumulator. Closes pr41935.
 
   **Result: 1499/1514 gcc-c-torture** (+1 test). Combined with c-testsuite 218/220, the pipeline now passes 1717/1734 (99.0%).
+- **2026-04-27 — codegen polish: global init edge cases**:
+  - **`_consume_one_member` recognizes Compound for struct member outside function context.** For global init (where `_elision_ctx` is None), a Compound `(struct T){...}` whose target_type matches the struct member type now passes through as-is — the inner struct emit unwraps it. Previously fell through to flat-value-elision, which mis-treated the Compound as a single scalar value and tried to pass it to the first member's emit.
+  - **Union with array-typed first member: brace elision for flat scalars.** `union U { u8 arr[16]; ... } u = {1,2,3,4}` now wraps `1,2,3,4` into a synthetic `InitializerList` for `arr`. Previously only a single value (1) went into arr's slot, then 2,3,4 were dropped.
+  - **Range designator `[start ... end] = expr` in global array init.** Mirrors the function-local fix from earlier — `_emit_global_array_init` handles `RangeDesignator` alongside `IntLiteral` for single-index designators.
+
+  No new test pass yet (00216 still has runtime issues), but unblocks several compile-time errors. Foundation for future c-testsuite wins.

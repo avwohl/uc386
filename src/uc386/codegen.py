@@ -1093,21 +1093,55 @@ class CodeGenerator:
                     i for i, g in enumerate(groups) if g == first_group
                 ]
                 if len(group_indices) > 1:
+                    # Distribute first_value's values across the
+                    # anon-struct's members. Designators within the
+                    # inner init reset the cursor to the named member.
                     sub_out: list[str] = []
+                    name_to_member_idx = {
+                        members[mi][0]: mi for mi in group_indices
+                    }
+                    placed: dict[int, ast.Expression] = {}
+                    cursor_pos = 0
+                    for v in first_value.values:
+                        if isinstance(v, ast.DesignatedInit):
+                            target = v.designators[0]
+                            if (
+                                isinstance(target, str)
+                                and target in name_to_member_idx
+                            ):
+                                mi = name_to_member_idx[target]
+                                if len(v.designators) > 1:
+                                    placed[mi] = ast.InitializerList(
+                                        values=[ast.DesignatedInit(
+                                            designators=v.designators[1:],
+                                            value=v.value,
+                                        )]
+                                    )
+                                else:
+                                    placed[mi] = v.value
+                                cursor_pos = group_indices.index(mi) + 1
+                                continue
+                        # Positional value — place at cursor_pos.
+                        if cursor_pos < len(group_indices):
+                            placed[group_indices[cursor_pos]] = v
+                            cursor_pos += 1
                     written = 0
-                    for src_idx, mi in enumerate(group_indices):
-                        if src_idx >= len(first_value.values):
-                            break
+                    for mi in group_indices:
                         m_name, m_ty, m_off = members[mi]
                         if m_off > written:
                             sub_out.append(
                                 f"        times {m_off - written} db 0"
                             )
                             written = m_off
-                        sub_out += self._emit_global_init(
-                            m_ty, first_value.values[src_idx],
-                            f"{name}.{m_name}",
-                        )
+                        if mi in placed:
+                            sub_out += self._emit_global_init(
+                                m_ty, placed[mi],
+                                f"{name}.{m_name}",
+                            )
+                        else:
+                            sub_out.append(
+                                f"        times {self._size_of(m_ty)} db 0"
+                            )
                         written = m_off + self._size_of(m_ty)
                     if total > written:
                         sub_out.append(
@@ -1137,6 +1171,22 @@ class CodeGenerator:
             else:
                 target_name = members[0][0]
                 value = first_value
+                # Brace elision: if the first member is an array or
+                # struct and the init values are scalars/strings, wrap
+                # them all into an InitializerList for the first member.
+                # `union { u8 arr[16]; ... } u = {1,2,3,4}` → arr fills.
+                first_m_ty = members[0][1]
+                if (
+                    not isinstance(value, ast.InitializerList)
+                    and not isinstance(value, ast.Compound)
+                    and len(init.values) >= 1
+                    and isinstance(first_m_ty, (ast.ArrayType, ast.StructType))
+                ):
+                    if (
+                        isinstance(first_m_ty, ast.ArrayType)
+                        and not isinstance(value, ast.StringLiteral)
+                    ):
+                        value = ast.InitializerList(values=list(init.values))
             target_ty = next(
                 ty for n, ty, _ in members if n == target_name
             )
@@ -1431,6 +1481,19 @@ class CodeGenerator:
         if isinstance(v, ast.InitializerList):
             return v, i + 1
         if isinstance(m_ty, ast.StructType):
+            # Compound literal `(T){...}` for the same struct type
+            # passes through as-is; the struct emit unwraps it.
+            if isinstance(v, ast.Compound) and isinstance(
+                v.target_type, ast.StructType
+            ):
+                try:
+                    if (
+                        self._resolve_struct_name(v.target_type)
+                        == self._resolve_struct_name(m_ty)
+                    ):
+                        return v, i + 1
+                except CodegenError:
+                    pass
             # If `v` is itself a struct-valued expression matching this
             # member type, pass it through — it's a struct copy, not a
             # flat-value run to elide. We cheaply infer the type from
@@ -1677,28 +1740,51 @@ class CodeGenerator:
             slots: dict[int, ast.Expression] = {}
             cursor = 0
             for value in values:
+                idx_range: list[int] | None = None
                 if isinstance(value, ast.DesignatedInit):
+                    designator = value.designators[0]
                     if (
+                        len(value.designators) == 1
+                        and isinstance(designator, ast.RangeDesignator)
+                    ):
+                        try:
+                            start = self._const_eval(
+                                designator.start, name
+                            )
+                            end = self._const_eval(designator.end, name)
+                        except CodegenError:
+                            raise CodegenError(
+                                f"global `{name}`: range designator must be "
+                                f"compile-time constants"
+                            )
+                        idx_range = list(range(start, end + 1))
+                        actual = value.value
+                        cursor = end + 1
+                    elif (
                         len(value.designators) != 1
-                        or not isinstance(value.designators[0], ast.IntLiteral)
+                        or not isinstance(designator, ast.IntLiteral)
                     ):
                         raise CodegenError(
                             f"global `{name}`: only single-level integer "
                             f"designators supported in array init"
                         )
-                    idx = value.designators[0].value
-                    actual = value.value
-                    cursor = idx + 1
+                    else:
+                        idx = designator.value
+                        actual = value.value
+                        cursor = idx + 1
+                        idx_range = [idx]
                 else:
                     idx = cursor
                     actual = value
                     cursor += 1
-                if idx < 0 or idx >= length:
-                    raise CodegenError(
-                        f"global `{name}`: initializer index {idx} out "
-                        f"of range (array size {length})"
-                    )
-                slots[idx] = actual
+                    idx_range = [idx]
+                for idx in idx_range:
+                    if idx < 0 or idx >= length:
+                        raise CodegenError(
+                            f"global `{name}`: initializer index {idx} out "
+                            f"of range (array size {length})"
+                        )
+                    slots[idx] = actual
 
             # If the element type is a basic type, the simple `dd v1, v2, ...`
             # form works. Otherwise (structs, sub-arrays, pointers larger
