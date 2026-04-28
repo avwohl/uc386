@@ -207,6 +207,18 @@ def run(
         i = 0
         ap = va_ptr
         n = len(fmt)
+
+        def read32_le(addr_ref):
+            bs = bytes(mu.mem_read(addr_ref[0], 4))
+            addr_ref[0] += 4
+            return int.from_bytes(bs, "little")
+
+        def read64_le(addr_ref):
+            bs = bytes(mu.mem_read(addr_ref[0], 8))
+            addr_ref[0] += 8
+            return int.from_bytes(bs, "little")
+
+        ap_box = [ap]
         while i < n:
             c = fmt[i:i+1]
             if c != b"%":
@@ -234,19 +246,33 @@ def run(
                 elif fmt[i:i+1] == b" ":
                     space_flag = True
                 i += 1
-            # width
+            # width — either an integer or `*` to read from ap.
             width = 0
-            while i < n and 0x30 <= fmt[i] <= 0x39:
-                width = width * 10 + (fmt[i] - 0x30)
+            if i < n and fmt[i:i+1] == b"*":
+                width = read32_le(ap_box)
+                if width < 0:
+                    # Negative width = '-' flag + abs value (C99 7.21.6.1#5).
+                    left_align = True
+                    width = -width
                 i += 1
-            # precision
+            else:
+                while i < n and 0x30 <= fmt[i] <= 0x39:
+                    width = width * 10 + (fmt[i] - 0x30)
+                    i += 1
+            # precision — `.N` (literal int) or `.*` (read from ap).
             precision = -1
             if i < n and fmt[i:i+1] == b".":
                 i += 1
-                precision = 0
-                while i < n and 0x30 <= fmt[i] <= 0x39:
-                    precision = precision * 10 + (fmt[i] - 0x30)
+                if i < n and fmt[i:i+1] == b"*":
+                    precision = read32_le(ap_box)
+                    if precision < 0:
+                        precision = -1   # negative precision = no precision
                     i += 1
+                else:
+                    precision = 0
+                    while i < n and 0x30 <= fmt[i] <= 0x39:
+                        precision = precision * 10 + (fmt[i] - 0x30)
+                        i += 1
             # length modifiers
             length_long_long = False
             length_short = False        # h
@@ -268,17 +294,13 @@ def run(
             conv = fmt[i:i+1]
             i += 1
 
-            def read32_le(addr_ref):
-                bs = bytes(mu.mem_read(addr_ref[0], 4))
-                addr_ref[0] += 4
-                return int.from_bytes(bs, "little")
-
-            def read64_le(addr_ref):
-                bs = bytes(mu.mem_read(addr_ref[0], 8))
-                addr_ref[0] += 8
-                return int.from_bytes(bs, "little")
-
-            ap_box = [ap]
+            # `read32_le`/`read64_le`/`ap_box` are defined at the top
+            # of `_printf_format` so the `*` width/precision branches
+            # can read from ap during format-spec parsing. Each `%` spec
+            # advances `ap_box[0]` as it consumes args. We capture the
+            # current ap value at this conversion's start so the
+            # original `ap = va_ptr` line at the top still holds (the
+            # outer `ap` variable is no longer used after init).
             if conv == b"%":
                 out += b"%"
                 continue
@@ -421,7 +443,6 @@ def run(
             else:
                 # Unknown — output as-is.
                 out += b"%" + conv
-            ap = ap_box[0]
         return bytes(out)
 
     def on_int(uc, intno, user_data):
