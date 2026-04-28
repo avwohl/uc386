@@ -519,3 +519,8 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`asm("mull %N" : "=a"(...), "=d"(...) : "0"(a), "rm"(b))`** lowers to `mul ecx; store EDX; store EAX`. Used by glibc-style fixed-point helpers — `unsigned mul → (low, high)` returned through two pointers. Source operand evaluates to ECX; the matching-output input goes to EAX; the `mul ecx` instruction does the multiply; outputs store EAX (low) and EDX (high) to their respective lvalues. Closes 960830-1.
 
   **Result: 1502/1514 gcc-c-torture** (+1 test). Combined with c-testsuite 218/220, the pipeline now passes 1720/1734 (99.19%).
+- **2026-04-28 — torture sweep: `-finstrument-functions` semantics (1502 → 1503)**:
+  - **`__attribute__((no_instrument_function))`** parsed (uc_core) and threaded through to FunctionDecl + VarDecl (which represents bodyless function declarations). New `_pending_no_instrument` parser flag, mirrored on both `FunctionDecl.no_instrument_function` and `VarDecl.no_instrument_function` AST fields.
+  - **uc386 codegen**: pre-scan top_decls building `_instrument_no_skip` (names of fns where any decl/def has the attr) and `_instrument_enabled` (True iff both `__cyg_profile_func_enter` and `__cyg_profile_func_exit` are defined in this TU). When both conditions are met, every other function gets `push retaddr; push fnaddr; call ___cyg_profile_func_enter; add esp, 8` after prologue setup, and the same for `__cyg_profile_func_exit` at `.epilogue:` (with EAX/EDX/st(0) saved across the call to preserve the return value). Skips main if it's marked NOCHK (eeprof-1's pattern).
+
+  **Result: 1503/1514 gcc-c-torture** (+1 test). Combined with c-testsuite 218/220, the pipeline now passes 1721/1734 (99.25%).

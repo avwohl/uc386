@@ -595,6 +595,31 @@ class CodeGenerator:
         # before header emission.
         self._auto_externs: set[str] = set()
 
+        # `-finstrument-functions` semantics. If both
+        # `__cyg_profile_func_enter` and `__cyg_profile_func_exit` are
+        # defined in this TU, every non-skipped function gets enter/
+        # exit calls injected at its prologue/epilogue. Functions
+        # marked `__attribute__((no_instrument_function))` (anywhere
+        # — forward decl or definition) are skipped, as are the two
+        # cyg fns themselves.
+        self._instrument_no_skip: set[str] = {
+            "__cyg_profile_func_enter",
+            "__cyg_profile_func_exit",
+        }
+        for d in top_decls:
+            if (isinstance(d, ast.FunctionDecl)
+                    and getattr(d, "no_instrument_function", False)):
+                self._instrument_no_skip.add(d.name)
+            elif (isinstance(d, ast.VarDecl)
+                    and isinstance(d.var_type, ast.FunctionType)
+                    and getattr(d, "no_instrument_function", False)):
+                self._instrument_no_skip.add(d.name)
+        defined_fn_names = {fn.name for fn in functions}
+        self._instrument_enabled = (
+            "__cyg_profile_func_enter" in defined_fn_names
+            and "__cyg_profile_func_exit" in defined_fn_names
+        )
+
         lines: list[str] = []
         # Header is emitted last so we can include any auto-collected
         # externs from the lowering pass below.
@@ -2734,12 +2759,61 @@ class CodeGenerator:
             out.append("        add     esp, 4")
             out.append("        test    eax, eax")
             out.append(f"        jnz     {user_target}")
+        # `-finstrument-functions`: enter call after prologue setup.
+        instrument = (
+            getattr(self, "_instrument_enabled", False)
+            and fn.name not in self._instrument_no_skip
+        )
+        if instrument:
+            out.append("        push    dword [ebp + 4]")
+            out.append(f"        push    _{fn.name}")
+            out.append("        call    ___cyg_profile_func_enter")
+            out.append("        add     esp, 8")
         out += body
         # C99: falling off the end of main returns 0. For other functions
         # this is technically undefined, but a deterministic zero beats
         # leaking whatever EAX held.
         out.append("        xor     eax, eax")
         out.append(".epilogue:")
+        # `-finstrument-functions`: exit call before stack teardown.
+        # Save the return value across the call so we can restore it.
+        if instrument:
+            ret_save: list[str] = []
+            ret_restore: list[str] = []
+            rt = fn.return_type
+            is_void = (
+                isinstance(rt, ast.BasicType) and rt.name == "void"
+            )
+            if not is_void:
+                if self._is_float_type(rt):
+                    size = self._size_of(rt)
+                    width = "dword" if size == 4 else "qword"
+                    ret_save = [
+                        f"        sub     esp, {size}",
+                        f"        fstp    {width} [esp]",
+                    ]
+                    ret_restore = [
+                        f"        fld     {width} [esp]",
+                        f"        add     esp, {size}",
+                    ]
+                elif self._is_long_long(rt):
+                    ret_save = [
+                        "        push    edx",
+                        "        push    eax",
+                    ]
+                    ret_restore = [
+                        "        pop     eax",
+                        "        pop     edx",
+                    ]
+                else:
+                    ret_save = ["        push    eax"]
+                    ret_restore = ["        pop     eax"]
+            out += ret_save
+            out.append("        push    dword [ebp + 4]")
+            out.append(f"        push    _{fn.name}")
+            out.append("        call    ___cyg_profile_func_exit")
+            out.append("        add     esp, 8")
+            out += ret_restore
         # `mov esp, ebp` reclaims any sub-esp-allocated VLA storage.
         out.append("        mov     esp, ebp")
         out.append("        pop     ebp")
