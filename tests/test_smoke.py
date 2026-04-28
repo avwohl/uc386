@@ -3352,6 +3352,25 @@ def test_decimal64_keyword_compiles_as_double():
     assert "section .data" in asm
 
 
+def test_logical_not_on_complex_lvalue_compiles():
+    # `!c` for a _Complex double Identifier crashed with "can't load
+    # size-16 value into eax" because `_unary` did an upfront
+    # `_eval_expr_to_eax(operand)` BEFORE checking the op. For `!`
+    # the eval was discarded and re-done via `_eval_to_bool_eax`,
+    # but the upfront eval had already raised.
+    # Same shape for `!int128_var` (size-16) and any other operand
+    # that doesn't fit a single EAX load.
+    # Fix: dispatch `!` first; only do the EAX-load for `+`/`-`/`~`.
+    asm = _compile(
+        "int main(void) {\n"
+        "    _Complex double c = 0.0 + 0.0i;\n"
+        "    if (!c) return 0;\n"
+        "    return 1;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
 def test_complex_division_imag_part_correct_direction():
     # `_complex_div_into_top` was emitting `fdivp st1, st0` for the
     # imag part, which computes `denom / numer_imag` — the wrong

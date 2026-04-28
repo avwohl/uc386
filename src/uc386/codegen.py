@@ -12602,6 +12602,18 @@ class CodeGenerator:
             )
         if not expr.is_prefix:
             raise CodegenError(f"postfix `{expr.op}` not implemented yet")
+        if expr.op == "!":
+            # `!x` works for complex / int128 / float / int operands —
+            # whatever `_eval_to_bool_eax` knows how to handle. Don't
+            # do an upfront EAX load (which would fail for size-16
+            # operands like _Complex double or __int128). The bool
+            # eval gives EAX = 1 for nonzero / 0 for zero; invert it.
+            out = self._eval_to_bool_eax(expr.operand, ctx)
+            return out + [
+                "        test    eax, eax",
+                "        sete    al",
+                "        movzx   eax, al",
+            ]
         out = self._eval_expr_to_eax(expr.operand, ctx)
         if expr.op == "+":
             return out
@@ -12609,17 +12621,6 @@ class CodeGenerator:
             return out + ["        neg     eax"]
         if expr.op == "~":
             return out + ["        not     eax"]
-        if expr.op == "!":
-            # `!f` for a float must compare against 0.0, not against the
-            # truncated int. Re-do the eval through `_eval_to_bool_eax`,
-            # which gives EAX = 1 for nonzero / 0 for zero, and then
-            # invert it.
-            out = self._eval_to_bool_eax(expr.operand, ctx)
-            return out + [
-                "        test    eax, eax",
-                "        sete    al",
-                "        movzx   eax, al",
-            ]
         raise CodegenError(f"unary `{expr.op}` not implemented yet")
 
     def _address_of(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
