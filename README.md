@@ -4,10 +4,14 @@ C23 compiler targeting the Intel 386 (i386 / x86-32) processor under a
 DOS extender — specifically the **flat 32-bit Watcom / DOS/4GW-era** C
 that early-to-mid-1990s PC games were written in.
 
-**Status: skeleton only.** The frontend (parsing, preprocessing,
-AST-level optimization) is fully functional via
-[uc_core](https://github.com/avwohl/uc_core). The x86 code generator
-is a stub.
+**Status: 100% on both reference test suites.** All 1514 executable
+[gcc-c-torture](https://github.com/llvm/llvm-test-suite) tests
+compile, assemble, and run correctly under our DOS emulator;
+all 220 [c-testsuite](https://github.com/c-testsuite/c-testsuite)
+tests pass. The frontend (parsing, preprocessing, AST-level
+optimization) lives in [uc_core](https://github.com/avwohl/uc_core);
+this repo owns the driver, the x86-32 NASM emitter, and the DOS
+runtime bindings. See `CLAUDE.md` for the per-slice development log.
 
 ## Goal
 
