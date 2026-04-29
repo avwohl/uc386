@@ -6333,3 +6333,72 @@ def test_push_pop_op_to_memop_skips_sub():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("push_pop_op_to_memop", 0) == 0
+
+
+# ── push_const_index_fold ───────────────────────────────────────
+
+
+def test_push_const_index_fold_zero():
+    """`xor ecx, ecx; push dword [eax + ecx*4]` →
+    `push dword [eax]`. Zero displacement collapses to plain deref.
+    """
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        xor     ecx, ecx\n"
+        "        push    dword [eax + ecx*4]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        pop     edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     ecx, ecx" not in out
+    assert "push    dword [eax]" in out
+    assert opt.stats.get("push_const_index_fold") == 1
+
+
+def test_push_const_index_fold_with_imm():
+    """`mov ecx, 2; push dword [eax + ecx*4]` →
+    `push dword [eax + 8]`. Constant index folded."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 2\n"
+        "        push    dword [eax + ecx*4]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        pop     edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    dword [eax + 8]" in out
+    assert opt.stats.get("push_const_index_fold") == 1
+
+
+def test_push_const_index_fold_skips_idx_reused():
+    """If IDX is read after the push (not dead), bail."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 1\n"
+        "        push    dword [eax + ecx*4]\n"
+        "        mov     edx, ecx\n"  # ecx still read here!
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_const_index_fold", 0) == 0
+
+
+def test_push_const_index_fold_skips_base_eq_idx():
+    """If BASE == IDX, the rewrite is unsafe (BASE's value would
+    change after dropping the const-load)."""
+    asm = (
+        "_f:\n"
+        "        xor     ecx, ecx\n"
+        "        push    dword [ecx + ecx*4]\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_const_index_fold", 0) == 0

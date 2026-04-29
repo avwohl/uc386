@@ -1247,3 +1247,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - The check became: `not (src_is_self and src_is_mem)` — drop unless source is a self-referential memory read.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +2 peephole tests (808 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: push_const_index_fold**: sister of `sib_const_index_fold` for the push form. Folds a constant-index SIB-form push into the displacement.
+  - **Pattern**: `mov IDX, IMM` (or `xor IDX, IDX` for IMM=0) followed by `push <size?> [BASE + IDX*SCALE [+/- DISP]]` → `push <size?> [BASE + (IMM*SCALE [+/- DISP])]`. The 2-byte xor or 5-byte mov is dropped; the SIB form gains constant displacement.
+  - **Common shape**: `arr[0]` or `arr[i]` indexing where the codegen materializes the const-zero index in ECX before the push. After my pass: `push dword [eax]` directly.
+  - Saves 2 bytes for `xor reg, reg` form, 5 bytes for `mov reg, IMM` form per match.
+  - **Conditions**: IDX dead after the push (push doesn't write IDX, so it retains the constant value; if read later, the rewrite is unsafe). BASE != IDX.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests (812 total). Pipeline 1734/1734 (100%).
