@@ -5179,6 +5179,276 @@ def test_disp_load_collapse_struct_member_pattern():
     assert opt.stats.get("disp_load_collapse") == 1
 
 
+# ── disp_store_collapse ───────────────────────────────────────────
+
+
+def test_disp_store_collapse_basic():
+    """`add reg, N; mov [reg], src` → `mov [reg + N], src` when reg is
+    dead after the store. Saves 2 bytes (drops the add)."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        add     ecx, 4\n"
+        "        mov     [ecx], eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     ecx" not in out
+    assert "mov     [ecx + 4], eax" in out
+    assert opt.stats.get("disp_store_collapse") == 1
+
+
+def test_disp_store_collapse_with_size_prefix():
+    """`add reg, N; mov dword [reg], imm` → `mov dword [reg + N], imm`."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        add     ecx, 4\n"
+        "        mov     dword [ecx], 42\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     ecx" not in out
+    assert "mov     dword [ecx + 4], 42" in out
+    assert opt.stats.get("disp_store_collapse") == 1
+
+
+def test_disp_store_collapse_negative_disp():
+    """Negative DISP collapses with `-` sign."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        add     ecx, -8\n"
+        "        mov     [ecx], eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     [ecx - 8], eax" in out
+    assert opt.stats.get("disp_store_collapse") == 1
+
+
+def test_disp_store_collapse_skips_when_reg_live():
+    """If REG is read after the store, can't drop the add."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        add     ecx, 4\n"
+        "        mov     [ecx], eax\n"
+        "        mov     edx, ecx\n"  # ecx live here
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("disp_store_collapse", 0) == 0
+
+
+def test_disp_store_collapse_skips_when_src_uses_base():
+    """If SRC references REG, the rewrite would change which value
+    is read at the store time."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 7\n"
+        "        add     eax, 4\n"
+        "        mov     [eax], eax\n"  # SRC == address reg
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("disp_store_collapse", 0) == 0
+
+
+def test_disp_store_collapse_rejects_non_literal_disp():
+    """Non-numeric add operand (e.g., label) doesn't collapse."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        add     ecx, _some_label\n"
+        "        mov     [ecx], eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("disp_store_collapse", 0) == 0
+
+
+def test_disp_store_collapse_rejects_existing_offset():
+    """If the store already uses `[reg + N]`, no further fold."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        add     ecx, 4\n"
+        "        mov     [ecx + 4], eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("disp_store_collapse", 0) == 0
+
+
+def test_disp_store_collapse_intermediate_load():
+    """Intermediate non-touching load is allowed between add and store.
+
+    Common shape: codegen emits `add reg, offset` then `mov src_reg,
+    [val_slot]` then `mov [reg], src_reg`. The intermediate load
+    doesn't reference REG, so disp_store_collapse can still fire
+    across it."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        add     ecx, 4\n"
+        "        mov     eax, [ebp + 16]\n"  # doesn't touch ecx
+        "        mov     [ecx], eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     ecx" not in out
+    assert "mov     [ecx + 4], eax" in out
+    assert opt.stats.get("disp_store_collapse") == 1
+
+
+def test_disp_store_collapse_skips_when_intermediate_reads_reg():
+    """If an intermediate instruction reads REG, can't fold."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        add     ecx, 4\n"
+        "        mov     edx, ecx\n"  # reads ecx
+        "        mov     [ecx], eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("disp_store_collapse", 0) == 0
+
+
+def test_disp_store_collapse_skips_when_intermediate_reads_flags():
+    """If an intermediate instruction reads flags, can't drop the add
+    (the add's flags would be observed)."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        add     ecx, 4\n"
+        "        je      .L_skip\n"  # reads flags
+        "        mov     [ecx], eax\n"
+        ".L_skip:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("disp_store_collapse", 0) == 0
+
+
+# ── load_add_xfer_forward ─────────────────────────────────────────
+
+
+def test_load_add_xfer_forward_basic():
+    """`mov R1, [m]; add R1, IMM; mov R2, R1` collapses to
+    `mov R2, [m]; add R2, IMM` when R1 is dead after.
+
+    Cascade note: after this pass converts the load+add+xfer to
+    `mov ecx, [ebp+8]; add ecx, 4`, disp_store_collapse may further
+    fold the trailing `mov [ecx], eax` into `mov [ecx + 4], eax`,
+    dropping the add too."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        add     eax, 4\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, [ebp + 16]\n"  # eax overwritten ⇒ dead
+        "        mov     [ecx], eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Pass fired at least once.
+    assert opt.stats.get("load_add_xfer_forward", 0) >= 1
+    # The transfer should be gone (cascading effect).
+    out_lines = out.split("\n")
+    has_xfer = any(
+        line.strip() == "mov     ecx, eax" for line in out_lines
+    )
+    assert not has_xfer
+
+
+def test_load_add_xfer_forward_skips_when_r1_live():
+    """If R1 is read after the transfer, we can't drop it."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        add     eax, 4\n"
+        "        mov     ecx, eax\n"
+        "        mov     [ebp - 4], eax\n"  # eax used here
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("load_add_xfer_forward", 0) == 0
+
+
+def test_load_add_xfer_forward_with_sub():
+    """`mov R1, [m]; sub R1, IMM; mov R2, R1` also collapses."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        sub     eax, 8\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, edx\n"  # eax overwritten = dead
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("load_add_xfer_forward", 0) >= 1
+
+
+def test_load_add_xfer_forward_rejects_self_reference():
+    """If SRC references R2, the rewrite would self-reference."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ecx + 8]\n"  # SRC references ECX
+        "        add     eax, 4\n"
+        "        mov     ecx, eax\n"  # would become mov ecx, [ecx + 8]
+        "        mov     eax, edx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("load_add_xfer_forward", 0) == 0
+
+
+def test_load_add_xfer_forward_rejects_non_literal_imm():
+    """Non-numeric add operand doesn't collapse."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        add     eax, _label\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, edx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("load_add_xfer_forward", 0) == 0
+
+
 # ── push_disp_collapse ───────────────────────────────────────────
 
 

@@ -431,6 +431,7 @@ class PeepholeOptimizer:
             # where the shl + add LABEL isn't followed by a load.
             lines = self._pass_shl_add_label_to_lea(lines)
             lines = self._pass_disp_load_collapse(lines)
+            lines = self._pass_disp_store_collapse(lines)
             lines = self._pass_push_disp_collapse(lines)
             lines = self._pass_push_index_collapse(lines)
             lines = self._pass_self_mov_elimination(lines)
@@ -449,6 +450,7 @@ class PeepholeOptimizer:
             lines = self._pass_dead_stack_store(lines)
             lines = self._pass_reg_copy_addr_forward(lines)
             lines = self._pass_value_forward_to_reg(lines)
+            lines = self._pass_load_add_xfer_forward(lines)
             lines = self._pass_byte_stores_to_dword(lines)
             lines = self._pass_pop_index_push_collapse(lines)
             lines = self._pass_pop_index_load_collapse(lines)
@@ -5014,6 +5016,157 @@ class PeepholeOptimizer:
             continue
         return out
 
+    def _pass_disp_store_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``add REG, DISP; ...; mov [REG], SRC`` into
+        ``...; mov [REG + DISP], SRC`` using x86's disp addressing
+        form.
+
+        Mirror of disp_load_collapse for stores. Saves bytes:
+        - DISP fits in imm8: save 2 bytes (3-byte add + 2-byte store
+          modrm → 3-byte store modrm with disp8).
+        - DISP needs imm32: save 1 byte similarly.
+
+        Tolerates up to 8 intermediate instructions between the add
+        and the store, provided each one:
+        - Doesn't read or write REG (we'd lose REG's pre-add value
+          which the rewrite needs to use directly).
+        - Doesn't read flags (the add sets flags; dropping the add
+          changes the observable flag state).
+
+        After the store:
+        - REG must be dead (the rewrite leaves REG with the pre-add
+          value).
+        - Flags must be safe (the add's flag effects aren't observed
+          via the rewrite).
+
+        Common in struct member assignment after the codegen produces
+        `add reg, offset; mov src, ...; mov [reg], src`. Pairs with
+        `load_add_xfer_forward` which collapses the prior
+        load+add+transfer into a direct load+add to the dest reg.
+        """
+        out = list(lines)
+        i = 0
+        while i < len(out):
+            a = out[i]
+            if not (a.kind == "instr" and a.op == "add"):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            if ap is None:
+                i += 1
+                continue
+            reg = ap[0].strip().lower()
+            try:
+                disp = int(ap[1].strip())
+            except ValueError:
+                i += 1
+                continue
+            if not self._is_general_register(reg):
+                i += 1
+                continue
+            # Walk forward up to 8 instr lines; each must:
+            # - not reference REG
+            # - not be a flag reader
+            # - not be a control-flow op (label, jump, ret)
+            # Stop when we find `mov [REG], SRC` (the store) or a
+            # blocker.
+            store_idx = None
+            scan_count = 0
+            j = i + 1
+            while j < len(out) and scan_count <= 8:
+                s = out[j]
+                if s.kind in ("blank", "comment"):
+                    j += 1
+                    continue
+                if s.kind != "instr":
+                    # Label / directive / data — can't continue.
+                    break
+                # Check if this is the candidate store.
+                if s.op == "mov":
+                    sp = _operands_split(s.operands)
+                    if sp is not None:
+                        s_dst, s_src = sp
+                        s_dst_stripped = s_dst.strip()
+                        size_prefix = ""
+                        for prefix in (
+                            "dword ", "word ", "byte ", "qword "
+                        ):
+                            if s_dst_stripped.lower().startswith(
+                                prefix
+                            ):
+                                size_prefix = s_dst_stripped[
+                                    :len(prefix)
+                                ]
+                                s_dst_stripped = s_dst_stripped[
+                                    len(prefix):
+                                ].lstrip()
+                                break
+                        mem_re = re.match(
+                            r"^\[([a-zA-Z]+)\s*\]$", s_dst_stripped
+                        )
+                        if (
+                            mem_re is not None
+                            and mem_re.group(1).lower() == reg
+                            and not self._references_reg_family(
+                                s_src.strip(), reg
+                            )
+                        ):
+                            # Found the store. Verify the size
+                            # prefix is preserved properly.
+                            store_idx = j
+                            store_size_prefix = size_prefix
+                            store_src = s_src.strip()
+                            break
+                # Not the candidate store. Check that this
+                # intermediate doesn't break the rewrite.
+                if self._references_reg_family(s.operands, reg):
+                    break
+                if s.op in self._FLAG_READING_OPS:
+                    break
+                # Control-flow ops break the scan.
+                if s.op in (
+                    "ret", "iret", "retf", "retn", "leave", "enter"
+                ):
+                    break
+                if s.op.startswith("j") or s.op == "call":
+                    break
+                scan_count += 1
+                j += 1
+            if store_idx is None:
+                i += 1
+                continue
+            # REG must be dead after the store.
+            if not self._reg_dead_after(out, store_idx + 1, reg):
+                i += 1
+                continue
+            # Flags must be safe after the store (we drop the add's
+            # flag-side effect).
+            if not self._flags_safe_after(out, store_idx + 1):
+                i += 1
+                continue
+            # Apply: drop line A, rewrite line at store_idx with
+            # `mov [REG + DISP], SRC`.
+            indent = self._extract_indent(out[store_idx].raw)
+            sign = "+" if disp >= 0 else "-"
+            new_dst = (
+                f"{store_size_prefix}[{reg} {sign} {abs(disp)}]"
+            )
+            new_raw = f"{indent}mov     {new_dst}, {store_src}"
+            new_line = Line(
+                raw=new_raw, kind="instr", op="mov",
+                operands=f"{new_dst}, {store_src}",
+            )
+            out[store_idx] = new_line
+            del out[i]
+            self.stats["disp_store_collapse"] = (
+                self.stats.get("disp_store_collapse", 0) + 1
+            )
+            # Don't advance i — the deletion shifted everything
+            # down by 1, and the new line at i may be another add.
+        return out
+
     def _pass_index_load_collapse(
         self, lines: list[Line]
     ) -> list[Line]:
@@ -9178,6 +9331,110 @@ class PeepholeOptimizer:
             out = out[:i] + [new_line] + out[i + 2:]
             self.stats["value_forward_to_reg"] = (
                 self.stats.get("value_forward_to_reg", 0) + 1
+            )
+            continue
+        return out
+
+    def _pass_load_add_xfer_forward(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``mov R1, SRC; add R1, IMM; mov R2, R1`` into
+        ``mov R2, SRC; add R2, IMM`` when R1 is dead after.
+
+        Saves 2 bytes (drops the register transfer). Sister of
+        `value_forward_to_reg` that handles the case where the load
+        is followed by a single arithmetic step before the transfer.
+
+        Common shape: struct member address materialization. The
+        codegen emits `mov R, [p_slot]; add R, offset; mov R2, R`
+        to compute the address of `p->member` into R2. After this
+        pass, the address goes directly to R2 — which lets later
+        passes (disp_store_collapse, disp_load_collapse) fold the
+        offset into the eventual deref.
+
+        Conditions:
+        - Three consecutive instr lines.
+        - Line A: ``mov R1, SRC`` (any source).
+        - Line B: ``add R1, IMM`` or ``sub R1, IMM`` (numeric).
+        - Line C: ``mov R2, R1`` (register copy).
+        - R1 != R2.
+        - R1 dead after line C.
+        - SRC must not reference R2 (would self-reference after
+          rewrite).
+        """
+        out = list(lines)
+        i = 0
+        while i + 2 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            c = out[i + 2]
+            if not (
+                a.kind == "instr" and a.op == "mov"
+                and b.kind == "instr" and b.op in ("add", "sub")
+                and c.kind == "instr" and c.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            cp = _operands_split(c.operands)
+            if ap is None or bp is None or cp is None:
+                i += 1
+                continue
+            r1 = ap[0].strip().lower()
+            src = ap[1].strip()
+            b_dst = bp[0].strip().lower()
+            b_imm = bp[1].strip()
+            c_dst = cp[0].strip().lower()
+            c_src = cp[1].strip().lower()
+            if (
+                not self._is_general_register(r1)
+                or not self._is_general_register(c_dst)
+            ):
+                i += 1
+                continue
+            # Add/sub must be on R1 with a numeric immediate.
+            if b_dst != r1:
+                i += 1
+                continue
+            try:
+                int(b_imm)
+            except ValueError:
+                i += 1
+                continue
+            # Line C must be R2 = R1, R1 != R2.
+            if c_src != r1 or c_dst == r1:
+                i += 1
+                continue
+            # SRC must not reference R2 (else changing dst reg from
+            # R1 to R2 would alter which memory location is read).
+            if "[" in src and _references_register(src, c_dst):
+                i += 1
+                continue
+            # SRC mustn't be R2 itself (would create self-mov).
+            if src.lower() == c_dst:
+                i += 1
+                continue
+            # R1 dead after line C.
+            if not self._reg_dead_after(out, i + 3, r1):
+                i += 1
+                continue
+            # Rewrite: replace 3 lines with 2.
+            indent_a = self._extract_indent(a.raw)
+            indent_b = self._extract_indent(b.raw)
+            new_a = Line(
+                raw=f"{indent_a}mov     {c_dst}, {src}",
+                kind="instr", op="mov",
+                operands=f"{c_dst}, {src}",
+            )
+            new_b = Line(
+                raw=f"{indent_b}{b.op}     {c_dst}, {b_imm}",
+                kind="instr", op=b.op,
+                operands=f"{c_dst}, {b_imm}",
+            )
+            out = out[:i] + [new_a, new_b] + out[i + 3:]
+            self.stats["load_add_xfer_forward"] = (
+                self.stats.get("load_add_xfer_forward", 0) + 1
             )
             continue
         return out
