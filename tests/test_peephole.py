@@ -2370,6 +2370,28 @@ def test_redundant_eax_load_disjoint_stack_writes_are_safe():
     assert opt.stats.get("redundant_eax_load") == 1
 
 
+def test_redundant_eax_load_after_store_to_unknown():
+    """When reg_mem was None (no prior load tracked), a `mov [m], REG`
+    establishes that REG equals [m] for any subsequent `mov REG, m`."""
+    asm = (
+        "_f:\n"
+        ".L_target:\n"
+        # No prior load — eax's value is unknown coming in (e.g.,
+        # from a merge of multiple branches).
+        "        mov     [ebp - 4], eax\n"
+        "        cmp     eax, ecx\n"  # read-only on eax, preserves
+        "        jle     .L_else\n"
+        "        mov     eax, [ebp - 4]\n"  # redundant after store
+        "        ret\n"
+        ".L_else:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The redundant load should be detected and dropped.
+    assert opt.stats.get("redundant_eax_load") == 1
+
+
 # ── label_offset_fold ────────────────────────────────────────────
 
 

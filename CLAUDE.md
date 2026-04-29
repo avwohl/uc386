@@ -1419,3 +1419,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete gcd win** (`b = a % b` after `cdq; idiv`): `mov eax, edx; mov [b], eax` → `mov [b], edx`. Saves 2 bytes.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +9 peephole tests (512 total). 957 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: redundant_eax_load tracks memory after stores**: extended `redundant_eax_load`'s memory-source tracker to also recognize that after `mov [m], REG` (where m is an ebp-offset and REG holds the source register), REG equals [m]'s value. A subsequent `mov REG, m` is then redundant.
+  - **Common shape**: ternary cascades (`int m = a > b ? a : b; m > c ? m : c`) where the codegen emits `mov [m_slot], eax` after computing the first ternary result, then later reloads via `mov eax, [m_slot]` for the second ternary's branch. Without this update, the merge-point reset at `.L_tern_end` wiped the tracker, so the reload couldn't be detected as redundant.
+  - **Conservative implementation**: only sets reg_mem to the new location when reg_mem was already None. If reg_mem was tracking a prior valid location (which the disjoint-stack-write check preserved), we keep that — multi-location tracking would be ideal but reg_mem is single-valued.
+  - **Cascade with jcc_jmp_inversion**: after the redundant load is dropped, the resulting `jle .L_else; jmp .L_end; .L_else: mov eax, [m]; .L_end:` chain (where `mov eax, [m]` was the now-dead reload) is collapsed by jcc_jmp_inversion to `jg .L_end; .L_else: ...`. So `_max3` body shrinks from 13 instructions to 9 — saves 4 instructions per ternary chain.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +1 peephole test (513 total). 958 unit tests total. Pipeline 1734/1734 (100%).

@@ -2776,12 +2776,30 @@ class PeepholeOptimizer:
                         out.append(line)
                         continue
                     if "[" in dest:
+                        # Aliasing check: if the store might alias
+                        # the currently-tracked memory, invalidate.
                         if reg_mem is not None and not self._mem_disjoint(
                             reg_mem, dest.strip()
                         ):
                             reg_mem = None
+                        # Sub-reg dest: shouldn't happen with `[`,
+                        # but be defensive.
                         if dest_low in sub_regs:
                             reg_mem = None
+                        # If the store is `mov [m], REG` where m is
+                        # an ebp-offset, then after the store REG
+                        # equals what's at m. Track that — a later
+                        # `mov REG, m` is then redundant. Only set
+                        # when reg_mem was None (we don't want to
+                        # overwrite a still-valid prior tracking
+                        # entry; full multi-location tracking would
+                        # be ideal but reg_mem is single-valued).
+                        if (
+                            reg_mem is None
+                            and src_norm.lower() == reg32
+                            and self._is_ebp_offset_mem(dest.strip())
+                        ):
+                            reg_mem = dest.strip()
                         out.append(line)
                         continue
                     if dest_low in sub_regs:
