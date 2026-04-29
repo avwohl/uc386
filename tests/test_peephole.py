@@ -5734,3 +5734,287 @@ def test_dead_stack_store_skips_across_lea_of_same_offset():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("dead_stack_store", 0) == 0
+
+
+# ── dup_push_pop_self_op ─────────────────────────────────────────
+
+
+def test_dup_push_pop_self_op_imul():
+    """The `arr[i] * arr[i]` pattern: codegen pushes a copy of the
+    left operand (memory) then reloads from the same memory for the
+    right operand. Drops the push/pop pair and rewrites `imul eax,
+    ecx` to `imul eax, eax`.
+    """
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp + 12]\n"
+        "        push    dword [eax + ecx*4]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        pop     ecx\n"
+        "        imul    eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    dword [eax + ecx*4]" not in out
+    assert "pop     ecx\n" not in out
+    assert "imul    eax, eax" in out
+    assert opt.stats.get("dup_push_pop_self_op") == 1
+
+
+def test_dup_push_pop_self_op_add():
+    """add is commutative — also collapses."""
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp - 4]\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        pop     ecx\n"
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     eax, eax" in out
+    assert opt.stats.get("dup_push_pop_self_op") == 1
+
+
+def test_dup_push_pop_self_op_skips_sub():
+    """sub is NOT commutative — must not collapse."""
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp - 4]\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        pop     ecx\n"
+        "        sub     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dup_push_pop_self_op", 0) == 0
+
+
+def test_dup_push_pop_self_op_skips_different_x():
+    """When push X1 and mov X2 differ, no rewrite."""
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp - 4]\n"
+        "        mov     eax, [ebp - 8]\n"  # different memory!
+        "        pop     ecx\n"
+        "        imul    eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dup_push_pop_self_op", 0) == 0
+
+
+def test_dup_push_pop_self_op_skips_esp_dependent_x():
+    """X must not reference esp — push/pop modify esp, so the mov's
+    read after the push would land at a different byte than what
+    push wrote (esp shifted by 4)."""
+    asm = (
+        "_f:\n"
+        "        push    dword [esp + 4]\n"
+        "        mov     eax, [esp + 4]\n"
+        "        pop     ecx\n"
+        "        imul    eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dup_push_pop_self_op", 0) == 0
+
+
+def test_dup_push_pop_self_op_skips_when_reg2_live():
+    """reg2 (the popped reg) holds X after the OP in the original;
+    in the rewrite reg2 is unchanged. If reg2 is live after, the
+    rewrite is unsafe."""
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp - 4]\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        pop     ecx\n"
+        "        imul    eax, ecx\n"
+        "        mov     edx, ecx\n"  # ECX is read here!
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dup_push_pop_self_op", 0) == 0
+
+
+def test_dup_push_pop_self_op_skips_pop_into_eax():
+    """If the pop reg matches the mov dest reg (both eax), the
+    pattern is different — pop overwrites the loaded value."""
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp - 4]\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        pop     eax\n"  # would overwrite eax!
+        "        imul    eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dup_push_pop_self_op", 0) == 0
+
+
+def test_dup_push_pop_self_op_register_form():
+    """When push pushes a register and the same register is loaded
+    via a mem ref (different shape) — should NOT match because push
+    operand is a reg name, mov src is `[mem]` — different text."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"  # push reg
+        "        mov     eax, [ebp - 4]\n"
+        "        pop     ecx\n"
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    # push eax != mov eax, [ebp-4] — different operands.
+    assert opt.stats.get("dup_push_pop_self_op", 0) == 0
+
+
+# ── push_pop_op_to_memop ─────────────────────────────────────────
+
+
+def test_push_pop_op_to_memop_factorial_imul():
+    """The recursive `n * factorial(n - 1)` shape: codegen pushes n
+    (an ebp-relative param) before the recursive call, then pops it
+    back into ECX after the call. Drops the push/pop and uses memory
+    operand directly: `imul eax, dword [ebp + 8]`."""
+    asm = (
+        "_factorial:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        push    dword [ebp + 8]\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        dec     eax\n"
+        "        push    eax\n"
+        "        call    _factorial\n"
+        "        add     esp, 4\n"
+        "        pop     ecx\n"
+        "        imul    eax, ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    dword [ebp + 8]" not in out
+    assert "pop     ecx\n" not in out
+    assert "imul    eax, dword [ebp + 8]" in out
+    assert opt.stats.get("push_pop_op_to_memop") == 1
+
+
+def test_push_pop_op_to_memop_skips_when_addr_taken():
+    """When the function takes the address of X via `lea reg, [ebp +
+    N]`, a call in the chain might mutate X via a captured pointer.
+    The codegen's saved-value-vs-current-value distinction matters
+    in this case — bail."""
+    asm = (
+        "_test:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        push    dword [ebp + 8]\n"
+        "        lea     eax, [ebp + 8]\n"  # captures &X
+        "        push    eax\n"
+        "        call    _mut2\n"
+        "        add     esp, 4\n"
+        "        pop     ecx\n"
+        "        add     eax, ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_op_to_memop", 0) == 0
+
+
+def test_push_pop_op_to_memop_skips_chain_writes_x():
+    """If the chain writes to X's slot, the rewrite would use the
+    new value instead of the saved one. Bail."""
+    asm = (
+        "_test:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        push    dword [ebp - 4]\n"
+        "        mov     eax, 99\n"
+        "        mov     [ebp - 4], eax\n"  # writes X!
+        "        call    _foo\n"
+        "        pop     ecx\n"
+        "        add     eax, ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_op_to_memop", 0) == 0
+
+
+def test_push_pop_op_to_memop_skips_register_push():
+    """X must be ebp-relative (function param or local). Register
+    pushes are not safe (the register's value isn't fixed)."""
+    asm = (
+        "_test:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        push    eax\n"  # register push, not ebp-relative
+        "        call    _foo\n"
+        "        pop     ecx\n"
+        "        add     eax, ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_op_to_memop", 0) == 0
+
+
+def test_push_pop_op_to_memop_skips_short_chain():
+    """The narrow 4-line case (chain length 1 with same X) is handled
+    by `_pass_dup_push_pop_self_op` and saves 1 byte more via reg-reg
+    form. This pass requires chain length ≥ 2 to avoid duplicating
+    optimization opportunities."""
+    asm = (
+        "_test:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        push    dword [ebp - 4]\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        pop     ecx\n"
+        "        add     eax, ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The narrow pass fires instead.
+    assert opt.stats.get("dup_push_pop_self_op", 0) == 1
+    assert opt.stats.get("push_pop_op_to_memop", 0) == 0
+    assert "add     eax, eax" in out
+
+
+def test_push_pop_op_to_memop_skips_sub():
+    """sub is NOT commutative — must not collapse."""
+    asm = (
+        "_test:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        push    dword [ebp + 8]\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        dec     eax\n"
+        "        push    eax\n"
+        "        call    _foo\n"
+        "        add     esp, 4\n"
+        "        pop     ecx\n"
+        "        sub     eax, ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_op_to_memop", 0) == 0

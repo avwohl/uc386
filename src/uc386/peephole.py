@@ -401,6 +401,8 @@ class PeepholeOptimizer:
             lines = self._pass_push_index_collapse(lines)
             lines = self._pass_self_mov_elimination(lines)
             lines = self._pass_transfer_pop_collapse(lines)
+            lines = self._pass_dup_push_pop_self_op(lines)
+            lines = self._pass_push_pop_op_to_memop(lines)
             lines = self._pass_label_load_collapse(lines)
             lines = self._pass_label_push_collapse(lines)
             lines = self._pass_label_store_collapse(lines)
@@ -4499,6 +4501,423 @@ class PeepholeOptimizer:
             )
             continue
         return out
+
+    def _pass_dup_push_pop_self_op(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse the canonical "X OP X" pattern where the codegen
+        pushes one copy of X and reloads X for the second operand.
+
+        Pattern (4 consecutive instr lines):
+            push    X
+            mov     reg1, X
+            pop     reg2
+            OP      reg1, reg2
+
+        Rewrite to:
+            mov     reg1, X
+            OP      reg1, reg1
+
+        Saves 2 instructions per match. The push/pop pair is dead
+        because both copies of X are equal (the mov reloaded it from
+        the same memory) — the OP can use reg1 as both operands.
+
+        Common in `arr[i] * arr[i]` style where the codegen evaluates
+        the left to memory-push form (because evaluating the right
+        will clobber EAX), then reloads from the same memory address.
+
+        Conditions:
+        - Line 1 op = "push", any operand X.
+        - Line 2 op = "mov", parts = (reg1, X) where reg1 is a 32-bit
+          GP register and X matches line 1's push operand text.
+        - Line 3 op = "pop", operand = reg2 (32-bit GP register, ≠
+          reg1).
+        - Line 4 op ∈ {add, and, or, xor, imul} (commutative), parts
+          = (reg1, reg2).
+        - X must not reference esp (push/pop modify ESP between
+          line 1 and line 3; if X depends on esp, the mov in line 2
+          could read different bytes than the push wrote).
+        - X must not reference reg1 if reg1 is non-eax — actually
+          this isn't an issue because we keep line 2 (the mov) which
+          loads X to reg1 in the original order. The OP comes after
+          the load, so reg1 holds X. We're just changing the OP's
+          second operand from reg2 (= X via pop) to reg1 (= X via
+          mov). Both equal X.
+        - reg2 must be dead after line 4. The original ends with
+          reg2 = X; the rewrite leaves reg2 unchanged.
+        """
+        out = list(lines)
+        i = 0
+        while i < len(out):
+            instrs = self._next_n_instrs(out, i, 4)
+            if instrs is None:
+                i += 1
+                continue
+            (a_idx, a), (b_idx, b), (c_idx, c), (d_idx, d) = instrs
+            if a.op != "push" or b.op != "mov" or c.op != "pop":
+                i += 1
+                continue
+            if d.op not in PeepholeOptimizer._COMMUTATIVE_BINOPS:
+                i += 1
+                continue
+            push_x = a.operands.strip()
+            # Line 2: mov reg1, X
+            bp = _operands_split(b.operands)
+            if bp is None:
+                i += 1
+                continue
+            b_dst, b_src = bp
+            reg1 = b_dst.strip().lower()
+            if reg1 not in PeepholeOptimizer._GP32:
+                i += 1
+                continue
+            # Compare push X and mov src X. They must read identical
+            # bytes; we compare normalized text. The push may have a
+            # `dword` prefix that the mov source omits; strip it.
+            push_x_norm = self._strip_size_prefix(push_x)
+            mov_src_norm = self._strip_size_prefix(b_src.strip())
+            if push_x_norm.lower() != mov_src_norm.lower():
+                i += 1
+                continue
+            # X must not reference esp (push moves esp).
+            if _references_register(push_x_norm, "esp"):
+                i += 1
+                continue
+            # Line 3: pop reg2
+            reg2 = c.operands.strip().lower()
+            if reg2 not in PeepholeOptimizer._GP32:
+                i += 1
+                continue
+            if reg2 == reg1:
+                i += 1
+                continue
+            # Line 4: OP reg1, reg2
+            dp = _operands_split(d.operands)
+            if dp is None:
+                i += 1
+                continue
+            d_dst, d_src = dp
+            if d_dst.strip().lower() != reg1:
+                i += 1
+                continue
+            if d_src.strip().lower() != reg2:
+                i += 1
+                continue
+            # reg2 must be dead after line 4.
+            if not self._reg_dead_after(out, d_idx + 1, reg2):
+                i += 1
+                continue
+            # Rewrite: drop A (push) and C (pop); modify D's operand.
+            indent = self._extract_indent(d.raw)
+            spaces = max(1, 8 - len(d.op))
+            new_d = Line(
+                raw=f"{indent}{d.op}{' ' * spaces}{reg1}, {reg1}",
+                kind="instr",
+                op=d.op,
+                operands=f"{reg1}, {reg1}",
+            )
+            out = (
+                out[:a_idx]
+                + [b]
+                + [new_d]
+                + out[d_idx + 1:]
+            )
+            self.stats["dup_push_pop_self_op"] = (
+                self.stats.get("dup_push_pop_self_op", 0) + 1
+            )
+            # Don't advance i; new line at i may fire another pass.
+            continue
+        return out
+
+    _GP32: frozenset[str] = frozenset({
+        "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+    })
+
+    def _pass_push_pop_op_to_memop(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse the LHS-saved-across-call binop pattern:
+
+            push    dword [ebp ± N]    ; save LHS
+            ... chain (incl. calls) ... ; produces RHS in EAX
+            pop     reg2                ; restore LHS into reg2
+            OP      reg1, reg2          ; reg1 = chain result (EAX)
+
+        Rewrite to:
+
+            ... chain ...
+            OP      reg1, [ebp ± N]    ; OP reg-mem (commutative)
+
+        Saves 2 instructions per match (drops the push and the pop).
+        Common in recursive functions where the LHS is saved across
+        the recursive call (e.g. ``n * factorial(n-1)``).
+
+        Conditions:
+        - Line 1: ``push <size?> [ebp + N]`` or ``push <size?> [ebp - N]``
+          where N is a numeric literal. Restricted to ebp-relative
+          addressing because ebp is callee-saved (cdecl), so X's
+          memory location is preserved across calls.
+        - Lines 2..N: chain. Stack-balanced (every inner push has a
+          matching inner pop or `add esp, K` cleanup). Must not store
+          to X (no `mov [ebp ± N], ...` with the same offset).
+          Calls allowed; we trust cdecl + ebp-callee-saved.
+        - Line N+1: ``pop reg2`` (32-bit GP register, ≠ reg1).
+        - Line N+2: ``OP reg1, reg2`` where OP ∈ commutative binops.
+        - reg2 must be dead after line N+2.
+        - Chain must not take the address of X via ``lea reg, [ebp ± N]``
+          with the same offset (a pointer to X could be passed to a
+          call that mutates it).
+        - Excludes the narrow 4-line case (chain length 1 with same X)
+          which is handled by `_pass_dup_push_pop_self_op` and saves
+          1 byte more (reg-reg form vs reg-mem form).
+        """
+        out = list(lines)
+        i = 0
+        while i < len(out):
+            push_line = out[i]
+            if (
+                push_line.kind != "instr"
+                or push_line.op != "push"
+            ):
+                i += 1
+                continue
+            push_x = push_line.operands.strip()
+            x_clean = self._strip_size_prefix(push_x)
+            x_off = self._ebp_offset(x_clean)
+            if x_off is None:
+                i += 1
+                continue
+            # Function-wide aliasing check: bail if any `lea` in the
+            # function takes the address of X's slot. If `&X` is
+            # captured anywhere, a call in the chain might mutate X
+            # via that pointer, and the saved-value-vs-current-value
+            # difference would be observable. (The codegen pushes
+            # unconditionally — it doesn't know whether the call
+            # could mutate; my pass assumes X is unchanged.)
+            if self._function_takes_ebp_addr(out, i, x_off):
+                i += 1
+                continue
+            # Walk forward to find the matching pop. Track stack
+            # depth — balanced inner push/pop pairs and add/sub esp
+            # adjustments are part of the chain.
+            depth = 1
+            pop_idx = None
+            chain_safe = True
+            j = i + 1
+            while j < len(out):
+                ln = out[j]
+                if ln.kind == "label":
+                    chain_safe = False
+                    break
+                if ln.kind != "instr":
+                    j += 1
+                    continue
+                op = ln.op
+                if op == "push":
+                    depth += 1
+                    j += 1
+                    continue
+                if op == "pop":
+                    depth -= 1
+                    if depth == 0:
+                        pop_idx = j
+                        break
+                    j += 1
+                    continue
+                if op in ("ret", "iret", "iretd", "retf", "retn",
+                          "leave", "jmp", "enter"):
+                    chain_safe = False
+                    break
+                if (
+                    op in ("add", "sub")
+                    and ln.operands.lower().startswith("esp,")
+                ):
+                    # Adjust depth: `add esp, 4` pops 1, `sub esp, 4`
+                    # pushes 1. We don't know the K dynamically — but
+                    # after `call`, ``add esp, K`` is the standard
+                    # cleanup. Treat as zero-net inner push/pop:
+                    # if it's `add esp, K`, decrement depth by K/4;
+                    # if `sub esp, K`, increment by K/4.
+                    parts_esp = _operands_split(ln.operands)
+                    if parts_esp is None:
+                        chain_safe = False
+                        break
+                    _, esp_amt = parts_esp
+                    try:
+                        amt = int(esp_amt.strip(), 0)
+                    except ValueError:
+                        chain_safe = False
+                        break
+                    if amt % 4 != 0:
+                        chain_safe = False
+                        break
+                    delta = amt // 4
+                    if op == "add":
+                        depth -= delta
+                    else:
+                        depth += delta
+                    if depth <= 0:
+                        # add esp, K can pop the saved X if K is too
+                        # large. Bail.
+                        chain_safe = False
+                        break
+                    j += 1
+                    continue
+                # Memory store check: bail if writes to X's slot.
+                op_parts = _operands_split(ln.operands or "")
+                if op_parts is not None:
+                    m_dest, _ = op_parts
+                    if "[" in m_dest:
+                        m_off = self._ebp_offset(
+                            self._strip_size_prefix(m_dest.strip())
+                        )
+                        if m_off is not None and m_off == x_off:
+                            chain_safe = False
+                            break
+                # LEA of address-of-X: bail (pointer escape).
+                if op == "lea":
+                    if op_parts is not None:
+                        _, lea_src = op_parts
+                        lea_off = self._ebp_offset(
+                            lea_src.strip()
+                        )
+                        if lea_off is not None and lea_off == x_off:
+                            chain_safe = False
+                            break
+                j += 1
+            if not chain_safe or pop_idx is None:
+                i += 1
+                continue
+            # Chain must have at least 2 instructions (the narrow
+            # 1-instr case is handled by _pass_dup_push_pop_self_op
+            # and saves 1 byte more via reg-reg form).
+            chain_instrs = sum(
+                1 for k in range(i + 1, pop_idx)
+                if out[k].kind == "instr"
+            )
+            if chain_instrs < 2:
+                i += 1
+                continue
+            # Pop reg2 (32-bit GP).
+            pop_reg = out[pop_idx].operands.strip().lower()
+            if pop_reg not in PeepholeOptimizer._GP32:
+                i += 1
+                continue
+            # Find the OP line right after pop (skip blanks/comments).
+            op_idx = None
+            for k in range(pop_idx + 1, len(out)):
+                if out[k].kind == "label":
+                    break
+                if out[k].kind == "instr":
+                    op_idx = k
+                    break
+            if op_idx is None:
+                i += 1
+                continue
+            op_line = out[op_idx]
+            if op_line.op not in PeepholeOptimizer._COMMUTATIVE_BINOPS:
+                i += 1
+                continue
+            opp = _operands_split(op_line.operands)
+            if opp is None:
+                i += 1
+                continue
+            reg1 = opp[0].strip().lower()
+            op_src = opp[1].strip().lower()
+            if reg1 not in PeepholeOptimizer._GP32 or reg1 == pop_reg:
+                i += 1
+                continue
+            if op_src != pop_reg:
+                i += 1
+                continue
+            # reg2 (pop_reg) dead after op_idx.
+            if not self._reg_dead_after(out, op_idx + 1, pop_reg):
+                i += 1
+                continue
+            # Rewrite. New OP line uses memory operand X.
+            indent = self._extract_indent(op_line.raw)
+            spacer = " " * max(8 - len(op_line.op), 1)
+            mem_text = f"dword {x_clean}"
+            new_op_raw = (
+                f"{indent}{op_line.op}{spacer}{reg1}, {mem_text}"
+            )
+            new_op_line = Line(
+                raw=new_op_raw,
+                kind="instr",
+                op=op_line.op,
+                operands=f"{reg1}, {mem_text}",
+            )
+            new_out = []
+            new_out.extend(out[:i])  # before push
+            new_out.extend(out[i + 1:pop_idx])  # chain (drop push)
+            new_out.extend(out[pop_idx + 1:op_idx])  # between pop & op
+            new_out.append(new_op_line)
+            new_out.extend(out[op_idx + 1:])
+            out = new_out
+            self.stats["push_pop_op_to_memop"] = (
+                self.stats.get("push_pop_op_to_memop", 0) + 1
+            )
+            # Don't advance i; new line may fire another pass.
+            continue
+        return out
+
+    def _function_takes_ebp_addr(
+        self, lines: list[Line], cur_idx: int, off: int
+    ) -> bool:
+        """Scan the enclosing function for any `lea reg, [ebp ± off]`
+        that captures the address of the slot at the given offset.
+
+        Walks outward from cur_idx until hitting a function-defining
+        label (a top-level label whose name starts with `_` and isn't
+        a `.local`). Conservatively returns True on syntactic match;
+        we don't try to prove that the captured address doesn't
+        escape — any escape opens the door to mid-chain mutation.
+        """
+        # Find function start: walk backward to the most recent
+        # top-level label (kind=label, label starts with `_`, no `.`).
+        start = 0
+        for k in range(cur_idx - 1, -1, -1):
+            ln = lines[k]
+            if ln.kind == "label":
+                lab = ln.label
+                if lab and lab.startswith("_") and "." not in lab:
+                    start = k + 1
+                    break
+        # Find function end: walk forward to the next top-level
+        # label (or end of file).
+        end = len(lines)
+        for k in range(cur_idx + 1, len(lines)):
+            ln = lines[k]
+            if ln.kind == "label":
+                lab = ln.label
+                if lab and lab.startswith("_") and "." not in lab:
+                    end = k
+                    break
+        # Build the X-pattern text we're matching against.
+        sign = "+" if off > 0 else "-"
+        target = f"[ebp {sign} {abs(off)}]"
+        for k in range(start, end):
+            ln = lines[k]
+            if ln.kind != "instr" or ln.op != "lea":
+                continue
+            opp = _operands_split(ln.operands)
+            if opp is None:
+                continue
+            _, src = opp
+            src_norm = src.strip().lower()
+            if src_norm == target:
+                return True
+        return False
+
+    @staticmethod
+    def _strip_size_prefix(text: str) -> str:
+        """Strip optional NASM size prefix (`dword`, `word`, `byte`,
+        `qword`) from a memory operand text."""
+        s = text.strip()
+        for prefix in ("dword ", "word ", "byte ", "qword "):
+            if s.lower().startswith(prefix):
+                return s[len(prefix):].lstrip()
+        return s
 
     def _pass_label_load_collapse(
         self, lines: list[Line]
