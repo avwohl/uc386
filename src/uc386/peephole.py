@@ -84,6 +84,10 @@ Currently implements:
     reg` into `OP dword [mem], IMM` when reg is dead after. OP is
     one of add/sub/and/or/xor. Saves 5 bytes per match. Common in
     compound assignments to memory operands (`x += 5`).
+  - fst_fstp_collapse: collapse `fst <addr>; fstp st0` into a single
+    `fstp <addr>`. Saves 2 bytes per match. Common in FPU-heavy
+    code — uc386 codegen lowers `*p = expr` for float/double via
+    fst+fstp-st0, which equals fstp-to-mem.
 
 Patterns to add (see PEEPHOLE_PLAN.md for details): tail calls,
 jump threading, multi-instruction right-operand retargeting.
@@ -305,6 +309,7 @@ class PeepholeOptimizer:
             lines = self._pass_label_offset_fold(lines)
             lines = self._pass_cmp_load_collapse(lines)
             lines = self._pass_rmw_collapse(lines)
+            lines = self._pass_fst_fstp_collapse(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -2477,6 +2482,54 @@ class PeepholeOptimizer:
         if sl in {"ebx", "ecx", "edx", "esi", "edi"}:
             return sl
         return None
+
+    def _pass_fst_fstp_collapse(self, lines: list[Line]) -> list[Line]:
+        """Collapse ``fst <addr>; fstp st0`` into a single
+        ``fstp <addr>``. Saves 2 bytes per match.
+
+        ``fst <addr>`` stores st0 to memory without popping; ``fstp
+        st0`` then pops the FPU stack (writing st0 to st0 first,
+        which is a no-op). The combined effect is equivalent to a
+        single ``fstp <addr>`` (store-and-pop). Same final FPU
+        stack state, same memory write, fewer bytes.
+
+        uc386 lowers ``*p = float_expr`` and similar through this
+        pattern — see ``_eval_float_to_st0`` callers that store via
+        ``fst`` followed by an explicit ``fstp st0`` cleanup.
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (
+                i + 1 < len(lines)
+                and line.kind == "instr"
+                and line.op == "fst"
+            ):
+                nxt = lines[i + 1]
+                if (
+                    nxt.kind == "instr"
+                    and nxt.op == "fstp"
+                    and nxt.operands.strip().lower()
+                    in ("st0", "st(0)")
+                ):
+                    indent = self._extract_indent(line.raw)
+                    new_raw = f"{indent}fstp    {line.operands}"
+                    new_line = Line(
+                        raw=new_raw,
+                        kind="instr",
+                        op="fstp",
+                        operands=line.operands,
+                    )
+                    out.append(new_line)
+                    self.stats["fst_fstp_collapse"] = (
+                        self.stats.get("fst_fstp_collapse", 0) + 1
+                    )
+                    i += 2
+                    continue
+            out.append(line)
+            i += 1
+        return out
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
         """P-jmp-to-next: `jmp X` immediately (modulo blanks/comments)

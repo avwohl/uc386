@@ -997,3 +997,8 @@ See `README.md` for the public roadmap (Phase 0–6).
   - Aggregate torture savings stable at 20.8% — most rmw operations in the codegen are immediate-form already (compound assign with literals); the register-form is rarer (compound assign of a non-cached reg, which is even rarer because uc386 keeps EAX cached by default).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +2 peephole tests (570 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: fst_fstp_collapse**: collapse `fst <addr>; fstp st0` into a single `fstp <addr>`. Saves 2 bytes per match. Common in FPU-heavy code — uc386's float store path emits `fst` (store without pop) followed by `fstp st0` (pop the FPU stack). The combined effect is `fstp <addr>` (store-and-pop): same memory write, same final FPU stack, 2 fewer bytes.
+  - **Match conditions**: two adjacent instructions, first is `fst <addr>`, second is `fstp st0` (or `fstp st(0)` — NASM accepts both forms).
+  - **20021120-1.c (FPU-heavy torture)**: 48807 → 43011 bytes (-5796 bytes, 11.9%). All 218 `fstp st0` lines in the unoptimized output collapsed.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests (575 total). Pipeline 1734/1734 (100%).

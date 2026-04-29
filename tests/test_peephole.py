@@ -2175,6 +2175,82 @@ def test_rmw_collapse_at_function_call_witness():
     assert opt.stats.get("rmw_collapse") == 1
 
 
+# ── fst_fstp_collapse ────────────────────────────────────────────
+
+
+def test_fst_fstp_collapse_basic_qword():
+    asm = (
+        "_f:\n"
+        "        fld     qword [eax]\n"
+        "        fst     qword [ebp - 8]\n"
+        "        fstp    st0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        fstp    qword [ebp - 8]" in out
+    assert "        fst     qword" not in out
+    assert "        fstp    st0" not in out
+    assert opt.stats.get("fst_fstp_collapse") == 1
+
+
+def test_fst_fstp_collapse_dword():
+    asm = (
+        "_f:\n"
+        "        fst     dword [ebp - 4]\n"
+        "        fstp    st0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        fstp    dword [ebp - 4]" in out
+    assert opt.stats.get("fst_fstp_collapse") == 1
+
+
+def test_fst_fstp_collapse_skips_when_not_st0():
+    """`fst X; fstp st1` (popping into a different register) is not
+    the simple case — leave it alone."""
+    asm = (
+        "_f:\n"
+        "        fst     qword [ebp - 8]\n"
+        "        fstp    st1\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        fst     qword [ebp - 8]" in out
+    assert opt.stats.get("fst_fstp_collapse", 0) == 0
+
+
+def test_fst_fstp_collapse_skips_intervening():
+    """Don't collapse when there's other code between the fst and
+    fstp — that code might depend on st0."""
+    asm = (
+        "_f:\n"
+        "        fst     qword [ebp - 8]\n"
+        "        fld1\n"
+        "        fstp    st0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("fst_fstp_collapse", 0) == 0
+
+
+def test_fst_fstp_collapse_st_paren_form():
+    """NASM accepts both `st0` and `st(0)`. Both should match."""
+    asm = (
+        "_f:\n"
+        "        fst     dword [eax]\n"
+        "        fstp    st(0)\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        fstp    dword [eax]" in out
+    assert opt.stats.get("fst_fstp_collapse") == 1
+
+
 # ── Convergence ──────────────────────────────────────────────────
 
 
