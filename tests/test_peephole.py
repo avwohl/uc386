@@ -7887,3 +7887,173 @@ def test_mov_test_setcc_movzx_collapse_global_memory():
     out = opt.optimize(asm)
     assert "cmp     dword [_glob], 0" in out
     assert opt.stats.get("mov_test_setcc_movzx_collapse", 0) == 1
+
+
+def test_rmw_mem_src_collapse_basic():
+    """`mov eax, [m1]; add eax, [m2]; mov [m1], eax; <eax-dead>` →
+    `mov eax, [m2]; add [m1], eax`. Saves 3 bytes.
+
+    Tests use `xor eax, eax` after the pattern to make EAX dead
+    (the rewrite changes EAX's final value, so we need EAX dead)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, [ebp - 8]\n"
+        "        mov     [ebp - 4], eax\n"
+        "        xor     eax, eax\n"  # EAX dead
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [ebp - 8]" in out
+    assert "add     [ebp - 4], eax" in out
+    # The original load+store of [ebp - 4] are gone.
+    assert "mov     eax, [ebp - 4]" not in out
+    assert "mov     [ebp - 4], eax" not in out
+    assert opt.stats.get("rmw_mem_src_collapse", 0) == 1
+
+
+def test_rmw_mem_src_collapse_all_ops():
+    """All supported OPs fire."""
+    for op in ["add", "sub", "and", "or", "xor"]:
+        asm = (
+            "_f:\n"
+            "        mov     eax, [ebp - 4]\n"
+            f"        {op}     eax, [ebp - 8]\n"
+            "        mov     [ebp - 4], eax\n"
+            "        xor     eax, eax\n"  # EAX dead
+            "        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        out = opt.optimize(asm)
+        spacer = " " * max(1, 8 - len(op))
+        assert f"{op}{spacer}[ebp - 4], eax" in out
+        assert opt.stats.get("rmw_mem_src_collapse", 0) == 1
+
+
+def test_rmw_mem_src_collapse_skips_imul():
+    """imul has no `imul r/m32, imm/r32` form for two memory operands.
+    Single-operand imul writes EDX:EAX. Skip imul (and imul-mem-form
+    isn't a 2-byte savings anyway)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        imul    eax, [ebp - 8]\n"
+        "        mov     [ebp - 4], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("rmw_mem_src_collapse", 0) == 0
+
+
+def test_rmw_mem_src_collapse_label_memory():
+    """Label memory `[_g]` and `[_h]` work."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [_g]\n"
+        "        add     eax, [_h]\n"
+        "        mov     [_g], eax\n"
+        "        xor     eax, eax\n"  # EAX dead
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [_h]" in out
+    assert "add     [_g], eax" in out
+    assert opt.stats.get("rmw_mem_src_collapse", 0) == 1
+
+
+def test_rmw_mem_src_collapse_skips_same_mem():
+    """If [m1] == [m2], same_memory_operand_reuse handles a
+    different optimization — and rmw_collapse can't apply because
+    the OP source would be EAX after the rewrite (rejected by
+    rmw_collapse). Just bail."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, [ebp - 4]\n"  # same m
+        "        mov     [ebp - 4], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("rmw_mem_src_collapse", 0) == 0
+
+
+def test_rmw_mem_src_collapse_skips_register_base_addr():
+    """If [m1] uses register-base addressing, aliasing with [m2]
+    is possible. Skip for safety."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebx]\n"  # register-base
+        "        add     eax, [ebp - 8]\n"
+        "        mov     [ebx], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("rmw_mem_src_collapse", 0) == 0
+
+
+def test_rmw_mem_src_collapse_skips_eax_live_after():
+    """If EAX is read after the store, the rewrite changes EAX's
+    final value (orig: eax = [m1] + [m2]; rewrite: eax = [m2])."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, [ebp - 8]\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     [ebp - 12], eax\n"  # EAX read again
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("rmw_mem_src_collapse", 0) == 0
+
+
+def test_rmw_mem_src_collapse_skips_mismatched_dest():
+    """If `mov [m1'], eax` stores to a DIFFERENT slot, this isn't a
+    compound assign on m1. Skip."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, [ebp - 8]\n"
+        "        mov     [ebp - 12], eax\n"  # different from [ebp - 4]
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("rmw_mem_src_collapse", 0) == 0
+
+
+def test_rmw_mem_src_collapse_skips_src_references_dest_reg():
+    """If [m2] references the dest register (e.g., `[eax + 4]`),
+    skip — the rewrite's `mov reg, [m2]` would self-reference."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, [eax + 4]\n"  # references eax
+        "        mov     [ebp - 4], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("rmw_mem_src_collapse", 0) == 0
+
+
+def test_rmw_mem_src_collapse_other_reg():
+    """Pattern works for non-EAX registers too."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        add     ecx, [ebp - 8]\n"
+        "        mov     [ebp - 4], ecx\n"
+        "        xor     ecx, ecx\n"  # ECX dead
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ecx, [ebp - 8]" in out
+    assert "add     [ebp - 4], ecx" in out
+    assert opt.stats.get("rmw_mem_src_collapse", 0) == 1

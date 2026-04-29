@@ -1334,3 +1334,12 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Sample fire rate**: 5 fires across 200 random torture tests (one per matching test). Modest but real. Combined with `cmp_load_collapse` (which handles `mov reg, [m]; cmp reg, X; jcc` for control flow), this completes coverage of the load-then-test idiom for both branch and value contexts.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +10 peephole tests (895 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: rmw_mem_src_collapse**: collapse compound-assign-with-memory-rhs chains. Pattern `mov reg, [m1]; OP reg, [m2]; mov [m1], reg` → `mov reg, [m2]; OP [m1], reg` for OP ∈ {add, sub, and, or, xor}. Saves 3 bytes per match (drops the original load + store = 6 bytes; gains the same-width load of [m2] and the mem-form OP = 6 bytes; net is 3 bytes shorter overall... wait actually: original = 3 instr × 3 bytes each = 9 bytes; rewrite = 2 instr × 3 bytes each = 6 bytes; saves 3 bytes).
+  - **Why this works**: x86 has no mem-mem OP form (`add [m1], [m2]` doesn't exist), but `add [m1], reg` does. By loading [m2] into reg INSTEAD of [m1], we get a 2-instruction in-place RMW.
+  - **Differs from `rmw_collapse`**: that pass handles immediate or register source (no memory). `rmw_mem_src_collapse` handles memory source by rearranging which mem becomes the dest.
+  - **Common in `s += i;`-style compound assigns** where both operands are memory. After binop_collapse merges `mov ecx, [i]; add eax, ecx` into `add eax, [i]`, my pass turns the surrounding `mov eax, [s]; ...; mov [s], eax` frame into `add [s], eax` directly.
+  - **Cascades with `redundant_eax_load`**: in for-loop bodies like `for (int i = 1; i <= n; i++) s += i;`, the loop top already loads `i` into EAX (`mov eax, [i]`) for the cmp. My rewrite produces `mov eax, [i]` then `add [s], eax`. The `mov eax, [i]` is then dropped by redundant_eax_load (EAX already holds [i]). Loop body shrinks from 3 instructions (load s, add i, store s) to 1 (`add [s], eax`).
+  - **Restricted to `[ebp ± N]` and `[_label]`** for both operands (frame slots and globals — no register-base derefs to avoid aliasing concerns).
+  - **Sample fire rate**: 2 of 200 random torture tests. Modest but real, with the cascade benefit being where the bigger savings come from.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +10 peephole tests (905 total). Pipeline 1734/1734 (100%).

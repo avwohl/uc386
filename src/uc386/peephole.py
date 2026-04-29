@@ -406,6 +406,7 @@ class PeepholeOptimizer:
             lines = self._pass_redundant_eax_load(lines)
             lines = self._pass_redundant_ecx_load(lines)
             lines = self._pass_rmw_collapse(lines)
+            lines = self._pass_rmw_mem_src_collapse(lines)
             lines = self._pass_div_mem_form(lines)
             lines = self._pass_mov_test_setcc_movzx_collapse(lines)
             lines = self._pass_shift_const_imm(lines)
@@ -3442,6 +3443,208 @@ class PeepholeOptimizer:
         if sl in {"ebx", "ecx", "edx", "esi", "edi"}:
             return sl
         return None
+
+    def _pass_rmw_mem_src_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``mov reg, [m1]; OP reg, [m2]; mov [m1], reg``
+        (compound assign with memory rhs) to
+        ``mov reg, [m2]; OP [m1], reg``.
+
+        Pattern (3 consecutive instr lines):
+            mov     reg, [m1]    ; load destination
+            OP      reg, [m2]    ; OP ∈ {add, sub, and, or, xor}
+            mov     [m1], reg    ; store back
+
+        Rewrite to:
+            mov     reg, [m2]    ; load source instead
+            OP      [m1], reg    ; mem-form RMW
+
+        Saves 3 bytes per match: drops the load + store pair, adds
+        the same-size load of [m2] and the same-size mem-form OP.
+
+        Differs from `rmw_collapse`: that pass handles immediate or
+        register source (no memory). Here both operands are memory,
+        which x86's `OP r/m32, imm/r32` doesn't allow — but we can
+        still benefit by rearranging which mem becomes the dest.
+
+        Common in compound-assign with memory rhs:
+            s += i;     // both s and i in memory
+        Lowers to `mov eax, [s]; add eax, [i]; mov [s], eax`
+        (after imm_binop_collapse merges the inner load).
+
+        Conditions:
+        - Line A: ``mov reg, [m1]`` where reg is GP32, [m1] is mem.
+        - Line B: ``OP reg, [m2]`` where OP ∈ {add, sub, and, or, xor},
+          same reg, [m2] is mem.
+        - Line C: ``mov [m1], reg`` (same m1, same reg).
+        - reg dead after C (we change reg's final value).
+        - [m1] textually != [m2] (otherwise same_memory_operand_reuse
+          already handled the chain differently).
+        - [m1] and [m2] are both restricted to ``[ebp ± N]`` or
+          ``[_label]`` forms (no register-base derefs to avoid
+          aliasing concerns).
+        - [m2] doesn't reference reg (would change after the RMW
+          modifies dest, but we read m2 BEFORE the RMW, so this is
+          actually fine — but be defensive).
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (
+                i + 2 < len(lines)
+                and line.kind == "instr"
+                and line.op == "mov"
+            ):
+                ap = _operands_split(line.operands)
+                if ap is not None:
+                    a_dst, a_src = ap
+                    a_dst_low = a_dst.strip().lower()
+                    a_src_norm = a_src.strip()
+                    if (
+                        a_dst_low in PeepholeOptimizer._GP32
+                        and self._is_safe_mem_form(a_src_norm)
+                    ):
+                        b = lines[i + 1]
+                        if (
+                            b.kind == "instr"
+                            and b.op in {"add", "sub", "and", "or", "xor"}
+                        ):
+                            bp = _operands_split(b.operands)
+                            if bp is not None:
+                                b_dst, b_src = bp
+                                b_dst_low = b_dst.strip().lower()
+                                b_src_norm = b_src.strip()
+                                if (
+                                    b_dst_low == a_dst_low
+                                    and self._is_safe_mem_form(
+                                        b_src_norm
+                                    )
+                                    and self._normalize_mem(b_src_norm)
+                                    != self._normalize_mem(a_src_norm)
+                                    and not _references_register(
+                                        b_src_norm, a_dst_low
+                                    )
+                                ):
+                                    c = lines[i + 2]
+                                    if (
+                                        c.kind == "instr"
+                                        and c.op == "mov"
+                                    ):
+                                        cp = _operands_split(c.operands)
+                                        if cp is not None:
+                                            c_dst, c_src = cp
+                                            c_src_low = (
+                                                c_src.strip().lower()
+                                            )
+                                            if (
+                                                self._normalize_mem(
+                                                    c_dst.strip()
+                                                )
+                                                == self._normalize_mem(
+                                                    a_src_norm
+                                                )
+                                                and c_src_low == a_dst_low
+                                                and self._reg_dead_after(
+                                                    lines, i + 3,
+                                                    a_dst_low,
+                                                )
+                                            ):
+                                                indent_a = (
+                                                    self._extract_indent(
+                                                        line.raw
+                                                    )
+                                                )
+                                                indent_b = (
+                                                    self._extract_indent(
+                                                        b.raw
+                                                    )
+                                                )
+                                                # New A: mov reg, [m2]
+                                                spacer_mov = " " * (
+                                                    8 - len("mov")
+                                                )
+                                                new_a_raw = (
+                                                    f"{indent_a}mov"
+                                                    f"{spacer_mov}"
+                                                    f"{a_dst_low}, "
+                                                    f"{b_src_norm}"
+                                                )
+                                                new_a = Line(
+                                                    raw=new_a_raw,
+                                                    kind="instr",
+                                                    op="mov",
+                                                    operands=(
+                                                        f"{a_dst_low}, "
+                                                        f"{b_src_norm}"
+                                                    ),
+                                                )
+                                                # New B: OP [m1], reg
+                                                spacer_b = " " * max(
+                                                    1, 8 - len(b.op)
+                                                )
+                                                new_b_raw = (
+                                                    f"{indent_b}{b.op}"
+                                                    f"{spacer_b}"
+                                                    f"{a_src_norm}, "
+                                                    f"{a_dst_low}"
+                                                )
+                                                new_b = Line(
+                                                    raw=new_b_raw,
+                                                    kind="instr",
+                                                    op=b.op,
+                                                    operands=(
+                                                        f"{a_src_norm}, "
+                                                        f"{a_dst_low}"
+                                                    ),
+                                                )
+                                                out.append(new_a)
+                                                out.append(new_b)
+                                                # Drop C
+                                                self.stats[
+                                                    "rmw_mem_src_collapse"
+                                                ] = (
+                                                    self.stats.get(
+                                                        "rmw_mem_src_collapse",
+                                                        0,
+                                                    ) + 1
+                                                )
+                                                i += 3
+                                                continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _is_safe_mem_form(operand: str) -> bool:
+        """Is `operand` a memory operand that's safe for our
+        peephole rewrites — i.e., `[ebp ± N]` (frame slot) or
+        `[_label]` (global)?
+
+        Excludes register-base addressing (`[eax]`, `[ebx + 4]`,
+        SIB forms like `[ebp + ecx*4]`) where aliasing with
+        another memory operand could give different results post-
+        rewrite.
+        """
+        s = operand.strip()
+        if not (s.startswith("[") and s.endswith("]")):
+            return False
+        inner = s[1:-1].strip()
+        # Form 1: ebp ± N
+        if re.match(
+            r"^\s*ebp\s*[+-]\s*(\d+|0x[0-9a-fA-F]+)\s*$",
+            inner,
+            re.IGNORECASE,
+        ):
+            return True
+        # Form 2: bare label _name (or with disp)
+        if re.match(
+            r"^\s*_[A-Za-z_][\w]*(\s*[+-]\s*(\d+|0x[0-9a-fA-F]+))?\s*$",
+            inner,
+        ):
+            return True
+        return False
 
     def _pass_mov_test_setcc_movzx_collapse(
         self, lines: list[Line]
