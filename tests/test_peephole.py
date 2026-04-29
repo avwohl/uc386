@@ -3054,8 +3054,8 @@ def test_index_load_collapse_with_negative_displacement():
 
 
 def test_index_load_collapse_with_size_prefix_and_disp():
-    """Sized memory operand with displacement preserves the size
-    prefix in the rewrite."""
+    """movsx with sized memory operand and displacement collapses
+    via SIB form, preserving op and size prefix."""
     asm = (
         "_f:\n"
         "        mov     eax, [ebp + 8]\n"
@@ -3067,9 +3067,40 @@ def test_index_load_collapse_with_size_prefix_and_disp():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    # Note: this matcher only fires for the `mov` op, not movsx,
-    # so it should NOT collapse (movsx is not in our match set).
-    assert opt.stats.get("index_load_collapse", 0) == 0
+    assert "movsx   eax, byte [eax + ecx*4 + 4]" in out
+    assert opt.stats.get("index_load_collapse") == 1
+
+
+def test_index_load_collapse_movzx_word():
+    """movzx for word loads also folds via SIB."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     ecx, 1\n"
+        "        add     eax, ecx\n"
+        "        movzx   eax, word [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "movzx   eax, word [eax + ecx*2]" in out
+    assert opt.stats.get("index_load_collapse") == 1
+
+
+def test_sib_const_index_fold_movsx():
+    """sib_const_index_fold preserves movsx (and movzx) op when
+    folding the const index."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 3\n"
+        "        movsx   eax, word [eax + ecx*2]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "movsx   eax, word [eax + 6]" in out
+    assert opt.stats.get("sib_const_index_fold") == 1
 
 
 # ── compound_assign_collapse ─────────────────────────────────────

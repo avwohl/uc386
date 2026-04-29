@@ -3566,6 +3566,8 @@ class PeepholeOptimizer:
         Restricted to GP 32-bit registers.
         """
         SCALE = {1: 2, 2: 4, 3: 8}
+        # mov, movsx, movzx — all support SIB-form memory operand.
+        LOAD_OPS = {"mov", "movsx", "movzx"}
         out = list(lines)
         i = 0
         while i + 2 < len(out):
@@ -3575,7 +3577,7 @@ class PeepholeOptimizer:
             if not (
                 a.kind == "instr" and a.op == "shl"
                 and b.kind == "instr" and b.op == "add"
-                and c.kind == "instr" and c.op == "mov"
+                and c.kind == "instr" and c.op in LOAD_OPS
             ):
                 i += 1
                 continue
@@ -3655,7 +3657,8 @@ class PeepholeOptimizer:
             ):
                 i += 1
                 continue
-            # Rewrite: drop A and B; replace C with SIB-form mov.
+            # Rewrite: drop A and B; replace C with SIB-form load.
+            # Preserve the original op (mov / movsx / movzx).
             indent = self._extract_indent(c.raw)
             scale = SCALE[n]
             if disp_sign is None:
@@ -3667,11 +3670,15 @@ class PeepholeOptimizer:
                     f"{size_prefix}[{base_reg} + {idx_reg}*{scale} "
                     f"{disp_sign} {disp_val}]"
                 )
-            new_raw = f"{indent}mov     {dst_reg}, {new_src}"
+            opname = c.op
+            spacer = " " * max(8 - len(opname), 1)
+            new_raw = (
+                f"{indent}{opname}{spacer}{dst_reg}, {new_src}"
+            )
             new_line = Line(
                 raw=new_raw,
                 kind="instr",
-                op="mov",
+                op=opname,
                 operands=f"{dst_reg}, {new_src}",
             )
             new_out = out[:i] + [new_line] + out[i + 3:]
@@ -4979,6 +4986,8 @@ class PeepholeOptimizer:
           case the load target overwrites IDX naturally).
         """
         SCALE_VALUES = {1, 2, 4, 8}
+        # Loads using SIB form: mov, movsx, movzx.
+        LOAD_OPS = {"mov", "movsx", "movzx"}
         out = list(lines)
         i = 0
         while i + 1 < len(out):
@@ -4987,7 +4996,7 @@ class PeepholeOptimizer:
             if not (
                 a.kind == "instr"
                 and a.op in {"mov", "xor"}
-                and b.kind == "instr" and b.op == "mov"
+                and b.kind == "instr" and b.op in LOAD_OPS
             ):
                 i += 1
                 continue
@@ -5095,9 +5104,13 @@ class PeepholeOptimizer:
                 new_src = (
                     f"{size_prefix}[{base_reg} - {-new_disp}]"
                 )
-            new_raw = f"{indent}mov     {dst_reg}, {new_src}"
+            opname = b.op  # mov / movsx / movzx — preserve.
+            spacer = " " * max(8 - len(opname), 1)
+            new_raw = (
+                f"{indent}{opname}{spacer}{dst_reg}, {new_src}"
+            )
             new_line = Line(
-                raw=new_raw, kind="instr", op="mov",
+                raw=new_raw, kind="instr", op=opname,
                 operands=f"{dst_reg}, {new_src}",
             )
             out = out[:i] + [new_line] + out[i + 2:]

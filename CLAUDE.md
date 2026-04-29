@@ -1200,3 +1200,8 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **20040218-1.c**: `_xb` and `_xw` each save 5 bytes per `arr[1]` access (3 occurrences).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite still 100%**. +7 peephole tests (321 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: index_load_collapse + sib_const_index_fold extended for movsx/movzx**: extend both passes' load-op set from `mov` to `{mov, movsx, movzx}`. The SIB byte form works identically for sub-word sign/zero-extending loads.
+  - **Common shape**: `short` array indexing — `short arr[N]; arr[i]` lowers as `mov ecx, IDX; shl ecx, 1; add base, ecx; movsx eax, word [base]`. With both passes extended, this collapses to `movsx eax, word [base + ecx*2]` (saves 5 bytes from index_load_collapse) then to `movsx eax, word [base + IDX*2]` if the index is constant (saves 5 more bytes from sib_const_index_fold).
+  - **20040218-1.c `_yb`**: 4 instructions for `arr[1]` access collapsed to 1 instruction. Saves ~8 bytes per such access.
+
+  **Result: 463/463 torture --full sample passing, 50/50 specific tests, 765 unit tests, 1514/1514 compile-only**. +2 peephole tests (323 total).
