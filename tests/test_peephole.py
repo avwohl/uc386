@@ -1280,6 +1280,197 @@ def test_right_operand_retarget_lea_chain():
     assert opt.stats.get("right_operand_retarget", 0) == 1
 
 
+# ── cmp_zero_to_test ─────────────────────────────────────────────
+
+
+def test_cmp_zero_to_test_eax():
+    """`cmp eax, 0` → `test eax, eax` (1 byte saved)."""
+    asm = (
+        "_f:\n"
+        "        cmp     eax, 0\n"
+        "        je      .L\n"
+        ".L:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "test    eax, eax" in out
+    assert "cmp     eax, 0" not in out
+    assert opt.stats.get("cmp_zero_to_test", 0) == 1
+
+
+def test_cmp_zero_to_test_other_regs():
+    """Pattern works for any 32-bit gp reg, not just EAX."""
+    asm = (
+        "_f:\n"
+        "        cmp     ebx, 0\n"
+        "        cmp     ecx, 0\n"
+        "        cmp     esi, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "test    ebx, ebx" in out
+    assert "test    ecx, ecx" in out
+    assert "test    esi, esi" in out
+    assert opt.stats.get("cmp_zero_to_test", 0) == 3
+
+
+def test_cmp_zero_to_test_skips_nonzero():
+    """`cmp eax, 5` doesn't fold."""
+    asm = (
+        "_f:\n"
+        "        cmp     eax, 5\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("cmp_zero_to_test", 0) == 0
+
+
+# ── dead_mov_to_reg ──────────────────────────────────────────────
+
+
+def test_dead_mov_postfix_inc():
+    """The classic postfix `i++` value-discarded pattern in for-loop
+    step: `mov eax, [X]; inc dword [X]; jmp .top` where the load
+    is dead because .top's first instr writes EAX."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        inc     dword [ebp - 4]\n"
+        "        jmp     .L_top\n"
+        ".L_top:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        cmp     eax, 10\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The first `mov eax, [ebp - 4]` (before inc) is dropped.
+    # The second one (after the label) is preserved.
+    assert out.count("mov     eax, [ebp - 4]") == 1
+    assert opt.stats.get("dead_mov_to_reg", 0) == 1
+
+
+def test_dead_mov_skips_when_value_used():
+    """If the load's value is read after, don't drop."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        inc     dword [ebp - 4]\n"
+        "        cmp     eax, 0\n"     # reads eax!
+        "        jne     .L\n"
+        ".L:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_mov_to_reg", 0) == 0
+
+
+def test_dead_mov_skips_self_referential_load():
+    """`mov eax, [eax]` reads EAX before writing — not safe to drop."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [eax]\n"
+        "        mov     eax, 5\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_mov_to_reg", 0) == 0
+
+
+def test_dead_mov_call_clobbers_eax():
+    """A direct `call _foo` clobbers EAX (cdecl), so a preceding
+    `mov eax, X` (where X isn't used by the call) is dead."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        call    _foo\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [ebp - 4]" not in out
+    assert opt.stats.get("dead_mov_to_reg", 0) == 1
+
+
+def test_dead_mov_skips_indirect_call_via_eax():
+    """`call eax` reads EAX, so the prior `mov eax, X` is live."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        call    eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_mov_to_reg", 0) == 0
+
+
+def test_dead_mov_eax_at_ret_is_live():
+    """At a `ret`, EAX is the return value (live). Don't drop a
+    prior mov to EAX — its value gets returned."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_mov_to_reg", 0) == 0
+
+
+def test_dead_mov_skips_implicit_eax_reader():
+    """`cdq` reads EAX implicitly. The candidate `mov eax, X` is
+    NOT dead — its value flows into cdq."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        cdq\n"
+        "        idiv    ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_mov_to_reg", 0) == 0
+
+
+def test_dead_mov_skips_div_reads_edx_eax():
+    """`idiv reg` reads EDX:EAX. A `mov eax, X` before idiv is
+    live — its value is the dividend's low half."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        cdq\n"          # also reads eax
+        "        idiv    ecx\n"  # reads edx:eax
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_mov_to_reg", 0) == 0
+
+
+def test_dead_mov_skips_other_regs():
+    """The pattern is restricted to EAX. Non-EAX regs (ECX, EBX,
+    EDX, ESI, EDI) might be implicitly used by nested-fn trampolines
+    (ECX) or the LL-return ABI (EDX), so dropping their writes is
+    risky. Skip."""
+    asm = (
+        "_f:\n"
+        "        mov     ebx, [ebp - 4]\n"
+        "        mov     ecx, 5\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ebx, [ebp - 4]" in out
+    assert "mov     ecx, 5" in out
+    assert opt.stats.get("dead_mov_to_reg", 0) == 0
+
+
 # ── Convergence ──────────────────────────────────────────────────
 
 

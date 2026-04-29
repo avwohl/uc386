@@ -54,6 +54,14 @@ Currently implements:
     instead. The `mov ecx, eax` becomes redundant and is dropped.
     Saves 2 bytes per binop with a non-trivial right-hand side
     (e.g. `a[i] cmp b[i]` where each side dereferences an array).
+  - cmp_zero_to_test: replace `cmp reg, 0` with `test reg, reg`.
+    Saves 1 byte per match (3-byte cmp-imm8-sign-ext → 2-byte test).
+    Identical flag effects for ZF/SF/OF/CF/PF.
+  - dead_mov_to_reg: drop `mov <reg>, <src>` when forward scan finds
+    a full reg overwrite before any read. Common in postfix `i++`
+    in for-loop steps where the value is discarded. Crosses labels
+    and unconditional jumps under the codegen invariant (regs are
+    always overwritten at the start of each labeled block).
 
 Patterns to add (see PEEPHOLE_PLAN.md for details): redundant
 mov-to-reg, tail calls, jump threading, multi-instruction right-
@@ -265,6 +273,8 @@ class PeepholeOptimizer:
             lines = self._pass_mov_zero_to_xor(lines)
             lines = self._pass_store_load_collapse(lines)
             lines = self._pass_right_operand_retarget(lines)
+            lines = self._pass_cmp_zero_to_test(lines)
+            lines = self._pass_dead_mov_to_reg(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -1420,6 +1430,296 @@ class PeepholeOptimizer:
             raw=new_raw, kind=line.kind, op=line.op,
             operands=new_operands,
         )
+
+    def _pass_cmp_zero_to_test(self, lines: list[Line]) -> list[Line]:
+        """Replace `cmp <reg>, 0` with `test <reg>, <reg>`.
+
+        Both forms set flags identically for the comparison-with-zero
+        case:
+        - ZF: 1 iff reg == 0
+        - SF: 1 iff reg's high bit is set (signed-negative)
+        - OF: 0 (no overflow possible)
+        - CF: 0 (no borrow possible)
+        - PF: parity of reg's low byte
+
+        Subsequent JCCs (je/jne/jl/jge/js/jns/etc.) all see the same
+        flag state, so the rewrite preserves semantics.
+
+        Saves 1 byte per match: `cmp eax, 0` is 3 bytes (with imm8
+        sign-extension); `test eax, eax` is 2 bytes.
+        """
+        out: list[Line] = []
+        for line in lines:
+            if (line.kind == "instr" and line.op == "cmp"):
+                parts = _operands_split(line.operands)
+                if parts is not None:
+                    dest, src = parts
+                    if (src.strip() == "0"
+                            and dest.lower() in {"eax", "ebx", "ecx",
+                                                 "edx", "esi", "edi",
+                                                 "ebp", "esp"}):
+                        leading_ws = re.match(r"^\s*", line.raw).group(0)
+                        new_raw = (
+                            f"{leading_ws}test    {dest}, {dest}"
+                        )
+                        out.append(Line(
+                            raw=new_raw, kind="instr", op="test",
+                            operands=f"{dest}, {dest}",
+                        ))
+                        self.stats["cmp_zero_to_test"] = (
+                            self.stats.get("cmp_zero_to_test", 0) + 1
+                        )
+                        continue
+            out.append(line)
+        return out
+
+    # Mapping from each 32-bit gp reg to its sub-register aliases
+    # (16-bit and 8-bit). Used by dead-mov / liveness analyses.
+    _REG_FAMILY: dict[str, frozenset[str]] = {
+        "eax": frozenset({"eax", "ax", "al", "ah"}),
+        "ebx": frozenset({"ebx", "bx", "bl", "bh"}),
+        "ecx": frozenset({"ecx", "cx", "cl", "ch"}),
+        "edx": frozenset({"edx", "dx", "dl", "dh"}),
+        "esi": frozenset({"esi", "si"}),
+        "edi": frozenset({"edi", "di"}),
+        "ebp": frozenset({"ebp", "bp"}),
+        "esp": frozenset({"esp", "sp"}),
+    }
+
+    @staticmethod
+    def _references_reg_family(text: str, reg32: str) -> bool:
+        """Does `text` reference reg32 or any of its sub-aliases?"""
+        for alias in PeepholeOptimizer._REG_FAMILY[reg32]:
+            if _references_register(text, alias):
+                return True
+        return False
+
+    @staticmethod
+    def _is_pure_reg_write(line: Line, reg32: str) -> bool:
+        """Does this instruction write reg32 in full WITHOUT reading
+        any of its sub-aliases first? Pure writes:
+        - mov reg, src where src doesn't reference reg-family
+        - lea reg, [...] where the address doesn't reference reg-family
+        - pop reg
+        - xor reg, reg
+        - movsx reg, src / movzx reg, src where src doesn't reference reg-family
+        - call <label> (clobbers EAX/ECX/EDX in cdecl, doesn't read reg)
+          for reg ∈ {eax, ecx, edx}
+        """
+        if line.kind != "instr":
+            return False
+        family = PeepholeOptimizer._REG_FAMILY[reg32]
+        if line.op in {"mov", "lea", "movsx", "movzx"}:
+            parts = _operands_split(line.operands)
+            if not parts:
+                return False
+            dest, src = parts
+            if dest.lower() != reg32:
+                return False
+            return not PeepholeOptimizer._references_reg_family(src, reg32)
+        if line.op == "pop":
+            if line.operands.strip().lower() == reg32:
+                return True
+            return False
+        if line.op == "xor":
+            parts = _operands_split(line.operands)
+            if (parts and parts[0].lower() == reg32
+                    and parts[1].strip().lower() == reg32):
+                return True
+            return False
+        if line.op == "call":
+            # Direct call clobbers caller-saved EAX/ECX/EDX.
+            # Indirect call via reg-family reads it — exclude.
+            operand = line.operands.strip().lower()
+            if operand in family:
+                return False
+            if "[" in operand:
+                # `call [reg + N]` reads reg.
+                if PeepholeOptimizer._references_reg_family(operand, reg32):
+                    return False
+            if reg32 in {"eax", "ecx", "edx"}:
+                return True
+        return False
+
+    # Instructions whose operands enumerate the registers they touch.
+    # Anything outside this list is treated conservatively as a read
+    # of any reg we're tracking (because of implicit reg references —
+    # e.g. cdq reads EAX, idiv reads EDX:EAX, lodsd reads ESI, etc.).
+    _EXPLICIT_OPERAND_OPS: frozenset[str] = frozenset({
+        "mov", "lea", "movsx", "movzx", "movsxd",
+        "push", "pop",
+        "add", "sub", "and", "or", "xor", "cmp", "test",
+        "imul", "neg", "not",
+        "shl", "shr", "sar", "sal", "rol", "ror",
+        "inc", "dec",
+        "nop", "leave",
+    })
+
+    @staticmethod
+    def _has_explicit_operands_only(line: Line) -> bool:
+        """Does this instruction's behavior depend ONLY on its
+        explicit operands (and not on implicit register references)?
+        Used to know when scanning past an instruction without
+        finding the tracked reg in the operand string is safe."""
+        return line.op in PeepholeOptimizer._EXPLICIT_OPERAND_OPS
+
+    def _reg_dead_after(
+        self, lines: list[Line], start_idx: int, reg32: str,
+        visited_labels: frozenset[str] = frozenset(),
+        depth: int = 0,
+    ) -> bool:
+        """Forward scan from start_idx. Return True if `reg32` is
+        provably dead — a pure-write happens before any read.
+
+        CFG-aware: at an unconditional `jmp X`, jumps to X (does not
+        continue text-fallthrough). At a label by text-fallthrough,
+        crosses transparently (the label may have other predecessors
+        but they all reach the same first instruction, so dead-ness
+        is determined by that instruction).
+
+        The codegen invariant — registers are not assumed to carry
+        values across labels — means cross-label scanning is safe
+        for the reg liveness question.
+        """
+        if depth > 5:
+            return False
+        family = self._REG_FAMILY[reg32]
+        scanned = 0
+        j = start_idx
+        while j < len(lines) and scanned < 20:
+            ln = lines[j]
+            if ln.kind in ("blank", "comment", "label"):
+                # Codegen invariant: regs are not assumed live at any
+                # label by predecessor jumps — any user of reg loads it
+                # fresh. So crossing labels by text-fallthrough is OK.
+                j += 1
+                continue
+            if ln.kind in ("directive", "data"):
+                # End of function (or section change). The function's
+                # return path was reached without finding a use.
+                if reg32 == "ecx":
+                    return True
+                return False
+            if ln.kind != "instr":
+                return False
+            scanned += 1
+            # Check pure-write FIRST (before checking reads), since
+            # mov reg, src can be a pure write OR self-RMW.
+            if PeepholeOptimizer._is_pure_reg_write(ln, reg32):
+                return True
+            # Function exit terminators.
+            if ln.op in {"ret", "iret", "iretd", "retf", "retn"}:
+                # EAX/EDX may be the return value (live).
+                # EBX/ESI/EDI/EBP are callee-saved (caller expects
+                # them preserved — dropping a write inside the function
+                # leaves them at the caller's value, which is fine).
+                # ECX is caller-saved scratch.
+                if reg32 in ("eax", "edx"):
+                    return False
+                return True
+            # If this instruction references the reg family in any
+            # operand, treat as a read.
+            if self._references_reg_family(ln.operands, reg32):
+                return False
+            # `jmp <label>` (direct, unconditional): chase the target.
+            # DO NOT fall through to text-next — that's unreachable
+            # from this CFG path.
+            if ln.op == "jmp":
+                target = _jmp_target(ln)
+                if target is None:
+                    return False  # indirect jmp — bail
+                if target in visited_labels:
+                    return False  # loop — bail
+                target_idx = self._find_label_idx(lines, target)
+                if target_idx is None:
+                    return False
+                # Tail-call into the scan at the label's first
+                # post-label instruction. Tail-call style avoids
+                # unbounded recursion when chains of jmps are short.
+                return self._reg_dead_after(
+                    lines, target_idx + 1, reg32,
+                    visited_labels | frozenset({target}),
+                    depth + 1,
+                )
+            # Conditional jumps split control flow — for accurate
+            # liveness we'd need to check both successors. Conservative:
+            # bail.
+            if ln.op.startswith("j") and ln.op != "jmp":
+                return False
+            # `call <label>` clobbers caller-saved regs (EAX/ECX/EDX).
+            if ln.op == "call":
+                operand = ln.operands.strip().lower()
+                if operand in family:
+                    # Indirect via reg — reads it.
+                    return False
+                if "[" in operand and self._references_reg_family(
+                        operand, reg32):
+                    return False
+                if reg32 in {"eax", "ecx", "edx"}:
+                    return True
+                # Reg preserved across cdecl call. Continue.
+                j += 1
+                continue
+            # If this instruction can have implicit register reads
+            # (e.g. cdq, idiv, lodsd, rep movsd) — bail conservatively.
+            if not PeepholeOptimizer._has_explicit_operands_only(ln):
+                return False
+            # Otherwise: explicit-operand instr that doesn't reference
+            # reg, didn't write it purely. Just move on.
+            j += 1
+        return False
+
+    @staticmethod
+    def _find_label_idx(lines: list[Line], label: str) -> int | None:
+        """Find the index of label `label` in `lines`. Returns the
+        index of the label line (the next instr is at idx+1)."""
+        for k, ln in enumerate(lines):
+            if ln.kind == "label" and ln.label == label:
+                return k
+        return None
+
+    def _pass_dead_mov_to_reg(self, lines: list[Line]) -> list[Line]:
+        """Drop `mov eax, <src>` (or `lea eax, ...`) when the loaded
+        value is provably dead — a pure overwrite of EAX follows
+        before any read.
+
+        Common in postfix `i++` in for-loop step where the value is
+        discarded:
+            mov eax, [ebp - 4]   ← this load
+            inc dword [ebp - 4]
+            jmp .L1_for_top      ← .L1_for_top: mov eax, [...] (overwrites)
+
+        Restricted to EAX because uc386 has a static-link convention
+        (nested-function trampolines) where ECX is an implicit input
+        to certain calls — dropping a `mov ecx, X` before such a
+        call would break the call. EBX/ESI/EDI/EBP are callee-saved
+        and rarely have dead writes worth dropping.
+
+        Conditions:
+        - Source must not reference EAX/AX/AL/AH (would be self-RMW).
+        - Forward scan finds a pure-write to EAX before any read.
+        - At a `ret`, EAX is live (return value).
+        """
+        out: list[Line] = []
+        for i, line in enumerate(lines):
+            if line.kind == "instr" and line.op in {"mov", "lea",
+                                                     "movsx", "movzx"}:
+                parts = _operands_split(line.operands)
+                if parts is not None:
+                    dest, src = parts
+                    dest_lower = dest.lower()
+                    if dest_lower == "eax":
+                        # Source mustn't read EAX — would be self-RMW.
+                        if not self._references_reg_family(src, "eax"):
+                            if self._reg_dead_after(lines, i + 1,
+                                                     "eax"):
+                                self.stats["dead_mov_to_reg"] = (
+                                    self.stats.get("dead_mov_to_reg", 0)
+                                    + 1
+                                )
+                                continue
+            out.append(line)
+        return out
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
         """P-jmp-to-next: `jmp X` immediately (modulo blanks/comments)

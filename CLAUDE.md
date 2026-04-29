@@ -942,3 +942,13 @@ See `README.md` for the public roadmap (Phase 0–6).
   - probe_misc: 2483 → 2353 bytes ASM (-130 bytes); 188 → 180 bytes COM (-8 bytes after libc dedup).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (517 total). Pipeline 1734/1734 (100%). Total benchmark size reduction climbs to 27.1%.
+- **2026-04-29 — Phase A peephole: cmp_zero_to_test + dead_mov_to_eax**: two more refinements.
+  - **cmp_zero_to_test**: `cmp <reg>, 0` → `test <reg>, <reg>`. Saves 1 byte per match (3-byte cmp-imm8-sign-ext → 2-byte test). Identical flag effects for ZF/SF/OF/CF/PF — JCCs after either form see the same flag state.
+  - **dead_mov_to_eax**: drop `mov eax, <src>` (or `lea/movsx/movzx`) when forward CFG-aware scan finds a pure overwrite of EAX before any read. Restricted to EAX because uc386's nested-fn trampoline convention sets ECX as an implicit input to certain calls — dropping a `mov ecx, X` before such a call would break the static-link mechanism.
+    - **CFG-aware scan**: at unconditional `jmp X`, follows the target label (does NOT continue text fallthrough — that's unreachable from this CFG path). At conditional jumps, conservatively bails (would need to verify both successors).
+    - **Implicit-reg-readers**: instructions like `cdq`/`idiv`/`lodsd` implicitly read EAX/EDX:EAX/ESI without listing them in operands. The scan treats any instruction outside an explicit allow-list (`mov`/`lea`/`add`/`sub`/`cmp`/jumps/etc.) as a read of the tracked reg.
+    - **Codegen invariant**: registers are not assumed live at any label by predecessor jumps — any user of a reg loads it fresh. So crossing labels by text-fallthrough is safe.
+    - **Common shape lifted**: postfix `i++` in for-loop step (`mov eax, [i]; inc dword [i]; jmp .L_top` where .L_top: starts with `mov eax, [...]` overwriting EAX). The load is dead since its value is never used.
+    - probe_loop: 1136 → 1105 bytes ASM (-31 bytes).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +12 peephole tests (529 total). Pipeline 1734/1734 (100%). Total benchmark size reduction stays at 27.7%.
