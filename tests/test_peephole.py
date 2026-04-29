@@ -2965,10 +2965,15 @@ def test_redundant_eax_load_through_cmp():
 
 
 def test_redundant_eax_load_through_test():
-    """`test eax, eax` is read-only on EAX — eax_mem stays valid."""
+    """`test eax, eax` is read-only on EAX — eax_mem stays valid.
+
+    Note: `mov eax, [mem]; test eax, eax` adjacent is consumed by
+    `cmp_load_collapse` first. We add an unrelated instruction
+    between to force this case to flow through redundant_eax_load."""
     asm = (
         "_f:\n"
         "        mov     eax, [ebp + 8]\n"
+        "        add     ebx, 1\n"  # blocks cmp_load_collapse
         "        test    eax, eax\n"
         "        mov     eax, [ebp + 8]\n"  # redundant
         "        ret\n"

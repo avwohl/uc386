@@ -346,9 +346,14 @@ class PeepholeOptimizer:
             lines = self._pass_cmp_zero_to_test(lines)
             lines = self._pass_dead_mov_to_reg(lines)
             lines = self._pass_prologue_to_enter(lines)
-            lines = self._pass_redundant_eax_load(lines)
             lines = self._pass_label_offset_fold(lines)
+            # cmp_load_collapse runs BEFORE redundant_eax_load: the
+            # smarter redundant_eax_load (with jcc-target tracking)
+            # can drop a mov that cmp_load_collapse would've fused
+            # with its cmp. Running cmp_load_collapse first lets both
+            # passes fire on independent patterns.
             lines = self._pass_cmp_load_collapse(lines)
+            lines = self._pass_redundant_eax_load(lines)
             lines = self._pass_rmw_collapse(lines)
             lines = self._pass_fst_fstp_collapse(lines)
             lines = self._pass_fpu_op_collapse(lines)
@@ -2093,9 +2098,14 @@ class PeepholeOptimizer:
         Tracking is conservative: we follow EAX's "current memory
         source" through a single straight-line block. Any of these
         invalidate the tracker:
-        - Control-flow boundaries (labels, jumps, calls, ret)
         - Any write to EAX (or AL/AH/AX) by any instruction
         - Any memory-write whose destination might alias M
+        - Calls and unconditional control flow (jmp/ret/etc.)
+
+        Conditional jumps (jcc) DO preserve the tracker on the
+        fall-through path; we record the jcc's eax_mem at the time
+        of the jump, keyed by target label. At each label, we merge
+        the jcc-recorded states with the fall-through state (if any).
 
         For aliasing, we only trust two stack expressions to be
         disjoint when both are literal ``[ebp + N]`` / ``[ebp - N]``
@@ -2111,12 +2121,41 @@ class PeepholeOptimizer:
         """
         out: list[Line] = []
         eax_mem: str | None = None  # The literal text of EAX's known mem source
+        # Per-label state: set of eax_mem seen at forward jcc to this
+        # label. None in the set means "saw a state of None / unknown".
+        # If the set has exactly one value, that's the merged state.
+        jcc_states: dict[str, set[str | None]] = {}
+        # Was the previous "real" instr unconditional (jmp/ret/etc.)?
+        # True means the upcoming label has NO fall-through predecessor;
+        # only jcc-tracked predecessors matter.
+        prev_unconditional = False
         for line in lines:
             if line.kind != "instr":
-                # Labels, directives, data, comments, blanks: control-
-                # flow boundaries (or potential boundaries) — invalidate.
+                # Labels, directives, data, comments, blanks: handle
+                # labels specially (merge jcc states with fall-through).
                 if line.kind == "label":
-                    eax_mem = None
+                    label = line.label
+                    saved = jcc_states.pop(label, None)
+                    if prev_unconditional:
+                        # No fall-through; only saved jcc states matter.
+                        if saved is not None and len(saved) == 1:
+                            (only,) = saved
+                            eax_mem = only
+                        else:
+                            eax_mem = None
+                    else:
+                        # Fall-through exists; merge with saved.
+                        if saved is None:
+                            # Only fall-through reaches this label.
+                            pass  # eax_mem stays as fall-through
+                        else:
+                            states = saved | {eax_mem}
+                            if len(states) == 1:
+                                (only,) = states
+                                eax_mem = only
+                            else:
+                                eax_mem = None
+                    prev_unconditional = False
                 out.append(line)
                 continue
             op = line.op
@@ -2173,15 +2212,29 @@ class PeepholeOptimizer:
             # if M2 == eax_mem, the load is redundant in the
             # fallthrough path. The taken-jcc path lands at L, where
             # the label-handling above resets eax_mem.
-            if op in {"call", "jmp", "ret", "iret", "iretd", "retf",
-                      "retn", "leave", "enter"}:
+            if op == "call":
                 eax_mem = None
+                prev_unconditional = False  # call returns to next line
+                out.append(line)
+                continue
+            if op in {"jmp", "ret", "iret", "iretd", "retf",
+                      "retn", "leave", "enter"}:
+                # Unconditional jmp: also save the target's state
+                # (taken with current eax_mem before invalidate).
+                if op == "jmp":
+                    target = line.operands.strip()
+                    jcc_states.setdefault(target, set()).add(eax_mem)
+                eax_mem = None
+                prev_unconditional = op != "enter"  # enter is prologue
                 out.append(line)
                 continue
             if op.startswith("j"):
-                # Conditional jump (jcc) — keep tracking. Note: `jmp`
-                # is filtered out above (unconditional). All remaining
-                # `j*` are jcc.
+                # Conditional jump (jcc) — keep tracking, save state
+                # for the target label so the taken path can pick it
+                # up at the label.
+                target = line.operands.strip()
+                jcc_states.setdefault(target, set()).add(eax_mem)
+                prev_unconditional = False
                 out.append(line)
                 continue
             # Instructions that READ EAX but don't WRITE it: cmp,

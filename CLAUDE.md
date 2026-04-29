@@ -1048,3 +1048,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - Combined with redundant_eax_load slice: `int max(int a, int b) { return a > b ? a : b; }` previously took ~12 instructions, now takes 7 (saving 8 bytes per qualifying ternary).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (184 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: redundant_eax_load — jcc-target tracking + pass reorder**: extends the `redundant_eax_load` tracker to propagate state through forward conditional jumps. The taken path of a jcc lands at a label whose entry state can be derived from the jcc's saved EAX-mem (the jcc didn't modify EAX, so the label receives the pre-jcc state).
+  - **Per-label state tracking**: at each jcc to forward target L, save the current eax_mem in `jcc_states[L]`. At each label, merge the saved states with the fall-through state (when present); if all incoming states agree on a single mem ref, propagate that as the entry state. Otherwise (disagreeing states or unknown predecessor) reset to None.
+  - **`prev_unconditional` flag**: tracks whether the previous instr was unconditional (jmp/ret/leave/etc.) — meaning the next label has no fall-through predecessor. In that case, only saved jcc states matter for the merge.
+  - **Pass reorder: cmp_load_collapse before redundant_eax_load**. The smarter tracker can drop a `mov eax, [mem]` that cmp_load_collapse would have folded into a cmp. To preserve cmp_load_collapse's gain, run it first; redundant_eax_load then handles independent patterns. Both passes operate on disjoint mov sites in practice.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. Same test count (the new behavior subsumes the old). Pipeline 1734/1734 (100%).
