@@ -5042,3 +5042,110 @@ def test_lea_store_collapse_skips_when_src_uses_reg():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("lea_store_collapse", 0) == 0
+
+
+# ── dead_stack_store ─────────────────────────────────────────────
+
+
+def test_dead_stack_store_basic():
+    """`mov [ebp - 12], 1; mov [ebp - 12], 100` drops the first."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 12], 1\n"
+        "        mov     dword [ebp - 12], 100\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     dword [ebp - 12], 1\n" not in out
+    assert "mov     dword [ebp - 12], 100" in out
+    assert opt.stats.get("dead_stack_store") == 1
+
+
+def test_dead_stack_store_with_unrelated_stores():
+    """Dead store survives across unrelated stores to other slots."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 12], 1\n"
+        "        mov     dword [ebp - 8], 2\n"
+        "        mov     dword [ebp - 12], 100\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     dword [ebp - 12], 1\n" not in out
+    assert "mov     dword [ebp - 8], 2" in out
+    assert "mov     dword [ebp - 12], 100" in out
+    assert opt.stats.get("dead_stack_store") == 1
+
+
+def test_dead_stack_store_skips_when_read():
+    """If [ebp - 12] is read between the two stores, don't drop."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 12], 1\n"
+        "        mov     eax, [ebp - 12]\n"  # reads it
+        "        mov     dword [ebp - 12], 100\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_stack_store", 0) == 0
+
+
+def test_dead_stack_store_skips_across_call():
+    """Calls clobber stack semantics — bail conservatively."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 12], 1\n"
+        "        call    _other\n"
+        "        mov     dword [ebp - 12], 100\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_stack_store", 0) == 0
+
+
+def test_dead_stack_store_skips_across_jump():
+    """Jumps mark control-flow boundaries — bail."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 12], 1\n"
+        "        jmp     .L1\n"
+        ".L1:\n"
+        "        mov     dword [ebp - 12], 100\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_stack_store", 0) == 0
+
+
+def test_dead_stack_store_skips_across_indirect_write():
+    """Indirect memory write through register might alias — bail."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 12], 1\n"
+        "        mov     dword [eax], 99\n"  # indirect write, might alias
+        "        mov     dword [ebp - 12], 100\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_stack_store", 0) == 0
+
+
+def test_dead_stack_store_skips_across_lea_of_same_offset():
+    """LEA producing the same address means a register might be used
+    for indirect read later — bail."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 12], 1\n"
+        "        lea     eax, [ebp - 12]\n"
+        "        mov     dword [ebp - 12], 100\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_stack_store", 0) == 0

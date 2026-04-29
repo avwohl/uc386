@@ -1168,3 +1168,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **probe_struct_more** (3-member struct + 2 member assignments + sum call): 47 → 43 lines after my prior slices, → 43 lines after these slices (`lea_store_collapse` and `lea_forward_to_reg` together drop the explicit address-load + transfer + store chain). The two `p.x = 100; p.y = 200;` assignments now lower as direct stack-slot stores.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (285 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: dead_stack_store**: drop `mov <size> [ebp ± N], V1` when a later `mov <size> [ebp ± N], V2` overwrites it before any read. Saves up to 7 bytes per match (drops a dword-imm store).
+  - **Common shape**: struct/array init followed by member assignment. `struct point p = {1, 2, 3}; p.x = 100;` emits two stores to `[ebp - 12]` back-to-back; the first is dead.
+  - **Conservative scan** (CFG-aware): bails on any read of `[ebp ± N]`, any call (callee MIGHT alias via prior address-take + escape), any LEA producing the target address (lea'd reg could be used for indirect read), any jump (control-flow boundary), any indirect memory write through a register (might alias), any non-trivial use of the slot.
+  - **probe_struct_more**: 43 → 41 lines. The `int x = 1; x = 100;`-style overwrites are dropped.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (292 total). Pipeline 1734/1734 (100%).

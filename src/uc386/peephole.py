@@ -408,6 +408,7 @@ class PeepholeOptimizer:
             lines = self._pass_lea_offset_fold(lines)
             lines = self._pass_lea_forward_to_reg(lines)
             lines = self._pass_lea_store_collapse(lines)
+            lines = self._pass_dead_stack_store(lines)
             lines = self._pass_value_forward_to_reg(lines)
             lines = self._pass_byte_stores_to_dword(lines)
             lines = self._pass_pop_index_push_collapse(lines)
@@ -5153,6 +5154,174 @@ class PeepholeOptimizer:
             )
             continue
         return out
+
+    def _pass_dead_stack_store(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Drop ``mov <size> [ebp ± N], V1`` when a later
+        ``mov <size> [ebp ± N], V2`` overwrites it before any read.
+
+        Saves up to 7 bytes per match (drops a dword-imm store).
+
+        Common after struct/array init followed by member assignment:
+        ``struct point p = {1, 2, 3}; p.x = 100;`` emits two stores
+        to [ebp - 12] back-to-back; the first is dead.
+
+        Conservative scan:
+        - Read of [ebp ± N] in any instruction's operands → store is
+          alive, bail.
+        - Call → bail (callee MIGHT have access to &x via prior
+          address-take + global; can't tell without escape analysis).
+        - LEA producing an address that might alias [ebp ± N] → bail
+          (the lea'd reg could be used for indirect access later).
+          Conservative: any LEA that references [ebp ± N] bails.
+          Other LEAs (label addresses) don't alias stack slots.
+        - Conditional or unconditional jump → bail (control-flow
+          boundary).
+        - Label → bail (predecessor may differ).
+        - Memory write through a register pointer → bail (might
+          alias).
+        - Reaching another `mov <size> [ebp ± N], V2` (same offset)
+          → fire: drop the first store.
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if line.kind != "instr":
+                out.append(line)
+                i += 1
+                continue
+            n_disp = self._stack_store_offset(line)
+            if n_disp is None:
+                out.append(line)
+                i += 1
+                continue
+            # Found a stack-imm-or-reg store. Scan forward.
+            if self._dead_stack_store_check(lines, i, n_disp):
+                self.stats["dead_stack_store"] = (
+                    self.stats.get("dead_stack_store", 0) + 1
+                )
+                i += 1  # Drop the line.
+                continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _stack_store_offset(line: Line) -> int | None:
+        """If `line` is `mov <size> [ebp ± N], SRC`, return N.
+        Otherwise None."""
+        if line.kind != "instr" or line.op != "mov":
+            return None
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return None
+        dest = parts[0].strip()
+        m = re.match(
+            r"^(dword|word|byte|qword)\s+\[\s*ebp\s*([+-])\s*(\d+)\s*\]$",
+            dest,
+            re.IGNORECASE,
+        )
+        if m is None:
+            return None
+        n = int(m.group(3))
+        if m.group(2) == "-":
+            n = -n
+        return n
+
+    def _dead_stack_store_check(
+        self, lines: list[Line], start_idx: int, target_offset: int,
+    ) -> bool:
+        """Return True if the store at lines[start_idx] is dead —
+        an overwrite to the same offset is reached before any read."""
+        target_re = re.compile(
+            rf"\[\s*ebp\s*[+-]\s*\d+\s*\]",
+            re.IGNORECASE,
+        )
+        # Build the exact text to look for in operands when scanning
+        # for reads. Both `[ebp + N]` and `[ebp - N]` (with original
+        # sign) are valid — but normalized through the offset.
+        for j in range(start_idx + 1, min(len(lines), start_idx + 30)):
+            ln = lines[j]
+            if ln.kind == "label":
+                # Control-flow boundary.
+                return False
+            if ln.kind != "instr":
+                continue
+            op = ln.op
+            ops = ln.operands
+            # Calls bail.
+            if op == "call":
+                return False
+            # Jumps bail (control flow).
+            if op in {"jmp", "ret", "iret", "iretd", "retf",
+                      "retn", "leave"} or op.startswith("j"):
+                return False
+            # Find any [ebp ± M] reference in this line.
+            for m in target_re.finditer(ops):
+                ref = m.group(0)
+                rm = re.match(
+                    r"^\[\s*ebp\s*([+-])\s*(\d+)\s*\]$",
+                    ref,
+                    re.IGNORECASE,
+                )
+                if not rm:
+                    continue
+                ref_off = int(rm.group(2))
+                if rm.group(1) == "-":
+                    ref_off = -ref_off
+                if ref_off != target_offset:
+                    continue
+                # Same offset — does the line WRITE or READ it?
+                if op == "mov":
+                    parts = _operands_split(ops)
+                    if parts is None:
+                        return False
+                    dest = parts[0].strip()
+                    src = parts[1].strip()
+                    # Dest matches our target offset → overwrite.
+                    if (
+                        ref in dest
+                        and self._stack_store_offset(ln)
+                        == target_offset
+                    ):
+                        return True
+                    # Src refs target offset → read.
+                    if ref in src:
+                        return False
+                    # Otherwise (other ops at this offset), conservative.
+                    return False
+                # Any other op (add/sub/etc.) reading or writing the
+                # offset is conservative — bail.
+                return False
+            # Memory write through register (e.g. mov [eax], X) might
+            # alias a stack slot if EAX was lea'd from one earlier.
+            # Conservative: bail on any indirect mem write.
+            if op == "mov":
+                parts = _operands_split(ops)
+                if parts is not None:
+                    dest = parts[0].strip()
+                    if "[" in dest and "ebp" not in dest.lower():
+                        # Indirect memory write.
+                        return False
+            # LEA referencing target offset → bail.
+            if op == "lea" and target_re.search(ops):
+                for m in target_re.finditer(ops):
+                    ref = m.group(0)
+                    rm = re.match(
+                        r"^\[\s*ebp\s*([+-])\s*(\d+)\s*\]$",
+                        ref,
+                        re.IGNORECASE,
+                    )
+                    if rm:
+                        ref_off = int(rm.group(2))
+                        if rm.group(1) == "-":
+                            ref_off = -ref_off
+                        if ref_off == target_offset:
+                            return False
+            # Otherwise, continue scanning.
+        return False
 
     def _pass_value_forward_to_reg(
         self, lines: list[Line]
