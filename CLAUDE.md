@@ -854,3 +854,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - The reference suites didn't catch these because they don't do `x * 2` strength reduction on side-effect-bearing Member or Compound expressions.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +2 smoke tests (414 total).
+- **2026-04-28 — `_Bool` from float in array / struct / global init (real bug)**: per C 6.3.1.2 a `_Bool` conversion compares against 0 (any non-zero → 1, zero → 0). Earlier I'd fixed scalar locals (`_Bool b = 0.5;` via `_eval_to_bool_eax`) but missed three sibling sites:
+  - **`_Bool arr[N] = {..., 0.5, ...}`** in `_array_init` fell through the per-element fallback `_eval_expr_to_eax` + `_store_from_eax`. For a float source, `_eval_expr_to_eax` truncates via `fistp` (so `0.5 → 0`), which is the WRONG conversion for `_Bool`. Fix: recognize bool element type and route through `_eval_to_bool_eax`.
+  - **`struct S { _Bool b; ... } s = {0.5, ...}`** in `_struct_init` had the same fallthrough. Fix: same dispatch.
+  - **`_Bool g = 0.5;` (and global arrays / struct members) in `_emit_global_init`** raised "initializer must be a constant expression" because `_const_eval` (integer-only) rejected `FloatLiteral`. Fix: for bool target, try `_const_eval` first, fall back to `_const_eval_float` on failure, then normalize to 0/1. Same fallback in the bool-array global directive path.
+  - Probed by `_Bool arr[5] = {0, 1, 5, -1, 0.1};` reading `arr[4] != 1` and aborting. Reference suites use bool with int literals only; no test exercises bool-from-float.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +3 smoke tests (417 total).

@@ -4872,3 +4872,66 @@ def test_compound_literal_with_side_effect_init_not_strength_reduced():
     assert asm.count("call    _side") == 1, (
         f"expected 1 call to _side, got {asm.count('call    _side')}"
     )
+
+
+def test_bool_array_element_init_from_float():
+    # `_Bool arr[3] = {0.5, 0.0, -1.7}` per C 6.3.1.2 normalizes
+    # each value to 0 or 1 — any non-zero float (including -1.7)
+    # becomes 1, only 0.0/-0.0 becomes 0. Previous codegen
+    # routed array bool elements through `_eval_expr_to_eax`,
+    # which truncated 0.5 to int 0 (not 1). Fix: dispatch bool
+    # elements through `_eval_to_bool_eax` (already used for
+    # bool scalar locals).
+    asm = _compile(
+        "int main(void) {\n"
+        "    _Bool arr[3] = {0.5, 0.0, -1.7};\n"
+        "    return arr[0] + arr[2];\n"  # 1 + 1 = 2
+        "}\n"
+    )
+    # The fix routes through fldz/fucompp/setne for floats.
+    # Prior buggy code did fistp eax (truncates 0.5 to 0).
+    assert "fldz" in asm
+    assert "setne" in asm
+
+
+def test_bool_struct_member_init_from_float():
+    # Same C 6.3.1.2 normalization for struct members. The
+    # `_struct_init` fallback dispatch was the integer-store
+    # path for bool members, which truncated floats to int.
+    asm = _compile(
+        "struct S { _Bool b; int x; };\n"
+        "int main(void) {\n"
+        "    struct S s = {0.5, 100};\n"
+        "    return s.b + s.x;\n"  # 1 + 100 = 101
+        "}\n"
+    )
+    assert "fldz" in asm
+    assert "setne" in asm
+
+
+def test_global_bool_init_from_float():
+    # Global `_Bool g = 0.5` previously raised because the global
+    # init path used `_const_eval` (integer-only). Now bool
+    # globals try integer first then fall back to
+    # `_const_eval_float`, normalizing to 0 / 1.
+    asm = _compile(
+        "_Bool g1 = 0.5;\n"
+        "_Bool g2 = -3.14;\n"
+        "_Bool g3 = 0.0;\n"
+        "_Bool arr[3] = {0.5, -1.7, 0.0};\n"
+        "int main(void) { return 0; }\n"
+    )
+    # Each bool global has its layout-time value normalized to 0/1.
+    # NASM directive `db 1` for non-zero, `db 0` for zero.
+    assert "_g1:" in asm
+    assert "_g2:" in asm
+    assert "_g3:" in asm
+    assert "_arr:" in asm
+    # The g1 / g2 stores should both be `db 1` (non-zero floats).
+    # g3 should be `db 0`.
+    g1_line = [l for l in asm.splitlines() if "db" in l and asm.split("_g1:")[1].splitlines()[1].strip() == l.strip()]
+    assert "_g1:\n        db      1" in asm or "_g1:\n        db      1\n" in asm
+    assert "_g2:\n        db      1" in asm or "_g2:\n        db      1\n" in asm
+    assert "_g3:\n        db      0" in asm or "_g3:\n        db      0\n" in asm
+    # Array: `db 1, 1, 0`
+    assert "_arr:\n        db      1, 1, 0" in asm

@@ -930,6 +930,18 @@ class CodeGenerator:
             if label_diff is not None:
                 directive = self._DATA_DIRECTIVE[self._size_of(ty)]
                 return [f"        {directive}      {label_diff}"]
+            # `_Bool` globals can initialize from any compile-time
+            # constant including floats — fall back to the float
+            # const-eval when the integer one fails. Per C 6.3.1.2
+            # the result normalizes to 0 / 1.
+            if ty.name == "bool":
+                try:
+                    value = self._const_eval(init, name)
+                except CodegenError:
+                    value = self._const_eval_float(init, name)
+                value = 1 if value != 0 else 0
+                directive = self._DATA_DIRECTIVE[self._size_of(ty)]
+                return [f"        {directive}      {value}"]
             value = self._const_eval(init, name)
             # __int128 globals: lay down two 64-bit halves (low, high)
             # honoring the value's signedness.
@@ -2158,11 +2170,16 @@ class CodeGenerator:
                                 )
                             ):
                                 slot = slot.values[0]
-                            v = self._const_eval(slot, name)
-                            # `_Bool` array element: normalize per
-                            # C 6.3.1.2 — any non-zero → 1, zero → 0.
+                            # `_Bool` array element: accept float
+                            # literals too; normalize per C 6.3.1.2.
                             if elem_type.name == "bool":
+                                try:
+                                    v = self._const_eval(slot, name)
+                                except CodegenError:
+                                    v = self._const_eval_float(slot, name)
                                 v = 1 if v != 0 else 0
+                            else:
+                                v = self._const_eval(slot, name)
                             values.append(str(v))
                         else:
                             values.append("0")
@@ -8643,6 +8660,15 @@ class CodeGenerator:
                             elem_actual, ctx, elem_type,
                         )
                         out.append("        add     esp, 4")
+                    elif (
+                        isinstance(elem_type, ast.BasicType)
+                        and elem_type.name == "bool"
+                    ):
+                        # `_Bool` element: normalize per C 6.3.1.2 so a
+                        # float / pointer / LL / complex source converts
+                        # to 0 or 1 rather than via integer truncation.
+                        out += self._eval_to_bool_eax(elem_actual, ctx)
+                        out += self._store_from_eax(_ebp_addr(elem_disp), elem_type)
                     else:
                         out += self._eval_expr_to_eax(elem_actual, ctx)
                         out += self._store_from_eax(_ebp_addr(elem_disp), elem_type)
@@ -8964,6 +8990,14 @@ class CodeGenerator:
                     store.append("        or      ecx, edx")
                     store.append(f"        mov     {unit_addr}, ecx")
                     out += store
+            elif (
+                isinstance(m_ty, ast.BasicType)
+                and m_ty.name == "bool"
+            ):
+                # `_Bool` member: normalize per C 6.3.1.2 so a float /
+                # pointer / LL / complex source converts to 0 or 1.
+                out += self._eval_to_bool_eax(actual, ctx)
+                out += self._store_from_eax(_ebp_addr(m_disp), m_ty)
             else:
                 out += self._eval_expr_to_eax(actual, ctx)
                 out += self._store_from_eax(_ebp_addr(m_disp), m_ty)
