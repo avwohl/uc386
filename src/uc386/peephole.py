@@ -8,13 +8,19 @@ crystallized, this module will be extracted to a separate `upeep386`
 package mirroring the upeepz80/uc80 split.
 
 Currently implements:
-  - P1 (dead-after-jmp): drop instructions between an unconditional
-    terminator (`jmp`, `ret`) and the next label.
-  - P-jmp-to-next: drop `jmp X` immediately followed by `X:`.
+  - dead_after_terminator: drop instrs between an unconditional `jmp`/
+    `ret` and the next label/directive/data line.
+  - jmp_to_next_label: drop `jmp X` immediately followed by `X:`.
+  - binop_collapse: replace the 4-line stack-machine right-operand
+    transfer (`push eax; mov eax, src; mov ecx, eax; pop eax`) with
+    `mov ecx, src` when src is a single-instruction load.
+  - store_collapse: drop the push/pop pair around a store (`push eax;
+    mov eax, src; pop ecx; mov [ecx], eax`) when src is a
+    single-instruction load that doesn't read ECX.
 
-Patterns to add (see PEEPHOLE_PLAN.md for details): push/pop store
-collapse, stack-machine binop collapse, redundant mov-to-reg, tail
-calls, jump threading.
+Patterns to add (see PEEPHOLE_PLAN.md for details): redundant
+mov-to-reg, tail calls, jump threading, multi-instruction right-
+operand retargeting.
 """
 
 from __future__ import annotations
@@ -99,6 +105,49 @@ def _is_unconditional_terminator(line: Line) -> bool:
     return False
 
 
+def _operands_split(operands: str) -> tuple[str, str] | None:
+    """Split a two-operand `mov` into (dest, src). Returns None for
+    anything that isn't a clean `dst, src` pair."""
+    if "," not in operands:
+        return None
+    # NASM allows commas inside `[...]` (`[ebp - 4]` doesn't have one,
+    # but `[ebp + ecx*4]` doesn't either; `[base + index, scale]`
+    # syntax doesn't exist in NASM). Effective addresses use `+` / `-`
+    # / `*`, never bare commas, so a top-level split on `,` is safe.
+    dest, _, src = operands.partition(",")
+    return dest.strip(), src.strip()
+
+
+def _references_register(text: str, reg: str) -> bool:
+    """Does `text` mention register `reg` (case-insensitive)? Looks for
+    word-boundary matches so `ecx` doesn't match `cx` or `recx`."""
+    return bool(re.search(rf"\b{reg}\b", text, re.IGNORECASE))
+
+
+def _is_simple_eax_load(line: Line) -> bool:
+    """Is this instruction a single `mov eax, <src>` where src is a
+    valid mov source operand (immediate, memory ref, register, label)?
+    The pattern needs this to know it can rewrite EAX→ECX safely."""
+    if line.kind != "instr" or line.op != "mov":
+        return False
+    parts = _operands_split(line.operands)
+    if parts is None:
+        return False
+    dest, _ = parts
+    return dest.lower() == "eax"
+
+
+def _retarget_eax_to_ecx(line: Line) -> Line:
+    """Rewrite `mov eax, src` to `mov ecx, src`. Caller verified the
+    line shape via `_is_simple_eax_load`."""
+    parts = _operands_split(line.operands)
+    assert parts is not None
+    _, src = parts
+    new_raw = re.sub(r"\beax\b", "ecx", line.raw, count=1)
+    new_operands = f"ecx, {src}"
+    return Line(raw=new_raw, kind="instr", op="mov", operands=new_operands)
+
+
 def _jmp_target(line: Line) -> str | None:
     """Return the target label of a direct `jmp <label>`, or None for
     indirect / unrecognized."""
@@ -145,11 +194,12 @@ class PeepholeOptimizer:
             before = len(lines)
             lines = self._pass_dead_after_terminator(lines)
             lines = self._pass_jmp_to_next_label(lines)
+            lines = self._pass_binop_collapse(lines)
+            lines = self._pass_store_collapse(lines)
             after = len(lines)
             if after == before:
-                # Conservatively also stop if no stat counters changed
-                # since last iteration. We use the simple length check
-                # because the only change passes do is delete lines.
+                # All passes only delete or replace-with-fewer; if the
+                # length didn't change, no rewrites fired this round.
                 break
 
         out = "\n".join(line.raw for line in lines)
@@ -201,6 +251,181 @@ class PeepholeOptimizer:
                 )
             i = j
         return out
+
+    def _pass_binop_collapse(self, lines: list[Line]) -> list[Line]:
+        """Collapse the stack-machine right-operand transfer pattern.
+
+        Match (4 consecutive instr lines, blanks/comments tolerated):
+            push    eax
+            mov     eax, <src>           ; single-instruction right
+            mov     ecx, eax
+            pop     eax
+        Replace with:
+            mov     ecx, <src>
+
+        The push saves the left operand; the right is loaded into EAX,
+        transferred to ECX as the binop's second operand, and EAX is
+        restored. After collapse, EAX is unchanged (no clobber → no
+        save needed), and the right lands directly in ECX.
+
+        Safe because `mov ecx, src` reads `src` with the same EAX/ECX
+        values as the original middle instruction did (push doesn't
+        change EAX, and the original middle hadn't touched ECX yet).
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            # Look for `push eax`.
+            if (line.kind == "instr" and line.op == "push"
+                    and line.operands.strip().lower() == "eax"):
+                # Need three more instr lines below: mov eax, src;
+                # mov ecx, eax; pop eax.
+                instrs = self._next_n_instrs(lines, i + 1, 3)
+                if instrs is not None and self._matches_binop_collapse(instrs):
+                    [(_, c), (_, d), (_, e)] = instrs
+                    # Keep original blanks/comments between push and the
+                    # first instr (none in our codegen, but be safe).
+                    # Build the replacement: a single retargeted line.
+                    new_line = _retarget_eax_to_ecx(c)
+                    # Skip from `push eax` (i) through `pop eax` (e_idx).
+                    e_idx = instrs[2][0]
+                    out.append(new_line)
+                    self.stats["binop_collapse"] = (
+                        self.stats.get("binop_collapse", 0) + 1
+                    )
+                    i = e_idx + 1
+                    continue
+            out.append(line)
+            i += 1
+        return out
+
+    def _pass_store_collapse(self, lines: list[Line]) -> list[Line]:
+        """Drop the push/pop pair around a store-through-pointer.
+
+        Match (4 consecutive instr lines):
+            push    eax
+            mov     eax, <src>           ; single-instruction value
+            pop     ecx
+            mov     [ecx], eax
+        Replace with:
+            mov     ecx, eax
+            mov     eax, <src>
+            mov     [ecx], eax
+
+        Net: drop push + pop, add `mov ecx, eax`. Saves 1 instruction
+        plus 2 stack ops. Conservative compared to the full retarget
+        variant; that one rewrites the previous `mov eax, addr` line
+        too. Defer.
+
+        Safe because `<src>` is verified not to read ECX (would
+        observe the new save value rather than the old caller-state).
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (line.kind == "instr" and line.op == "push"
+                    and line.operands.strip().lower() == "eax"):
+                instrs = self._next_n_instrs(lines, i + 1, 3)
+                if instrs is not None and self._matches_store_collapse(instrs):
+                    [(c_idx, c), (d_idx, _d), (e_idx, e)] = instrs
+                    # Replace `push eax` with `mov ecx, eax`.
+                    push_line = line
+                    new_push = Line(
+                        raw=push_line.raw.replace(
+                            "push    eax", "mov     ecx, eax", 1
+                        ).replace("push eax", "mov ecx, eax", 1),
+                        kind="instr", op="mov", operands="ecx, eax",
+                    )
+                    out.append(new_push)
+                    out.append(c)
+                    out.append(e)
+                    self.stats["store_collapse"] = (
+                        self.stats.get("store_collapse", 0) + 1
+                    )
+                    i = e_idx + 1
+                    continue
+            out.append(line)
+            i += 1
+        return out
+
+    # ── Helpers for multi-line patterns ───────────────────────────
+
+    def _next_n_instrs(self, lines: list[Line], start: int,
+                       n: int) -> list[tuple[int, Line]] | None:
+        """Return the next N instruction lines starting at index
+        `start`, as `[(idx, line), ...]`. Skip blanks/comments. Return
+        None if we hit a label/directive/data before finding N instrs."""
+        out: list[tuple[int, Line]] = []
+        j = start
+        while j < len(lines) and len(out) < n:
+            ln = lines[j]
+            if ln.kind == "instr":
+                out.append((j, ln))
+            elif ln.kind in ("label", "directive", "data"):
+                return None
+            j += 1
+        if len(out) < n:
+            return None
+        return out
+
+    @staticmethod
+    def _matches_binop_collapse(
+        instrs: list[tuple[int, Line]],
+    ) -> bool:
+        """Verify the 3-instruction tail of the binop pattern:
+        `mov eax, <src>; mov ecx, eax; pop eax`."""
+        c_line = instrs[0][1]
+        d_line = instrs[1][1]
+        e_line = instrs[2][1]
+        if not _is_simple_eax_load(c_line):
+            return False
+        # `push eax` decreases ESP by 4. If src is ESP-relative, the
+        # original `mov eax, [esp + N]` reads from a different location
+        # than the post-collapse `mov ecx, [esp + N]` would. Skip.
+        parts = _operands_split(c_line.operands)
+        assert parts is not None
+        _, src = parts
+        if _references_register(src, "esp"):
+            return False
+        if not (d_line.op == "mov"
+                and d_line.operands.replace(" ", "").lower() == "ecx,eax"):
+            return False
+        if not (e_line.op == "pop"
+                and e_line.operands.strip().lower() == "eax"):
+            return False
+        return True
+
+    @staticmethod
+    def _matches_store_collapse(
+        instrs: list[tuple[int, Line]],
+    ) -> bool:
+        """Verify the 3-instruction tail of the store pattern:
+        `mov eax, <src>; pop ecx; mov [ecx], eax` where src doesn't
+        read ECX or ESP."""
+        c_line = instrs[0][1]
+        d_line = instrs[1][1]
+        e_line = instrs[2][1]
+        if not _is_simple_eax_load(c_line):
+            return False
+        parts = _operands_split(c_line.operands)
+        assert parts is not None
+        _, src = parts
+        # src must not read ECX (would alias the saved address) or ESP
+        # (the push shifted ESP, so an `[esp + N]` operand reads a
+        # different byte than it would post-collapse).
+        if _references_register(src, "ecx"):
+            return False
+        if _references_register(src, "esp"):
+            return False
+        if not (d_line.op == "pop"
+                and d_line.operands.strip().lower() == "ecx"):
+            return False
+        if not (e_line.op == "mov"
+                and e_line.operands.replace(" ", "").lower() == "[ecx],eax"):
+            return False
+        return True
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
         """P-jmp-to-next: `jmp X` immediately (modulo blanks/comments)

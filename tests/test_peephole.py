@@ -212,6 +212,187 @@ def test_real_world_function_end():
     assert "ret" in out
 
 
+# ── binop_collapse ───────────────────────────────────────────────
+
+
+def test_binop_collapse_with_immediate():
+    """The canonical binop right-operand pattern collapses."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        push    eax\n"
+        "        mov     eax, 1\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The 4 stack-machine lines collapse to one `mov ecx, 1`.
+    assert "push    eax" not in out
+    assert "mov     ecx, eax" not in out
+    assert "pop     eax" not in out
+    assert "mov     ecx, 1" in out
+    # The cmp survives.
+    assert "cmp     eax, ecx" in out
+    assert opt.stats.get("binop_collapse", 0) == 1
+
+
+def test_binop_collapse_with_memory_operand():
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp - 8]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ecx, [ebp - 8]" in out
+    assert opt.stats.get("binop_collapse", 0) == 1
+
+
+def test_binop_collapse_skips_esp_relative_source():
+    """`push eax` shifts ESP, so a subsequent `[esp + N]` read targets
+    a different byte after collapse. Don't fire."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [esp + 4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Pattern must NOT fire — the [esp + N] is push-relative.
+    assert opt.stats.get("binop_collapse", 0) == 0
+    assert "push    eax" in out
+    assert "pop     eax" in out
+
+
+def test_store_collapse_skips_esp_relative_source():
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        push    eax\n"
+        "        mov     eax, [esp + 8]\n"
+        "        pop     ecx\n"
+        "        mov     [ecx], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("store_collapse", 0) == 0
+
+
+def test_binop_collapse_does_not_fire_on_store_pattern():
+    """The store pattern uses `pop ecx` (not `mov ecx, eax; pop eax`),
+    so binop_collapse must skip it."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        push    eax\n"
+        "        mov     eax, 100\n"
+        "        pop     ecx\n"
+        "        mov     [ecx], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # binop_collapse should NOT have fired (no mov ecx, eax marker).
+    assert opt.stats.get("binop_collapse", 0) == 0
+
+
+def test_binop_collapse_handles_chain_of_binops():
+    """Two adjacent binops should both collapse."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        push    eax\n"
+        "        mov     eax, 1\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        add     eax, ecx\n"
+        "        push    eax\n"
+        "        mov     eax, 2\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("binop_collapse", 0) == 2
+
+
+# ── store_collapse ───────────────────────────────────────────────
+
+
+def test_store_collapse_with_immediate():
+    """Store-through-pointer with literal value drops push/pop pair."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        push    eax\n"
+        "        mov     eax, 42\n"
+        "        pop     ecx\n"
+        "        mov     [ecx], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    eax" not in out
+    assert "pop     ecx" not in out
+    # The value-load and store survive.
+    assert "mov     eax, 42" in out
+    assert "mov     [ecx], eax" in out
+    # And we picked up a `mov ecx, eax` to save the address.
+    assert "mov     ecx, eax" in out
+    assert opt.stats.get("store_collapse", 0) == 1
+
+
+def test_store_collapse_skips_when_src_reads_ecx():
+    """If the value-load reads ECX, collapsing would change semantics
+    (the new ECX value would be the saved address rather than caller-
+    state)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        push    eax\n"
+        "        mov     eax, [ecx]\n"
+        "        pop     ecx\n"
+        "        mov     [ecx], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("store_collapse", 0) == 0
+
+
+def test_store_collapse_does_not_fire_on_binop_pattern():
+    """The binop pattern uses `mov ecx, eax; pop eax` (not `pop ecx;
+    mov [ecx], eax`), so store_collapse must skip it."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        push    eax\n"
+        "        mov     eax, 1\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("store_collapse", 0) == 0
+
+
 # ── Convergence ──────────────────────────────────────────────────
 
 
