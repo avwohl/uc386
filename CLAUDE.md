@@ -1308,3 +1308,12 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Sample fire rate**: 3 of 300 random torture tests (10 fires total), 1 of 220 c-testsuite. Modest but real; common after `store_chain_retarget` exposes the pattern. Updated `test_store_chain_retarget_two_instr_chain` to expect the now-further-collapsed `add ecx, ecx` form.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +12 peephole tests (864 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: shift_const_imm**: collapse `mov ecx, IMM; <shift> reg, cl` (where IMM in 0..31) into `<shift> reg, IMM`. The codegen lowers EVERY constant-count shift through CL — `mov ecx, N; shl eax, cl` (7 bytes) — even when N is a compile-time literal. x86 has direct `shl r/m32, imm8` (3 bytes for N>1, 2 bytes for N=1 via the special D1 form). Saves 4-5 bytes per match.
+  - **All shift/rotate ops covered**: shl/shr/sar/sal/rol/ror/rcl/rcr (2-operand: `OP reg, cl`) plus shld/shrd (3-operand: `OP dst, src, cl`).
+  - **Restricted to dst != ECX** since dropping the only definition of ECX would make the destination undefined (any subsequent ECX read would also see undefined). The codegen never emits `mov ecx, IMM; shl ecx, cl` directly — that would be `ecx = IMM << ecx` which is incoherent.
+  - **Restricted to IMM in [0, 31]** for safety. x86 hardware masks shift count to 31 anyway, but NASM accepts the imm form for these values without warnings.
+  - **Sample fire rate**: 13 of 200 random torture tests with 99 total fires (~7-8 fires per matching test). High-impact pass.
+  - **Concrete example**: `(x << 1) + (x << 3) + (x >> 2) + (x >> 4)` lowers to `mov eax, [x]; shl eax, 1; mov ecx, [x]; shl ecx, 3; add eax, ecx; mov ecx, [x]; sar ecx, 2; add eax, ecx; mov ecx, [x]; sar ecx, 4; add eax, ecx` — was 4 fewer instructions when each `mov ecx, N` was paired with `shl/sar eax, cl`.
+  - **Synergy with `right_operand_retarget`**: after my pass collapses to `shl eax, N`, the chain becomes a 2-instruction EAX-writing chain (`mov eax, [x]; shl eax, N`). retarget then rewrites the chain to write ECX directly, dropping the surrounding push/pop save-frame.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +11 peephole tests (875 total). Pipeline 1734/1734 (100%).

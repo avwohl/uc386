@@ -7403,3 +7403,166 @@ def test_same_memory_operand_reuse_whitespace_tolerant():
     out = opt.optimize(asm)
     assert "add     ecx, ecx" in out
     assert opt.stats.get("same_memory_operand_reuse", 0) == 1
+
+
+def test_shift_const_imm_shl():
+    """`mov ecx, 3; shl eax, cl` → `shl eax, 3`. Saves 5 bytes."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 3\n"
+        "        shl     eax, cl\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "shl     eax, 3" in out
+    assert "mov     ecx, 3" not in out
+    assert opt.stats.get("shift_const_imm", 0) == 1
+
+
+def test_shift_const_imm_all_ops():
+    """All shift/rotate ops fire."""
+    for op in ["shl", "shr", "sar", "sal", "rol", "ror", "rcl", "rcr"]:
+        asm = (
+            "_f:\n"
+            f"        mov     ecx, 5\n"
+            f"        {op}     eax, cl\n"
+            "        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        out = opt.optimize(asm)
+        spacer = " " * max(1, 8 - len(op))
+        assert f"{op}{spacer}eax, 5" in out
+        assert opt.stats.get("shift_const_imm", 0) == 1
+
+
+def test_shift_const_imm_three_operand():
+    """shld/shrd are 3-operand: `shld dst, src, cl` → `shld dst, src, IMM`."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 4\n"
+        "        shld    eax, ebx, cl\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "shld    eax, ebx, 4" in out
+    assert "mov     ecx, 4" not in out
+    assert opt.stats.get("shift_const_imm", 0) == 1
+
+
+def test_shift_const_imm_skips_imm_too_large():
+    """IMM > 31 — skip. x86 hardware masks to 31 anyway, but the
+    explicit form is invalid for >31. Conservative: only allow 0..31."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 32\n"
+        "        shl     eax, cl\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("shift_const_imm", 0) == 0
+
+
+def test_shift_const_imm_skips_negative_imm():
+    """Negative IMM — skip."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, -1\n"
+        "        shl     eax, cl\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("shift_const_imm", 0) == 0
+
+
+def test_shift_const_imm_skips_non_numeric():
+    """Source is a label or memory — skip."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, _shift_count\n"  # label
+        "        shl     eax, cl\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("shift_const_imm", 0) == 0
+
+
+def test_shift_const_imm_skips_dest_ecx():
+    """Destination is ECX — skip (we'd be dropping the only ECX def
+    that drives the destination)."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 3\n"
+        "        shl     ecx, cl\n"  # dest = ecx
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("shift_const_imm", 0) == 0
+
+
+def test_shift_const_imm_skips_ecx_live_after():
+    """ECX has subsequent reader — skip."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 2\n"
+        "        shl     eax, cl\n"
+        "        mov     edx, ecx\n"  # reads ECX
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("shift_const_imm", 0) == 0
+
+
+def test_shift_const_imm_zero_shift_handled_by_mov_zero_to_xor():
+    """Shift by 0 is degenerate — the optimizer folds `x << 0` to
+    `x` before codegen, so this case doesn't arise in practice. If
+    `mov ecx, 0` somehow reaches the peephole, `mov_zero_to_xor`
+    runs before my pass and converts to `xor ecx, ecx`. My pass
+    doesn't recognize that form (and there's no point — shift-by-0
+    doesn't actually arise), so the result is unchanged from
+    mov_zero_to_xor's output."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 0\n"
+        "        shl     eax, cl\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # mov_zero_to_xor fires first; shift_const_imm doesn't fire.
+    assert "xor     ecx, ecx" in out
+    assert opt.stats.get("shift_const_imm", 0) == 0
+
+
+def test_shift_const_imm_max_shift():
+    """Shift by 31 (max for 32-bit) — should fire."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 31\n"
+        "        shl     eax, cl\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "shl     eax, 31" in out
+    assert opt.stats.get("shift_const_imm", 0) == 1
+
+
+def test_shift_const_imm_hex_imm():
+    """Hex immediate works."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 0x10\n"  # 16
+        "        shl     eax, cl\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "shl     eax, 16" in out
+    assert opt.stats.get("shift_const_imm", 0) == 1

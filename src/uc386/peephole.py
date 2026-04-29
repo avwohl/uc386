@@ -406,6 +406,7 @@ class PeepholeOptimizer:
             lines = self._pass_redundant_eax_load(lines)
             lines = self._pass_redundant_ecx_load(lines)
             lines = self._pass_rmw_collapse(lines)
+            lines = self._pass_shift_const_imm(lines)
             lines = self._pass_same_memory_operand_reuse(lines)
             lines = self._pass_fst_fstp_collapse(lines)
             lines = self._pass_fpu_op_collapse(lines)
@@ -3439,6 +3440,139 @@ class PeepholeOptimizer:
         if sl in {"ebx", "ecx", "edx", "esi", "edi"}:
             return sl
         return None
+
+    def _pass_shift_const_imm(self, lines: list[Line]) -> list[Line]:
+        """Collapse ``mov ecx, IMM; <shift> reg, cl`` into
+        ``<shift> reg, IMM`` for compile-time-constant shift counts.
+
+        Pattern (2 consecutive instr lines):
+            mov     ecx, IMM            ; numeric literal in 0..31
+            <op>    reg, cl             ; op ∈ {shl, shr, sar, sal,
+                                                rol, ror, rcl, rcr,
+                                                shld, shrd}
+
+        Replace with:
+            <op>    reg, IMM
+
+        Saves 4-5 bytes per match. ``mov ecx, imm32`` is 5 bytes;
+        ``shl reg, cl`` is 2 bytes; combined 7 bytes. ``shl reg, 1``
+        is 2 bytes (special D1 form), ``shl reg, imm8`` (imm > 1) is
+        3 bytes.
+
+        The codegen lowers every constant-count shift through CL —
+        ``mov ecx, N; shl eax, cl`` — even when N is a compile-time
+        literal. x86 has direct ``shl r/m32, imm8`` so the CL detour
+        is wasted bytes.
+
+        Conditions:
+        - Line A is ``mov ecx, IMM`` with IMM a numeric literal in
+          [0, 31] (the 32-bit shift count is masked by 31 in
+          hardware; NASM accepts the imm form for these values).
+        - Line B is a shift/rotate op with destination = some 32-bit
+          register != ECX, source = literal ``cl``. Sub-word
+          destinations (al/ax) are excluded — they have their own
+          encoding considerations.
+        - ECX must be dead after Line B (we're dropping its only
+          definition).
+        - shld/shrd are 3-operand instructions (`shld dst, src, cl`);
+          the count operand is the third one. Same rewrite pattern.
+        """
+        out: list[Line] = []
+        i = 0
+        shift_ops = {
+            "shl", "shr", "sar", "sal",
+            "rol", "ror", "rcl", "rcr",
+            "shld", "shrd",
+        }
+        while i < len(lines):
+            line = lines[i]
+            if (
+                i + 1 < len(lines)
+                and line.kind == "instr"
+                and line.op == "mov"
+            ):
+                ap = _operands_split(line.operands)
+                if ap is not None:
+                    a_dst, a_src = ap
+                    if a_dst.strip().lower() == "ecx":
+                        imm = self._parse_numeric_immediate(a_src)
+                        if imm is not None and 0 <= imm <= 31:
+                            b = lines[i + 1]
+                            if (
+                                b.kind == "instr"
+                                and b.op in shift_ops
+                                and self._shift_uses_cl(b)
+                                and self._shift_dest_not_ecx(b)
+                                and self._reg_dead_after(
+                                    lines, i + 2, "ecx"
+                                )
+                            ):
+                                indent = self._extract_indent(b.raw)
+                                spacer = " " * max(1, 8 - len(b.op))
+                                # Replace the trailing `cl` with imm.
+                                new_operands = self._replace_cl_with_imm(
+                                    b.operands, imm,
+                                )
+                                new_raw = (
+                                    f"{indent}{b.op}{spacer}"
+                                    f"{new_operands}"
+                                )
+                                new_line = Line(
+                                    raw=new_raw, kind="instr",
+                                    op=b.op,
+                                    operands=new_operands,
+                                )
+                                out.append(new_line)
+                                self.stats["shift_const_imm"] = (
+                                    self.stats.get(
+                                        "shift_const_imm", 0,
+                                    ) + 1
+                                )
+                                i += 2
+                                continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _shift_uses_cl(line: Line) -> bool:
+        """Does this shift instruction use CL as the count operand?
+        Two-operand form: `shl reg, cl`. Three-operand (shld/shrd):
+        `shld dst, src, cl`."""
+        ops = line.operands
+        # Look for a trailing `, cl` (case-insensitive).
+        return bool(re.search(r",\s*cl\s*$", ops, re.IGNORECASE))
+
+    @staticmethod
+    def _shift_dest_not_ecx(line: Line) -> bool:
+        """The shift destination (first operand) must not be ECX or
+        any of its aliases (or a memory operand referencing ECX).
+        We're dropping the `mov ecx, IMM` so the destination must
+        not depend on ECX's value."""
+        ops = line.operands
+        # Split on commas; first operand is the destination.
+        first = ops.split(",")[0].strip().lower()
+        if first in {"ecx", "cx", "cl", "ch"}:
+            return False
+        # If destination is memory and it references ECX, skip.
+        if "[" in first and PeepholeOptimizer._references_ecx(first):
+            return False
+        return True
+
+    @staticmethod
+    def _replace_cl_with_imm(operands: str, imm: int) -> str:
+        """Replace the trailing `cl` in a shift's operands with `imm`.
+
+        For `eax, cl` → `eax, <imm>`.
+        For `eax, ebx, cl` → `eax, ebx, <imm>` (shld/shrd form).
+        """
+        return re.sub(
+            r",(\s*)cl(\s*)$",
+            f",\\g<1>{imm}\\g<2>",
+            operands,
+            count=1,
+            flags=re.IGNORECASE,
+        )
 
     def _pass_same_memory_operand_reuse(
         self, lines: list[Line]
