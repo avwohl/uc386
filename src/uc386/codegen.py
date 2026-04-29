@@ -11678,8 +11678,16 @@ class CodeGenerator:
             if l_ptr and r_ptr:
                 return ast.BasicType(name="int")
             if l_ptr:
+                # Decay ArrayType → PointerType per C — the arithmetic
+                # result is always a pointer, never an array. Without
+                # this, `sizeof(arr + 1)` would return the full array
+                # size instead of pointer size (4).
+                if isinstance(lt, ast.ArrayType):
+                    return ast.PointerType(base_type=lt.base_type)
                 return lt
             if r_ptr:
+                if isinstance(rt, ast.ArrayType):
+                    return ast.PointerType(base_type=rt.base_type)
                 return rt
             # Float promotion: if either operand is float, the result is
             # float (or double if either is double).

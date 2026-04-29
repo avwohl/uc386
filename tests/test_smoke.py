@@ -4948,6 +4948,23 @@ def test_bool_bitfield_compound_assign_with_float():
     assert "setne" in asm
 
 
+def test_sizeof_array_in_arithmetic_decays_to_pointer():
+    # `sizeof(arr + 1)` should return pointer size (4), not the
+    # full array size. Previously `_type_of(BinaryOp("+", ArrayType, IntLiteral))`
+    # returned ArrayType, so sizeof reported the array's full
+    # storage. Per C, an array in arithmetic context decays to a
+    # pointer.
+    asm = _compile(
+        "int main(void) {\n"
+        "    int arr[20];\n"
+        "    return sizeof(arr + 1);\n"  # should be 4
+        "}\n"
+    )
+    # Compile-time fold: the only `mov eax, N` for the return is 4.
+    assert "mov     eax, 4" in asm
+    assert "mov     eax, 80" not in asm
+
+
 def test_global_bool_init_from_float():
     # Global `_Bool g = 0.5` previously raised because the global
     # init path used `_const_eval` (integer-only). Now bool

@@ -868,3 +868,6 @@ See `README.md` for the public roadmap (Phase 0–6).
   - Reference suites don't trigger this — they don't compound-assign float / LL to bool lvalues. Probed with `*p += 0.7`, `arr[i] += 0.5`, `s.m += 0.5`, `s.b -= 1.0`, `*get_p() += 0.7` (side-effect lvalue fires once), `arr[i++] += 0.5` (single-fire i++).
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +2 smoke tests (419 total).
+- **2026-04-28 — `sizeof(arr + 1)` returned full array size (real bug, was a known limitation)**: from CLAUDE.md slice 12 — `sizeof(arr + 0)` returned the full array size instead of pointer size because `_type_of` didn't decay arrays in arithmetic results. Per C, an array in arithmetic context (`arr + N`, `arr - N`) decays to a pointer; the result of the `+` is `int *`, not `int [N]`. Fix: in `_type_of(BinaryOp("+"|"-"))`'s pointer-propagation branch, when the propagated operand is `ArrayType`, return `PointerType(base_type=arr.base_type)` instead. Smoke test verifies `sizeof(arr + 1)` is 4. The arr-arithmetic scaling and ptr-ptr subtraction paths are unaffected because they only need the pointee size, which is preserved.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +1 smoke test (420 total).
