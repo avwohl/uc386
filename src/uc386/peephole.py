@@ -5381,31 +5381,31 @@ class PeepholeOptimizer:
     def _pass_push_pop_to_mov(
         self, lines: list[Line]
     ) -> list[Line]:
-        """Replace ``push IMM_OR_LABEL; ... stack-balanced chain ... ;
-        pop REG`` with ``mov REG, IMM_OR_LABEL`` (placed where the
-        pop was), dropping the push entirely.
+        """Replace ``push X; ... stack-balanced chain ... ; pop REG``
+        with ``mov REG, X`` (placed where the pop was), dropping the
+        push entirely.
 
-        Saves 1 byte per match (push imm32 + pop reg = 5 + 1 = 6
-        bytes; mov reg, imm32 = 5 bytes). Plus eliminates a stack
-        round-trip.
+        Saves 1 byte per match — push X + pop reg vs. mov reg, X.
+
+        X may be:
+        - A numeric immediate or label/label-arithmetic expression
+          (the original case).
+        - A memory operand (``[ebp ± N]``, ``[label]``, etc.) where
+          the chain doesn't write to memory aliasing X.
 
         Conditions:
-        - First instr: ``push X`` where X is a numeric immediate or
-          a label/label-arithmetic expression (no register, no
-          memory deref).
+        - First instr: ``push X``.
         - Walk forward, tracking stack depth. Match the FIRST
-          ``pop REG`` at depth 0 (going forward, push +1, pop -1).
-          If we encounter a `pop` at depth 1 (matches our push),
-          that's our matching pop.
-        - Chain between push and pop must not access [esp + N]
-          (stack address depends on push), call (clobbers stack),
-          or ret/leave/enter (similar). Conditional/unconditional
-          jumps fence the rewrite (control flow may bypass the
-          push/pop pair).
+          ``pop REG`` at depth 0.
+        - Chain between push and pop must not access [esp + N], call,
+          or ret/leave/enter. Any jump fences the rewrite.
+        - If X is memory, the chain must not write to memory that
+          may alias X.
 
         Common after pop_index_*_collapse drops the indexing chain
         but leaves the original `push BASE` and `pop BASE_REG` —
         which now have no chain between them or a trivial chain.
+        Also fires on struct-copy retptr-save patterns.
         """
         out = list(lines)
         i = 0
@@ -5415,19 +5415,29 @@ class PeepholeOptimizer:
                 i += 1
                 continue
             push_op = a.operands.strip()
-            # Check: imm or label (not register or mem).
-            if "[" in push_op or self._is_general_register(
-                push_op.lower()
-            ):
+            # Skip register pushes — those are saving register values
+            # and the codegen needs the round-trip.
+            if self._is_general_register(push_op.lower()):
                 i += 1
                 continue
-            # Optional size keyword strip — but a 32-bit push of
-            # imm doesn't normally have one.
+            # Optional size keyword strip.
             stripped = push_op
             for prefix in ("dword ", "word ", "byte ", "qword "):
                 if stripped.lower().startswith(prefix):
                     stripped = stripped[len(prefix):].lstrip()
                     break
+            # Is it a memory operand?
+            push_is_mem = stripped.startswith("[")
+            # For memory operands, restrict to ebp-relative literal
+            # offsets (`[ebp + N]` / `[ebp - N]`). ebp is callee-saved
+            # and frame-relative; the chain can't change ebp without
+            # invoking control flow we already bail on. Other forms
+            # like `[eax + ecx*4]` reference registers the chain may
+            # modify, making the post-pop value differ from the
+            # pushed value.
+            if push_is_mem and self._ebp_offset(stripped) is None:
+                i += 1
+                continue
             # Walk forward looking for matching pop.
             depth = 1  # we're past the push
             match_idx = None
@@ -5474,6 +5484,27 @@ class PeepholeOptimizer:
                 if "esp" in (ln.operands or "").lower():
                     failed = True
                     break
+                # If X is memory, bail on chain instructions that
+                # may write to memory aliasing X.
+                if push_is_mem:
+                    ops_text = ln.operands or ""
+                    if (
+                        ops_text
+                        and ln.op
+                        not in self._READ_ONLY_FIRST_MEM
+                    ):
+                        first_op = (
+                            ops_text.split(",", 1)[0].strip()
+                            if "," in ops_text
+                            else ops_text.strip()
+                        )
+                        if "[" in first_op:
+                            if not self._mem_disjoint(
+                                self._strip_size_prefix(first_op),
+                                self._strip_size_prefix(stripped),
+                            ):
+                                failed = True
+                                break
                 j += 1
             if failed or match_idx is None:
                 i += 1

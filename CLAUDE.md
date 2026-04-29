@@ -1233,3 +1233,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - The bug had been latent since the chain extension landed; the immediate-adjacent fast path was correct, only the chain path mishandled 1-operand RMW ops.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +9 peephole tests (801 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: push_pop_to_mov memory-operand extension + cmp_load_collapse chain extension + chain extension reordering**: extends `push_pop_to_mov` to also fire when X is an ebp-relative memory operand. Catches the struct-copy retptr-save pattern where the codegen emits `push dword [ebp + 8]; lea edx, [src]; pop ecx` to save the destination pointer across struct address computation.
+  - **`push_pop_to_mov` for memory X**. Extends the existing pass — was imm/label-only, now also handles `[ebp ± N]` literal-offset memory pushes. Saves 1 byte per match (push mem + pop reg = 4 bytes; mov reg, mem = 3 bytes).
+  - **Restricted to ebp-relative literal offsets**. Other memory forms like `[reg + idx*scale]` or `[label]` are excluded. The chain might modify the registers in X's addressing (e.g., `push [eax + ecx*4]; mov eax, [ebp - 4]; pop ecx` — the `mov eax, ...` clobbers eax, so the rewrite would read from a different address). ebp-relative is safe because ebp is callee-saved and not modified except via control flow we already bail on.
+  - **Bug found and fixed during integration**: c-testsuite 00015 + 00151 regressed when I initially allowed all memory operands. The fix narrowed the restriction to ebp-relative only.
+  - **Aliasing check**: when push X is memory, the chain must not write to memory aliasing X. Reuses the same logic from `cmp_load_collapse`'s chain extension — first-operand check with `_READ_ONLY_FIRST_MEM` exclusion list and `_mem_disjoint`.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests (806 total). Pipeline 1734/1734 (100%).

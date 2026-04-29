@@ -5398,6 +5398,91 @@ def test_push_pop_to_mov_skips_register():
     assert opt.stats.get("push_pop_to_mov", 0) == 0
 
 
+def test_push_pop_to_mov_memory_param_save():
+    """`push [ebp + N]` (function param) saved across a chain that
+    doesn't touch the slot — drops to `mov reg, [ebp + N]`. Saves
+    1 byte. Common in struct-copy retptr-save patterns."""
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp + 8]\n"
+        "        lea     edx, [ebp - 12]\n"
+        "        pop     ecx\n"
+        "        mov     eax, [edx + 0]\n"
+        "        mov     [ecx + 0], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    dword [ebp + 8]" not in out
+    # The pop got replaced with `mov ecx, [ebp + 8]`.
+    assert "mov     ecx, [ebp + 8]" in out
+    assert opt.stats.get("push_pop_to_mov") == 1
+
+
+def test_push_pop_to_mov_memory_skips_alias_write():
+    """If the chain writes to memory aliasing X, bail."""
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp + 8]\n"
+        "        mov     [ebp + 8], 99\n"  # writes X!
+        "        pop     ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_to_mov", 0) == 0
+
+
+def test_push_pop_to_mov_memory_disjoint_writes_ok():
+    """Disjoint ebp-relative writes don't alias — collapse fires."""
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp + 8]\n"
+        "        mov     dword [ebp - 4], 99\n"  # disjoint
+        "        pop     ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("push_pop_to_mov") == 1
+    assert "mov     ecx, [ebp + 8]" in out
+
+
+def test_push_pop_to_mov_skips_sib_form():
+    """`push [reg + idx*scale]` references registers that the chain
+    may modify — bail. ebp-relative literal offsets only.
+
+    Regression: c-testsuite 00015 had `push [eax + ecx*4]` followed
+    by `mov eax, [ebp - 4]` which clobbers eax — the rewrite would
+    have read from the wrong address.
+    """
+    asm = (
+        "_f:\n"
+        "        push    dword [eax + ecx*4]\n"
+        "        mov     eax, [ebp - 4]\n"  # clobbers eax!
+        "        pop     ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_to_mov", 0) == 0
+
+
+def test_push_pop_to_mov_skips_label_memory():
+    """`push [_glob]` (label-addressed memory) — bail since the
+    chain may write to globals through pointers."""
+    asm = (
+        "_f:\n"
+        "        push    dword [_glob]\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        pop     edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_to_mov", 0) == 0
+
+
 def test_push_pop_to_mov_skips_with_call():
     """Call inside the chain — fence (call could disturb stack)."""
     asm = (
