@@ -249,6 +249,113 @@ def test_dead_after_call_returning_fn():
     assert "mov     eax, 1" in out
 
 
+def test_unreferenced_label_removal_basic():
+    """Drop a label that's preceded by terminator and not referenced."""
+    asm = (
+        "_f:\n"
+        "        jmp     .target\n"
+        ".orphan:\n"
+        "        mov     eax, 1\n"
+        ".target:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # .orphan is preceded by `jmp .target` (terminator) and unreferenced.
+    # After dropping it, dead_after_terminator extends past `mov eax, 1`.
+    assert ".orphan:" not in out
+    assert opt.stats.get("unreferenced_label_removal", 0) >= 1
+
+
+def test_unreferenced_label_removal_skips_referenced():
+    """Don't drop a label that has a reference."""
+    asm = (
+        "_f:\n"
+        "        jmp     .target\n"
+        ".target:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # .target is referenced by jmp — keep.
+    # (Although jmp_to_next_label may merge it; that's a different pass.)
+    assert opt.stats.get("unreferenced_label_removal", 0) == 0
+
+
+def test_unreferenced_label_removal_skips_with_fallthrough():
+    """Don't drop a label preceded by a non-terminator (fallthrough)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 1\n"
+        ".label:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # .label has fallthrough from `mov eax, 1` — don't drop.
+    assert ".label:" in out
+    assert opt.stats.get("unreferenced_label_removal", 0) == 0
+
+
+def test_unreferenced_label_removal_preserves_epilogue():
+    """Don't drop a label directly followed by leave/ret — that's
+    a function epilogue."""
+    asm = (
+        "_f:\n"
+        "        call    _abort\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # .epilogue is preceded by `call _abort` (now a terminator) and
+    # unreferenced. But it's followed by leave/ret — preserve as
+    # function-epilogue convention.
+    assert ".epilogue:" in out
+
+
+def test_unreferenced_label_removal_global_label_preserved():
+    """Global labels (no leading `.`) are not considered for removal."""
+    asm = (
+        "_f:\n"
+        "        jmp     .end\n"
+        "_unreferenced:\n"
+        "        ret\n"
+        ".end:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # _unreferenced is global — preserve.
+    assert "_unreferenced:" in out
+
+
+def test_unreferenced_label_removal_switch_end():
+    """The canonical case: a switch's `.L1_switch_end:` after a
+    default-body that always returns. The label is unreferenced."""
+    asm = (
+        "_f:\n"
+        "        jmp     .L_default\n"
+        ".L_default:\n"
+        "        mov     eax, -1\n"
+        "        jmp     .epilogue\n"
+        ".L1_switch_end:\n"
+        "        xor     eax, eax\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # .L1_switch_end is preceded by `jmp .epilogue` (terminator) and
+    # unreferenced. Drop it.
+    assert ".L1_switch_end:" not in out
+    # The dead `xor eax, eax` between the dropped label and .epilogue
+    # gets cleaned by dead_after_terminator.
+    assert opt.stats.get("unreferenced_label_removal", 0) >= 1
+
+
 def test_stats_count_jmp_to_next():
     asm = (
         "_f:\n"

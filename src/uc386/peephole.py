@@ -442,6 +442,12 @@ class PeepholeOptimizer:
             lines = self._pass_push_pop_to_mov(lines)
             lines = self._pass_sib_const_index_fold(lines)
             lines = self._pass_push_const_index_fold(lines)
+            # Drop labels that aren't referenced anywhere. Other
+            # passes may have replaced jcc/jmp targets, leaving some
+            # labels orphaned. After dropping, dead_after_terminator
+            # in the next pass-iteration may extend the dead zone
+            # past the dropped label, dropping more code.
+            lines = self._pass_unreferenced_label_removal(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -497,6 +503,116 @@ class PeepholeOptimizer:
                 )
             i = j
         return out
+
+    def _pass_unreferenced_label_removal(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Drop NASM-local label definitions (`.LX:`) that meet ALL
+        these conditions:
+        1. No operand in the file references them (textual match).
+        2. They are PRECEDED by an unconditional terminator (jmp/ret/
+           call-noreturn). This means there's no fallthrough into the
+           label — only jumps could reach it, but condition 1 says
+           there are no jumps. So the label is truly unreachable.
+        3. They are NOT immediately followed by `leave`/`ret`. This
+           preserves function epilogues even when no early returns
+           exist (the codegen emits `.epilogue:` consistently).
+
+        After dropping, `dead_after_terminator` may extend the dead
+        zone past the dropped label, dropping more code.
+
+        Counts use textual matching:
+        - A label `.LX:` contributes 1 textual match (its definition).
+        - References from operands (`jmp .LX`, `je .LX`, `_outer.LX`,
+          `dd .LX`) contribute additional matches.
+        - If only the definition exists (count == 1) AND conditions
+          2-3 hold, drop.
+
+        Limitations:
+        - NASM-local labels with the same name in different functions
+          are conflated (textual matching).
+        - Global labels (those without a leading `.`) are not
+          considered for removal — they may be exported.
+        """
+        label_pattern = re.compile(r"\.[A-Za-z_]\w*")
+        # Count textual occurrences across the entire file.
+        counts: dict[str, int] = {}
+        for line in lines:
+            for match in label_pattern.finditer(line.raw):
+                name = match.group()
+                counts[name] = counts.get(name, 0) + 1
+        # Walk and drop unreferenced label definitions.
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if line.kind == "label":
+                stripped = line.raw.strip()
+                if stripped.endswith(":"):
+                    name = stripped[:-1].strip()
+                    if (
+                        name.startswith(".")
+                        and counts.get(name, 0) <= 1
+                        and self._preceded_by_terminator(lines, i)
+                        and not self._followed_by_function_epilogue(
+                            lines, i + 1
+                        )
+                    ):
+                        self.stats["unreferenced_label_removal"] = (
+                            self.stats.get(
+                                "unreferenced_label_removal", 0
+                            ) + 1
+                        )
+                        i += 1
+                        continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _preceded_by_terminator(
+        lines: list[Line], idx: int
+    ) -> bool:
+        """Look BACKWARD from `idx` for the previous instruction
+        (skipping blanks/comments/labels). Return True if it's an
+        unconditional terminator. If no instruction is found before
+        a directive or the file start, return False (conservative)."""
+        for k in range(idx - 1, -1, -1):
+            ln = lines[k]
+            if ln.kind in ("blank", "comment"):
+                continue
+            if ln.kind == "label":
+                continue  # consecutive labels — keep looking back
+            if ln.kind == "directive":
+                return False
+            if ln.kind == "instr":
+                return _is_unconditional_terminator(ln)
+            return False
+        return False
+
+    @staticmethod
+    def _followed_by_function_epilogue(
+        lines: list[Line], start: int
+    ) -> bool:
+        """Look at the next instruction (skipping blanks/comments).
+        Return True if it's `leave`, `ret`, or another label (which
+        means the label we're considering is part of a chain leading
+        to an epilogue). Return False otherwise."""
+        for k in range(start, len(lines)):
+            ln = lines[k]
+            if ln.kind == "label":
+                # Chained label — if THAT is followed by leave/ret,
+                # then ours is too. Recurse.
+                return PeepholeOptimizer._followed_by_function_epilogue(
+                    lines, k + 1
+                )
+            if ln.kind in ("blank", "comment"):
+                continue
+            if ln.kind == "instr":
+                return ln.op in {"leave", "ret",
+                                 "iret", "iretd", "retf", "retn"}
+            return False
+        return False
 
     def _pass_binop_collapse(self, lines: list[Line]) -> list[Line]:
         """Collapse the stack-machine right-operand transfer pattern.
