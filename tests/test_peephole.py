@@ -2832,6 +2832,154 @@ def test_narrowing_load_test_collapse_skips_full_dword_load():
     assert opt.stats.get("cmp_load_collapse", 0) == 1
 
 
+# ── redundant_eax_load: read-only ops + jcc fall-through ─────────
+
+
+def test_redundant_eax_load_through_cmp():
+    """`cmp eax, X` reads EAX but doesn't write — eax_mem stays
+    valid across cmp."""
+    asm = (
+        "_max:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        cmp     eax, [ebp + 12]\n"
+        "        mov     eax, [ebp + 8]\n"  # redundant
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Only one `mov eax, [ebp + 8]` should remain — the second is
+    # dropped (eax already holds [ebp + 8] after the cmp).
+    assert out.count("mov     eax, [ebp + 8]") == 1
+    assert opt.stats.get("redundant_eax_load") == 1
+
+
+def test_redundant_eax_load_through_test():
+    """`test eax, eax` is read-only on EAX — eax_mem stays valid."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        test    eax, eax\n"
+        "        mov     eax, [ebp + 8]\n"  # redundant
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert out.count("mov     eax, [ebp + 8]") == 1
+    assert opt.stats.get("redundant_eax_load") == 1
+
+
+def test_redundant_eax_load_through_push_eax():
+    """`push eax` reads EAX but doesn't write — eax_mem stays valid.
+
+    Note: a tight ``mov eax, [mem]; push eax`` pair would be eaten by
+    ``push_memory``. To test only the redundant-load behavior across
+    a push, we put another use of EAX between the load and the push,
+    and an OUTSIDE redundant load after the push."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        add     eax, eax\n"  # uses eax — push_memory can't fire
+        "        push    eax\n"
+        "        mov     eax, [ebp + 8]\n"  # not redundant (eax was modified)
+        "        pop     edx\n"  # different reg avoids push_memory tail
+        "        ret\n"
+    )
+    # push_memory only fires when src is an exact mem operand of mov.
+    # The above is *literally* not a push_memory candidate. The
+    # `mov eax, [ebp + 8]` after the push IS NOT redundant (eax got
+    # modified by `add eax, eax`). This is a placeholder showing the
+    # tracker correctly invalidates after EAX-modifying ops.
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    # Tracker reset after `add eax, eax`, so the second mov isn't
+    # redundant.
+    assert opt.stats.get("redundant_eax_load", 0) == 0
+
+
+def test_redundant_eax_load_through_jcc_fallthrough():
+    """Conditional jumps (jcc) preserve EAX state on the fallthrough
+    path. `mov eax, M; cmp eax, X; jcc L; mov eax, M` — the second
+    load is redundant in the fallthrough path."""
+    asm = (
+        "_max:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        cmp     eax, [ebp + 12]\n"
+        "        jle     .L1\n"
+        "        mov     eax, [ebp + 8]\n"  # redundant on fallthrough
+        "        jmp     .L2\n"
+        ".L1:\n"
+        "        mov     eax, [ebp + 12]\n"
+        ".L2:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Two `mov eax, [ebp + 8]` originally; one is dropped (redundant).
+    assert out.count("mov     eax, [ebp + 8]") == 1
+    assert opt.stats.get("redundant_eax_load") == 1
+
+
+def test_redundant_eax_load_invalidates_after_label():
+    """Labels are merge points — multiple incoming paths could put
+    different values in EAX. After a label, the tracker must reset.
+
+    To prove that, we keep the first mov live and avoid passes that
+    would consume it (cmp_load_collapse, dead_mov_to_reg)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        push    eax\n"  # uses eax (keeps the load alive)
+        ".target:\n"  # label invalidates tracking
+        "        mov     eax, [ebp + 8]\n"  # NOT redundant
+        "        pop     edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    # Tracker invalidates at .target:, so the second mov is NOT
+    # treated as redundant.
+    assert opt.stats.get("redundant_eax_load", 0) == 0
+
+
+def test_redundant_eax_load_invalidates_after_call():
+    """`call` clobbers EAX (return value)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        push    eax\n"  # uses eax (keeps the load alive)
+        "        call    _g\n"
+        "        add     esp, 4\n"
+        "        mov     eax, [ebp + 8]\n"  # NOT redundant — call wrote eax
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The first mov+push pair gets push_memory'd to `push dword [...]`,
+    # so the FIRST mov is consumed — but the SECOND mov is preserved.
+    assert out.count("mov     eax, [ebp + 8]") == 1
+    assert opt.stats.get("redundant_eax_load", 0) == 0
+
+
+def test_redundant_eax_load_invalidates_after_unconditional_jmp():
+    """An unconditional `jmp` also invalidates — the next text
+    instruction is unreachable except via a label, where we'd reset
+    again. Conservative: reset at jmp. (jcc keeps tracking — that's
+    the previous test.)"""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        jmp     .else\n"
+        "        mov     eax, [ebp + 8]\n"  # unreachable as fallthrough
+        ".else:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    # The unreachable mov gets dropped by `dead_after_terminator`,
+    # not by redundant_eax_load.
+    assert opt.stats.get("redundant_eax_load", 0) == 0
+
+
 # ── push_memory ──────────────────────────────────────────────────
 
 

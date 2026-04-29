@@ -2159,10 +2159,35 @@ class PeepholeOptimizer:
                     out.append(line)
                     continue
             # Any non-mov instruction: be conservative.
-            # Calls, jumps, ret: control-flow boundary.
+            # Calls and unconditional control flow boundaries
+            # invalidate EAX. Conditional jumps (jcc) do NOT — the
+            # fallthrough path preserves EAX, and labels (which are
+            # merge points) invalidate separately. So `cmp eax, X;
+            # jcc L; mov eax, M2` doesn't reset tracking at the jcc;
+            # if M2 == eax_mem, the load is redundant in the
+            # fallthrough path. The taken-jcc path lands at L, where
+            # the label-handling above resets eax_mem.
             if op in {"call", "jmp", "ret", "iret", "iretd", "retf",
-                      "retn", "leave", "enter"} or op.startswith("j"):
+                      "retn", "leave", "enter"}:
                 eax_mem = None
+                out.append(line)
+                continue
+            if op.startswith("j"):
+                # Conditional jump (jcc) — keep tracking. Note: `jmp`
+                # is filtered out above (unconditional). All remaining
+                # `j*` are jcc.
+                out.append(line)
+                continue
+            # Instructions that READ EAX but don't WRITE it: cmp,
+            # test, push. These are safe — they don't change EAX's
+            # value, so eax_mem stays valid.
+            if op in {"cmp", "test", "push"}:
+                # Verify EAX isn't being COMPARED with something that
+                # might be a memory write (it can't — these all are
+                # pure reads). Just preserve tracking.
+                # Caveat: any non-EAX dest write to memory still needs
+                # the alias check below, but cmp/test/push don't
+                # write memory.
                 out.append(line)
                 continue
             # Instructions that may write EAX (explicit operand or
