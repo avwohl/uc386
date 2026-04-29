@@ -66,10 +66,19 @@ Currently implements:
     becomes `enter IMM, 0`. Saves 2-5 bytes per function (depending
     on whether IMM fits in imm8). Identical semantics — enter
     pushes EBP, sets EBP=ESP, allocates IMM stack bytes.
+  - redundant_eax_load: drop `mov eax, M` when EAX already provably
+    holds M's value (we just loaded it; intervening instructions
+    don't write EAX or alias-modify M). Common in `int v = x; v * v`
+    where the second `mov eax, [ebp+8]` is redundant.
+  - label_offset_fold: collapse `mov reg, LABEL; add reg, IMM` (or
+    `sub reg, IMM`) into `mov reg, LABEL ± IMM`. NASM resolves the
+    `LABEL ± IMM` at assemble time, producing a single 5-byte
+    `mov reg, imm32` and dropping the 3-byte add/sub. Saves 3 bytes
+    per match. Common in pointer arithmetic on globals
+    (`mov eax, _g; add eax, 8` for `g[2]`).
 
-Patterns to add (see PEEPHOLE_PLAN.md for details): redundant
-mov-to-reg, tail calls, jump threading, multi-instruction right-
-operand retargeting.
+Patterns to add (see PEEPHOLE_PLAN.md for details): tail calls,
+jump threading, multi-instruction right-operand retargeting.
 """
 
 from __future__ import annotations
@@ -280,6 +289,8 @@ class PeepholeOptimizer:
             lines = self._pass_cmp_zero_to_test(lines)
             lines = self._pass_dead_mov_to_reg(lines)
             lines = self._pass_prologue_to_enter(lines)
+            lines = self._pass_redundant_eax_load(lines)
+            lines = self._pass_label_offset_fold(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -809,7 +820,15 @@ class PeepholeOptimizer:
         instrs: list[tuple[int, Line]],
         a_line: Line,
     ) -> bool:
-        """Verify line B (`mov [addr], eax`) and line C (`mov eax, X`)."""
+        """Verify line B (`mov [addr], eax`) and line C (`mov eax, X`).
+
+        Line C must be a *fresh* EAX overwrite — its source operand
+        must not reference EAX/AX/AL/AH. Otherwise the instruction is
+        a self-RMW (e.g. ``mov eax, [eax]``) and depends on EAX's
+        prior value. Dropping line A (``mov eax, IMM``) in that case
+        would change line C's effective behavior because EAX would no
+        longer hold IMM.
+        """
         b_line = instrs[0][1]
         c_line = instrs[1][1]
         if b_line.op != "mov":
@@ -825,14 +844,9 @@ class PeepholeOptimizer:
         # store widths and a different rewrite).
         if b_src.strip().lower() != "eax":
             return False
-        # Line C must be `mov eax, anything` — the EAX overwrite witness.
-        if c_line.op != "mov":
-            return False
-        parts_c = _operands_split(c_line.operands)
-        if parts_c is None:
-            return False
-        c_dest, _c_src = parts_c
-        if c_dest.lower() != "eax":
+        # Line C must be a fresh EAX overwrite (any of mov/lea/movsx/
+        # movzx/pop/xor-self) whose source is EAX-independent.
+        if not PeepholeOptimizer._is_fresh_eax_write(c_line):
             return False
         return True
 
@@ -1903,6 +1917,299 @@ class PeepholeOptimizer:
         while n < len(raw) and raw[n] in " \t":
             n += 1
         return raw[:n]
+
+    def _pass_redundant_eax_load(self, lines: list[Line]) -> list[Line]:
+        """Drop ``mov eax, M`` when EAX already provably holds M's
+        value — we loaded it earlier in the basic block and nothing
+        between then and now wrote EAX or touched M.
+
+        Tracking is conservative: we follow EAX's "current memory
+        source" through a single straight-line block. Any of these
+        invalidate the tracker:
+        - Control-flow boundaries (labels, jumps, calls, ret)
+        - Any write to EAX (or AL/AH/AX) by any instruction
+        - Any memory-write whose destination might alias M
+
+        For aliasing, we only trust two stack expressions to be
+        disjoint when both are literal ``[ebp + N]`` / ``[ebp - N]``
+        offsets (different N). Stores via a register address (e.g.
+        ``[ecx]``), or to a label, conservatively invalidate.
+
+        Tracked operands: literal-offset stack reads (``[ebp + N]``,
+        ``[ebp - N]``). Register sources, immediates, and labels are
+        not tracked because they don't alias-conflict with anything
+        codegen emits (immediates) or aren't worth tracking
+        (registers — codegen reloads from memory, not register-to-
+        register).
+        """
+        out: list[Line] = []
+        eax_mem: str | None = None  # The literal text of EAX's known mem source
+        for line in lines:
+            if line.kind != "instr":
+                # Labels, directives, data, comments, blanks: control-
+                # flow boundaries (or potential boundaries) — invalidate.
+                if line.kind == "label":
+                    eax_mem = None
+                out.append(line)
+                continue
+            op = line.op
+            ops = line.operands
+            # Direct mov: this is where the redundant-load check fires.
+            if op == "mov":
+                parts = _operands_split(ops)
+                if parts is not None:
+                    dest, src = parts
+                    dest_low = dest.strip().lower()
+                    src_norm = src.strip()
+                    if dest_low == "eax":
+                        # mov eax, X
+                        if (
+                            eax_mem is not None
+                            and self._is_ebp_offset_mem(src_norm)
+                            and src_norm == eax_mem
+                        ):
+                            self.stats["redundant_eax_load"] = (
+                                self.stats.get("redundant_eax_load", 0) + 1
+                            )
+                            continue
+                        # New EAX value — track if it's a stack mem ref;
+                        # otherwise stop tracking.
+                        if self._is_ebp_offset_mem(src_norm):
+                            eax_mem = src_norm
+                        else:
+                            eax_mem = None
+                        out.append(line)
+                        continue
+                    # mov [...], src — a memory write
+                    if "[" in dest:
+                        if eax_mem is not None and not self._mem_disjoint(
+                            eax_mem, dest.strip()
+                        ):
+                            eax_mem = None
+                        # If dest is AL/AH/AX, also invalidate (sub-eax
+                        # write).
+                        if dest_low in {"al", "ah", "ax"}:
+                            eax_mem = None
+                        out.append(line)
+                        continue
+                    # mov reg, src — only EAX-family writes invalidate.
+                    if dest_low in {"al", "ah", "ax"}:
+                        eax_mem = None
+                    out.append(line)
+                    continue
+            # Any non-mov instruction: be conservative.
+            # Calls, jumps, ret: control-flow boundary.
+            if op in {"call", "jmp", "ret", "iret", "iretd", "retf",
+                      "retn", "leave", "enter"} or op.startswith("j"):
+                eax_mem = None
+                out.append(line)
+                continue
+            # Instructions that may write EAX (explicit operand or
+            # implicit). Conservative: any reference to eax/ax/al/ah
+            # in operands, OR any instruction in `_IMPLICIT_REG_USERS`
+            # for EAX (cdq/idiv/etc. write or read EAX).
+            if (
+                self._references_reg_family(ops, "eax")
+                or op in PeepholeOptimizer._IMPLICIT_REG_USERS
+            ):
+                eax_mem = None
+                out.append(line)
+                continue
+            # Other instructions that might write memory (add/sub/inc/
+            # dec/and/or/xor/shl/shr/sar with a memory dest).
+            # Conservative: any instruction with `[` in operands could
+            # be a memory write. Invalidate if the destination might
+            # alias eax_mem.
+            if "[" in ops:
+                # Try to extract the destination operand and check
+                # disjointness. For a 2-op instruction like `add [X], Y`
+                # the destination is the first operand.
+                parts = _operands_split(ops)
+                if parts is not None:
+                    dest, _ = parts
+                    if "[" in dest and eax_mem is not None and not (
+                        self._mem_disjoint(eax_mem, dest.strip())
+                    ):
+                        eax_mem = None
+                else:
+                    # Single-operand instructions like `inc [X]` —
+                    # be conservative.
+                    if eax_mem is not None:
+                        eax_mem = None
+            out.append(line)
+        return out
+
+    @staticmethod
+    def _is_ebp_offset_mem(text: str) -> bool:
+        """Match exactly `[ebp + N]` or `[ebp - N]` (or `dword [...]`,
+        etc.) where N is a numeric literal."""
+        # Strip optional size prefix (`dword`, `word`, `byte`).
+        stripped = text.strip()
+        for prefix in ("dword ", "word ", "byte ", "qword "):
+            if stripped.lower().startswith(prefix):
+                stripped = stripped[len(prefix):].lstrip()
+                break
+        return bool(re.fullmatch(
+            r"\[\s*ebp\s*[+-]\s*\d+\s*\]", stripped, re.IGNORECASE
+        ))
+
+    @staticmethod
+    def _mem_disjoint(a: str, b: str) -> bool:
+        """Conservative aliasing check: True if `a` and `b` are
+        provably-disjoint memory references. Only handles literal
+        ``[ebp + N]`` offsets (different N → disjoint).
+
+        Returns False (= "may alias") for anything we can't reason
+        about (register-base derefs, labels, etc.).
+        """
+        a_off = PeepholeOptimizer._ebp_offset(a)
+        b_off = PeepholeOptimizer._ebp_offset(b)
+        if a_off is None or b_off is None:
+            return False
+        return a_off != b_off
+
+    @staticmethod
+    def _ebp_offset(text: str) -> int | None:
+        """Extract the offset from `[ebp + N]` / `[ebp - N]`. Returns
+        None for non-matching forms."""
+        stripped = text.strip()
+        for prefix in ("dword ", "word ", "byte ", "qword "):
+            if stripped.lower().startswith(prefix):
+                stripped = stripped[len(prefix):].lstrip()
+                break
+        m = re.fullmatch(
+            r"\[\s*ebp\s*([+-])\s*(\d+)\s*\]", stripped, re.IGNORECASE
+        )
+        if not m:
+            return None
+        sign, num = m.group(1), m.group(2)
+        return int(num) if sign == "+" else -int(num)
+
+    def _pass_label_offset_fold(self, lines: list[Line]) -> list[Line]:
+        """Collapse ``mov reg, LABEL; add reg, IMM`` (or ``sub reg, IMM``)
+        into ``mov reg, LABEL ± IMM``. NASM resolves the ``LABEL ± IMM``
+        at assemble time, producing a single 5-byte ``mov reg, imm32``
+        and eliminating the 3-byte add/sub. Saves 3 bytes per match.
+
+        Common in pointer arithmetic on globals: ``mov eax, _g;
+        add eax, 8`` to compute ``&g[2]`` or ``&s.field``.
+
+        Conditions:
+        - First line is ``mov R, X`` where X is non-numeric, non-memory,
+          non-register (i.e., a label or label-relative expression).
+        - Second line is ``add R, IMM`` or ``sub R, IMM`` (numeric
+          literal immediate; not a memory or register).
+        - Same R.
+        - The flags-after-add are dead (no Jcc / setCC / cmov / adc /
+          sbb reading them before they're overwritten). The folded
+          ``mov`` doesn't set flags, so the original add/sub's flag
+          effects must be unobserved.
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (
+                i + 1 < len(lines)
+                and line.kind == "instr"
+                and line.op == "mov"
+            ):
+                parts = _operands_split(line.operands)
+                if parts is not None:
+                    dest, src = parts
+                    dest_low = dest.strip().lower()
+                    src_norm = src.strip()
+                    if (
+                        self._is_general_register(dest_low)
+                        and self._is_label_like(src_norm)
+                    ):
+                        nxt = lines[i + 1]
+                        if (
+                            nxt.kind == "instr"
+                            and nxt.op in ("add", "sub")
+                        ):
+                            nxt_parts = _operands_split(nxt.operands)
+                            if nxt_parts is not None:
+                                ndest, nsrc = nxt_parts
+                                imm = self._parse_numeric_immediate(
+                                    nsrc.strip()
+                                )
+                                if (
+                                    ndest.strip().lower() == dest_low
+                                    and imm is not None
+                                    and self._flags_safe_after(lines, i + 2)
+                                ):
+                                    op_sign = "+" if nxt.op == "add" else "-"
+                                    indent = self._extract_indent(line.raw)
+                                    new_src = f"{src_norm} {op_sign} {imm}"
+                                    new_raw = (
+                                        f"{indent}mov     "
+                                        f"{dest.strip()}, {new_src}"
+                                    )
+                                    new_line = Line(
+                                        raw=new_raw,
+                                        kind="instr",
+                                        op="mov",
+                                        operands=(
+                                            f"{dest.strip()}, {new_src}"
+                                        ),
+                                    )
+                                    out.append(new_line)
+                                    self.stats["label_offset_fold"] = (
+                                        self.stats.get(
+                                            "label_offset_fold", 0
+                                        ) + 1
+                                    )
+                                    i += 2
+                                    continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _is_general_register(text: str) -> bool:
+        return text.strip().lower() in {
+            "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+        }
+
+    @staticmethod
+    def _is_label_like(text: str) -> bool:
+        """True if text looks like a label or label-arithmetic expr —
+        not a memory deref, not a pure numeric literal, not a register
+        name."""
+        s = text.strip()
+        if not s:
+            return False
+        if s.startswith("[") or s.endswith("]"):
+            return False
+        if PeepholeOptimizer._is_general_register(s):
+            return False
+        if s.lower() in {
+            "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh",
+            "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
+        }:
+            return False
+        # Pure numeric literal (decimal, hex, octal, binary)?
+        try:
+            int(s, 0)
+            return False
+        except ValueError:
+            pass
+        # Looks like a label (or label expression). Could be `_foo`,
+        # `_foo + 4`, `.L1_top`, `__heap`, etc.
+        return True
+
+    @staticmethod
+    def _parse_numeric_immediate(text: str) -> int | None:
+        """Parse `42`, `0x1A`, `0o17`, `0b101`. Returns None for
+        anything else (registers, memory, labels, expressions)."""
+        s = text.strip()
+        if not s:
+            return None
+        try:
+            return int(s, 0)
+        except ValueError:
+            return None
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
         """P-jmp-to-next: `jmp X` immediately (modulo blanks/comments)

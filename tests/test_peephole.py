@@ -551,6 +551,31 @@ def test_imm_store_collapse_skips_register_source():
     assert opt.stats.get("imm_store_collapse", 0) == 0
 
 
+def test_imm_store_collapse_skips_self_rmw_witness():
+    """Regression: `mov eax, [eax]` is a self-RMW (reads EAX before
+    writing). It cannot serve as the EAX-overwrite witness for
+    imm_store_collapse, because dropping the original `mov eax, IMM`
+    would change what address `[eax]` reads.
+
+    Bug observed in c-testsuite 00163: `int *b = &(struct.b);
+    printf("%d", *b);` produced this 3-line pattern after
+    label_offset_fold + store_load_collapse, and imm_store_collapse
+    was incorrectly dropping the IMM load.
+    """
+    asm = (
+        "_f:\n"
+        "        mov     eax, _g + 4\n"
+        "        mov     [ebp - 8], eax\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The IMM load must survive — `mov eax, [eax]` reads EAX.
+    assert "mov     eax, _g + 4" in out
+    assert opt.stats.get("imm_store_collapse", 0) == 0
+
+
 # ── setcc_jcc_collapse ───────────────────────────────────────────
 
 
@@ -1645,6 +1670,252 @@ def test_prologue_to_enter_byte_savings():
     in_lines = [l for l in asm.splitlines() if l.strip()]
     out_lines = [l for l in out.splitlines() if l.strip()]
     assert len(in_lines) - len(out_lines) == 2
+
+
+# ── redundant_eax_load ───────────────────────────────────────────
+
+
+def test_redundant_eax_load_basic():
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        imul    eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Second `mov eax, [ebp + 8]` is redundant.
+    occurrences = out.count("mov     eax, [ebp + 8]")
+    assert occurrences == 1
+    assert opt.stats.get("redundant_eax_load") == 1
+
+
+def test_redundant_eax_load_skips_label_boundary():
+    """Don't drop across a label — control-flow could enter from
+    elsewhere."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        ".L1:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Both loads must survive (label could be a jump target).
+    # (dead_mov_to_reg might still drop the first one — but the
+    # second must remain.)
+    assert "mov     eax, [ebp + 8]\n.L1:" in out or out.count(
+        "mov     eax, [ebp + 8]"
+    ) >= 1
+    # Whatever happens, redundant_eax_load shouldn't fire.
+    assert opt.stats.get("redundant_eax_load", 0) == 0
+
+
+def test_redundant_eax_load_skips_call_clobber():
+    """A call clobbers EAX — the second load is NOT redundant."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        call    _bar\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("redundant_eax_load", 0) == 0
+
+
+def test_redundant_eax_load_skips_aliasing_write():
+    """A write to the same memory invalidates the tracked value."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     [ebp + 8], ecx\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("redundant_eax_load", 0) == 0
+
+
+def test_redundant_eax_load_disjoint_stack_writes_are_safe():
+    """A write to a different ebp offset is provably disjoint."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     [ebp - 8], eax\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        imul    eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert out.count("mov     eax, [ebp + 8]") == 1
+    assert opt.stats.get("redundant_eax_load") == 1
+
+
+# ── label_offset_fold ────────────────────────────────────────────
+
+
+def test_label_offset_fold_basic_add():
+    asm = (
+        "_f:\n"
+        "        mov     eax, _b\n"
+        "        add     eax, 8\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        mov     eax, _b + 8" in out
+    assert "add     eax, 8" not in out
+    assert opt.stats.get("label_offset_fold") == 1
+
+
+def test_label_offset_fold_basic_sub():
+    asm = (
+        "_f:\n"
+        "        mov     eax, _b\n"
+        "        sub     eax, 4\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        mov     eax, _b - 4" in out
+    assert "sub     eax, 4" not in out
+    assert opt.stats.get("label_offset_fold") == 1
+
+
+def test_label_offset_fold_skips_numeric_source():
+    """If the mov source is a numeric literal, the codegen should
+    have already const-folded — don't fire."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 42\n"
+        "        add     eax, 8\n"
+        "        mov     ecx, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("label_offset_fold", 0) == 0
+
+
+def test_label_offset_fold_skips_memory_source():
+    asm = (
+        "_f:\n"
+        "        mov     eax, [_b]\n"
+        "        add     eax, 8\n"
+        "        mov     ecx, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("label_offset_fold", 0) == 0
+
+
+def test_label_offset_fold_skips_when_flags_read():
+    """`add` sets flags; if a Jcc reads them before they're
+    overwritten, dropping the add changes program behavior."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _b\n"
+        "        add     eax, 8\n"
+        "        je      .L1\n"
+        ".L1:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("label_offset_fold", 0) == 0
+
+
+def test_label_offset_fold_safe_when_next_overwrites_flags():
+    """If the next instruction overwrites flags (cmp/test/another
+    arithmetic), the original add's flag effects are dead → safe to
+    drop."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _b\n"
+        "        add     eax, 8\n"
+        "        cmp     eax, ecx\n"
+        "        je      .L1\n"
+        ".L1:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        mov     eax, _b + 8" in out
+    assert opt.stats.get("label_offset_fold") == 1
+
+
+def test_label_offset_fold_skips_register_source():
+    """`mov reg, reg` shouldn't trigger — only label/expression
+    sources warrant the fold."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, ecx\n"
+        "        add     eax, 8\n"
+        "        mov     edx, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("label_offset_fold", 0) == 0
+
+
+def test_label_offset_fold_handles_label_arithmetic_source():
+    """`mov eax, _b + 4` followed by `add eax, 4` should fold to
+    `mov eax, _b + 4 + 4` (NASM resolves at assemble time)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _b + 4\n"
+        "        add     eax, 4\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # NASM accepts nested label-arithmetic.
+    assert opt.stats.get("label_offset_fold") == 1
+    assert "        mov     eax, _b + 4 + 4" in out
+
+
+def test_label_offset_fold_dot_label():
+    """User-declared local labels (`.foo`) are still address-takers."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, .L1_target\n"
+        "        add     eax, 16\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("label_offset_fold") == 1
+    assert "        mov     eax, .L1_target + 16" in out
+
+
+def test_label_offset_fold_works_with_any_register():
+    """Pattern fires for ECX, EDX, etc. — not just EAX."""
+    for reg in ("eax", "ebx", "ecx", "edx", "esi", "edi"):
+        asm = (
+            "_f:\n"
+            f"        mov     {reg}, _glob\n"
+            f"        add     {reg}, 8\n"
+            f"        mov     [esp - 4], {reg}\n"
+            "        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        out = opt.optimize(asm)
+        assert f"        mov     {reg}, _glob + 8" in out, f"{reg}: {out}"
+        assert opt.stats.get("label_offset_fold") == 1
 
 
 # ── Convergence ──────────────────────────────────────────────────
