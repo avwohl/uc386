@@ -8644,9 +8644,34 @@ class CodeGenerator:
             else:
                 bytes_to_store = raw_bytes
             out: list[str] = []
-            for i, byte in enumerate(bytes_to_store):
+            # Pack the string bytes into the widest stores that fit.
+            # 4 consecutive bytes → 1 dword store (saves 9 bytes vs
+            # 4 byte stores). 2 bytes → 1 word store.
+            i = 0
+            while i < len(bytes_to_store):
                 addr = _ebp_addr(base_disp + i * elem_size)
-                out.append(f"        mov     byte {addr}, {byte}")
+                if i + 4 <= len(bytes_to_store):
+                    # Pack into little-endian dword.
+                    packed = (
+                        bytes_to_store[i]
+                        | (bytes_to_store[i + 1] << 8)
+                        | (bytes_to_store[i + 2] << 16)
+                        | (bytes_to_store[i + 3] << 24)
+                    )
+                    out.append(f"        mov     dword {addr}, {packed}")
+                    i += 4
+                elif i + 2 <= len(bytes_to_store):
+                    packed = (
+                        bytes_to_store[i]
+                        | (bytes_to_store[i + 1] << 8)
+                    )
+                    out.append(f"        mov     word {addr}, {packed}")
+                    i += 2
+                else:
+                    out.append(
+                        f"        mov     byte {addr}, {bytes_to_store[i]}"
+                    )
+                    i += 1
             # Bulk zero-fill the trailing bytes via the widest-store
             # helper (dword/word/byte). Each `char[N]` element is
             # 1 byte, so the byte count = number of unfilled elements.

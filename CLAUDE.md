@@ -1132,3 +1132,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Restart-from-i**: after a successful pack, the loop doesn't advance — the next 4 lines starting at i (which is now the dword store) might form another packable group with the next byte stores. This handles 8+ consecutive byte stores correctly (2 fires for 8 stores).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests (258 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — codegen: char-array string-init body uses widest-store packing**: extends the previous `_zero_fill_at` optimization to the body of the string init too. The codegen now packs `char arr[N] = "..."` source bytes into 4-byte dword chunks (then 2-byte word, then 1-byte) instead of per-byte.
+  - `char arr[5] = "hi"`: was 3 byte stores → now 1 word store (h, i packed) + 1 byte store (null). Saves 1 byte.
+  - `char buf[32] = "hello"`: was 6 byte stores + 26 zero-fill bytes → now 1 dword (h, e, l, l) + 1 word (o, null) + zero-fill. Saves another ~10 bytes on top of the previous slice's wins.
+  - The peephole's `byte_stores_to_dword` covers other adjacent byte-store patterns (e.g. struct/array literal init), but the codegen-side packing is more efficient for string init since it can pack across the embedded null terminator.
+  - Updated `test_char_array_string_init_inferred_size` and `test_char_array_string_init_with_padding` to expect the word-packed output.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. Pipeline 1734/1734 (100%).

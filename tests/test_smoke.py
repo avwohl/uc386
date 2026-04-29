@@ -2773,20 +2773,20 @@ def test_int_array_inferred_size_from_init():
 def test_char_array_string_init_inferred_size():
     asm = _compile('int main(void) { char s[] = "hi"; return 0; }')
     # 'h' (104), 'i' (105), '\\0' → 3 bytes payload, slot rounds to 4.
+    # Codegen packs `h` and `i` into one word store (0x6968 = 26984)
+    # and emits the null terminator as a byte store.
     assert "sub     esp, 4" in asm
-    assert "mov     byte [ebp - 4], 104" in asm
-    assert "mov     byte [ebp - 3], 105" in asm
+    assert "mov     word [ebp - 4], 26984" in asm  # 'i'<<8 | 'h'
     assert "mov     byte [ebp - 2], 0" in asm
 
 
 def test_char_array_string_init_with_padding():
-    # `char t[5] = "hi"` writes h, i, null, then zero-fills the
-    # remaining bytes via the widest-store path (`_zero_fill_at`).
+    # `char t[5] = "hi"` writes h, i (packed as word), null, then
+    # zero-fills the remaining bytes via `_zero_fill_at`.
     asm = _compile('int main(void) { char t[5] = "hi"; return 0; }')
     assert "sub     esp, 8" in asm  # 5 rounds to 8
-    assert "mov     byte [ebp - 8], 104" in asm
-    assert "mov     byte [ebp - 7], 105" in asm
-    assert "mov     byte [ebp - 6], 0" in asm
+    assert "mov     word [ebp - 8], 26984" in asm  # 'h', 'i' packed
+    assert "mov     byte [ebp - 6], 0" in asm  # null terminator
     # Trailing 2 bytes zero-fill via single word store (covers -5, -4).
     assert "mov     word [ebp - 5], 0" in asm
 
