@@ -404,6 +404,7 @@ class PeepholeOptimizer:
             lines = self._pass_label_load_collapse(lines)
             lines = self._pass_value_forward_to_reg(lines)
             lines = self._pass_byte_stores_to_dword(lines)
+            lines = self._pass_pop_index_push_collapse(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -4380,6 +4381,121 @@ class PeepholeOptimizer:
             out = out[:i] + [new_line] + out[i + 2:]
             self.stats["label_load_collapse"] = (
                 self.stats.get("label_load_collapse", 0) + 1
+            )
+            continue
+        return out
+
+    def _pass_pop_index_push_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse the array-index-then-push pattern that uses a
+        prior `pop` for the base.
+
+        Pattern:
+            shl IDX, N           ; scale index
+            pop BASE             ; restore previously-pushed base
+            add IDX, BASE        ; compute address
+            push dword [IDX]     ; push arr[i]
+
+        Rewrite:
+            pop BASE
+            push dword [BASE + IDX*SCALE]
+
+        Saves 4 bytes per match (drops shl + add; the SIB-form push
+        adds 1 byte over the plain `push dword [reg]` form).
+
+        Conditions:
+        - 4 consecutive instr lines.
+        - Line A: ``shl IDX, N`` for N ∈ {1, 2, 3}.
+        - Line B: ``pop BASE``.
+        - Line C: ``add IDX, BASE``.
+        - Line D: ``push dword [IDX]``.
+        - IDX dead after Line D (the SIB-form push reads IDX but
+          doesn't write; original ended with IDX = base + idx*scale,
+          new ends with IDX = unscaled index — different post-state).
+        """
+        SCALE = {1: 2, 2: 4, 3: 8}
+        out = list(lines)
+        i = 0
+        while i + 3 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            c = out[i + 2]
+            d = out[i + 3]
+            if not (
+                a.kind == "instr" and a.op == "shl"
+                and b.kind == "instr" and b.op == "pop"
+                and c.kind == "instr" and c.op == "add"
+                and d.kind == "instr" and d.op == "push"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            cp = _operands_split(c.operands)
+            if ap is None or cp is None:
+                i += 1
+                continue
+            idx_reg = ap[0].strip().lower()
+            try:
+                n = int(ap[1].strip())
+            except ValueError:
+                i += 1
+                continue
+            if n not in SCALE:
+                i += 1
+                continue
+            base_reg = b.operands.strip().lower()
+            c_dst = cp[0].strip().lower()
+            c_src = cp[1].strip().lower()
+            if (
+                not self._is_general_register(idx_reg)
+                or not self._is_general_register(base_reg)
+                or c_dst != idx_reg
+                or c_src != base_reg
+                or idx_reg == base_reg
+            ):
+                i += 1
+                continue
+            # Line D's operand: `dword [IDX]`.
+            d_op = d.operands.strip()
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if d_op.lower().startswith(prefix):
+                    d_op_stripped = d_op[len(prefix):].lstrip()
+                    break
+            else:
+                d_op_stripped = d_op
+            mem_re = re.match(
+                r"^\[\s*([a-zA-Z]+)\s*\]$", d_op_stripped
+            )
+            if mem_re is None or mem_re.group(1).lower() != idx_reg:
+                i += 1
+                continue
+            # IDX dead after line D.
+            if not self._reg_dead_after(out, i + 4, idx_reg):
+                i += 1
+                continue
+            # Build rewrite.
+            scale = SCALE[n]
+            indent_b = self._extract_indent(b.raw)
+            indent_d = self._extract_indent(d.raw)
+            new_pop = Line(
+                raw=b.raw,
+                kind="instr", op="pop", operands=base_reg,
+            )
+            new_push_src = (
+                f"dword [{base_reg} + {idx_reg}*{scale}]"
+            )
+            new_push = Line(
+                raw=f"{indent_d}push    {new_push_src}",
+                kind="instr",
+                op="push",
+                operands=new_push_src,
+            )
+            out = out[:i] + [new_pop, new_push] + out[i + 4:]
+            self.stats["pop_index_push_collapse"] = (
+                self.stats.get(
+                    "pop_index_push_collapse", 0
+                ) + 1
             )
             continue
         return out

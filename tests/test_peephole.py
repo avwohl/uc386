@@ -4606,3 +4606,80 @@ def test_byte_stores_to_dword_positive_offset():
     # 0x04030201 = 67305985
     assert "mov     dword [ebp + 8], 67305985" in out
     assert opt.stats.get("byte_stores_to_dword") == 1
+
+
+# ── pop_index_push_collapse ──────────────────────────────────────
+
+
+def test_pop_index_push_collapse_basic():
+    """`shl idx, 2; pop base; add idx, base; push dword [idx]` →
+    `pop base; push dword [base + idx*4]`."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"  # save base
+        "        mov     eax, 3\n"  # load index
+        "        shl     eax, 2\n"
+        "        pop     ecx\n"
+        "        add     eax, ecx\n"
+        "        push    dword [eax]\n"
+        "        mov     eax, ecx\n"  # eax dead before this
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    dword [ecx + eax*4]" in out
+    assert "shl     eax, 2" not in out
+    assert "add     eax, ecx" not in out
+    assert opt.stats.get("pop_index_push_collapse") == 1
+
+
+def test_pop_index_push_collapse_skips_when_idx_live():
+    """If IDX is read after the push, can't drop."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, 3\n"
+        "        shl     eax, 2\n"
+        "        pop     ecx\n"
+        "        add     eax, ecx\n"
+        "        push    dword [eax]\n"
+        "        mov     [ebp - 4], eax\n"  # eax live (the address)
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("pop_index_push_collapse", 0) == 0
+
+
+def test_pop_index_push_collapse_skips_invalid_scale():
+    """Only scales 2/4/8."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 3\n"
+        "        shl     eax, 4\n"  # scale 16, not supported
+        "        pop     ecx\n"
+        "        add     eax, ecx\n"
+        "        push    dword [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("pop_index_push_collapse", 0) == 0
+
+
+def test_pop_index_push_collapse_scale_8():
+    """Scale 8 (long-long arrays)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 3\n"
+        "        shl     eax, 3\n"  # scale 8
+        "        pop     ecx\n"
+        "        add     eax, ecx\n"
+        "        push    dword [eax]\n"
+        "        mov     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    dword [ecx + eax*8]" in out
+    assert opt.stats.get("pop_index_push_collapse") == 1
