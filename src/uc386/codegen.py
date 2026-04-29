@@ -319,8 +319,12 @@ class _FuncCtx:
 class CodeGenerator:
     """i386/MS-DOS backend."""
 
-    def __init__(self, module_name: str = "main"):
+    def __init__(self, module_name: str = "main", peephole: bool = True):
         self.module_name = module_name
+        self.peephole_enabled = peephole
+        # Statistics from the most recent peephole pass; populated by
+        # `generate()` when peephole_enabled is True.
+        self.peephole_stats: dict[str, int] = {}
         # Module-level state populated during generate(). Strings are
         # interned by content so identical literals share a label.
         self._strings: dict[str, str] = {}
@@ -721,7 +725,13 @@ class CodeGenerator:
         if bss_lines:
             lines.append("")
             lines += bss_lines
-        return "\n".join(lines) + "\n"
+        asm = "\n".join(lines) + "\n"
+        if self.peephole_enabled:
+            from . import peephole as _peephole
+            opt = _peephole.PeepholeOptimizer()
+            asm = opt.optimize(asm)
+            self.peephole_stats = opt.stats
+        return asm
 
     def _header(self, externs: list[str]) -> list[str]:
         out = [

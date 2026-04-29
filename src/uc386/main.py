@@ -128,6 +128,8 @@ def main() -> int:
     ap.add_argument("-E", "--preprocess-only", action="store_true")
     ap.add_argument("-P", "--no-preprocess", action="store_true")
     ap.add_argument("--no-ast-optimize", action="store_true")
+    ap.add_argument("--no-peephole", action="store_true",
+                    help="Disable asm-level peephole optimization")
     ap.add_argument("--int", dest="int_bits", type=int, choices=[16, 32],
                     help="int width in bits (default: 32 — Watcom flat-32)")
     ap.add_argument("--long", dest="long_bits", type=int, choices=[32, 64],
@@ -196,12 +198,17 @@ def main() -> int:
         if not args.no_ast_optimize:
             unit = ASTOptimizer(3, type_config=type_config).optimize(unit)
 
-        gen = CodeGenerator(module_name=input_paths[0].stem)
+        gen = CodeGenerator(module_name=input_paths[0].stem,
+                            peephole=not args.no_peephole)
         code = gen.generate(unit)
         output_path.write_text(code)
 
         if args.verbose:
             print(f"uc386: wrote {output_path}")
+            if gen.peephole_stats:
+                print("  peephole optimizations:")
+                for name, count in sorted(gen.peephole_stats.items()):
+                    print(f"    {name}: {count}")
         return 0
 
     except (PreprocessorError, LexerError) as e:

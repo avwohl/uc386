@@ -13,9 +13,17 @@ from uc386.codegen import CodeGenerator, CodegenError
 
 
 def _compile(src: str) -> str:
+    """Compile a snippet and return raw codegen output.
+
+    Smoke tests assert against the codegen's direct emission shape;
+    they don't go through the optimizer (so AST optimizations don't
+    rewrite patterns out from under them) or the peephole pass (so
+    asm-level rewrites don't either). Tests targeting the optimizer
+    or peephole opt in explicitly via their own helpers.
+    """
     tokens = list(Lexer(src, "test.c").tokenize())
     unit = Parser(tokens).parse()
-    return CodeGenerator().generate(unit)
+    return CodeGenerator(peephole=False).generate(unit)
 
 
 def test_backend_implements_protocol():
