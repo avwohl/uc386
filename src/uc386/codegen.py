@@ -4142,6 +4142,28 @@ class CodeGenerator:
             return self._member_address(expr, ctx)
         if isinstance(expr, ast.Index):
             return self._index_address(expr, ctx)
+        # Comma operator with complex result: eval lhs for side effects,
+        # then yield the rhs's complex address. Use type-aware
+        # evaluation for the lhs so a complex-typed lhs (e.g. `a = X`
+        # where a is complex) doesn't try to load 16 bytes into EAX.
+        if isinstance(expr, ast.BinaryOp) and expr.op == ",":
+            lt = self._type_of(expr.left, ctx)
+            if isinstance(lt, ast.ComplexType):
+                out = self._complex_value_address(expr.left, ctx)
+            elif self._is_int128(lt):
+                out = self._int128_value_address(expr.left, ctx)
+            elif isinstance(lt, ast.StructType):
+                out = self._struct_address(expr.left, ctx)
+            elif self._is_long_long(lt):
+                out = self._eval_expr_to_edx_eax(expr.left, ctx)
+            elif self._is_float_type(lt):
+                out = self._eval_float_to_st0(expr.left, ctx)
+                # Pop the value off the FPU stack without storing.
+                out.append("        fstp    st0")
+            else:
+                out = self._eval_expr_to_eax(expr.left, ctx)
+            out += self._complex_value_address(expr.right, ctx)
+            return out
         if (
             isinstance(expr, ast.Call)
             and self._is_complex_returning_call(expr, ctx)
@@ -4206,6 +4228,24 @@ class CodeGenerator:
             out = self._eval_complex_to(inner, dest, ctx)
             out.append(f"        lea     eax, {_ebp_addr(disp)}")
             return out
+        # GCC statement expression `({ ...; expr; })` whose trailing
+        # expression is complex-typed. Run head items in scope, then
+        # delegate to the trailing expression's complex-address path.
+        if isinstance(expr, ast.StmtExpr):
+            ctx.enter_scope()
+            try:
+                out: list[str] = []
+                items = expr.body.items
+                for item in items[:-1]:
+                    out += self._item(item, ctx)
+                last = items[-1]
+                if isinstance(last, ast.ExpressionStmt) and last.expr is not None:
+                    out += self._complex_value_address(last.expr, ctx)
+                else:
+                    out += self._item(last, ctx)
+                return out
+            finally:
+                ctx.exit_scope()
         raise CodegenError(
             f"can't take address of complex `{type(expr).__name__}`"
         )
@@ -5318,6 +5358,31 @@ class CodeGenerator:
             out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
             out += self._emit_int128_copy("esi", "edi")
             return out
+        # Plain assignment `lhs = rhs` in int128 context (e.g.
+        # `a = b = c`). Execute the side-effect (mutating lhs), then
+        # copy the lhs's new value into the dest slot for chained use.
+        if op == "=":
+            out = self._int128_copy_assign(expr.left, expr.right, ctx)
+            out += self._int128_value_address(expr.left, ctx)
+            out.append("        mov     esi, eax")
+            out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+            out += self._emit_int128_copy("esi", "edi")
+            return out
+        # Compound assignment `lhs OP= rhs` in int128 context. Same
+        # shape: execute the compound for its side effect, then copy
+        # the new value to dest.
+        if op in self._COMPOUND_OPS:
+            base_op = self._COMPOUND_OPS[op]
+            inner = ast.BinaryOp(
+                op=base_op, left=expr.left, right=expr.right,
+            )
+            ctx.alloc_call_temp(inner, 16)
+            out = self._int128_copy_assign(expr.left, inner, ctx)
+            out += self._int128_value_address(expr.left, ctx)
+            out.append("        mov     esi, eax")
+            out.append(f"        lea     edi, {_ebp_addr(dest_disp)}")
+            out += self._emit_int128_copy("esi", "edi")
+            return out
         # Helper: copy left's int128 value into dest_disp slot.
         def copy_left_into_dest() -> list[str]:
             o = self._int128_value_address(expr.left, ctx)
@@ -5983,8 +6048,12 @@ class CodeGenerator:
         """`complex_lvalue OP= rhs`. For Identifier lvalues use the
         simple desugar; for non-Identifier use the snapshot pattern."""
         size = self._size_of(cplx_ty)
+        # Strip the trailing `=` from `op` to get the base operation
+        # (`+=` → `+`, etc.); look up via _COMPOUND_OPS so we don't
+        # re-synthesize the compound form (which would recurse).
+        base_op = self._COMPOUND_OPS.get(op, op)
         if isinstance(expr.left, ast.Identifier):
-            inner = ast.BinaryOp(op=op, left=expr.left, right=expr.right)
+            inner = ast.BinaryOp(op=base_op, left=expr.left, right=expr.right)
             ctx.alloc_call_temp(inner, size)
             return self._complex_copy_assign(
                 ast.BinaryOp(op="=", left=expr.left, right=inner),
@@ -6024,8 +6093,10 @@ class CodeGenerator:
         # Synthesize Identifier(snap) OP rhs and assign back through
         # *addr_slot. We re-route through _complex_copy_assign with
         # a synthetic *p lvalue that dereferences the addr_slot.
+        # Use the base op (not the compound form) so the inner BinaryOp
+        # is `snap + rhs`, not `snap += rhs`.
         snap_id = ast.Identifier(name=snap_slot_name)
-        inner = ast.BinaryOp(op=op, left=snap_id, right=expr.right)
+        inner = ast.BinaryOp(op=base_op, left=snap_id, right=expr.right)
         ctx.alloc_call_temp(inner, size)
         # We need to build the dereference of the address slot's value.
         # Easiest: compose a new lvalue = `*addr_slot_id`. Then
@@ -6277,6 +6348,12 @@ class CodeGenerator:
             target_ty = self._type_of(expr.left, ctx)
             if isinstance(target_ty, ast.StructType):
                 return self._struct_copy_assign(expr, target_ty, ctx)
+        if isinstance(expr, ast.BinaryOp) and expr.op == ",":
+            # `(side_effect, struct_expr)` — eval lhs for side effects,
+            # then yield the rhs's struct address.
+            out = self._eval_expr_to_eax(expr.left, ctx)
+            out += self._struct_address(expr.right, ctx)
+            return out
         if isinstance(expr, ast.TernaryOp):
             # `cond ? a : b` where both arms are struct-typed.
             # Evaluate the chosen arm into the per-ternary temp slot
@@ -8273,6 +8350,14 @@ class CodeGenerator:
             return self._complex_assign_from_scalar(
                 synth, decl.init, var_type, ctx,
             )
+        # `_Bool` initialization: compare init against 0 directly so float,
+        # complex, and other types convert per C 6.3.1.2 (any non-zero
+        # value becomes 1) — not via integer truncation. `_eval_to_bool_eax`
+        # already knows about float/LL/int128/complex/int/pointer.
+        if isinstance(var_type, ast.BasicType) and var_type.name == "bool":
+            return self._eval_to_bool_eax(decl.init, ctx) + self._store_from_eax(
+                _ebp_addr(disp), var_type
+            )
         return self._eval_expr_to_eax(decl.init, ctx) + self._store_from_eax(
             _ebp_addr(disp), var_type
         )
@@ -9470,8 +9555,49 @@ class CodeGenerator:
             if expr.op == "~":
                 return self._complex_conj_into_top(expr, eff_ty, ctx)
         if isinstance(expr, ast.BinaryOp):
+            if expr.op == ",":
+                # Comma operator with complex result: eval lhs for side
+                # effects (type-aware so a complex-typed lhs doesn't
+                # try to load 16 bytes into EAX), then eval rhs into
+                # the dest at TOS.
+                lt = self._type_of(expr.left, ctx)
+                if isinstance(lt, ast.ComplexType):
+                    out = self._complex_value_address(expr.left, ctx)
+                elif self._is_int128(lt):
+                    out = self._int128_value_address(expr.left, ctx)
+                elif isinstance(lt, ast.StructType):
+                    out = self._struct_address(expr.left, ctx)
+                elif self._is_long_long(lt):
+                    out = self._eval_expr_to_edx_eax(expr.left, ctx)
+                elif self._is_float_type(lt):
+                    out = self._eval_float_to_st0(expr.left, ctx)
+                    out.append("        fstp    st0")
+                else:
+                    out = self._eval_expr_to_eax(expr.left, ctx)
+                out += self._eval_complex_into_top(expr.right, ctx, dest_ty)
+                return out
             if expr.op == "=":
                 return self._complex_assign_into_top(expr, eff_ty, ctx)
+            # Complex compound assignment in complex context (`a += b`
+            # where both are complex). Execute the compound assign for
+            # its side effect (which mutates the lvalue), then copy the
+            # lvalue's new value into the destination at TOS.
+            if expr.op in self._COMPOUND_OPS:
+                inner_op = self._COMPOUND_OPS[expr.op]
+                synth = ast.BinaryOp(op=inner_op, left=expr.left, right=expr.right)
+                ctx.alloc_call_temp(synth, self._size_of(eff_ty))
+                out: list[str] = []
+                # Side-effecting assignment: mutate the lvalue.
+                out += self._compound_assign_complex_lvalue(
+                    expr, expr.op, eff_ty, ctx,
+                )
+                # Now copy the lvalue's new value into the destination.
+                # `_copy_complex_lvalue_into_top` reads expr.left from
+                # its address and stores into [esp]'s pointed-to slot.
+                out += self._copy_complex_lvalue_into_top(
+                    expr.left, eff_ty, ctx,
+                )
+                return out
             # Integer-base complex constant arithmetic: fold at compile
             # time and store the integer halves directly. Avoids the
             # FPU paths that would mishandle 1/2-byte halves.
@@ -14961,6 +15087,49 @@ class CodeGenerator:
         if self._is_long_long(target_ty):
             return self._assign_ll(expr, ctx)
 
+        # `_Bool` lvalue: convert rhs via `_eval_to_bool_eax` so float,
+        # complex, long-long, and other types compare against 0
+        # directly per C 6.3.1.2 — not via integer truncation that would
+        # turn 0.5 into 0.
+        if isinstance(target_ty, ast.BasicType) and target_ty.name == "bool":
+            out = self._eval_to_bool_eax(expr.right, ctx)
+            if isinstance(expr.left, ast.Identifier):
+                return out + self._identifier_store(expr.left.name, ctx)
+            if isinstance(expr.left, ast.UnaryOp) and expr.left.op == "*":
+                addr = self._eval_expr_to_eax(expr.left.operand, ctx)
+                return (
+                    addr
+                    + ["        push    eax"]
+                    + self._eval_to_bool_eax(expr.right, ctx)
+                    + ["        pop     ecx"]
+                    + self._store_from_eax("[ecx]", target_ty)
+                )
+            if isinstance(expr.left, ast.Index):
+                addr = self._index_address(expr.left, ctx)
+                return (
+                    addr
+                    + ["        push    eax"]
+                    + self._eval_to_bool_eax(expr.right, ctx)
+                    + ["        pop     ecx"]
+                    + self._store_from_eax("[ecx]", target_ty)
+                )
+            if isinstance(expr.left, ast.Member):
+                bf = self._bitfield_info(expr.left, ctx)
+                if bf is not None:
+                    # Bit-field with bool declared type — go through
+                    # the regular bitfield store with the normalized
+                    # 0/1 value.
+                    pass  # fall through to default handler below
+                else:
+                    addr = self._member_address(expr.left, ctx)
+                    return (
+                        addr
+                        + ["        push    eax"]
+                        + self._eval_to_bool_eax(expr.right, ctx)
+                        + ["        pop     ecx"]
+                        + self._store_from_eax("[ecx]", target_ty)
+                    )
+
         # Vector-typed lvalue (gcc vector_size types are ArrayType in
         # our AST). Copy via memcpy of `sizeof(vector)` bytes from the
         # rhs's address. Catches any l-value shape (Identifier, Member,
@@ -15215,6 +15384,34 @@ class CodeGenerator:
                 )
             out.append(f"        lea     eax, {_ebp_addr(disp)}")
             return out
+        if isinstance(expr, ast.BinaryOp) and expr.op == "=":
+            # Vector chained assignment in vector-value context (e.g.
+            # `b = c = a`). Execute the assignment (which mutates the
+            # lhs and returns &lhs in EAX from `_vector_copy_assign`).
+            return self._vector_copy_assign(
+                expr, self._type_of(expr.left, ctx), ctx,
+            )
+        if isinstance(expr, ast.BinaryOp) and expr.op in self._COMPOUND_OPS:
+            # Vector compound assign in vector-value context. Execute
+            # the compound for its side effect, then return &lhs.
+            base_op = self._COMPOUND_OPS[expr.op]
+            inner = ast.BinaryOp(
+                op=base_op, left=expr.left, right=expr.right,
+            )
+            target_ty = self._type_of(expr.left, ctx)
+            ctx.alloc_call_temp(inner, self._size_of(target_ty))
+            out: list[str] = []
+            if isinstance(expr.left, ast.Identifier):
+                synth = ast.BinaryOp(op="=", left=expr.left, right=inner)
+                out += self._vector_copy_assign(synth, target_ty, ctx)
+            else:
+                out += self._compound_assign_vector_lvalue(
+                    expr, expr.op, target_ty, ctx,
+                )
+            # The compound assign helpers leave the lhs's address in
+            # EAX (or we re-derive it). Re-derive for safety.
+            out += self._vector_value_address(expr.left, ctx)
+            return out
         if isinstance(expr, (ast.BinaryOp, ast.UnaryOp)):
             return self._eval_vector_into_temp(expr, ctx)
         if isinstance(expr, ast.Call) and self._is_vector_returning_call(expr, ctx):
@@ -15240,6 +15437,23 @@ class CodeGenerator:
                 return self._vector_ternary_into(
                     expr, ctx.call_temps[id(expr)], ty, ctx,
                 )
+        # GCC statement expression `({ ...; expr; })` whose trailing
+        # expression is vector-typed.
+        if isinstance(expr, ast.StmtExpr):
+            ctx.enter_scope()
+            try:
+                out: list[str] = []
+                items = expr.body.items
+                for item in items[:-1]:
+                    out += self._item(item, ctx)
+                last = items[-1]
+                if isinstance(last, ast.ExpressionStmt) and last.expr is not None:
+                    out += self._vector_value_address(last.expr, ctx)
+                else:
+                    out += self._item(last, ctx)
+                return out
+            finally:
+                ctx.exit_scope()
         raise CodegenError(
             f"vector value: unsupported expression {type(expr).__name__}"
         )

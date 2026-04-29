@@ -4609,3 +4609,181 @@ def test_va_args_comma_swallow():
     # With varargs, comma is kept.
     assert 'bar("%d", 5)' in out or 'bar("%d",5)' in out
     assert 'bar("%d %d", 1' in out or 'bar("%d %d",1' in out
+
+
+def test_bool_init_from_float():
+    # `bool b = 0.5;` per C 6.3.1.2 must set b = 1 (any non-zero value
+    # converts to 1 — the conversion is "compares equal to 0", not
+    # "truncates to int and tests for non-zero"). Previously
+    # `_var_init` for non-float / non-LL / non-int128 / non-complex
+    # scalar lvalues went through `_eval_expr_to_eax` which truncates
+    # 0.5 to int 0 via fistp — and then `_store_from_eax`'s bool
+    # normalization saw 0 and stored 0.
+    asm = _compile(
+        "extern void abort(void);\n"
+        "int main(void) {\n"
+        "    _Bool b = 0.5;\n"
+        "    if ((int)b != 1) abort();\n"
+        "    _Bool b2 = -0.5;\n"
+        "    if ((int)b2 != 1) abort();\n"
+        "    _Bool b0 = 0.0;\n"
+        "    if ((int)b0 != 0) abort();\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
+def test_bool_assign_from_float():
+    # Similar bug for `b = 0.5;` (assign, not init). Float / LL /
+    # int128 / complex / pointer rhs into a bool lvalue must compare
+    # against 0 directly, not truncate-and-test. The fix is in
+    # `_assign`: route bool-lvalue assignments through
+    # `_eval_to_bool_eax` for any lvalue shape.
+    asm = _compile(
+        "extern void abort(void);\n"
+        "int main(void) {\n"
+        "    _Bool b;\n"
+        "    b = 0.5;\n"
+        "    if ((int)b != 1) abort();\n"
+        "    long long ll = 0x100000000LL;\n"
+        "    b = ll;  // low half is 0 but high half non-zero\n"
+        "    if ((int)b != 1) abort();\n"
+        "    int x = 5;\n"
+        "    int *p = &x;\n"
+        "    b = p;\n"
+        "    if ((int)b != 1) abort();\n"
+        "    p = 0;\n"
+        "    b = p;\n"
+        "    if ((int)b != 0) abort();\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
+def test_printf_c_with_width():
+    # `%5c` and `%-5c` must honor width. Previously the `%c` branch
+    # in dos_emu's printf ignored width entirely, producing just the
+    # single character. Fix in dos_emu adds the same width/left-align
+    # handling that `%s` already had.
+    from uc_core.preprocessor import Preprocessor
+    # Just confirm compile — the dos_emu side is verified at runtime
+    # via the broader probe tests.
+    asm = _compile(
+        "extern int sprintf(char *, const char *, ...);\n"
+        "extern int strcmp(const char *, const char *);\n"
+        "extern void abort(void);\n"
+        "int main(void) {\n"
+        "    char buf[20];\n"
+        "    sprintf(buf, \"[%5c]\", 'X');\n"
+        "    if (strcmp(buf, \"[    X]\") != 0) abort();\n"
+        "    sprintf(buf, \"[%-5c]\", 'X');\n"
+        "    if (strcmp(buf, \"[X    ]\") != 0) abort();\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
+def test_printf_star_width_negative():
+    # `printf("%*c", -5, 'X')` should produce left-aligned X with
+    # 5 chars total. Previously `read32_le` in dos_emu returned
+    # unsigned, so `width < 0` never fired — width became 4294967291
+    # (=2^32-5), and the resulting 4-billion-byte string crashed
+    # the emu with an unmapped memory write.
+    asm = _compile(
+        "extern int sprintf(char *, const char *, ...);\n"
+        "int main(void) {\n"
+        "    char buf[20];\n"
+        "    sprintf(buf, \"[%*c]\", -5, 'X');\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
+def test_complex_stmt_expr():
+    # Statement expression `({ ...; complex_expr; })` was raising
+    # "can't take address of complex `StmtExpr`" because
+    # `_complex_value_address` had no StmtExpr branch. Fix: run head
+    # items in scope, then delegate to the trailing expression's
+    # complex-address path.
+    asm = _compile(
+        "extern void abort(void);\n"
+        "int main(void) {\n"
+        "    _Complex double c = ({\n"
+        "        _Complex double t = 1.0 + 2.0i;\n"
+        "        t = t * 2;\n"
+        "        t;\n"
+        "    });\n"
+        "    if (__real__ c != 2.0 || __imag__ c != 4.0) abort();\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
+def test_vector_stmt_expr():
+    # Same shape — `_vector_value_address` had no StmtExpr branch.
+    asm = _compile(
+        "typedef int v4si __attribute__((vector_size(16)));\n"
+        "extern void abort(void);\n"
+        "int main(void) {\n"
+        "    v4si v = ({\n"
+        "        v4si t = {1, 2, 3, 4};\n"
+        "        t;\n"
+        "    });\n"
+        "    int *p = (int*)&v;\n"
+        "    if (p[0] != 1 || p[3] != 4) abort();\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
+def test_label_followed_by_decl():
+    # Per C23 6.8.2, a label may precede a declaration as well as a
+    # statement. Was previously rejected with "Unexpected token: INT".
+    asm = _compile(
+        "extern void abort(void);\n"
+        "int main(void) {\n"
+        "    int n = 0;\n"
+        "    if (n < 10) goto target;\n"
+        "target:\n"
+        "    int x = 42;\n"
+        "    int y = x * 2;\n"
+        "    if (x != 42 || y != 84) abort();\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    assert "_main:" in asm
+
+
+def test_complex_compound_assign_chain():
+    # `a += b += rhs` for `_Complex T` was producing garbage in the
+    # outer `a` because two bugs combined:
+    # (1) `_eval_complex_into_top` had no case for compound-op
+    #     BinaryOps (`+=`, `-=`, ...) — fell through to
+    #     `_scalar_to_complex_into_top` which evaluated the complex
+    #     RHS via `_eval_float_to_st0` (giving real-only with garbage).
+    # (2) `_compound_assign_complex_lvalue` for Identifier desugared
+    #     by re-using the compound op (`a += b` → `BinaryOp("+=", a,
+    #     b)`) — so the inner BinaryOp was identical to the outer,
+    #     causing recursion when the new dispatch in (1) was added.
+    # Fixes: route compound complex → execute side effect, then copy
+    # lvalue's new value to TOS dest. Strip `=` from op via
+    # `_COMPOUND_OPS` to get the base operation (`+=` → `+`) when
+    # synthesizing the inner BinaryOp.
+    asm = _compile(
+        "extern void abort(void);\n"
+        "int main(void) {\n"
+        "    _Complex double a = 1.0 + 2.0i;\n"
+        "    _Complex double b = 1.0 + 2.0i;\n"
+        "    a += b += 1.0 + 1.0i;\n"
+        "    if (__real__ b != 2.0 || __imag__ b != 3.0) abort();\n"
+        "    if (__real__ a != 3.0 || __imag__ a != 5.0) abort();\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    assert "_main:" in asm

@@ -250,6 +250,9 @@ def run(
             width = 0
             if i < n and fmt[i:i+1] == b"*":
                 width = read32_le(ap_box)
+                # read32_le returns unsigned; convert to signed.
+                if width >= 0x80000000:
+                    width -= 0x100000000
                 if width < 0:
                     # Negative width = '-' flag + abs value (C99 7.21.6.1#5).
                     left_align = True
@@ -265,6 +268,9 @@ def run(
                 i += 1
                 if i < n and fmt[i:i+1] == b"*":
                     precision = read32_le(ap_box)
+                    # read32_le returns unsigned; convert to signed.
+                    if precision >= 0x80000000:
+                        precision -= 0x100000000
                     if precision < 0:
                         precision = -1   # negative precision = no precision
                     i += 1
@@ -395,7 +401,13 @@ def run(
                 out += s
             elif conv == b"c":
                 val = read32_le(ap_box)
-                out += bytes([val & 0xFF])
+                s = bytes([val & 0xFF])
+                if width > len(s):
+                    if left_align:
+                        s = s + b" " * (width - len(s))
+                    else:
+                        s = b" " * (width - len(s)) + s
+                out += s
             elif conv == b"s":
                 addr = read32_le(ap_box)
                 s = _read_cstr_local(addr)
