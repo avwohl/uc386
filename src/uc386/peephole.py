@@ -28,6 +28,9 @@ Currently implements:
     eax, eax; jz/jnz LBL` boolean-materialize-then-branch sequence
     with a single conditional jump using the (possibly inverted) CC.
     Saves 3 instructions per `if`/`while`/`for` condition.
+  - push_immediate: replace `mov eax, IMM_OR_LABEL; push eax` with
+    `push IMM_OR_LABEL` when the next instruction overwrites EAX
+    (the mov was just for the push). Common at every cdecl arg site.
 
 Patterns to add (see PEEPHOLE_PLAN.md for details): redundant
 mov-to-reg, tail calls, jump threading, multi-instruction right-
@@ -148,6 +151,30 @@ def _is_simple_eax_load(line: Line) -> bool:
     return dest.lower() == "eax"
 
 
+def _is_imm_or_label_to_eax(line: Line) -> bool:
+    """Is this `mov eax, <constant-expr>` — immediate or label-address,
+    NOT a memory deref or register source? Used by both
+    imm_store_collapse and push_immediate."""
+    if line.kind != "instr" or line.op != "mov":
+        return False
+    parts = _operands_split(line.operands)
+    if parts is None:
+        return False
+    dest, src = parts
+    if dest.lower() != "eax":
+        return False
+    # Reject memory derefs.
+    if "[" in src:
+        return False
+    # Reject bare register names.
+    regs = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+            "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
+            "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"}
+    if src.lower() in regs:
+        return False
+    return True
+
+
 def _retarget_eax_to_ecx(line: Line) -> Line:
     """Rewrite `mov eax, src` to `mov ecx, src`. Caller verified the
     line shape via `_is_simple_eax_load`."""
@@ -210,6 +237,7 @@ class PeepholeOptimizer:
             lines = self._pass_leave_collapse(lines)
             lines = self._pass_imm_store_collapse(lines)
             lines = self._pass_setcc_jcc_collapse(lines)
+            lines = self._pass_push_immediate(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -543,6 +571,83 @@ class PeepholeOptimizer:
             i += 1
         return out
 
+    def _pass_push_immediate(self, lines: list[Line]) -> list[Line]:
+        """Replace `mov eax, IMM_OR_LABEL; push eax` with `push X`
+        when the next instruction overwrites EAX.
+
+        The codegen emits `mov eax, X; push eax` for every cdecl arg
+        push. NASM's `push imm8` / `push imm32` instructions skip the
+        EAX round-trip entirely. The next instruction must overwrite
+        EAX for the rewrite to be safe (otherwise EAX's value-after-
+        push is observable).
+
+        Conditions:
+        - First instr: `mov eax, src` where src has no `[` (constant).
+        - Second instr: `push eax`.
+        - Third instr (witness): writes EAX (mov eax, * / xor eax, eax
+          / call * / etc.).
+        """
+        def overwrites_eax(line: Line) -> bool:
+            if line.kind != "instr":
+                return False
+            # `call X` clobbers EAX (caller-saved in cdecl).
+            if line.op == "call":
+                return True
+            # `xor eax, eax` (and other xor reg, reg) clobbers.
+            if line.op == "xor":
+                parts = _operands_split(line.operands)
+                if parts and parts[0].lower() == "eax":
+                    return True
+                return False
+            # `mov eax, anything` overwrites.
+            if line.op == "mov":
+                parts = _operands_split(line.operands)
+                if parts and parts[0].lower() == "eax":
+                    return True
+                return False
+            # `lea eax, ...` overwrites.
+            if line.op == "lea":
+                parts = _operands_split(line.operands)
+                if parts and parts[0].lower() == "eax":
+                    return True
+                return False
+            # `pop eax` overwrites.
+            if line.op == "pop":
+                if line.operands.strip().lower() == "eax":
+                    return True
+                return False
+            return False
+
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (line.kind == "instr" and line.op == "mov"
+                    and _is_imm_or_label_to_eax(line)):
+                instrs = self._next_n_instrs(lines, i + 1, 2)
+                if instrs is not None:
+                    [(b_idx, b_line), (c_idx, c_line)] = instrs
+                    if (b_line.op == "push"
+                            and b_line.operands.strip().lower() == "eax"
+                            and overwrites_eax(c_line)):
+                        # Build `push <src>`. Preserve indentation.
+                        parts = _operands_split(line.operands)
+                        assert parts is not None
+                        _, src = parts
+                        leading_ws = re.match(r"^\s*", line.raw).group(0)
+                        new_raw = f"{leading_ws}push    {src}"
+                        new_line = Line(raw=new_raw, kind="instr",
+                                        op="push", operands=src)
+                        out.append(new_line)
+                        self.stats["push_immediate"] = (
+                            self.stats.get("push_immediate", 0) + 1
+                        )
+                        i = b_idx + 1  # Skip past the push; keep witness
+                        continue
+            out.append(line)
+            i += 1
+        return out
+
     def _pass_imm_store_collapse(self, lines: list[Line]) -> list[Line]:
         """Collapse `mov eax, IMM; mov [addr], eax; mov eax, X` to
         `mov dword [addr], IMM; mov eax, X`.
@@ -599,26 +704,7 @@ class PeepholeOptimizer:
     def _is_imm_to_eax(line: Line) -> bool:
         """Is this a `mov eax, <constant-expr>` (immediate or label,
         but not a memory deref or register source)?"""
-        if line.kind != "instr" or line.op != "mov":
-            return False
-        parts = _operands_split(line.operands)
-        if parts is None:
-            return False
-        dest, src = parts
-        if dest.lower() != "eax":
-            return False
-        # Reject memory derefs (would need NASM mem-mem move which
-        # doesn't exist on x86) and register sources (could alias EAX
-        # itself or be a live register).
-        if "[" in src:
-            return False
-        # Reject bare register names — they might be live elsewhere.
-        regs = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
-                "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
-                "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"}
-        if src.lower() in regs:
-            return False
-        return True
+        return _is_imm_or_label_to_eax(line)
 
     @staticmethod
     def _matches_imm_store(

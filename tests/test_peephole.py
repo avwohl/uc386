@@ -630,6 +630,90 @@ def test_setcc_jcc_collapse_does_not_fire_if_eax_used_between():
     assert opt.stats.get("setcc_jcc_collapse", 0) == 0
 
 
+# ── push_immediate ───────────────────────────────────────────────
+
+
+def test_push_immediate_label():
+    """The canonical printf-style arg push: mov eax, _str; push eax;
+    call _printf — collapses to push _str; call _printf."""
+    asm = (
+        "_main:\n"
+        "        mov     eax, _uc386_str0\n"
+        "        push    eax\n"
+        "        call    _printf\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    _uc386_str0" in out
+    assert "mov     eax, _uc386_str0" not in out
+    assert opt.stats.get("push_immediate", 0) == 1
+
+
+def test_push_immediate_literal():
+    asm = (
+        "_main:\n"
+        "        mov     eax, 42\n"
+        "        push    eax\n"
+        "        call    _f\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    42" in out
+    assert opt.stats.get("push_immediate", 0) == 1
+
+
+def test_push_immediate_chains_for_multi_arg_call():
+    """`printf("%d %d", x, y)` pushes 3 args — all should collapse."""
+    asm = (
+        "_main:\n"
+        "        mov     eax, 5\n"
+        "        push    eax\n"
+        "        mov     eax, 10\n"
+        "        push    eax\n"
+        "        mov     eax, _str\n"
+        "        push    eax\n"
+        "        call    _printf\n"
+        "        add     esp, 12\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("push_immediate", 0) == 3
+
+
+def test_push_immediate_skips_when_eax_live_after_push():
+    """If the next instruction reads EAX (e.g., add eax, ecx), the
+    `mov eax, X` was loading EAX for use beyond just the push. Skip."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 5\n"
+        "        push    eax\n"
+        "        add     eax, ecx\n"  # reads EAX!
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_immediate", 0) == 0
+
+
+def test_push_immediate_skips_memory_source():
+    """`mov eax, [ebp - 4]` is a memory load — the rewritten push
+    would need NASM mem-imm push (which doesn't exist as a single
+    instruction in the same form). Skip."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        push    eax\n"
+        "        call    _f\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_immediate", 0) == 0
+
+
 # ── Convergence ──────────────────────────────────────────────────
 
 

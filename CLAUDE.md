@@ -915,3 +915,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Hello-world: 123 → 91 bytes** (32 bytes saved). With selective libc + this, hello-world's `_start` is 3 instructions: `call _main; mov ah, 4Ch; int 21h`.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: push_immediate**: collapses every cdecl arg-push site. The codegen emits `mov eax, X; push eax` for each arg in a `f(arg1, arg2, ...)` call; that's 6 bytes (5 for `mov eax, imm32` + 1 for `push eax`) where `push imm32` alone would be 5 bytes (or 2 bytes for `push imm8`). Rewrites to `push X` when the next instruction overwrites EAX (mov eax, * / xor eax, eax / call * / lea eax, * / pop eax) — the witness that EAX was just being staged for the push. Skipped when src is a memory deref (NASM has no equivalent single-instruction mem-imm push form).
+  - 9 hits on probe_size.c (every arg push).
+  - probe_size.c: 226 → **148 lines** (34.5% total reduction across all 8 peephole patterns).
+  - Hello-world: 95 → 91 bytes (4 bytes via push_immediate's 1-byte saving + dead_after_terminator's 3-byte xor elimination).
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +5 peephole tests (51 total). Pipeline 1734/1734 (100%).
