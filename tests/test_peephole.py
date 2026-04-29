@@ -1471,6 +1471,182 @@ def test_dead_mov_skips_other_regs():
     assert opt.stats.get("dead_mov_to_reg", 0) == 0
 
 
+# ── prologue_to_enter ────────────────────────────────────────────
+
+
+def test_prologue_to_enter_basic():
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        sub     esp, 24\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        enter   24, 0" in out
+    assert "        push    ebp" not in out
+    assert "        mov     ebp, esp" not in out
+    assert "        sub     esp, 24" not in out
+    assert opt.stats.get("prologue_to_enter") == 1
+
+
+def test_prologue_to_enter_skips_no_sub_esp():
+    """Frame size 0 — no `sub esp` line — skip (enter would be larger)."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "enter" not in out
+    assert opt.stats.get("prologue_to_enter", 0) == 0
+
+
+def test_prologue_to_enter_skips_register_sub():
+    """`sub esp, eax` (VLA-style) must not collapse."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        sub     esp, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "enter" not in out
+    assert "sub     esp, eax" in out
+    assert opt.stats.get("prologue_to_enter", 0) == 0
+
+
+def test_prologue_to_enter_skips_imm_too_large():
+    """Frame size > 65535 — imm doesn't fit `enter`'s imm16 first
+    operand. Skip."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        sub     esp, 70000\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "enter" not in out
+    assert "sub     esp, 70000" in out
+    assert opt.stats.get("prologue_to_enter", 0) == 0
+
+
+def test_prologue_to_enter_at_imm16_boundary():
+    """65535 fits, 65536 doesn't."""
+    for imm, should_fire in [(65535, True), (65536, False)]:
+        asm = (
+            "_f:\n"
+            "        push    ebp\n"
+            "        mov     ebp, esp\n"
+            f"        sub     esp, {imm}\n"
+            "        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        out = opt.optimize(asm)
+        if should_fire:
+            assert f"enter   {imm}, 0" in out
+            assert opt.stats.get("prologue_to_enter") == 1
+        else:
+            assert "enter" not in out
+            assert opt.stats.get("prologue_to_enter", 0) == 0
+
+
+def test_prologue_to_enter_hex_immediate():
+    """NASM accepts `0x18` as well as `24` for the sub esp operand."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        sub     esp, 0x18\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Decoded as 24 decimal, emitted as decimal in the new instruction.
+    assert "        enter   24, 0" in out
+    assert opt.stats.get("prologue_to_enter") == 1
+
+
+def test_prologue_to_enter_multiple_functions():
+    asm = (
+        "_a:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        sub     esp, 8\n"
+        "        ret\n"
+        "_b:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        sub     esp, 16\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        enter   8, 0" in out
+    assert "        enter   16, 0" in out
+    assert opt.stats.get("prologue_to_enter") == 2
+
+
+def test_prologue_to_enter_skips_when_intervening_label():
+    """If there's a label between the three lines, the pattern is not
+    a true prologue — skip. (Pathological — codegen never emits this.)"""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        ".weird:\n"
+        "        mov     ebp, esp\n"
+        "        sub     esp, 24\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "enter" not in out
+    assert opt.stats.get("prologue_to_enter", 0) == 0
+
+
+def test_prologue_to_enter_skips_when_static_link_save_first():
+    """Lifted nested fns save ECX into a static-link slot AFTER the
+    prologue, not within it. The pattern still matches (3 instr lines
+    are contiguous), and the ECX save is preserved untouched."""
+    asm = (
+        "_inner:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        sub     esp, 12\n"
+        "        mov     [ebp - 12], ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        enter   12, 0" in out
+    assert "        mov     [ebp - 12], ecx" in out
+    assert opt.stats.get("prologue_to_enter") == 1
+
+
+def test_prologue_to_enter_byte_savings():
+    """Verify the 3-line → 1-line collapse: line count drops by 2."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        sub     esp, 24\n"
+        "        ret\n"
+    )
+    out = optimize(asm)
+    # Original: 5 lines (label + 3 prologue + ret).
+    # Optimized: 3 lines (label + enter + ret).
+    in_lines = [l for l in asm.splitlines() if l.strip()]
+    out_lines = [l for l in out.splitlines() if l.strip()]
+    assert len(in_lines) - len(out_lines) == 2
+
+
 # ── Convergence ──────────────────────────────────────────────────
 
 

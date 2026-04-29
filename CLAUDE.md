@@ -965,3 +965,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Hello.com: 94 → 70 bytes** (-24 bytes — exactly the dead `.data` block). Programs that DO use the data labels (printf with stdio, malloc with heap, etc.) include them as needed.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: prologue_to_enter**: collapse the standard cdecl prologue `push ebp; mov ebp, esp; sub esp, IMM` to a single `enter IMM, 0` instruction. Per Intel SDM, `enter IMM, 0` is defined as exactly that three-instruction sequence (no extra register touches at level=0). Saves 2 bytes per function when IMM ≤ imm8 (most common — frame size < 128), 5 bytes per function when IMM is imm32 (frame size ≥ 128). The `enter` instruction is slow on modern CPUs but for the i386/DOS target there's no concern.
+  - **Constraints**: three consecutive `instr` lines (no labels/comments/blanks between), IMM must be a numeric literal in the (0, 65535] range (`enter`'s first operand is imm16). Functions with no locals (`push ebp; mov ebp, esp` only — 3 bytes) skip the rewrite since `enter 0, 0` (4 bytes) would be bigger. Functions with VLA-style `sub esp, eax` skip too — only literal IMM matches.
+  - **Static-link save preserved**: lifted nested fns emit `mov [ebp - X], ecx` after the prologue. The 3-line pattern matches the prologue itself; the ECX save sits as the next instruction unaffected.
+  - **Wired in optimizer loop**: runs alongside `dead_after_terminator`, `binop_collapse`, `store_collapse`, `leave_collapse`, `imm_store_collapse`, etc.
+  - probe_multifn (3 functions with locals): each prologue saves 2 bytes; `_sum` with 12-byte frame becomes `enter 12, 0` (4 bytes) instead of `push ebp; mov ebp, esp; sub esp, 12` (6 bytes).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +10 peephole tests (540 total). Pipeline 1734/1734 (100%).

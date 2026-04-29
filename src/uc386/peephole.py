@@ -62,6 +62,10 @@ Currently implements:
     in for-loop steps where the value is discarded. Crosses labels
     and unconditional jumps under the codegen invariant (regs are
     always overwritten at the start of each labeled block).
+  - prologue_to_enter: `push ebp; mov ebp, esp; sub esp, IMM`
+    becomes `enter IMM, 0`. Saves 2-5 bytes per function (depending
+    on whether IMM fits in imm8). Identical semantics — enter
+    pushes EBP, sets EBP=ESP, allocates IMM stack bytes.
 
 Patterns to add (see PEEPHOLE_PLAN.md for details): redundant
 mov-to-reg, tail calls, jump threading, multi-instruction right-
@@ -275,6 +279,7 @@ class PeepholeOptimizer:
             lines = self._pass_right_operand_retarget(lines)
             lines = self._pass_cmp_zero_to_test(lines)
             lines = self._pass_dead_mov_to_reg(lines)
+            lines = self._pass_prologue_to_enter(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -1812,6 +1817,92 @@ class PeepholeOptimizer:
                                 continue
             out.append(line)
         return out
+
+    def _pass_prologue_to_enter(self, lines: list[Line]) -> list[Line]:
+        """P-prologue-to-enter: collapse the standard cdecl prologue
+        ``push ebp; mov ebp, esp; sub esp, IMM`` to a single
+        ``enter IMM, 0`` instruction. Saves 2 bytes when IMM fits in
+        imm8, 5 bytes when IMM is imm32. Identical semantics — Intel
+        defines ``enter IMM, 0`` to be exactly the three-instruction
+        sequence (no extra register touches at level=0).
+
+        Constraints:
+        - Three consecutive ``instr`` lines (no intervening comments,
+          blanks, or labels).
+        - IMM must be a literal in (0, 65535] (the imm16 width of the
+          first ``enter`` operand).
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (
+                i + 2 < len(lines)
+                and line.kind == "instr"
+                and line.op == "push"
+                and line.operands.strip().lower() == "ebp"
+                and lines[i + 1].kind == "instr"
+                and self._is_mov_ebp_esp(lines[i + 1])
+                and lines[i + 2].kind == "instr"
+                and lines[i + 2].op == "sub"
+            ):
+                imm = self._extract_sub_esp_imm(lines[i + 2])
+                if imm is not None and 0 < imm <= 65535:
+                    indent = self._extract_indent(line.raw)
+                    new_raw = f"{indent}enter   {imm}, 0"
+                    new_line = Line(
+                        raw=new_raw,
+                        kind="instr",
+                        op="enter",
+                        operands=f"{imm}, 0",
+                    )
+                    out.append(new_line)
+                    self.stats["prologue_to_enter"] = (
+                        self.stats.get("prologue_to_enter", 0) + 1
+                    )
+                    i += 3
+                    continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _is_mov_ebp_esp(line: Line) -> bool:
+        if line.op != "mov":
+            return False
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return False
+        dest, src = parts
+        return dest.strip().lower() == "ebp" and src.strip().lower() == "esp"
+
+    @staticmethod
+    def _extract_sub_esp_imm(line: Line) -> int | None:
+        if line.op != "sub":
+            return None
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return None
+        dest, src = parts
+        if dest.strip().lower() != "esp":
+            return None
+        s = src.strip()
+        # Reject memory derefs and bare register names.
+        if "[" in s:
+            return None
+        try:
+            if s.lower().startswith("0x"):
+                return int(s, 16)
+            return int(s)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _extract_indent(raw: str) -> str:
+        n = 0
+        while n < len(raw) and raw[n] in " \t":
+            n += 1
+        return raw[:n]
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
         """P-jmp-to-next: `jmp X` immediately (modulo blanks/comments)
