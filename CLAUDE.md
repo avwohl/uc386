@@ -1106,3 +1106,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Compile timeout bump**: bumped `run_gcc_torture.py`'s compile timeout from 15s to 30s. Tests like pr23135 take ~12-13s of peephole time (very large generated asm: 720K lines from a 4KB source) and were flaking under load. The slice itself doesn't change perf measurably (12.34s pre-slice → 12.25s post-slice on pr23135).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests (234 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: transfer_pop_collapse**: collapse the binop tail `mov ecx, eax; pop eax; OP eax, ecx` into `pop ecx; OP eax, ecx` for commutative OPs (add, and, or, xor, imul). The original sequence saves the chain's EAX value to ECX, restores the LHS from stack to EAX, then computes EAX = LHS OP RHS. For commutative ops, the operand order doesn't matter, so we pop directly into ECX and compute EAX = RHS OP LHS in place. Saves 2 bytes per match (drops the `mov ecx, eax`).
+  - **Complement to right_operand_retarget**: that pass eliminates the entire push/transfer/pop frame when the chain consists of pure EAX writes. transfer_pop_collapse handles the case where the chain mixes EAX and ECX writes (e.g. `mov eax, [base]; mov ecx, [idx]; mov eax, [base + idx*scale]`) — retarget bails because writing ECX would conflict with the retargeted EAX→ECX. transfer_pop_collapse fires there, dropping just the trailing `mov ecx, eax`.
+  - **Restricted to commutative ops**. sub/idiv/cmp etc. are NOT commutative — operand order matters for the result or the comparison-flag direction.
+  - **Probe**: `s += p[i] + p[i+1] + p[i+2]` — the binop tail of each `+` collapses. 3 fires on probe_chain.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (240 total). Pipeline 1734/1734 (100%).

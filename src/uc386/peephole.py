@@ -400,6 +400,7 @@ class PeepholeOptimizer:
             lines = self._pass_push_disp_collapse(lines)
             lines = self._pass_push_index_collapse(lines)
             lines = self._pass_self_mov_elimination(lines)
+            lines = self._pass_transfer_pop_collapse(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -4172,6 +4173,86 @@ class PeepholeOptimizer:
                 for r in CALLER_SAVED:
                     zero_regs.discard(r)
             out.append(line)
+        return out
+
+    # Commutative two-operand binops where `OP eax, ecx` and
+    # `OP ecx, eax` produce identical EAX results. imul (two-operand
+    # form) is included; sub/div/idiv etc. are NOT.
+    _COMMUTATIVE_BINOPS: frozenset[str] = frozenset({
+        "add", "and", "or", "xor", "imul",
+    })
+
+    def _pass_transfer_pop_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse the binop tail `mov ecx, eax; pop eax; OP eax, ecx`
+        into `pop ecx; OP eax, ecx` when OP is commutative.
+
+        The original sequence saves the chain's EAX value into ECX,
+        restores the LHS from stack to EAX, then computes EAX = LHS
+        OP RHS. For commutative ops the operand order doesn't matter,
+        so we can pop the saved LHS into ECX directly and compute
+        EAX = RHS OP LHS in place.
+
+        Saves 2 bytes per match (drops the `mov ecx, eax`).
+
+        Conditions:
+        - Three consecutive instr lines.
+        - Line A: ``mov ecx, eax``.
+        - Line B: ``pop eax``.
+        - Line C: ``OP eax, ecx`` with OP ∈ {add, and, or, xor, imul}.
+        - ECX is dead before the chain (the chain only uses ECX as
+          scratch; we change which value lands there but the next
+          read of ECX overwrites it). This is the codegen invariant
+          for stack-machine binops.
+
+        Note: ECX's post-collapse value is the LHS instead of the
+        RHS. Any reader of ECX between `OP` and the next ECX-writer
+        would see a different value. The codegen never generates
+        such readers — the binop tail always either ends the
+        expression or feeds into a `push eax` / next subexpression
+        that re-loads ECX from scratch.
+        """
+        out = list(lines)
+        i = 0
+        while i + 2 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            c = out[i + 2]
+            if not (
+                a.kind == "instr" and a.op == "mov"
+                and a.operands.strip().lower() == "ecx, eax"
+                and b.kind == "instr" and b.op == "pop"
+                and b.operands.strip().lower() == "eax"
+                and c.kind == "instr"
+                and c.op in PeepholeOptimizer._COMMUTATIVE_BINOPS
+            ):
+                i += 1
+                continue
+            cp = _operands_split(c.operands)
+            if cp is None:
+                i += 1
+                continue
+            cdst, csrc = cp
+            if (
+                cdst.strip().lower() != "eax"
+                or csrc.strip().lower() != "ecx"
+            ):
+                i += 1
+                continue
+            # Rewrite: drop A, replace B with `pop ecx`, keep C.
+            indent = self._extract_indent(b.raw)
+            new_pop = Line(
+                raw=f"{indent}pop     ecx",
+                kind="instr",
+                op="pop",
+                operands="ecx",
+            )
+            out = out[:i] + [new_pop, c] + out[i + 3:]
+            self.stats["transfer_pop_collapse"] = (
+                self.stats.get("transfer_pop_collapse", 0) + 1
+            )
+            continue
         return out
 
     def _pass_self_mov_elimination(

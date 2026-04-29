@@ -4188,3 +4188,120 @@ def test_self_mov_elimination_keeps_mov_with_memory():
     out = opt.optimize(asm)
     assert "mov     [eax], eax" in out
     assert opt.stats.get("self_mov_elimination", 0) == 0
+
+
+# ── transfer_pop_collapse ────────────────────────────────────────
+
+
+def test_transfer_pop_collapse_add():
+    """`mov ecx, eax; pop eax; add eax, ecx` → `pop ecx; add eax, ecx`.
+    Add is commutative.
+
+    Use a chain that touches ECX so right_operand_retarget can't fire
+    (it requires all chain ops to be pure writes to EAX).
+    """
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ecx, eax" not in out
+    assert "pop     ecx" in out
+    assert "add     eax, ecx" in out
+    assert opt.stats.get("transfer_pop_collapse") == 1
+
+
+def test_transfer_pop_collapse_imul():
+    """imul (two-operand) is also commutative."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        imul    eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "pop     ecx" in out
+    assert "imul    eax, ecx" in out
+    assert opt.stats.get("transfer_pop_collapse") == 1
+
+
+def test_transfer_pop_collapse_skips_sub():
+    """sub is NOT commutative — must not collapse."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        sub     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("transfer_pop_collapse", 0) == 0
+
+
+def test_transfer_pop_collapse_skips_cmp():
+    """cmp's operand order matters for signed comparisons — skip."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("transfer_pop_collapse", 0) == 0
+
+
+def test_transfer_pop_collapse_skips_idiv():
+    """idiv reads EDX:EAX and is NOT commutative."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        idiv    ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("transfer_pop_collapse", 0) == 0
+
+
+def test_transfer_pop_collapse_xor():
+    """xor is commutative."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        xor     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "pop     ecx" in out
+    assert "xor     eax, ecx" in out
+    assert opt.stats.get("transfer_pop_collapse") == 1
