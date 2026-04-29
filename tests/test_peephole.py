@@ -2840,6 +2840,132 @@ def test_narrowing_load_test_collapse_skips_full_dword_load():
     assert opt.stats.get("cmp_load_collapse", 0) == 1
 
 
+# ── index_load_collapse ──────────────────────────────────────────
+
+
+def test_index_load_collapse_scale_4():
+    """`shl ecx, 2; add eax, ecx; mov eax, [eax]` collapses to
+    `mov eax, [eax + ecx*4]` using x86's SIB byte."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, ecx\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [eax + ecx*4]" in out
+    assert "shl     ecx, 2" not in out
+    assert opt.stats.get("index_load_collapse") == 1
+
+
+def test_index_load_collapse_scale_2():
+    """Scale 2 (for short arrays): `shl reg, 1`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     ecx, 1\n"
+        "        add     eax, ecx\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [eax + ecx*2]" in out
+    assert opt.stats.get("index_load_collapse") == 1
+
+
+def test_index_load_collapse_scale_8():
+    """Scale 8 (for long-long arrays / pointer arrays): `shl 3`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     ecx, 3\n"
+        "        add     eax, ecx\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [eax + ecx*8]" in out
+    assert opt.stats.get("index_load_collapse") == 1
+
+
+def test_index_load_collapse_skips_when_idx_live():
+    """If IDX is read after the load, we can't drop the shl."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, ecx\n"
+        "        mov     eax, [eax]\n"
+        "        mov     [ebp - 4], ecx\n"  # reads ECX!
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("index_load_collapse", 0) == 0
+
+
+def test_index_load_collapse_skips_when_base_live_distinct():
+    """If DST != BASE and BASE is live after the load, we can't drop
+    the add."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, ecx\n"
+        "        mov     edx, [eax]\n"  # DST=edx, BASE=eax — distinct
+        "        mov     [ebp - 4], eax\n"  # reads EAX
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("index_load_collapse", 0) == 0
+
+
+def test_index_load_collapse_distinct_dst_when_base_dead():
+    """When DST != BASE but BASE is dead after the load, the rewrite
+    is safe."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, ecx\n"
+        "        mov     edx, [eax]\n"  # DST=edx, BASE=eax dead after
+        "        mov     eax, edx\n"  # overwrites eax (witness)
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     edx, [eax + ecx*4]" in out
+    assert opt.stats.get("index_load_collapse") == 1
+
+
+def test_index_load_collapse_skips_invalid_scale():
+    """Only scales 2/4/8 — not scale 16 or scale 1."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     ecx, 4\n"  # scale 16, not supported
+        "        add     eax, ecx\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("index_load_collapse", 0) == 0
+
+
 # ── compound_assign_collapse ─────────────────────────────────────
 
 

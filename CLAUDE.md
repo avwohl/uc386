@@ -1073,3 +1073,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Disjoint-mem aliasing check**: chain modifications to [m] are detected via `_mem_overlaps`. Two ebp-relative literal offsets are disjoint when offsets differ; everything else (register-base derefs, label addresses) conservatively overlaps.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (202 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: index_load_collapse**: collapse `shl IDX, N; add BASE, IDX; mov DST, [BASE]` into `mov DST, [BASE + IDX*SCALE]` using x86's SIB byte. Saves 4 bytes per match (shl is 3 bytes, add reg/reg is 2; the SIB-form mov gains 1 byte).
+  - **Common shape**: `arr[i]` array indexing for int arrays (scale 4) and pointer/struct arrays (scale 4 or 8 depending on element size). The codegen emits `shl idx, log2(elem_size); add base, idx; mov dst, [base]` for any indexed load with a power-of-2 element size.
+  - **Conditions**: three consecutive instr lines. shl's count ∈ {1, 2, 3} for scale {2, 4, 8}. base and idx must be different GP registers. mov src must be `[base]` (plain deref, no offset, no existing SIB). IDX dead after the mov (we drop the shl, so IDX retains its pre-shl value). BASE either == DST (overwritten by mov) or dead after.
+  - **sumarr loop body**: 6 instructions → 4 instructions. The `mov eax, [ebp + 8]; mov ecx, [ebp - 8]; shl ecx, 2; add eax, ecx; mov eax, [eax]; add [ebp - 4], eax` chain becomes `mov eax, [ebp + 8]; mov ecx, [ebp - 8]; mov eax, [eax + ecx*4]; add [ebp - 4], eax`. Combined with `compound_assign_collapse` (drops the push/pop framing) and `index_load_collapse`, the inner loop is now ~6 bytes instead of ~14 bytes per iteration.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (209 total). Pipeline 1734/1734 (100%).

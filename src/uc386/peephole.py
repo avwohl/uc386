@@ -108,6 +108,13 @@ Currently implements:
     relative addressing; the original mov+push is 4 bytes. Saves 1
     byte per match. Common in cdecl call-site arg setup, where the
     intermediate register is dead after the push.
+  - index_load_collapse: collapse the array-index address-
+    computation chain `shl IDX, N; add BASE, IDX; mov DST, [BASE]`
+    into a single `mov DST, [BASE + IDX*SCALE]` using x86's SIB
+    byte. Saves 4 bytes per match (shl + add gone, mov gains 1
+    byte for the SIB byte). N ∈ {1, 2, 3} for scale 2/4/8. Common
+    in `arr[i]` array indexing for int arrays (scale 4) and
+    pointer arrays (scale 4).
   - compound_assign_collapse: collapse the codegen's compound-
     assignment frame `push dword [m]; <chain>; mov ecx, eax;
     pop eax; OP eax, ecx; mov [m], eax` into a single in-place
@@ -382,6 +389,7 @@ class PeepholeOptimizer:
             lines = self._pass_zero_init_collapse(lines)
             lines = self._pass_redundant_xor_zero(lines)
             lines = self._pass_compound_assign_collapse(lines)
+            lines = self._pass_index_load_collapse(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -3391,6 +3399,137 @@ class PeepholeOptimizer:
         "bp": "ebp",
         "sp": "esp",
     }
+
+    def _pass_index_load_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``shl IDX, N; add BASE, IDX; mov DST, [BASE]``
+        into ``mov DST, [BASE + IDX*SCALE]`` where SCALE = 2^N.
+
+        x86 supports the SIB byte form ``[base + index*scale]``
+        directly in mov memory operands, eliminating the need for
+        explicit shl + add to compute the address. Saves 4 bytes
+        per match (shl is 3 bytes, add reg/reg is 2 bytes; the
+        SIB-form mov gains 1 byte over the plain `[reg]` form).
+
+        Conditions:
+        - Three consecutive instr lines (no labels/comments between).
+        - Line A: ``shl IDX, N`` where N ∈ {1, 2, 3} (scale 2/4/8;
+          scale 1 = no-op shl, irrelevant).
+        - Line B: ``add BASE, IDX`` (different reg).
+        - Line C: ``mov DST, [BASE]`` (plain memory deref of BASE).
+        - IDX must be dead after Line C (we drop the shl, so IDX
+          retains its pre-shl value; subsequent code expecting the
+          shifted value would be wrong).
+        - BASE must be either the same reg as DST (overwritten by
+          the load) OR dead after Line C.
+
+        Restricted to GP 32-bit registers.
+        """
+        SCALE = {1: 2, 2: 4, 3: 8}
+        out = list(lines)
+        i = 0
+        while i + 2 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            c = out[i + 2]
+            if not (
+                a.kind == "instr" and a.op == "shl"
+                and b.kind == "instr" and b.op == "add"
+                and c.kind == "instr" and c.op == "mov"
+            ):
+                i += 1
+                continue
+            # Parse line A.
+            ap = _operands_split(a.operands)
+            if ap is None:
+                i += 1
+                continue
+            idx_reg = ap[0].strip().lower()
+            try:
+                n = int(ap[1].strip())
+            except ValueError:
+                i += 1
+                continue
+            if n not in SCALE:
+                i += 1
+                continue
+            if not self._is_general_register(idx_reg):
+                i += 1
+                continue
+            # Parse line B.
+            bp = _operands_split(b.operands)
+            if bp is None:
+                i += 1
+                continue
+            base_reg = bp[0].strip().lower()
+            b_src = bp[1].strip().lower()
+            if (
+                not self._is_general_register(base_reg)
+                or b_src != idx_reg
+                or base_reg == idx_reg
+            ):
+                i += 1
+                continue
+            # Parse line C.
+            cp = _operands_split(c.operands)
+            if cp is None:
+                i += 1
+                continue
+            dst_reg = cp[0].strip().lower()
+            c_src = cp[1].strip()
+            if not self._is_general_register(dst_reg):
+                i += 1
+                continue
+            # Source must be `[BASE]` (no offset, no SIB already).
+            c_src_stripped = c_src
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if c_src_stripped.lower().startswith(prefix):
+                    c_src_stripped = c_src_stripped[
+                        len(prefix):
+                    ].lstrip()
+                    break
+            mem_re = re.match(
+                r"^\[([a-zA-Z]+)\s*\]$", c_src_stripped
+            )
+            if mem_re is None:
+                i += 1
+                continue
+            mem_reg = mem_re.group(1).lower()
+            if mem_reg != base_reg:
+                i += 1
+                continue
+            # Liveness: IDX dead after line C; BASE either ==
+            # DST (overwritten) or dead after.
+            if not self._reg_dead_after(out, i + 3, idx_reg):
+                i += 1
+                continue
+            if base_reg != dst_reg and not self._reg_dead_after(
+                out, i + 3, base_reg
+            ):
+                i += 1
+                continue
+            # Rewrite: drop A and B; replace C with SIB-form mov.
+            indent = self._extract_indent(c.raw)
+            scale = SCALE[n]
+            new_src = f"[{base_reg} + {idx_reg}*{scale}]"
+            new_raw = f"{indent}mov     {dst_reg}, {new_src}"
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op="mov",
+                operands=f"{dst_reg}, {new_src}",
+            )
+            new_out = out[:i] + [new_line] + out[i + 3:]
+            out = new_out
+            self.stats["index_load_collapse"] = (
+                self.stats.get(
+                    "index_load_collapse", 0
+                ) + 1
+            )
+            # Restart from the rewrite point.
+            continue
+        return out
 
     # Compound-assign binops (used by _pass_compound_assign_collapse).
     # imul is excluded — `imul r/m32` (one-operand) writes EDX:EAX,
