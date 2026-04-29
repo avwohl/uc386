@@ -1017,10 +1017,46 @@ class PeepholeOptimizer:
                     )
                     i = b_idx + 1
                     continue
-                # CFG-aware fallback DISABLED — was causing
-                # strcmp-1/strncmp-1 regressions. Investigation
-                # pending. Until then, only the immediate-witness
-                # fast path fires.
+                # Slow path: CFG-aware liveness — check Line B (next
+                # instr is `mov [m], eax`) and EAX dead after.
+                next_instrs = self._next_n_instrs(lines, i + 1, 1)
+                if next_instrs is not None:
+                    [(b_idx, b_line)] = next_instrs
+                    if (
+                        b_line.op == "mov"
+                        and self._is_eax_to_mem_store(b_line)
+                        and self._reg_dead_after(
+                            lines, b_idx + 1, "eax"
+                        )
+                    ):
+                        parts_a = _operands_split(line.operands)
+                        assert parts_a is not None
+                        _, src_imm = parts_a
+                        addr = self._mem_dest(b_line)
+                        if addr is not None:
+                            leading_ws = re.match(
+                                r"^\s*", line.raw
+                            ).group(0)
+                            new_raw = (
+                                f"{leading_ws}mov     dword "
+                                f"{addr}, {src_imm}"
+                            )
+                            new_line = Line(
+                                raw=new_raw, kind="instr", op="mov",
+                                operands=(
+                                    f"dword {addr}, {src_imm}"
+                                ),
+                            )
+                            out_list.append(new_line)
+                            self.stats[
+                                "imm_store_collapse"
+                            ] = (
+                                self.stats.get(
+                                    "imm_store_collapse", 0
+                                ) + 1
+                            )
+                            i = b_idx + 1
+                            continue
             out_list.append(line)
             i += 1
         return out_list
@@ -2188,6 +2224,9 @@ class PeepholeOptimizer:
         - Calls and unconditional control flow (jmp/ret/etc.)
         - Any instruction in ``_IMPLICIT_REG_USERS`` (over-
           conservative — some only touch other regs, but safe)
+        - Any label that's the target of a BACKWARD jump (loop top —
+          the back-edge means downstream stores to M may invalidate
+          the cached value before re-entry)
 
         Conditional jumps (jcc) DO preserve the tracker on the
         fall-through path; we record the jcc's reg_mem at the time
@@ -2205,6 +2244,26 @@ class PeepholeOptimizer:
         or aren't worth tracking (registers — codegen reloads from
         memory, not register-to-register).
         """
+        # Pre-compute labels that are targets of backward jumps.
+        # At those labels, we conservatively reset reg_mem because
+        # the back-edge may have stores that invalidate cached
+        # state before re-entry.
+        label_positions: dict[str, int] = {}
+        for k, ln in enumerate(lines):
+            if ln.kind == "label":
+                label_positions[ln.label] = k
+        loop_top_labels: set[str] = set()
+        for k, ln in enumerate(lines):
+            if ln.kind == "instr" and (
+                ln.op == "jmp" or ln.op.startswith("j")
+            ):
+                target = _branch_target(ln)
+                if target is None:
+                    continue
+                target_idx = label_positions.get(target)
+                if target_idx is not None and target_idx <= k:
+                    loop_top_labels.add(target)
+
         out: list[Line] = []
         reg_mem: str | None = None  # The literal text of REG's known mem source
         jcc_states: dict[str, set[str | None]] = {}
@@ -2214,7 +2273,12 @@ class PeepholeOptimizer:
                 if line.kind == "label":
                     label = line.label
                     saved = jcc_states.pop(label, None)
-                    if prev_unconditional:
+                    if label in loop_top_labels:
+                        # Loop top: a back-edge may store to memory
+                        # between iterations, invalidating any cached
+                        # reg_mem value. Conservatively reset.
+                        reg_mem = None
+                    elif prev_unconditional:
                         if saved is not None and len(saved) == 1:
                             (only,) = saved
                             reg_mem = only

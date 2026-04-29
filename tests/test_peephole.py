@@ -584,11 +584,19 @@ def test_imm_store_collapse_skips_self_rmw_witness():
     assert opt.stats.get("imm_store_collapse", 0) == 0
 
 
-def test_imm_store_collapse_cfg_aware_across_label_disabled():
-    """The CFG-aware fallback for imm_store_collapse was disabled
-    after a regression (strcmp-1.c, strncmp-1.c torture failures).
-    Documents the current behavior: collapse only fires with the
-    immediate-witness fast path. Investigation pending.
+def test_imm_store_collapse_cfg_aware_across_label():
+    """CFG-aware fallback fires across a label boundary when EAX is
+    dead via every CFG path. The pre-loop init `int i = -5;` lowers
+    as `mov eax, -5; mov [m], eax; .L_top: ...`. The label boundary
+    blocks the immediate-witness fast path; the CFG-aware fallback
+    sees that every path through the loop body and the loop exit
+    overwrites EAX before reading it, so the rewrite is safe.
+
+    Re-enabled after fixing `redundant_eax_load` to invalidate its
+    cached reg_mem at any label that's the target of a backward
+    jump (loop top). The earlier strcmp-1/strncmp-1 regression was
+    rooted in that downstream pass — once the back-edge invalidation
+    landed, this CFG fallback became safe to re-enable.
     """
     asm = (
         "_f:\n"
@@ -604,9 +612,12 @@ def test_imm_store_collapse_cfg_aware_across_label_disabled():
         "        ret\n"
     )
     opt = PeepholeOptimizer()
-    opt.optimize(asm)
-    # CFG-aware fallback disabled; should NOT fire across label.
-    assert opt.stats.get("imm_store_collapse", 0) == 0
+    out = opt.optimize(asm)
+    assert opt.stats.get("imm_store_collapse", 0) == 1
+    assert "mov     dword [ebp - 8], -5" in out
+    # The two pre-rewrite lines should be gone.
+    assert "mov     eax, -5\n" not in out
+    assert "        mov     [ebp - 8], eax\n" not in out
 
 
 def test_imm_store_collapse_cfg_aware_skips_when_eax_live():
