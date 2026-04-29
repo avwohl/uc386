@@ -80,6 +80,10 @@ Currently implements:
     `cmp dword [mem], X` when reg is dead after. Saves 2-3 bytes
     per match. Common in `if (var == X)` and `if (var)` (the
     latter via `cmp_zero_to_test`'s output).
+  - rmw_collapse: collapse `mov reg, [mem]; OP reg, IMM; mov [mem],
+    reg` into `OP dword [mem], IMM` when reg is dead after. OP is
+    one of add/sub/and/or/xor. Saves 5 bytes per match. Common in
+    compound assignments to memory operands (`x += 5`).
 
 Patterns to add (see PEEPHOLE_PLAN.md for details): tail calls,
 jump threading, multi-instruction right-operand retargeting.
@@ -300,6 +304,7 @@ class PeepholeOptimizer:
             lines = self._pass_redundant_eax_load(lines)
             lines = self._pass_label_offset_fold(lines)
             lines = self._pass_cmp_load_collapse(lines)
+            lines = self._pass_rmw_collapse(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -2336,6 +2341,118 @@ class PeepholeOptimizer:
             ):
                 return f"cmp     dword {src_mem}, 0"
         return None
+
+    def _pass_rmw_collapse(self, lines: list[Line]) -> list[Line]:
+        """Collapse ``mov reg, [mem]; OP reg, IMM; mov [mem], reg``
+        into ``OP dword [mem], IMM`` when reg is dead after the store.
+
+        OP ∈ {add, sub, and, or, xor}. x86 supports the
+        ``OP r/m32, imm`` form for all of these. Saves 5 bytes per
+        match (3-byte load + 3-byte op + 3-byte store → single
+        3-4-byte memory-RMW instruction).
+
+        Common in compound assignments to memory locations:
+        ``int x; x += 5;`` lowers to ``mov eax, [mem]; add eax, 5;
+        mov [mem], eax``.
+
+        Conditions:
+        - Line A: ``mov reg, [mem]`` (plain mov; mem must be a memory
+          deref).
+        - Line B: ``OP reg, IMM`` where OP is add/sub/and/or/xor and
+          IMM is a numeric literal (not register, not memory).
+        - Line C: ``mov [mem], reg`` (same mem as line A; same reg).
+        - reg is dead after line C (CFG-aware scan).
+        - Restricted to EAX (matches sister passes).
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (
+                i + 2 < len(lines)
+                and line.kind == "instr"
+                and line.op == "mov"
+            ):
+                ap = _operands_split(line.operands)
+                if ap is not None:
+                    adest, asrc = ap
+                    adest_low = adest.strip().lower()
+                    asrc_norm = asrc.strip()
+                    if (
+                        adest_low == "eax"
+                        and asrc_norm.startswith("[")
+                        and asrc_norm.endswith("]")
+                    ):
+                        b = lines[i + 1]
+                        if (
+                            b.kind == "instr"
+                            and b.op in {"add", "sub", "and", "or", "xor"}
+                        ):
+                            bp = _operands_split(b.operands)
+                            if bp is not None:
+                                bdest, bsrc = bp
+                                imm = self._parse_numeric_immediate(
+                                    bsrc.strip()
+                                )
+                                if (
+                                    bdest.strip().lower() == "eax"
+                                    and imm is not None
+                                ):
+                                    c = lines[i + 2]
+                                    if (
+                                        c.kind == "instr"
+                                        and c.op == "mov"
+                                    ):
+                                        cp = _operands_split(c.operands)
+                                        if cp is not None:
+                                            cdest, csrc = cp
+                                            if (
+                                                cdest.strip()
+                                                == asrc_norm
+                                                and csrc.strip().lower()
+                                                == "eax"
+                                                and self._reg_dead_after(
+                                                    lines, i + 3, "eax"
+                                                )
+                                            ):
+                                                indent = (
+                                                    self._extract_indent(
+                                                        line.raw
+                                                    )
+                                                )
+                                                # Pad op to 8 chars
+                                                # like other emits.
+                                                spacer = " " * (
+                                                    8 - len(b.op)
+                                                )
+                                                new_raw = (
+                                                    f"{indent}{b.op}"
+                                                    f"{spacer}dword "
+                                                    f"{asrc_norm}, {imm}"
+                                                )
+                                                new_line = Line(
+                                                    raw=new_raw,
+                                                    kind="instr",
+                                                    op=b.op,
+                                                    operands=(
+                                                        f"dword "
+                                                        f"{asrc_norm}, "
+                                                        f"{imm}"
+                                                    ),
+                                                )
+                                                out.append(new_line)
+                                                self.stats[
+                                                    "rmw_collapse"
+                                                ] = (
+                                                    self.stats.get(
+                                                        "rmw_collapse", 0
+                                                    ) + 1
+                                                )
+                                                i += 3
+                                                continue
+            out.append(line)
+            i += 1
+        return out
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
         """P-jmp-to-next: `jmp X` immediately (modulo blanks/comments)

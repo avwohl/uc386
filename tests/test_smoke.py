@@ -5030,21 +5030,24 @@ def test_while_loop_condition_invalidates_pre_loop_copies():
     cs_start = asm.index("_cleanup:")
     cs_end = asm.index("\n.epilogue:", cs_start)
     cs = asm[cs_start:cs_end]
-    while_top = cs.index(".L")
-    # Verify: there's no rewrite of the condition to use [ebp+8]
-    # (head, the param). Buggy form had `mov eax, [ebp + 8]` in
-    # the loop top.
-    while_section = cs[while_top:]
-    # The first `mov eax, [...]` after the .L_while_top label
-    # should NOT be from [ebp+8]. Easiest: assert the loop top
-    # loads from a negative ebp offset (a local).
+    # Verify: the condition reads from a NEGATIVE ebp offset (the
+    # local `p`), not a positive offset (the param `head`). The exact
+    # instruction varies by peephole-optimization era — the original
+    # codegen emitted `mov eax, [ebp - N]`, after cmp_load_collapse
+    # we get `cmp dword [ebp - N], 0` (or similar). Either is fine
+    # as long as the offset sign is negative.
     import re
-    first_load = re.search(r'\.L\w+_while_top:\s*\n\s*mov\s+eax,\s*\[ebp\s*([+-])\s*(\d+)\]', cs)
-    assert first_load is not None, "expected loop-top mov from [ebp - N]"
-    sign = first_load.group(1)
+    first_ebp_ref = re.search(
+        r'\.L\w+_while_top:\s*\n\s*\w+\s+'
+        r'(?:dword\s+)?(?:eax,\s*)?\[ebp\s*([+-])\s*(\d+)\]', cs
+    )
+    assert first_ebp_ref is not None, (
+        f"expected loop-top reference to [ebp - N] or [ebp + N]\n{cs}"
+    )
+    sign = first_ebp_ref.group(1)
     assert sign == "-", (
-        f"loop top loads from [ebp + {first_load.group(2)}] (param head); "
-        f"should load from [ebp - N] (local p)"
+        f"loop top references [ebp + {first_ebp_ref.group(2)}] "
+        f"(param head); should reference [ebp - N] (local p)"
     )
 
 

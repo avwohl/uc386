@@ -2036,6 +2036,113 @@ def test_cmp_load_collapse_one_branch_uses_eax():
     assert opt.stats.get("cmp_load_collapse", 0) == 0
 
 
+# ── rmw_collapse ─────────────────────────────────────────────────
+
+
+def test_rmw_collapse_basic_add():
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, 5\n"
+        "        mov     [ebp - 4], eax\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        add     dword [ebp - 4], 5" in out
+    # Original 3 instructions gone.
+    assert "mov     eax, [ebp - 4]" not in out
+    assert "add     eax, 5" not in out
+    assert "mov     [ebp - 4], eax" not in out
+    assert opt.stats.get("rmw_collapse") == 1
+
+
+def test_rmw_collapse_all_ops():
+    """sub, and, or, xor — all have x86 r/m32, imm forms."""
+    for op in ("sub", "and", "or", "xor"):
+        asm = (
+            "_f:\n"
+            "        mov     eax, [ebp - 4]\n"
+            f"        {op}     eax, 7\n"
+            "        mov     [ebp - 4], eax\n"
+            "        xor     eax, eax\n"
+            "        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        out = opt.optimize(asm)
+        # Account for op-name padding: NASM keeps a 4-char gutter.
+        # Just check the op + memory operand survives.
+        assert f"{op}" in out and f"dword [ebp - 4], 7" in out, (
+            f"{op}: {out}"
+        )
+        assert opt.stats.get("rmw_collapse") == 1
+
+
+def test_rmw_collapse_skips_eax_live_after():
+    """If EAX is live after the store (e.g. it's the return value),
+    don't collapse — the rewrite drops the EAX update."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, 5\n"
+        "        mov     [ebp - 4], eax\n"
+        "        ret\n"  # EAX is the return value
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("rmw_collapse", 0) == 0
+
+
+def test_rmw_collapse_skips_register_immediate():
+    """`add eax, ecx` (register source) needs a different rewrite —
+    `add [mem], ecx` would still work but we restrict to immediates
+    for now to keep the scope tight."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("rmw_collapse", 0) == 0
+
+
+def test_rmw_collapse_skips_mismatched_addresses():
+    """Load and store must reference the same memory."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, 5\n"
+        "        mov     [ebp - 8], eax\n"  # Different address!
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("rmw_collapse", 0) == 0
+
+
+def test_rmw_collapse_at_function_call_witness():
+    """A function call that clobbers EAX makes the load-store-call
+    pattern eligible for collapse."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, 1\n"
+        "        mov     [ebp - 4], eax\n"
+        "        call    _other\n"  # clobbers EAX
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        add     dword [ebp - 4], 1" in out
+    assert opt.stats.get("rmw_collapse") == 1
+
+
 # ── Convergence ──────────────────────────────────────────────────
 
 

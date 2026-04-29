@@ -987,3 +987,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - Initial 50 c-testsuite tests: 66 fires. Each saves 2-3 bytes; estimated ~150 bytes per 50 tests on c-testsuite.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (562 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: rmw_collapse**: collapse `mov reg, [mem]; OP reg, IMM; mov [mem], reg` into `OP dword [mem], IMM` when reg is dead after the store. OP ∈ {add, sub, and, or, xor}. x86 supports the `OP r/m32, imm` form for all of these. Saves 5 bytes per match (8-byte 3-instr sequence → 3-4-byte memory-RMW instruction). Common in compound assignments to memory locations: `x += 5`, `flags |= 0x20`, etc.
+  - **Constraints**: same memory operand in load and store, immediate source (not register or memory), reg dead after store via the same CFG-aware liveness used by `dead_mov_to_reg` and `cmp_load_collapse`. Restricted to EAX.
+  - The `rmw_collapse` doesn't fire when EAX is live for a chained operation (`x += 5; x -= 3` keeps EAX live between statements via cached value, so neither the first nor the second `+=` collapses on its own). The pattern fires at boundaries where EAX gets clobbered (function calls, `xor eax, eax` returns, etc.) — every "last RMW before flow change" eligible.
+  - One smoke test was updated: `test_while_loop_condition_invalidates_pre_loop_copies` looked for `mov eax, [ebp - N]` at the loop top. After `cmp_load_collapse` the loop top is now `cmp dword [ebp - N], 0`. The test was updated to accept either shape, gated only on the offset being negative (a local) vs positive (the param).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (568 total). Pipeline 1734/1734 (100%).
