@@ -2832,6 +2832,122 @@ def test_narrowing_load_test_collapse_skips_full_dword_load():
     assert opt.stats.get("cmp_load_collapse", 0) == 1
 
 
+# ── push_memory ──────────────────────────────────────────────────
+
+
+def test_push_memory_basic():
+    """`mov eax, [mem]; push eax` → `push dword [mem]`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        push    eax\n"
+        "        call    _g\n"  # clobbers eax (witness)
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    dword [ebp - 4]" in out
+    assert "mov     eax, [ebp - 4]" not in out
+    assert opt.stats.get("push_memory") == 1
+
+
+def test_push_memory_label_addressed():
+    """Memory operand can be a label-addressed global."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [_g]\n"
+        "        push    eax\n"
+        "        call    _h\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    dword [_g]" in out
+    assert opt.stats.get("push_memory") == 1
+
+
+def test_push_memory_skips_when_eax_live_after_push():
+    """If EAX is read after the push (e.g. used as another arg or
+    return value), the load can't be dropped."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        push    eax\n"
+        "        push    eax\n"  # eax is used again
+        "        call    _g\n"
+        "        add     esp, 8\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_memory", 0) == 0
+
+
+def test_push_memory_skips_esp_relative():
+    """ESP-relative memory operands are skipped — push decrements
+    ESP, so mov-then-push of [esp + N] would shift between the two
+    operations."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [esp + 8]\n"
+        "        push    eax\n"
+        "        call    _g\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_memory", 0) == 0
+
+
+def test_push_memory_works_for_other_regs():
+    """Pattern fires for any of the supported regs."""
+    for reg in ("ebx", "ecx", "edx", "esi", "edi", "ebp"):
+        asm = (
+            "_f:\n"
+            f"        mov     {reg}, [ebp - 4]\n"
+            f"        push    {reg}\n"
+            f"        mov     {reg}, 0\n"  # witness: overwrites reg
+            "        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        out = opt.optimize(asm)
+        assert "push    dword [ebp - 4]" in out, f"failed for {reg}"
+        assert opt.stats.get("push_memory") == 1
+
+
+def test_push_memory_runs_after_right_operand_retarget():
+    """The inner save-restore pattern
+    `push eax / chain / mov ecx, eax / pop eax` is a
+    right_operand_retarget candidate. push_memory runs AFTER that
+    pass so it doesn't disrupt it.
+
+    Here the inner mov+push is `mov eax, [ebp + 8]; push eax`
+    followed by a mov-eax chain. right_operand_retarget should
+    retarget the chain to ECX and remove the push/pop framing
+    entirely. push_memory should NOT fire on that mov+push."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp - 8]\n"
+        "        shl     eax, 2\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # right_operand_retarget collapsed the push/pop frame.
+    assert "push    eax" not in out
+    assert "pop     eax" not in out
+    # push_memory didn't fire (the mov+push was consumed by retarget).
+    assert opt.stats.get("push_memory", 0) == 0
+
+
 def test_narrowing_load_test_collapse_skips_signed_jcc():
     """Regression: torture's doloop-1 uses
     ``unsigned char z; --z > 0`` which expands to

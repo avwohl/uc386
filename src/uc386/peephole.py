@@ -103,6 +103,11 @@ Currently implements:
     a flag-setting arithmetic op on the same reg. Common after
     `and eax, MASK; test eax, eax; jcc` — the AND already set ZF/SF
     based on its result, so the test is redundant. Saves 2 bytes.
+  - push_memory: collapse `mov reg, [mem]; push reg` into a single
+    `push dword [mem]`. NASM's `push r/m32` form is 3 bytes for ebp-
+    relative addressing; the original mov+push is 4 bytes. Saves 1
+    byte per match. Common in cdecl call-site arg setup, where the
+    intermediate register is dead after the push.
   - narrowing_load_test_collapse: collapse
     `movsx/movzx eax, byte [SRC]; test eax, eax` into
     `cmp byte [SRC], 0` (and likewise for word). The narrowing load
@@ -325,6 +330,14 @@ class PeepholeOptimizer:
             lines = self._pass_mov_zero_to_xor(lines)
             lines = self._pass_store_load_collapse(lines)
             lines = self._pass_right_operand_retarget(lines)
+            # push_memory runs AFTER right_operand_retarget — that pass
+            # consumes inner `push eax / chain / mov ecx,eax / pop eax`
+            # save-restore frames, eliminating the inner mov+push
+            # entirely (saves more than push_memory's 1-byte rewrite).
+            # Run push_memory afterwards so it picks up only the
+            # remaining mov+push pairs (outer save-pushes that don't
+            # have a matching mov-ecx-eax pop pattern).
+            lines = self._pass_push_memory(lines)
             lines = self._pass_cmp_zero_to_test(lines)
             lines = self._pass_dead_mov_to_reg(lines)
             lines = self._pass_prologue_to_enter(lines)
@@ -800,6 +813,87 @@ class PeepholeOptimizer:
                                 self.stats.get("push_immediate", 0) + 1
                             )
                             continue
+            i += 1
+        return out
+
+    def _pass_push_memory(self, lines: list[Line]) -> list[Line]:
+        """Collapse ``mov reg, [mem]; push reg`` into a single
+        ``push dword [mem]``.
+
+        NASM's ``push r/m32`` form is 3 bytes for ebp-relative
+        addressing (``FF /6 modrm``); the original mov+push is 4
+        bytes (``mov reg, [mem]`` is 3 bytes + ``push reg`` is 1
+        byte). Saves 1 byte per match.
+
+        Common in cdecl call-site arg setup, where the intermediate
+        register is dead after the push (the caller's call instruction
+        doesn't read its arg-setup registers).
+
+        Conditions:
+        - Line A: ``mov reg, [mem]`` (memory source, register dest).
+        - Line B: ``push reg`` (same reg).
+        - reg is dead after the push (CFG-aware via `_reg_dead_after`).
+
+        Restricted to EAX/EBX/ECX/EDX/ESI/EDI/EBP — avoids ESP
+        (which would corrupt the stack) and segment registers.
+
+        ESP-relative memory operands (``[esp + N]``) are skipped:
+        ``push`` decrements ESP, so the memory operand's address
+        would shift between mov and push (well, it's stable in
+        mov-then-push-with-direct-mem because the memory access
+        happens before ESP changes — but we play conservative).
+        """
+        SUPPORTED_REGS = {
+            "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp",
+        }
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (
+                i + 1 < len(lines)
+                and line.kind == "instr"
+                and line.op == "mov"
+            ):
+                parts = _operands_split(line.operands)
+                if parts is not None:
+                    dest, src = parts
+                    dest_low = dest.strip().lower()
+                    src_norm = src.strip()
+                    if (
+                        dest_low in SUPPORTED_REGS
+                        and src_norm.startswith("[")
+                        and src_norm.endswith("]")
+                        and "esp" not in src_norm.lower()
+                    ):
+                        nxt = lines[i + 1]
+                        if (
+                            nxt.kind == "instr"
+                            and nxt.op == "push"
+                            and nxt.operands.strip().lower()
+                            == dest_low
+                            and self._reg_dead_after(
+                                lines, i + 2, dest_low
+                            )
+                        ):
+                            indent = self._extract_indent(nxt.raw)
+                            new_operands = f"dword {src_norm}"
+                            new_raw = (
+                                f"{indent}push    {new_operands}"
+                            )
+                            new_line = Line(
+                                raw=new_raw,
+                                kind="instr",
+                                op="push",
+                                operands=new_operands,
+                            )
+                            out.append(new_line)
+                            self.stats["push_memory"] = (
+                                self.stats.get("push_memory", 0) + 1
+                            )
+                            i += 2
+                            continue
+            out.append(line)
             i += 1
         return out
 
