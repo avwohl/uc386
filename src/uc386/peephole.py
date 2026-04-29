@@ -415,6 +415,9 @@ class PeepholeOptimizer:
             lines = self._pass_byte_stores_to_dword(lines)
             lines = self._pass_pop_index_push_collapse(lines)
             lines = self._pass_pop_index_load_collapse(lines)
+            # Runs AFTER pop_index_*_collapse so those passes can
+            # consume the SIB-form patterns first.
+            lines = self._pass_pop_op_chain_retarget(lines)
             lines = self._pass_push_pop_to_mov(lines)
             lines = self._pass_sib_const_index_fold(lines)
             lines = self._pass_push_const_index_fold(lines)
@@ -1517,6 +1520,85 @@ class PeepholeOptimizer:
         if not src.startswith("["):
             return None
         return (dest_lower, re.sub(r"\s+", "", src))
+
+    def _pass_pop_op_chain_retarget(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Sister of `right_operand_retarget` for the short-form
+        commutative tail. Match (looking back from
+        `pop ecx; OP_commutative eax, ecx`):
+
+            push    eax                   ← LHS save
+            <fresh EAX write>             ← chain instr 1
+            <EAX read-or-RMW>*            ← chain instrs 2..N
+            pop     ecx                   ← restore LHS to ECX
+            <OP>    eax, ecx              ← commutative OP
+
+        Replace with:
+
+            <retargeted chain instr 1>    ← dest ECX
+            <retargeted chain instrs 2..N>
+            <OP>    eax, ecx              ← unchanged; LHS in EAX,
+                                            RHS in ECX (commutative)
+
+        Drops push + pop = 2 bytes per match. Common in compound
+        assigns / additive chains where the codegen emits the
+        short-form save/restore (no intervening `mov ecx, eax`)
+        because the OP is commutative.
+
+        Conditions are the same as `right_operand_retarget` except
+        the terminal pattern is `pop ecx; OP eax, ecx` instead of
+        `mov ecx, eax; pop eax`.
+        """
+        out = list(lines)
+        i = 0
+        while i < len(out):
+            line = out[i]
+            # Match `pop ecx`.
+            if not (
+                line.kind == "instr"
+                and line.op == "pop"
+                and line.operands.strip().lower() == "ecx"
+            ):
+                i += 1
+                continue
+            # Next instr must be `OP_commutative eax, ecx`.
+            instrs_after = self._next_n_instrs(out, i + 1, 1)
+            if instrs_after is None:
+                i += 1
+                continue
+            op_line = instrs_after[0][1]
+            if op_line.op not in PeepholeOptimizer._COMMUTATIVE_BINOPS:
+                i += 1
+                continue
+            opp = _operands_split(op_line.operands)
+            if opp is None:
+                i += 1
+                continue
+            if (
+                opp[0].strip().lower() != "eax"
+                or opp[1].strip().lower() != "ecx"
+            ):
+                i += 1
+                continue
+            # Backward scan to find the chain.
+            chain_info = self._find_rhs_chain(out, i)
+            if chain_info is None:
+                i += 1
+                continue
+            push_idx, chain_indices = chain_info
+            # Retarget every chain instruction.
+            for k in chain_indices:
+                out[k] = self._retarget_instr_eax_to_ecx(out[k])
+            # Drop pop_idx (= i) and push_idx (back to front).
+            out.pop(i)
+            out.pop(push_idx)
+            self.stats["pop_op_chain_retarget"] = (
+                self.stats.get("pop_op_chain_retarget", 0) + 1
+            )
+            i = push_idx
+            continue
+        return out
 
     def _pass_right_operand_retarget(self, lines: list[Line]) -> list[Line]:
         """Retarget the binop RHS chain from EAX to ECX, then drop

@@ -1254,3 +1254,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Conditions**: IDX dead after the push (push doesn't write IDX, so it retains the constant value; if read later, the rewrite is unsafe). BASE != IDX.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests (812 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: pop_op_chain_retarget**: sister of `right_operand_retarget` for the short-form commutative tail. Catches the case where the codegen emits `push eax; chain; pop ecx; OP_commutative eax, ecx` directly (without the intermediate `mov ecx, eax`). Drops push + pop and retargets the chain.
+  - **Pattern**: `push eax; <chain>; pop ecx; OP eax, ecx` (commutative OP) → `<retargeted chain>; OP eax, ecx`. EAX retains the LHS naturally because the retargeted chain only writes ECX.
+  - **Conditions** (same as `right_operand_retarget`): chain instructions must all write EAX as their dest; first chain instr must be a fresh write (no self-RMW); sources must not reference ECX.
+  - **Pass order**: runs AFTER `pop_index_*_collapse` so those passes can consume the SIB-form patterns first. Without this ordering, my new pass would prematurely collapse the index-load patterns.
+  - Common in `a + b + c` chains where the codegen emits the short-form save/restore (no mov_ecx_eax) for commutative compound assigns.
+  - Saves 2 bytes per match (drops push + pop).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +3 peephole tests (815 total). Pipeline 1734/1734 (100%).

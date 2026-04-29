@@ -6402,3 +6402,62 @@ def test_push_const_index_fold_skips_base_eq_idx():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("push_const_index_fold", 0) == 0
+
+
+# ── pop_op_chain_retarget ──────────────────────────────────────
+
+
+def test_pop_op_chain_retarget_basic():
+    """`push eax; chain; pop ecx; add eax, ecx` (commutative tail)
+    where chain produces RHS in EAX. Drops push + pop, retargets
+    chain to write ECX. Saves 2 bytes."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + 8]\n"
+        "        pop     ecx\n"
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    eax\n" not in out
+    assert "pop     ecx\n" not in out
+    # Chain retargeted to ECX.
+    assert "mov     ecx, [ebp + 8]" in out
+    assert "mov     ecx, [ecx + 8]" in out
+    # OP unchanged (reads EAX as LHS, ECX as RHS).
+    assert "add     eax, ecx" in out
+    assert opt.stats.get("pop_op_chain_retarget") == 1
+
+
+def test_pop_op_chain_retarget_skips_sub():
+    """sub is NOT commutative — can't retarget."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        pop     ecx\n"
+        "        sub     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("pop_op_chain_retarget", 0) == 0
+
+
+def test_pop_op_chain_retarget_skips_self_rmw_first():
+    """First chain instr must be a fresh write — `mov eax, [eax]`
+    reads eax (= LHS) and would change semantics if retargeted."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [eax]\n"  # self-RMW: reads eax!
+        "        pop     ecx\n"
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("pop_op_chain_retarget", 0) == 0
