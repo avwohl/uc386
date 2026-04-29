@@ -2251,6 +2251,107 @@ def test_fst_fstp_collapse_st_paren_form():
     assert opt.stats.get("fst_fstp_collapse") == 1
 
 
+# ── fpu_op_collapse ──────────────────────────────────────────────
+
+
+def test_fpu_op_collapse_faddp():
+    asm = (
+        "_f:\n"
+        "        fld     qword [eax]\n"
+        "        faddp   st1, st0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        fadd    qword [eax]" in out
+    assert "        fld" not in out
+    assert "        faddp" not in out
+    assert opt.stats.get("fpu_op_collapse") == 1
+
+
+def test_fpu_op_collapse_all_ops():
+    """faddp/fmulp/fsubp/fdivp/fsubrp/fdivrp all map to memory form."""
+    mapping = {
+        "faddp": "fadd",
+        "fmulp": "fmul",
+        "fsubp": "fsub",
+        "fdivp": "fdiv",
+        "fsubrp": "fsubr",
+        "fdivrp": "fdivr",
+    }
+    for popf, memf in mapping.items():
+        asm = (
+            "_f:\n"
+            "        fld     dword [ebp - 4]\n"
+            f"        {popf}   st1, st0\n"
+            "        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        out = opt.optimize(asm)
+        # Just check the op + memory operand survives — exact spacing
+        # depends on op-name length (spacer is `8 - len(op)`).
+        assert (memf in out and "dword [ebp - 4]" in out), (
+            f"{popf}: {out}"
+        )
+        assert opt.stats.get("fpu_op_collapse") == 1
+
+
+def test_fpu_op_collapse_dword():
+    asm = (
+        "_f:\n"
+        "        fld     dword [ebp - 4]\n"
+        "        fmulp   st1, st0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        fmul    dword [ebp - 4]" in out
+    assert opt.stats.get("fpu_op_collapse") == 1
+
+
+def test_fpu_op_collapse_skips_intervening():
+    """No collapse when there's other code between fld and the
+    pop-form op."""
+    asm = (
+        "_f:\n"
+        "        fld     qword [eax]\n"
+        "        fchs\n"
+        "        faddp   st1, st0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("fpu_op_collapse", 0) == 0
+
+
+def test_fpu_op_collapse_skips_non_st1_st0_form():
+    """`faddp st(2), st(0)` (different operands) is not the standard
+    case — leave it alone."""
+    asm = (
+        "_f:\n"
+        "        fld     qword [eax]\n"
+        "        faddp   st2, st0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("fpu_op_collapse", 0) == 0
+
+
+def test_fpu_op_collapse_bare_pop_form():
+    """`faddp` with no operands defaults to `st1, st0` per Intel."""
+    asm = (
+        "_f:\n"
+        "        fld     qword [eax]\n"
+        "        faddp\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        fadd    qword [eax]" in out
+    assert opt.stats.get("fpu_op_collapse") == 1
+
+
 # ── Convergence ──────────────────────────────────────────────────
 
 

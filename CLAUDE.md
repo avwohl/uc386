@@ -1002,3 +1002,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **20021120-1.c (FPU-heavy torture)**: 48807 → 43011 bytes (-5796 bytes, 11.9%). All 218 `fstp st0` lines in the unoptimized output collapsed.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests (575 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: fpu_op_collapse**: collapse `fld <addr>; faddp st1, st0` (and friends) into a single memory-form `fadd <addr>`. Same FPU stack and memory state, 2 bytes saved per match. Applies to faddp/fmulp/fsubp/fdivp/fsubrp/fdivrp.
+  - Pop-form `faddp st1, st0` computes `st1 += st0; pop` — new top is `old_st1 + addr_value`. Memory-form `fadd <addr>` computes `st0 += addr_value` — new top is `old_st0 + addr_value`. With the surrounding context (st0 just loaded from <addr>, old st0 was old top), both forms produce the same final state on the new top.
+  - Also accepts the bare-form `faddp` (no operands), which Intel defines as `faddp st1, st0`.
+  - **20021120-1.c**: 43011 → 40611 bytes (−2400 bytes). 96 collapses; combined with other passes the total peephole savings on this FPU-heavy test is 8196 bytes (48807 → 40611, 16.8% reduction).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (581 total). Pipeline 1734/1734 (100%).

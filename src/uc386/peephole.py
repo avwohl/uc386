@@ -88,6 +88,11 @@ Currently implements:
     `fstp <addr>`. Saves 2 bytes per match. Common in FPU-heavy
     code — uc386 codegen lowers `*p = expr` for float/double via
     fst+fstp-st0, which equals fstp-to-mem.
+  - fpu_op_collapse: collapse `fld <addr>; foppc st1, st0` into a
+    single memory-form FPU op `fop <addr>`. Same FPU stack/memory
+    state, 2 bytes saved per match. Applies to faddp / fsubp /
+    fmulp / fdivp (the fsubrp/fdivrp swapped variants get their own
+    rewrites).
 
 Patterns to add (see PEEPHOLE_PLAN.md for details): tail calls,
 jump threading, multi-instruction right-operand retargeting.
@@ -310,6 +315,7 @@ class PeepholeOptimizer:
             lines = self._pass_cmp_load_collapse(lines)
             lines = self._pass_rmw_collapse(lines)
             lines = self._pass_fst_fstp_collapse(lines)
+            lines = self._pass_fpu_op_collapse(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -2530,6 +2536,84 @@ class PeepholeOptimizer:
             out.append(line)
             i += 1
         return out
+
+    # Mapping: pop-form FPU op → memory-form (same direction).
+    _FPU_POP_TO_MEM: dict[str, str] = {
+        "faddp": "fadd",
+        "fmulp": "fmul",
+        "fsubp": "fsub",
+        "fdivp": "fdiv",
+        "fsubrp": "fsubr",
+        "fdivrp": "fdivr",
+    }
+
+    def _pass_fpu_op_collapse(self, lines: list[Line]) -> list[Line]:
+        """Collapse ``fld <addr>; faddp st1, st0`` (and friends) into
+        a single ``fadd <addr>``. Same FPU stack/memory state, 2
+        bytes saved per match.
+
+        Maps:
+          fld <addr>; faddp [st1, st0]  → fadd <addr>
+          fld <addr>; fmulp [st1, st0]  → fmul <addr>
+          fld <addr>; fsubp [st1, st0]  → fsub <addr>
+          fld <addr>; fdivp [st1, st0]  → fdiv <addr>
+          fld <addr>; fsubrp [st1, st0] → fsubr <addr>
+          fld <addr>; fdivrp [st1, st0] → fdivr <addr>
+
+        The pop-form ``faddp st1, st0`` computes ``st1 = st1 + st0;
+        pop`` — the new top is ``old_st1 + addr_value``. The memory
+        form ``fadd <addr>`` computes ``st0 = st0 + <addr_value>``.
+        With the surrounding context (st0 was loaded from <addr>,
+        st1 was the previous top), both produce the same final
+        ``old_st0 + <addr_value>`` on the new top.
+
+        The pop-form variants with explicit ``st1, st0`` operands
+        are accepted; bare ``faddp`` (which defaults to st1, st0)
+        is also accepted for completeness, though our codegen
+        currently always emits the explicit form.
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (
+                i + 1 < len(lines)
+                and line.kind == "instr"
+                and line.op == "fld"
+            ):
+                nxt = lines[i + 1]
+                mem_form = self._FPU_POP_TO_MEM.get(nxt.op or "")
+                if mem_form is not None and self._is_pop_st1_st0(nxt):
+                    indent = self._extract_indent(line.raw)
+                    spacer = " " * (8 - len(mem_form))
+                    new_raw = (
+                        f"{indent}{mem_form}{spacer}{line.operands}"
+                    )
+                    new_line = Line(
+                        raw=new_raw,
+                        kind="instr",
+                        op=mem_form,
+                        operands=line.operands,
+                    )
+                    out.append(new_line)
+                    self.stats["fpu_op_collapse"] = (
+                        self.stats.get("fpu_op_collapse", 0) + 1
+                    )
+                    i += 2
+                    continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _is_pop_st1_st0(line: Line) -> bool:
+        """Match the ``st1, st0`` operand form (or the bare form,
+        which defaults to ``st1, st0``)."""
+        ops = line.operands.strip().lower()
+        if ops == "":
+            return True
+        no_space = ops.replace(" ", "")
+        return no_space in {"st1,st0", "st(1),st(0)"}
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
         """P-jmp-to-next: `jmp X` immediately (modulo blanks/comments)
