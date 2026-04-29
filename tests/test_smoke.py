@@ -4787,3 +4787,45 @@ def test_complex_compound_assign_chain():
         "}\n"
     )
     assert "_main:" in asm
+
+
+def test_va_arg_strength_reduce_safety():
+    # `va_arg(ap, int) * 2` was being strength-reduced to
+    # `va_arg + va_arg` because uc_core's `_expr_has_side_effects`
+    # didn't recognize `VaArgExpr` as having a side effect (it
+    # advances the va_list pointer). The strength reduction emitted
+    # the operand twice, advancing ap twice, skipping a value.
+    # The optimizer is what fires this rule, so we have to run it
+    # explicitly here — `_compile` skips it.
+    from uc_core.ast_optimizer import ASTOptimizer
+    src = (
+        "typedef char *va_list;\n"
+        "extern void abort(void);\n"
+        "int double_arg(int n, ...) {\n"
+        "    va_list ap;\n"
+        "    __builtin_va_start(ap, n);\n"
+        "    int x = __builtin_va_arg(ap, int) * 2;\n"
+        "    __builtin_va_end(ap);\n"
+        "    return x;\n"
+        "}\n"
+        "int main(void) {\n"
+        "    if (double_arg(1, 21) != 42) abort();\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    tokens = list(Lexer(src, "test.c").tokenize())
+    unit = Parser(tokens).parse()
+    unit = ASTOptimizer(3).optimize(unit)
+    asm = CodeGenerator().generate(unit)
+    # The fix: VaArgExpr is recognized as side-effect-bearing, so
+    # `va_arg(ap, int) * 2` is NOT rewritten to `va_arg + va_arg`.
+    # Count the `add dword [ebp - <ap_slot>], 4` (advance ap by
+    # sizeof(int)) pattern inside `_double_arg`. Buggy form emits
+    # the advance TWICE (once per duplicated va_arg); fixed form
+    # emits it ONCE.
+    da_start = asm.index("_double_arg:")
+    da_end = asm.index("\n_main:", da_start)
+    da = asm[da_start:da_end]
+    # ap is at [ebp - 4] (first local).
+    advances = da.count("add     dword [ebp - 4], 4")
+    assert advances == 1, f"expected 1 va_arg advance, got {advances}"
