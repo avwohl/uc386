@@ -4459,6 +4459,31 @@ def test_add_esp_to_pop_skips_large_imm():
     assert opt.stats.get("add_esp_to_pop", 0) == 0
 
 
+def test_add_esp_to_pop_when_next_is_pop_ecx():
+    """`add esp, 4; pop ecx` collapses even without a preceding
+    call. The next `pop ecx` overwrites ECX, so the value the new
+    pop loads is irrelevant."""
+    asm = (
+        "_f:\n"
+        "        fild    dword [esp]\n"
+        "        add     esp, 4\n"
+        "        pop     ecx\n"
+        "        fstp    dword [ecx]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    out_lines = out.split("\n")
+    has_add = any(
+        line.strip() == "add     esp, 4" for line in out_lines
+    )
+    assert not has_add
+    # Both pop ecx instructions should be present (one from
+    # the conversion + the original).
+    assert out.count("pop     ecx") == 2
+    assert opt.stats.get("add_esp_to_pop") == 1
+
+
 def test_narrow_store_reload_collapse_word():
     """`mov word [m], ax; movsx eax, word [m]` collapses to
     `mov word [m], ax; movsx eax, ax`. Saves 1 byte."""

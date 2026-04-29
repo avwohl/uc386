@@ -6688,10 +6688,24 @@ class PeepholeOptimizer:
             # files (pr23135 has 720K lines and thousands of `add esp`
             # sites; the slow check pushed compile time over the
             # runner timeout).
-            if not self._prev_instr_is_call(out, i):
-                i += 1
-                continue
-            if not self._next_instr_doesnt_read_ecx(out, i + 1):
+            # Eligible if either:
+            # (a) previous is `call` AND next doesn't read ECX
+            #     (cdecl arg cleanup — ECX dead by convention)
+            # (b) next is `pop ecx` (overwrites ECX — `pop` reads
+            #     from [esp], not from ECX)
+            #
+            # Case (b) handles patterns like `fild dword [esp]; add
+            # esp, 4; pop ecx` where the `add` is x87-stack scratch
+            # cleanup, not a call cleanup. Saves 2 bytes per match.
+            if self._next_instr_is_pop_ecx(out, i + 1):
+                # Always eligible — pop ecx overwrites ECX without
+                # reading it.
+                pass
+            elif self._prev_instr_is_call(out, i):
+                if not self._next_instr_doesnt_read_ecx(out, i + 1):
+                    i += 1
+                    continue
+            else:
                 i += 1
                 continue
             indent = self._extract_indent(line.raw)
@@ -6748,6 +6762,27 @@ class PeepholeOptimizer:
                 return True
             return not self._references_reg_family(ln.operands, "ecx")
         return True
+
+    @staticmethod
+    def _next_instr_is_pop_ecx(
+        lines: list[Line], idx: int,
+    ) -> bool:
+        """Walk forward from idx to find the next instruction. Return
+        True if it's `pop ecx` — which overwrites ECX with the new
+        TOS value, making the prior ECX value irrelevant."""
+        j = idx
+        while j < len(lines):
+            ln = lines[j]
+            if ln.kind in ("blank", "comment"):
+                j += 1
+                continue
+            if ln.kind != "instr":
+                return False
+            return (
+                ln.op == "pop"
+                and ln.operands.strip().lower() == "ecx"
+            )
+        return False
 
     # Commutative two-operand binops where `OP eax, ecx` and
     # `OP ecx, eax` produce identical EAX results. imul (two-operand
