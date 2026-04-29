@@ -4013,3 +4013,103 @@ def test_push_index_collapse_scale_8():
     out = opt.optimize(asm)
     assert "push    dword [eax + ecx*8]" in out
     assert opt.stats.get("push_index_collapse") == 1
+
+
+# ── redundant_ecx_load ───────────────────────────────────────────
+
+
+def test_redundant_ecx_load_basic():
+    """`mov ecx, [m]; <push that doesn't touch ecx>; mov ecx, [m]`
+    drops the second load."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        push    dword [eax + ecx*4]\n"  # reads ecx, doesn't write
+        "        mov     ecx, [ebp - 8]\n"  # redundant
+        "        inc     ecx\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Only one `mov ecx, [ebp - 8]` should remain.
+    assert out.count("mov     ecx, [ebp - 8]") == 1
+    assert opt.stats.get("redundant_ecx_load") == 1
+
+
+def test_redundant_ecx_load_invalidates_after_ecx_write():
+    """If ECX is written between two loads, the second isn't redundant."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        mov     ecx, eax\n"  # ECX overwritten
+        "        mov     ecx, [ebp - 8]\n"  # NOT redundant (ECX changed)
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_ecx_load", 0) == 0
+
+
+def test_redundant_ecx_load_invalidates_after_call():
+    """A call clobbers ECX (cdecl scratch); reload is needed."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        call    _other\n"  # clobbers ECX
+        "        mov     ecx, [ebp - 8]\n"  # NOT redundant
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_ecx_load", 0) == 0
+
+
+def test_redundant_ecx_load_invalidates_after_cl_write():
+    """A write to CL (sub-register) invalidates ECX tracking."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        mov     cl, 0\n"  # CL overwritten
+        "        mov     ecx, [ebp - 8]\n"  # NOT redundant
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_ecx_load", 0) == 0
+
+
+def test_redundant_ecx_load_invalidates_after_shl_cl():
+    """`shl reg, cl` reads CL — but doesn't write ECX. So a subsequent
+    `mov ecx, [m]` IS redundant if [m] was already loaded into ecx."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     eax, cl\n"  # reads CL, doesn't write
+        "        mov     ecx, [ebp - 8]\n"  # actually redundant
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    # `shl eax, cl` references the ecx family in operands, so tracker
+    # invalidates conservatively. The pass treats "any reference" as
+    # potentially clobbering, even though shl reg, cl only reads.
+    # Conservative is correct; we won't drop the second mov.
+    assert opt.stats.get("redundant_ecx_load", 0) == 0
+
+
+def test_redundant_ecx_load_through_jcc_fallthrough():
+    """A jcc's fallthrough preserves ECX tracking."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        cmp     eax, 5\n"
+        "        jl      .else\n"
+        "        mov     ecx, [ebp - 8]\n"  # redundant on fallthrough
+        "        ret\n"
+        ".else:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_ecx_load") == 1

@@ -384,6 +384,7 @@ class PeepholeOptimizer:
             # passes fire on independent patterns.
             lines = self._pass_cmp_load_collapse(lines)
             lines = self._pass_redundant_eax_load(lines)
+            lines = self._pass_redundant_ecx_load(lines)
             lines = self._pass_rmw_collapse(lines)
             lines = self._pass_fst_fstp_collapse(lines)
             lines = self._pass_fpu_op_collapse(lines)
@@ -2128,19 +2129,41 @@ class PeepholeOptimizer:
         return raw[:n]
 
     def _pass_redundant_eax_load(self, lines: list[Line]) -> list[Line]:
-        """Drop ``mov eax, M`` when EAX already provably holds M's
-        value — we loaded it earlier in the basic block and nothing
-        between then and now wrote EAX or touched M.
+        """Drop ``mov eax, M`` when EAX already provably holds M.
+        See ``_run_redundant_reg_load`` for the algorithm."""
+        return self._run_redundant_reg_load(
+            lines, "eax", {"al", "ah", "ax"}, "redundant_eax_load",
+        )
 
-        Tracking is conservative: we follow EAX's "current memory
+    def _pass_redundant_ecx_load(self, lines: list[Line]) -> list[Line]:
+        """Drop ``mov ecx, M`` when ECX already provably holds M.
+        Sister of ``_pass_redundant_eax_load``. Common after
+        ``index_load_collapse`` / ``push_index_collapse`` leaves
+        a ``mov ecx, [m]`` whose value is still in ECX from the
+        prior load."""
+        return self._run_redundant_reg_load(
+            lines, "ecx", {"cl", "ch", "cx"}, "redundant_ecx_load",
+        )
+
+    def _run_redundant_reg_load(
+        self, lines: list[Line], reg32: str,
+        sub_regs: set[str], stat_key: str,
+    ) -> list[Line]:
+        """Drop ``mov REG, M`` when REG already provably holds M's
+        value — we loaded it earlier in the basic block and nothing
+        between then and now wrote REG or touched M.
+
+        Tracking is conservative: we follow REG's "current memory
         source" through a single straight-line block. Any of these
         invalidate the tracker:
-        - Any write to EAX (or AL/AH/AX) by any instruction
+        - Any write to REG (or its sub-regs) by any instruction
         - Any memory-write whose destination might alias M
         - Calls and unconditional control flow (jmp/ret/etc.)
+        - Any instruction in ``_IMPLICIT_REG_USERS`` (over-
+          conservative — some only touch other regs, but safe)
 
         Conditional jumps (jcc) DO preserve the tracker on the
-        fall-through path; we record the jcc's eax_mem at the time
+        fall-through path; we record the jcc's reg_mem at the time
         of the jump, keyed by target label. At each label, we merge
         the jcc-recorded states with the fall-through state (if any).
 
@@ -2149,175 +2172,119 @@ class PeepholeOptimizer:
         offsets (different N). Stores via a register address (e.g.
         ``[ecx]``), or to a label, conservatively invalidate.
 
-        Tracked operands: literal-offset stack reads (``[ebp + N]``,
-        ``[ebp - N]``). Register sources, immediates, and labels are
-        not tracked because they don't alias-conflict with anything
-        codegen emits (immediates) or aren't worth tracking
-        (registers — codegen reloads from memory, not register-to-
-        register).
+        Tracked operands: literal-offset stack reads. Register
+        sources, immediates, and labels are not tracked because they
+        don't alias-conflict with anything codegen emits (immediates)
+        or aren't worth tracking (registers — codegen reloads from
+        memory, not register-to-register).
         """
         out: list[Line] = []
-        eax_mem: str | None = None  # The literal text of EAX's known mem source
-        # Per-label state: set of eax_mem seen at forward jcc to this
-        # label. None in the set means "saw a state of None / unknown".
-        # If the set has exactly one value, that's the merged state.
+        reg_mem: str | None = None  # The literal text of REG's known mem source
         jcc_states: dict[str, set[str | None]] = {}
-        # Was the previous "real" instr unconditional (jmp/ret/etc.)?
-        # True means the upcoming label has NO fall-through predecessor;
-        # only jcc-tracked predecessors matter.
         prev_unconditional = False
         for line in lines:
             if line.kind != "instr":
-                # Labels, directives, data, comments, blanks: handle
-                # labels specially (merge jcc states with fall-through).
                 if line.kind == "label":
                     label = line.label
                     saved = jcc_states.pop(label, None)
                     if prev_unconditional:
-                        # No fall-through; only saved jcc states matter.
                         if saved is not None and len(saved) == 1:
                             (only,) = saved
-                            eax_mem = only
+                            reg_mem = only
                         else:
-                            eax_mem = None
+                            reg_mem = None
                     else:
-                        # Fall-through exists; merge with saved.
                         if saved is None:
-                            # Only fall-through reaches this label.
-                            pass  # eax_mem stays as fall-through
+                            pass
                         else:
-                            states = saved | {eax_mem}
+                            states = saved | {reg_mem}
                             if len(states) == 1:
                                 (only,) = states
-                                eax_mem = only
+                                reg_mem = only
                             else:
-                                eax_mem = None
+                                reg_mem = None
                     prev_unconditional = False
                 out.append(line)
                 continue
             op = line.op
             ops = line.operands
-            # Direct mov: this is where the redundant-load check fires.
             if op == "mov":
                 parts = _operands_split(ops)
                 if parts is not None:
                     dest, src = parts
                     dest_low = dest.strip().lower()
                     src_norm = src.strip()
-                    if dest_low == "eax":
-                        # mov eax, X
+                    if dest_low == reg32:
+                        # mov REG, X
                         if (
-                            eax_mem is not None
+                            reg_mem is not None
                             and self._is_ebp_offset_mem(src_norm)
-                            and src_norm == eax_mem
+                            and src_norm == reg_mem
                         ):
-                            self.stats["redundant_eax_load"] = (
-                                self.stats.get("redundant_eax_load", 0) + 1
+                            self.stats[stat_key] = (
+                                self.stats.get(stat_key, 0) + 1
                             )
                             continue
-                        # New EAX value — track if it's a stack mem ref;
-                        # otherwise stop tracking.
                         if self._is_ebp_offset_mem(src_norm):
-                            eax_mem = src_norm
+                            reg_mem = src_norm
                         else:
-                            eax_mem = None
+                            reg_mem = None
                         out.append(line)
                         continue
-                    # mov [...], src — a memory write
                     if "[" in dest:
-                        if eax_mem is not None and not self._mem_disjoint(
-                            eax_mem, dest.strip()
+                        if reg_mem is not None and not self._mem_disjoint(
+                            reg_mem, dest.strip()
                         ):
-                            eax_mem = None
-                        # If dest is AL/AH/AX, also invalidate (sub-eax
-                        # write).
-                        if dest_low in {"al", "ah", "ax"}:
-                            eax_mem = None
+                            reg_mem = None
+                        if dest_low in sub_regs:
+                            reg_mem = None
                         out.append(line)
                         continue
-                    # mov reg, src — only EAX-family writes invalidate.
-                    if dest_low in {"al", "ah", "ax"}:
-                        eax_mem = None
+                    if dest_low in sub_regs:
+                        reg_mem = None
                     out.append(line)
                     continue
-            # Any non-mov instruction: be conservative.
-            # Calls and unconditional control flow boundaries
-            # invalidate EAX. Conditional jumps (jcc) do NOT — the
-            # fallthrough path preserves EAX, and labels (which are
-            # merge points) invalidate separately. So `cmp eax, X;
-            # jcc L; mov eax, M2` doesn't reset tracking at the jcc;
-            # if M2 == eax_mem, the load is redundant in the
-            # fallthrough path. The taken-jcc path lands at L, where
-            # the label-handling above resets eax_mem.
             if op == "call":
-                eax_mem = None
-                prev_unconditional = False  # call returns to next line
+                reg_mem = None
+                prev_unconditional = False
                 out.append(line)
                 continue
             if op in {"jmp", "ret", "iret", "iretd", "retf",
                       "retn", "leave", "enter"}:
-                # Unconditional jmp: also save the target's state
-                # (taken with current eax_mem before invalidate).
                 if op == "jmp":
                     target = line.operands.strip()
-                    jcc_states.setdefault(target, set()).add(eax_mem)
-                eax_mem = None
-                prev_unconditional = op != "enter"  # enter is prologue
+                    jcc_states.setdefault(target, set()).add(reg_mem)
+                reg_mem = None
+                prev_unconditional = op != "enter"
                 out.append(line)
                 continue
             if op.startswith("j"):
-                # Conditional jump (jcc) — keep tracking, save state
-                # for the target label so the taken path can pick it
-                # up at the label.
                 target = line.operands.strip()
-                jcc_states.setdefault(target, set()).add(eax_mem)
+                jcc_states.setdefault(target, set()).add(reg_mem)
                 prev_unconditional = False
                 out.append(line)
                 continue
-            # Instructions that READ EAX but don't WRITE it: cmp,
-            # test, push. These are safe — they don't change EAX's
-            # value, so eax_mem stays valid.
             if op in {"cmp", "test", "push"}:
-                # Verify EAX isn't being COMPARED with something that
-                # might be a memory write (it can't — these all are
-                # pure reads). Just preserve tracking.
-                # Caveat: any non-EAX dest write to memory still needs
-                # the alias check below, but cmp/test/push don't
-                # write memory.
                 out.append(line)
                 continue
-            # Instructions that may write EAX (explicit operand or
-            # implicit). Conservative: any reference to eax/ax/al/ah
-            # in operands, OR any instruction in `_IMPLICIT_REG_USERS`
-            # for EAX (cdq/idiv/etc. write or read EAX).
             if (
-                self._references_reg_family(ops, "eax")
+                self._references_reg_family(ops, reg32)
                 or op in PeepholeOptimizer._IMPLICIT_REG_USERS
             ):
-                eax_mem = None
+                reg_mem = None
                 out.append(line)
                 continue
-            # Other instructions that might write memory (add/sub/inc/
-            # dec/and/or/xor/shl/shr/sar with a memory dest).
-            # Conservative: any instruction with `[` in operands could
-            # be a memory write. Invalidate if the destination might
-            # alias eax_mem.
             if "[" in ops:
-                # Try to extract the destination operand and check
-                # disjointness. For a 2-op instruction like `add [X], Y`
-                # the destination is the first operand.
                 parts = _operands_split(ops)
                 if parts is not None:
                     dest, _ = parts
-                    if "[" in dest and eax_mem is not None and not (
-                        self._mem_disjoint(eax_mem, dest.strip())
+                    if "[" in dest and reg_mem is not None and not (
+                        self._mem_disjoint(reg_mem, dest.strip())
                     ):
-                        eax_mem = None
+                        reg_mem = None
                 else:
-                    # Single-operand instructions like `inc [X]` —
-                    # be conservative.
-                    if eax_mem is not None:
-                        eax_mem = None
+                    if reg_mem is not None:
+                        reg_mem = None
             out.append(line)
         return out
 

@@ -1093,3 +1093,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Probe**: `s += p[i] + p[i+1] + p[i+2]` — the first iteration's `arr[i]` push collapses, subsequent uses already had `[base + idx*scale]` from index_load_collapse since their uses are mov rather than push.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (223 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: redundant_ecx_load (parametrized)**: extend `redundant_eax_load`'s tracker to ECX. The single-block "current memory source" tracker is sound for any GP register since the invalidation rules are identical: any write to the register family invalidates, calls invalidate (cdecl scratch), unconditional control flow invalidates, conditional jumps preserve fall-through with merge at labels.
+  - **Refactored `_pass_redundant_eax_load` into a parametrized helper `_run_redundant_reg_load(lines, reg32, sub_regs, stat_key)`**. Both `_pass_redundant_eax_load` and the new `_pass_redundant_ecx_load` are thin wrappers. ~190 lines of EAX-specific code → ~30-line helper used by both.
+  - **Common shape lifted**: in array-traversal patterns like `s += p[i] + p[i+1] + p[i+2]`, the codegen emits `mov ecx, [i]` once before each `arr[*]` access. After `push_index_collapse` collapses the address arithmetic, what's left is `push dword [eax + ecx*4]; mov ecx, [i]` — and the second load is redundant since push doesn't write ECX. Now collapsed.
+  - **Saves 3 bytes per match** (typical: `mov ecx, [ebp - N]` is 3 bytes for ebp-relative).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (229 total). Pipeline 1734/1734 (100%).
