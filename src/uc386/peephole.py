@@ -406,6 +406,7 @@ class PeepholeOptimizer:
             lines = self._pass_redundant_eax_load(lines)
             lines = self._pass_redundant_ecx_load(lines)
             lines = self._pass_rmw_collapse(lines)
+            lines = self._pass_same_memory_operand_reuse(lines)
             lines = self._pass_fst_fstp_collapse(lines)
             lines = self._pass_fpu_op_collapse(lines)
             lines = self._pass_add_one_to_inc(lines)
@@ -3438,6 +3439,120 @@ class PeepholeOptimizer:
         if sl in {"ebx", "ecx", "edx", "esi", "edi"}:
             return sl
         return None
+
+    def _pass_same_memory_operand_reuse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``mov REG, [m]; OP REG, [same m]`` into
+        ``mov REG, [m]; OP REG, REG`` for commutative OPs.
+
+        After the load, REG holds [m]. For commutative ops where the
+        second operand is the SAME memory location, we can use REG
+        twice instead of re-reading. The result is identical
+        (reg op reg == reg op [m] when reg == [m]).
+
+        Saves 1 byte per match: ``OP r32, [ebp ± imm8]`` is 3 bytes;
+        ``OP r32, r32`` is 2 bytes.
+
+        Common after `store_chain_retarget` rewrites the chain for
+        ``arr[i] = i + i``: the chain becomes
+        ``mov ecx, [i]; add ecx, [i]`` which we collapse here.
+
+        Conditions:
+        - Line A: ``mov REG, [m]`` where REG is a 32-bit GP register,
+          [m] is a memory deref.
+        - Line B: ``OP REG, [m]`` where OP ∈ {add, and, or, xor},
+          same REG, same [m] (whitespace-normalized text match).
+        - [m] doesn't reference REG itself (would self-modify after
+          collapse — but actually safe since the value is the same;
+          still defensive).
+        - [m] is restricted to ``[ebp ± N]`` (frame-local, never
+          volatile in our codegen) for safety against potential
+          volatile MMIO loads through globals or pointers.
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (
+                i + 1 < len(lines)
+                and line.kind == "instr"
+                and line.op == "mov"
+            ):
+                ap = _operands_split(line.operands)
+                if ap is not None:
+                    a_dst, a_src = ap
+                    a_dst_low = a_dst.strip().lower()
+                    a_src_norm = a_src.strip()
+                    if (
+                        a_dst_low in PeepholeOptimizer._GP32
+                        and self._is_ebp_relative_mem(a_src_norm)
+                    ):
+                        b = lines[i + 1]
+                        if (
+                            b.kind == "instr"
+                            and b.op in PeepholeOptimizer._COMMUTATIVE_BINOPS
+                        ):
+                            bp = _operands_split(b.operands)
+                            if bp is not None:
+                                b_dst, b_src = bp
+                                b_dst_low = b_dst.strip().lower()
+                                b_src_norm = b_src.strip()
+                                if (
+                                    b_dst_low == a_dst_low
+                                    and self._normalize_mem(b_src_norm)
+                                    == self._normalize_mem(a_src_norm)
+                                ):
+                                    indent = self._extract_indent(b.raw)
+                                    spacer = " " * max(1, 8 - len(b.op))
+                                    new_raw = (
+                                        f"{indent}{b.op}{spacer}"
+                                        f"{a_dst_low}, {a_dst_low}"
+                                    )
+                                    new_line = Line(
+                                        raw=new_raw, kind="instr",
+                                        op=b.op,
+                                        operands=(
+                                            f"{a_dst_low}, {a_dst_low}"
+                                        ),
+                                    )
+                                    out.append(line)
+                                    out.append(new_line)
+                                    self.stats[
+                                        "same_memory_operand_reuse"
+                                    ] = (
+                                        self.stats.get(
+                                            "same_memory_operand_reuse",
+                                            0,
+                                        ) + 1
+                                    )
+                                    i += 2
+                                    continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _is_ebp_relative_mem(operand: str) -> bool:
+        """Is `operand` of the form `[ebp + N]` or `[ebp - N]` with a
+        numeric literal N? Whitespace-tolerant."""
+        s = operand.strip()
+        if not (s.startswith("[") and s.endswith("]")):
+            return False
+        inner = s[1:-1].strip()
+        # Match `ebp [+|-] <numeric>`.
+        m = re.match(
+            r"^\s*ebp\s*([+-])\s*(\d+|0x[0-9a-fA-F]+)\s*$",
+            inner,
+            re.IGNORECASE,
+        )
+        return m is not None
+
+    @staticmethod
+    def _normalize_mem(operand: str) -> str:
+        """Whitespace-normalized lowercase form of a memory operand
+        for textual comparison."""
+        return "".join(operand.lower().split())
 
     def _pass_fst_fstp_collapse(self, lines: list[Line]) -> list[Line]:
         """Collapse ``fst <addr>; fstp st0`` into a single

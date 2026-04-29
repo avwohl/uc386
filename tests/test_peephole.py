@@ -388,9 +388,11 @@ def test_store_chain_retarget_two_instr_chain():
     # push/pop are gone.
     assert "push    eax" not in out
     assert "pop     ecx" not in out
-    # Chain retargeted to ECX.
+    # Chain retargeted to ECX. The second instruction is then further
+    # collapsed by `same_memory_operand_reuse` to `add ecx, ecx` since
+    # ECX already holds [ebp - 4].
     assert "mov     ecx, [ebp - 4]" in out
-    assert "add     ecx, [ebp - 4]" in out
+    assert "add     ecx, ecx" in out
     # Store swapped to use EAX as address.
     assert "mov     [eax], ecx" in out
     assert opt.stats.get("store_chain_retarget", 0) == 1
@@ -7207,3 +7209,197 @@ def test_index_load_collapse_label_skips_idx_reused():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("index_load_collapse_label", 0) == 0
+
+
+def test_same_memory_operand_reuse_add():
+    """`mov reg, [m]; add reg, [m]` → `mov reg, [m]; add reg, reg`.
+
+    After the load, REG holds [m]. The second operand can use REG
+    instead of re-reading. Saves 1 byte (3-byte mem-form add → 2-byte
+    reg-reg add)."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        add     ecx, [ebp - 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     ecx, ecx" in out
+    assert "add     ecx, [ebp - 4]" not in out
+    assert opt.stats.get("same_memory_operand_reuse", 0) == 1
+
+
+def test_same_memory_operand_reuse_and_or_xor():
+    """All commutative ops {and, or, xor} fire. `add` already covered."""
+    for op in ["and", "or", "xor"]:
+        asm = (
+            "_f:\n"
+            f"        mov     eax, [ebp + 8]\n"
+            f"        {op}     eax, [ebp + 8]\n"
+            "        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        out = opt.optimize(asm)
+        spacer = " " * max(1, 8 - len(op))
+        assert f"{op}{spacer}eax, eax" in out
+        assert opt.stats.get("same_memory_operand_reuse", 0) == 1
+
+
+def test_same_memory_operand_reuse_imul():
+    """imul is commutative — `int x; x*x` lowers to `mov eax, [m]; imul
+    eax, [m]` which collapses to `mov eax, [m]; imul eax, eax`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        imul    eax, [ebp + 8]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "imul    eax, eax" in out
+    assert "imul    eax, [ebp + 8]" not in out
+    assert opt.stats.get("same_memory_operand_reuse", 0) == 1
+
+
+def test_same_memory_operand_reuse_skips_sub():
+    """`sub` is not commutative — `mov reg, [m]; sub reg, [m]` IS
+    always 0, but the rewrite to `sub reg, reg` would be a different
+    optimization (zero idiom). Skip for safety; that's a separate slice."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        sub     ecx, [ebp - 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("same_memory_operand_reuse", 0) == 0
+
+
+def test_same_memory_operand_reuse_skips_cmp_test():
+    """`cmp` and `test` set flags differently when the second operand
+    is replaced by REG. `cmp REG, [m]` where REG=[m] gives ZF=1, all
+    other flags 0. `cmp REG, REG` where REG=[m] gives the same flags.
+    But `test REG, REG` gives ZF=([m]==0), SF=high_bit. Different! For
+    safety, skip both. (cmp could be safe, but conservative beats
+    clever.)"""
+    for op in ["cmp", "test"]:
+        asm = (
+            "_f:\n"
+            "        mov     ecx, [ebp - 4]\n"
+            f"        {op}     ecx, [ebp - 4]\n"
+            "        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        opt.optimize(asm)
+        assert opt.stats.get("same_memory_operand_reuse", 0) == 0
+
+
+def test_same_memory_operand_reuse_skips_different_mem():
+    """Different memory operands — must NOT collapse."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        add     ecx, [ebp - 8]\n"  # different offset
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     ecx, [ebp - 8]" in out
+    assert opt.stats.get("same_memory_operand_reuse", 0) == 0
+
+
+def test_same_memory_operand_reuse_skips_different_reg():
+    """Different destination registers — load goes into ECX, op goes
+    into EAX. EAX doesn't hold [m], so we can't substitute."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        add     eax, [ebp - 4]\n"  # different dest
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     eax, [ebp - 4]" in out
+    assert opt.stats.get("same_memory_operand_reuse", 0) == 0
+
+
+def test_same_memory_operand_reuse_skips_label_mem():
+    """Source is `[_glob]` — label memory could be volatile MMIO. We
+    restrict to ebp-relative for safety."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [_glob]\n"
+        "        add     ecx, [_glob]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("same_memory_operand_reuse", 0) == 0
+
+
+def test_same_memory_operand_reuse_skips_sib_mem():
+    """Source is `[ebp + ecx*4]` — SIB form, not a frame slot. Skip."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + ecx*4]\n"
+        "        add     eax, [ebp + ecx*4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("same_memory_operand_reuse", 0) == 0
+
+
+def test_same_memory_operand_reuse_chain_pattern():
+    """Realistic chain after store_chain_retarget: end-to-end test
+    that the i+i pattern collapses through the pipeline."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 8]\n"
+        "        lea     eax, [_g + eax*4]\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, [ebp - 4]\n"
+        "        pop     ecx\n"
+        "        mov     [ecx], eax\n"
+        "        xor     eax, eax\n"
+        "        xor     ecx, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # store_chain_retarget rewrote chain to ECX, then
+    # same_memory_operand_reuse simplified add ecx, [ebp - 4] to add ecx, ecx.
+    assert "add     ecx, ecx" in out
+    assert opt.stats.get("store_chain_retarget", 0) == 1
+    assert opt.stats.get("same_memory_operand_reuse", 0) == 1
+
+
+def test_same_memory_operand_reuse_negative_offset_match():
+    """`[ebp - 4]` and `[ebp - 4]` match (same negative offset)."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, [ebp - 16]\n"
+        "        and     edx, [ebp - 16]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "and     edx, edx" in out
+    assert opt.stats.get("same_memory_operand_reuse", 0) == 1
+
+
+def test_same_memory_operand_reuse_whitespace_tolerant():
+    """Memory operand text comparison should be whitespace-normalized."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        add     ecx, [ ebp - 4 ]\n"  # extra whitespace
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     ecx, ecx" in out
+    assert opt.stats.get("same_memory_operand_reuse", 0) == 1
