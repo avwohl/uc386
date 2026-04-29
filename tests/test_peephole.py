@@ -8133,3 +8133,141 @@ def test_dead_stack_store_chained_three_assigns():
     occurrences = out.count("mov     [ebp - 4], eax")
     assert occurrences == 1, f"Expected 1 final store, got {occurrences}"
     assert opt.stats.get("dead_stack_store", 0) >= 2
+
+
+def test_reg_copy_addr_forward_basic():
+    """`mov ecx, eax; mov [ecx], V` → `mov [eax], V`. Saves 2 bytes."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, eax\n"
+        "        mov     dword [ecx], 5\n"
+        "        xor     ecx, ecx\n"  # ecx dead after
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     dword [eax], 5" in out
+    assert "mov     ecx, eax" not in out
+    assert opt.stats.get("reg_copy_addr_forward", 0) == 1
+
+
+def test_reg_copy_addr_forward_load():
+    """`mov ecx, eax; mov edx, [ecx]` → `mov edx, [eax]`."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, eax\n"
+        "        mov     edx, [ecx]\n"
+        "        xor     ecx, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     edx, [eax]" in out
+    assert opt.stats.get("reg_copy_addr_forward", 0) == 1
+
+
+def test_reg_copy_addr_forward_disp():
+    """`mov ecx, eax; mov edx, [ecx + 8]` → `mov edx, [eax + 8]`."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, eax\n"
+        "        mov     edx, [ecx + 8]\n"
+        "        xor     ecx, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     edx, [eax + 8]" in out
+    assert opt.stats.get("reg_copy_addr_forward", 0) == 1
+
+
+def test_reg_copy_addr_forward_skips_no_addr_use():
+    """If line B doesn't use REGB in addressing, don't fire."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, eax\n"
+        "        mov     edx, ecx\n"  # uses ecx as src, not in [...]
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    # value_forward_to_reg might fire here, but reg_copy_addr_forward
+    # should NOT.
+    assert opt.stats.get("reg_copy_addr_forward", 0) == 0
+
+
+def test_reg_copy_addr_forward_skips_regb_live_after():
+    """If REGB is read after line B, don't drop the copy."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, eax\n"
+        "        mov     edx, [ecx]\n"
+        "        mov     esi, ecx\n"  # ecx still live
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("reg_copy_addr_forward", 0) == 0
+
+
+def test_reg_copy_addr_forward_skips_b_writes_rega():
+    """If line B writes to REGA, REGA's value would change before
+    addressing resolves. Conservative: skip."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, [ecx]\n"  # writes eax (= REGA)
+        "        xor     ecx, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("reg_copy_addr_forward", 0) == 0
+
+
+def test_reg_copy_addr_forward_index_use():
+    """`mov ecx, eax; mov edx, [ebx + ecx*4]` → `mov edx, [ebx + eax*4]`."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, eax\n"
+        "        mov     edx, [ebx + ecx*4]\n"
+        "        xor     ecx, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     edx, [ebx + eax*4]" in out
+    assert opt.stats.get("reg_copy_addr_forward", 0) == 1
+
+
+def test_reg_copy_addr_forward_skips_self_mov():
+    """`mov eax, eax` is a self-mov; skip (handled by self_mov_elim)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, eax\n"  # self-mov
+        "        mov     ecx, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    # The self-mov gets eliminated by another pass; we don't fire.
+    assert opt.stats.get("reg_copy_addr_forward", 0) == 0
+
+
+def test_reg_copy_addr_forward_store_through_pointer():
+    """Realistic case: `*p = V` lowering. Codegen often emits
+    `lea reg, addr; mov ecx, reg; mov [ecx], V`."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp + 8]\n"
+        "        mov     ecx, eax\n"
+        "        mov     dword [ecx], 5\n"
+        "        xor     ecx, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # mov ecx, eax dropped; substituted to use eax directly.
+    assert "mov     ecx, eax" not in out
+    assert "mov     dword [eax], 5" in out
+    assert opt.stats.get("reg_copy_addr_forward", 0) == 1

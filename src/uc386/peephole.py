@@ -443,6 +443,7 @@ class PeepholeOptimizer:
             lines = self._pass_lea_forward_to_reg(lines)
             lines = self._pass_lea_store_collapse(lines)
             lines = self._pass_dead_stack_store(lines)
+            lines = self._pass_reg_copy_addr_forward(lines)
             lines = self._pass_value_forward_to_reg(lines)
             lines = self._pass_byte_stores_to_dword(lines)
             lines = self._pass_pop_index_push_collapse(lines)
@@ -2346,6 +2347,15 @@ class PeepholeOptimizer:
                 if reg32 in ("eax", "edx"):
                     return False
                 return True
+            # `leave` is `mov esp, ebp; pop ebp` — it READS EBP and
+            # WRITES ESP and EBP. For EBP/ESP, the read makes them
+            # alive at this point; for other regs, leave doesn't
+            # touch them, continue scanning.
+            if ln.op == "leave":
+                if reg32 in ("ebp", "esp"):
+                    return False
+                j += 1
+                continue
             # If this instruction references the reg family in any
             # operand, treat as a read.
             if self._references_reg_family(ln.operands, reg32):
@@ -2359,7 +2369,7 @@ class PeepholeOptimizer:
                     return False  # indirect jmp — bail
                 if target in visited_labels:
                     return False  # loop — bail
-                target_idx = self._find_label_idx(lines, target)
+                target_idx = self._find_label_idx(lines, target, j)
                 if target_idx is None:
                     return False
                 # Tail-call into the scan at the label's first
@@ -2379,7 +2389,7 @@ class PeepholeOptimizer:
                     return False  # indirect/unparseable — bail
                 if target in visited_labels:
                     return False  # loop — bail
-                target_idx = self._find_label_idx(lines, target)
+                target_idx = self._find_label_idx(lines, target, j)
                 if target_idx is None:
                     return False
                 # Target path: must be dead.
@@ -2417,9 +2427,58 @@ class PeepholeOptimizer:
         return False
 
     @staticmethod
-    def _find_label_idx(lines: list[Line], label: str) -> int | None:
+    def _find_label_idx(
+        lines: list[Line], label: str, from_idx: int | None = None,
+    ) -> int | None:
         """Find the index of label `label` in `lines`. Returns the
-        index of the label line (the next instr is at idx+1)."""
+        index of the label line (the next instr is at idx+1).
+
+        NASM local-label scoping: a label starting with `.` is
+        scoped to the most recent non-local (`_name`) label before
+        the reference. Two functions can have `.L2_endif:` and
+        they're DIFFERENT labels.
+
+        If `label` starts with `.` and `from_idx` is provided, the
+        scope is determined by finding the most recent non-local
+        label before `from_idx`. Search proceeds within that scope
+        only (until the next non-local label).
+
+        For non-local labels OR when `from_idx` is None (legacy
+        callers), returns the first occurrence.
+        """
+        if label.startswith(".") and from_idx is not None:
+            # Find scope owner: most recent non-local label before
+            # (or at) `from_idx - 1`.
+            scope_start = -1
+            for k in range(min(from_idx - 1, len(lines) - 1), -1, -1):
+                ln = lines[k]
+                if (
+                    ln.kind == "label"
+                    and not ln.label.startswith(".")
+                ):
+                    scope_start = k
+                    break
+            if scope_start == -1:
+                # No scope owner found; fall back to first match.
+                for k, ln in enumerate(lines):
+                    if ln.kind == "label" and ln.label == label:
+                        return k
+                return None
+            # Search within scope: from scope_start to the next
+            # non-local label (exclusive).
+            for k in range(scope_start, len(lines)):
+                ln = lines[k]
+                if ln.kind == "label":
+                    if ln.label == label:
+                        return k
+                    # Hit a different non-local label — past our scope.
+                    if (
+                        not ln.label.startswith(".")
+                        and k > scope_start
+                    ):
+                        return None
+            return None
+        # Non-local label OR no from_idx context — use first match.
         for k, ln in enumerate(lines):
             if ln.kind == "label" and ln.label == label:
                 return k
@@ -8228,6 +8287,167 @@ class PeepholeOptimizer:
                             return False
             # Otherwise, continue scanning.
         return False
+
+    def _pass_reg_copy_addr_forward(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``mov REGB, REGA; <instr using [REGB...]>``
+        into ``<instr using [REGA...]>`` when REGB is dead after.
+
+        Pattern (2 consecutive instr lines):
+            mov     REGB, REGA       ; register copy
+            <op>    ..., [REGB...]   ; address uses REGB as base
+
+        Rewrite to:
+            <op>    ..., [REGA...]   ; substituted
+
+        Saves 2 bytes per match (drops the 2-byte register copy).
+
+        Common after `*p = V` lowering: codegen emits
+            lea     eax, addr
+            mov     [ebp - N], eax       ; store p
+            mov     ecx, eax             ; setup for deref
+            mov     dword [ecx], V       ; *p = V
+        The `mov ecx, eax; mov [ecx], V` pair collapses to
+        `mov [eax], V`.
+
+        Conditions:
+        - Line A: ``mov REGB, REGA`` where REGA, REGB are GP32 regs,
+          REGA != REGB.
+        - Line B: an instruction whose operand contains ``[REGB...]``
+          (REGB used as base register in memory addressing).
+        - REGB dead after line B (we're dropping its only writer).
+        - Line B's operand can be safely rewritten by replacing
+          REGB with REGA in the [...] expression.
+        - REGA isn't being modified in line B (would change its
+          value before the addressing is resolved). Conservative:
+          REGA must not be a destination of line B.
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (
+                i + 1 < len(lines)
+                and line.kind == "instr"
+                and line.op == "mov"
+            ):
+                ap = _operands_split(line.operands)
+                if ap is not None:
+                    a_dst, a_src = ap
+                    a_dst_low = a_dst.strip().lower()
+                    a_src_low = a_src.strip().lower()
+                    if (
+                        a_dst_low in PeepholeOptimizer._GP32
+                        and a_src_low in PeepholeOptimizer._GP32
+                        and a_dst_low != a_src_low
+                    ):
+                        b = lines[i + 1]
+                        if (
+                            b.kind == "instr"
+                            and self._instr_uses_reg_in_addr(
+                                b, a_dst_low,
+                            )
+                            and not self._instr_writes_reg(
+                                b, a_src_low,
+                            )
+                            and self._reg_dead_after(
+                                lines, i + 2, a_dst_low,
+                            )
+                        ):
+                            new_b = self._substitute_addr_reg(
+                                b, a_dst_low, a_src_low,
+                            )
+                            if new_b is not None:
+                                out.append(new_b)
+                                self.stats[
+                                    "reg_copy_addr_forward"
+                                ] = (
+                                    self.stats.get(
+                                        "reg_copy_addr_forward", 0,
+                                    ) + 1
+                                )
+                                i += 2
+                                continue
+            out.append(line)
+            i += 1
+        return out
+
+    def _instr_uses_reg_in_addr(self, line: Line, reg: str) -> bool:
+        """Does any operand of `line` contain `[reg...]` (reg used
+        as memory base or index)?"""
+        if line.kind != "instr":
+            return False
+        ops = line.operands
+        # Find all `[...]` substrings and check if any reference reg.
+        for m in re.finditer(r"\[[^\]]*\]", ops):
+            if _references_register(m.group(0), reg):
+                return True
+        return False
+
+    @staticmethod
+    def _instr_writes_reg(line: Line, reg: str) -> bool:
+        """Does this instruction write to `reg` (as destination)?"""
+        if line.kind != "instr":
+            return False
+        op = line.op
+        # mov, lea, movsx, movzx — first operand is destination.
+        if op in {"mov", "lea", "movsx", "movzx", "add", "sub",
+                  "and", "or", "xor", "imul", "shl", "shr",
+                  "sar", "rol", "ror", "rcl", "rcr", "adc",
+                  "sbb", "neg", "not", "inc", "dec"}:
+            parts = _operands_split(line.operands)
+            if parts is None:
+                # Single-operand op (neg, not, inc, dec).
+                operand = line.operands.strip().lower()
+                return operand == reg.lower()
+            return parts[0].strip().lower() == reg.lower()
+        # pop reg writes to reg.
+        if op == "pop":
+            return line.operands.strip().lower() == reg.lower()
+        # call may write eax (cdecl return).
+        if op == "call" and reg.lower() in {"eax", "ecx", "edx"}:
+            return True
+        return False
+
+    def _substitute_addr_reg(
+        self, line: Line, old_reg: str, new_reg: str,
+    ) -> Line | None:
+        """Substitute `old_reg` with `new_reg` in any `[...]`
+        addressing in `line`'s operands. Returns the new Line, or
+        None if substitution would change semantics in an unexpected
+        way.
+        """
+        # Build a regex that finds [...] groups and substitutes
+        # `old_reg` with `new_reg` inside, using word boundaries.
+        def repl(match: re.Match) -> str:
+            inner = match.group(0)
+            # Substitute old_reg with new_reg inside the brackets,
+            # case-insensitively, using word boundaries.
+            return re.sub(
+                rf"\b{old_reg}\b",
+                new_reg,
+                inner,
+                flags=re.IGNORECASE,
+            )
+
+        new_operands = re.sub(
+            r"\[[^\]]*\]",
+            repl,
+            line.operands,
+        )
+        if new_operands == line.operands:
+            # Substitution didn't change anything (shouldn't happen
+            # if _instr_uses_reg_in_addr returned True).
+            return None
+        # Reconstruct the line preserving leading whitespace.
+        indent = self._extract_indent(line.raw)
+        spacer = " " * max(1, 8 - len(line.op))
+        new_raw = f"{indent}{line.op}{spacer}{new_operands}"
+        return Line(
+            raw=new_raw, kind="instr",
+            op=line.op, operands=new_operands,
+        )
 
     def _pass_value_forward_to_reg(
         self, lines: list[Line]
