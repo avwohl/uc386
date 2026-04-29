@@ -531,6 +531,105 @@ def test_imm_store_collapse_skips_register_source():
     assert opt.stats.get("imm_store_collapse", 0) == 0
 
 
+# ── setcc_jcc_collapse ───────────────────────────────────────────
+
+
+def test_setcc_jcc_collapse_setle_jz():
+    """setle + jz means "jump if NOT (<=)", i.e., jump if strictly
+    greater. Emit `jg`."""
+    asm = (
+        "_f:\n"
+        "        cmp     eax, ecx\n"
+        "        setle    al\n"
+        "        movzx   eax, al\n"
+        "        test    eax, eax\n"
+        "        jz      .target\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        jg     " in out
+    assert ".target" in out
+    assert "setle" not in out
+    assert "movzx" not in out
+    assert "test" not in out
+    assert "jz" not in out
+    assert opt.stats.get("setcc_jcc_collapse", 0) == 1
+
+
+def test_setcc_jcc_collapse_setne_jz():
+    """setne + jz means "jump if NOT (!=)", i.e., jump if equal.
+    Emit `je`."""
+    asm = (
+        "_f:\n"
+        "        cmp     eax, ecx\n"
+        "        setne    al\n"
+        "        movzx   eax, al\n"
+        "        test    eax, eax\n"
+        "        jz      .target\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        je     " in out
+    assert opt.stats.get("setcc_jcc_collapse", 0) == 1
+
+
+def test_setcc_jcc_collapse_setl_jnz():
+    """setl + jnz means "jump if (< was true)", i.e., jump if strictly
+    less. Emit `jl` directly (no inversion)."""
+    asm = (
+        "_f:\n"
+        "        cmp     eax, ecx\n"
+        "        setl    al\n"
+        "        movzx   eax, al\n"
+        "        test    eax, eax\n"
+        "        jnz     .target\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        jl     " in out
+    assert opt.stats.get("setcc_jcc_collapse", 0) == 1
+
+
+def test_setcc_jcc_collapse_unsigned():
+    """Unsigned conditions (a/ae/b/be) work the same way."""
+    asm = (
+        "_f:\n"
+        "        cmp     eax, ecx\n"
+        "        seta    al\n"
+        "        movzx   eax, al\n"
+        "        test    eax, eax\n"
+        "        jz      .target\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # seta + jz → "jump if NOT >", i.e., be (below or equal).
+    assert "        jbe    " in out
+    assert opt.stats.get("setcc_jcc_collapse", 0) == 1
+
+
+def test_setcc_jcc_collapse_does_not_fire_if_eax_used_between():
+    """If anything between the setCC and jz reads EAX (other than the
+    movzx/test we recognize), the boolean might be needed for more
+    than just the branch — skip."""
+    asm = (
+        "_f:\n"
+        "        cmp     eax, ecx\n"
+        "        setl    al\n"
+        "        movzx   eax, al\n"
+        "        mov     [ebp - 4], eax\n"  # stores the bool — needed!
+        "        test    eax, eax\n"
+        "        jz      .target\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("setcc_jcc_collapse", 0) == 0
+
+
 # ── Convergence ──────────────────────────────────────────────────
 
 

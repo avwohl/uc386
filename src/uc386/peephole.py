@@ -24,6 +24,10 @@ Currently implements:
     mov eax, X` with `mov dword [addr], IMM; mov eax, X`. The
     immediate-store form is one NASM instruction; the EAX overwrite
     in the third line confirms EAX was dead.
+  - setcc_jcc_collapse: replace the `setCC al; movzx eax, al; test
+    eax, eax; jz/jnz LBL` boolean-materialize-then-branch sequence
+    with a single conditional jump using the (possibly inverted) CC.
+    Saves 3 instructions per `if`/`while`/`for` condition.
 
 Patterns to add (see PEEPHOLE_PLAN.md for details): redundant
 mov-to-reg, tail calls, jump threading, multi-instruction right-
@@ -205,6 +209,7 @@ class PeepholeOptimizer:
             lines = self._pass_store_collapse(lines)
             lines = self._pass_leave_collapse(lines)
             lines = self._pass_imm_store_collapse(lines)
+            lines = self._pass_setcc_jcc_collapse(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -435,6 +440,108 @@ class PeepholeOptimizer:
                 and e_line.operands.replace(" ", "").lower() == "[ecx],eax"):
             return False
         return True
+
+    # Inverse table for `j<cc>` mnemonics. Mirrors `set<cc>`'s opposite
+    # condition. Used by setcc_jcc_collapse.
+    _CC_INVERSE: dict[str, str] = {
+        "e": "ne", "ne": "e",
+        "z": "nz", "nz": "z",   # z is alias of e
+        "l": "ge", "ge": "l",
+        "le": "g", "g": "le",
+        "b": "ae", "ae": "b",
+        "be": "a", "a": "be",
+        "c": "nc", "nc": "c",   # c is alias of b
+        "s": "ns", "ns": "s",
+        "o": "no", "no": "o",
+        "p": "np", "np": "p",
+        "pe": "po", "po": "pe",
+    }
+
+    def _pass_setcc_jcc_collapse(self, lines: list[Line]) -> list[Line]:
+        """Replace the setCC + movzx + test + jz/jnz boolean-materialize
+        chain with a single conditional jump.
+
+        Match (4 consecutive instr lines):
+            setCC   al                ; or any sub-byte register
+            movzx   eax, al           ; widen
+            test    eax, eax
+            j[n]z   LBL
+
+        Replace with:
+            j<CC-or-inverse>  LBL
+
+        Mapping: `jz LBL` after `setCC al` jumps when AL was 0 — i.e.,
+        when the inverted CC was true. So emit `j<inverse-of-CC> LBL`.
+        `jnz LBL` jumps when AL was 1 — emit `j<CC> LBL` directly.
+
+        The setCC's destination must be the low byte of EAX (AL),
+        the movzx must widen AL into EAX, and the test must be on
+        EAX. We don't try to handle other registers (BL, CL, etc.) —
+        the codegen always uses AL → EAX in this pattern.
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (line.kind == "instr"
+                    and line.op.startswith("set")
+                    and line.op[3:] in self._CC_INVERSE):
+                # setCC. Check operand is `al`.
+                if line.operands.strip().lower() != "al":
+                    out.append(line)
+                    i += 1
+                    continue
+                instrs = self._next_n_instrs(lines, i + 1, 3)
+                if instrs is None:
+                    out.append(line)
+                    i += 1
+                    continue
+                b_line = instrs[0][1]
+                c_line = instrs[1][1]
+                d_line = instrs[2][1]
+                # b: `movzx eax, al`
+                if not (b_line.op == "movzx"
+                        and b_line.operands.replace(" ", "").lower()
+                            == "eax,al"):
+                    out.append(line)
+                    i += 1
+                    continue
+                # c: `test eax, eax`
+                if not (c_line.op == "test"
+                        and c_line.operands.replace(" ", "").lower()
+                            == "eax,eax"):
+                    out.append(line)
+                    i += 1
+                    continue
+                # d: `jz LBL` or `jnz LBL`. Resolve target label.
+                if d_line.op not in ("jz", "je", "jnz", "jne"):
+                    out.append(line)
+                    i += 1
+                    continue
+                target = d_line.operands.strip()
+                if not target:
+                    out.append(line)
+                    i += 1
+                    continue
+                # Map: setCC + jz → j<inverted CC>; setCC + jnz → j<CC>
+                cc = line.op[3:]
+                jz_like = d_line.op in ("jz", "je")
+                final_cc = self._CC_INVERSE[cc] if jz_like else cc
+                leading_ws = re.match(r"^\s*", line.raw).group(0)
+                new_raw = f"{leading_ws}j{final_cc:<7}{target}"
+                new_line = Line(raw=new_raw, kind="instr",
+                                op=f"j{final_cc}", operands=target)
+                out.append(new_line)
+                self.stats["setcc_jcc_collapse"] = (
+                    self.stats.get("setcc_jcc_collapse", 0) + 1
+                )
+                # Skip past lines i (setCC), b, c, d.
+                d_idx = instrs[2][0]
+                i = d_idx + 1
+                continue
+            out.append(line)
+            i += 1
+        return out
 
     def _pass_imm_store_collapse(self, lines: list[Line]) -> list[Line]:
         """Collapse `mov eax, IMM; mov [addr], eax; mov eax, X` to
