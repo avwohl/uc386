@@ -584,6 +584,49 @@ def test_imm_store_collapse_skips_self_rmw_witness():
     assert opt.stats.get("imm_store_collapse", 0) == 0
 
 
+def test_imm_store_collapse_cfg_aware_across_label():
+    """CFG-aware fallback fires when EAX is dead across a label
+    boundary (e.g. loop initialization where the loop top doesn't
+    read EAX).
+
+    Pre: `mov eax, IMM; mov [m], eax; .label: cmp [m], X; ...`
+    Post: `mov dword [m], IMM; .label: cmp [m], X; ...`
+    """
+    asm = (
+        "_f:\n"
+        "        mov     eax, -5\n"
+        "        mov     [ebp - 8], eax\n"
+        ".L_top:\n"
+        "        cmp     dword [ebp - 8], 200\n"
+        "        jge     .L_end\n"
+        "        mov     eax, [ebp - 8]\n"  # overwrites EAX (dead across label)
+        "        jmp     .L_top\n"
+        ".L_end:\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     dword [ebp - 8], -5" in out
+    assert opt.stats.get("imm_store_collapse") == 1
+
+
+def test_imm_store_collapse_cfg_aware_skips_when_eax_live():
+    """CFG-aware fallback must respect liveness — if EAX is read
+    after the label boundary, the rewrite is unsafe."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 99\n"
+        "        mov     [ebp - 4], eax\n"
+        ".L_top:\n"
+        "        push    eax\n"  # EAX read here!
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("imm_store_collapse", 0) == 0
+
+
 # ── setcc_jcc_collapse ───────────────────────────────────────────
 
 

@@ -1187,3 +1187,8 @@ See `README.md` for the public roadmap (Phase 0–6).
   - After: 3-instruction loop body — `mov eax, [ebp - 8]; mov eax, [_g + eax*4]; add [ebp - 4], eax`
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +20 peephole tests (312 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: imm_store_collapse CFG-aware fallback**: extends `imm_store_collapse` to fire across label boundaries when EAX is provably dead via CFG-aware liveness. The fast path (immediate witness in next 2 instructions) still runs first; the slow path uses `_reg_dead_after` for cases where the witness is past a label.
+  - **Common shape**: pre-loop initialization `int i = -5;` lowers as `mov eax, -5; mov [m], eax; .L_top: cmp [m], 200; ...`. Without the CFG-aware fallback, the label boundary blocks `_next_n_instrs` from finding the EAX overwrite witness. The slow path checks "EAX dead at [m] = .L_top + body" via `_reg_dead_after` — if true, the rewrite is safe.
+  - **probe_branch**: `mov dword [ebp - 8], -5` directly emitted instead of `mov eax, -5; mov [ebp - 8], eax`. Saves 5 bytes per pre-loop init. Same shape applies to any var-init-followed-by-loop pattern.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +2 peephole tests (314 total). Pipeline 1734/1734 (100%).

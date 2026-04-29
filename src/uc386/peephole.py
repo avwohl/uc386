@@ -962,32 +962,42 @@ class PeepholeOptimizer:
         return out
 
     def _pass_imm_store_collapse(self, lines: list[Line]) -> list[Line]:
-        """Collapse `mov eax, IMM; mov [addr], eax; mov eax, X` to
-        `mov dword [addr], IMM; mov eax, X`.
+        """Collapse `mov eax, IMM; mov [addr], eax` to `mov dword
+        [addr], IMM`, when EAX is provably dead after the store.
 
-        The third instruction is the witness that EAX was dead after
-        the store — its rewrite of EAX makes the load-via-EAX
-        unnecessary. NASM accepts `mov dword [addr], IMM` directly.
+        The fast path uses an immediate witness (the very next instr
+        is a fresh EAX overwrite); a CFG-aware fallback uses
+        ``_reg_dead_after`` for cases where the witness is past a
+        label boundary (basic block boundary).
+
+        NASM accepts `mov dword [addr], IMM` directly.
 
         Conditions:
         - Line A: `mov eax, src` where src is a constant expression
           (no `[` — i.e., not a memory load, not a register-to-EAX
           where the register might be live).
         - Line B: `mov [addr], eax` — a 4-byte store from EAX.
-        - Line C: `mov eax, anything` — confirms EAX is dead.
-
-        We don't fold without the witness — without line C we can't
-        be sure EAX wasn't live for a comparison/return/etc.
+        - EAX must be dead after Line B (immediate witness OR CFG-
+          aware liveness).
         """
-        out: list[Line] = []
+        out_list: list[Line] = []
         i = 0
         while i < len(lines):
             line = lines[i]
             if (line.kind == "instr" and line.op == "mov"
                     and self._is_imm_to_eax(line)):
-                instrs = self._next_n_instrs(lines, i + 1, 2)
-                if instrs is not None and self._matches_imm_store(instrs, line):
-                    [(b_idx, b_line), (c_idx, _c)] = instrs
+                # Try the fast path first: immediate witness in the
+                # next 2 instructions (B then C-as-witness).
+                fast_instrs = self._next_n_instrs(lines, i + 1, 2)
+                fired_fast = False
+                b_idx_fast = None
+                if fast_instrs is not None and self._matches_imm_store(
+                    fast_instrs, line
+                ):
+                    [(b_idx_fast, _b), (_c_idx, _c)] = fast_instrs
+                    fired_fast = True
+                if fired_fast:
+                    [(b_idx, b_line), (_c_idx, _c)] = fast_instrs
                     parts_a = _operands_split(line.operands)
                     assert parts_a is not None
                     _, src_imm = parts_a
@@ -1000,18 +1010,55 @@ class PeepholeOptimizer:
                         raw=new_raw, kind="instr", op="mov",
                         operands=f"dword {addr}, {src_imm}",
                     )
-                    out.append(new_line)
+                    out_list.append(new_line)
                     self.stats["imm_store_collapse"] = (
                         self.stats.get("imm_store_collapse", 0) + 1
                     )
-                    # Skip past line A (i) and line B (b_idx). Keep
-                    # line C in place (the witness mov-eax) since the
-                    # caller might want it.
                     i = b_idx + 1
                     continue
-            out.append(line)
+                # Slow path: CFG-aware liveness — check Line B (next
+                # instr is `mov [m], eax`) and EAX dead after.
+                next_instrs = self._next_n_instrs(lines, i + 1, 1)
+                if next_instrs is not None:
+                    [(b_idx, b_line)] = next_instrs
+                    if (
+                        b_line.op == "mov"
+                        and self._is_eax_to_mem_store(b_line)
+                        and self._reg_dead_after(
+                            lines, b_idx + 1, "eax"
+                        )
+                    ):
+                        parts_a = _operands_split(line.operands)
+                        assert parts_a is not None
+                        _, src_imm = parts_a
+                        addr = self._mem_dest(b_line)
+                        if addr is not None:
+                            leading_ws = re.match(
+                                r"^\s*", line.raw
+                            ).group(0)
+                            new_raw = (
+                                f"{leading_ws}mov     dword "
+                                f"{addr}, {src_imm}"
+                            )
+                            new_line = Line(
+                                raw=new_raw, kind="instr", op="mov",
+                                operands=(
+                                    f"dword {addr}, {src_imm}"
+                                ),
+                            )
+                            out_list.append(new_line)
+                            self.stats[
+                                "imm_store_collapse"
+                            ] = (
+                                self.stats.get(
+                                    "imm_store_collapse", 0
+                                ) + 1
+                            )
+                            i = b_idx + 1
+                            continue
+            out_list.append(line)
             i += 1
-        return out
+        return out_list
 
     @staticmethod
     def _is_imm_to_eax(line: Line) -> bool:
