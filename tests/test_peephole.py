@@ -356,6 +356,174 @@ def test_unreferenced_label_removal_switch_end():
     assert opt.stats.get("unreferenced_label_removal", 0) >= 1
 
 
+# ── store_chain_retarget ─────────────────────────────────────────
+
+
+def test_store_chain_retarget_two_instr_chain():
+    """`push eax; mov eax, X; add eax, Y; pop ecx; mov [ecx], eax`
+    (multi-instr chain) → `mov ecx, X; add ecx, Y; mov [eax], ecx`.
+
+    The chain rewrites to ECX, the final store uses EAX (preserved
+    address). Drops push + pop = 2 bytes.
+
+    Use a multi-instr address computation (not just `mov eax, _g`,
+    which push_immediate would consume first via the cascade
+    push_immediate → push_pop_to_mov)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 8]\n"  # eax = address (from local)
+        "        shl     eax, 2\n"
+        "        add     eax, _arr\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, [ebp - 4]\n"
+        "        pop     ecx\n"
+        "        mov     [ecx], eax\n"
+        "        xor     eax, eax\n"  # EAX dead after store
+        "        xor     ecx, ecx\n"  # ECX dead after store
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # push/pop are gone.
+    assert "push    eax" not in out
+    assert "pop     ecx" not in out
+    # Chain retargeted to ECX.
+    assert "mov     ecx, [ebp - 4]" in out
+    assert "add     ecx, [ebp - 4]" in out
+    # Store swapped to use EAX as address.
+    assert "mov     [eax], ecx" in out
+    assert opt.stats.get("store_chain_retarget", 0) == 1
+
+
+def test_store_chain_retarget_skips_short_chain():
+    """Single-instr chain (push eax; mov eax, src; pop ecx; mov
+    [ecx], eax) is handled by the existing store_collapse pass.
+    Both passes can fire; either is acceptable."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _g\n"
+        "        push    eax\n"
+        "        mov     eax, 100\n"
+        "        pop     ecx\n"
+        "        mov     [ecx], eax\n"
+        "        xor     eax, eax\n"
+        "        xor     ecx, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Either store_collapse or store_chain_retarget fires.
+    fired = (
+        opt.stats.get("store_collapse", 0)
+        + opt.stats.get("store_chain_retarget", 0)
+    )
+    assert fired >= 1
+
+
+def test_store_chain_retarget_skips_eax_live_after():
+    """If EAX is live after the store, the rewrite would change EAX's
+    post-state from chain result to address. Bail."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _g\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, [ebp - 4]\n"
+        "        pop     ecx\n"
+        "        mov     [ecx], eax\n"
+        "        ret\n"  # EAX is the return value!
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    # Neither pattern may fire.
+    assert opt.stats.get("store_chain_retarget", 0) == 0
+
+
+def test_store_chain_retarget_skips_ecx_live_after():
+    """If ECX is live after the store, the rewrite leaves ECX with
+    the chain result instead of the address. Bail."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _g\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, [ebp - 4]\n"
+        "        pop     ecx\n"
+        "        mov     [ecx], eax\n"
+        "        mov     eax, ecx\n"  # ECX is read after the store
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("store_chain_retarget", 0) == 0
+
+
+def test_store_chain_retarget_skips_chain_reads_ecx():
+    """If a chain instr reads ECX, the chain is not retargetable —
+    after retarget the chain would read its own running value. Bail."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _g\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, ecx\n"  # reads ECX (would self-reference)
+        "        pop     ecx\n"
+        "        mov     [ecx], eax\n"
+        "        xor     eax, eax\n"
+        "        xor     ecx, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("store_chain_retarget", 0) == 0
+
+
+def test_store_chain_retarget_skips_non_fresh_first():
+    """Chain's first instr must be a fresh-write to EAX. If it reads
+    EAX in src (RMW), the chain depends on EAX's prior value (the
+    address) — bail."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _g\n"
+        "        push    eax\n"
+        "        add     eax, 4\n"  # NOT a fresh write — reads EAX
+        "        pop     ecx\n"
+        "        mov     [ecx], eax\n"
+        "        xor     eax, eax\n"
+        "        xor     ecx, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("store_chain_retarget", 0) == 0
+
+
+def test_store_chain_retarget_chain_with_eax_in_src_ok():
+    """Chain instrs after the first may reference [eax] — these get
+    retargeted to [ecx] in the rewrite, preserving semantics. Use
+    a multi-instr address load to avoid push_immediate."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 8]\n"
+        "        shl     eax, 2\n"
+        "        add     eax, _arr\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, [eax + 4]\n"  # reads [eax]; retargets to [ecx]
+        "        pop     ecx\n"
+        "        mov     [ecx], eax\n"
+        "        xor     eax, eax\n"
+        "        xor     ecx, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Chain retargeted: EAX → ECX in dest AND in src [eax + 4] → [ecx + 4].
+    assert "add     ecx, [ecx + 4]" in out
+    assert opt.stats.get("store_chain_retarget", 0) == 1
+
+
 def test_stats_count_jmp_to_next():
     asm = (
         "_f:\n"

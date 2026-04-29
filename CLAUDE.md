@@ -1284,3 +1284,12 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete impact**: probe_swcase drops `.L1_switch_end:` and the dead `xor eax, eax` after default's `jmp .epilogue`, plus the `jmp .epilogue` itself (jmp_to_next_label fires after the drop). 72 fires across the first 50 torture tests where it fired.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (839 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: store_chain_retarget**: multi-instruction sister of `store_collapse`. The existing `store_collapse` only handles chain length 1 (`push eax; mov eax, src; pop ecx; mov [ecx], eax` → `mov ecx, eax; mov eax, src; mov [ecx], eax`). For multi-instruction chains, the new pass retargets the chain to write ECX instead of EAX, then swaps the final store's operands.
+  - **Pattern**: `push eax; <chain (1+ instrs writing only EAX, fresh-write at start, no ECX/ESP refs)>; pop ecx; mov [ecx], eax`. Replace with: `<chain' (chain rewritten so EAX-family → ECX-family throughout)>; mov [eax], ecx`.
+  - **Key insight**: after retargeting the chain to ECX, EAX (preserved across the chain) still holds the address. The store's operand layout swaps from `mov [ecx], eax` (address in ECX, value in EAX) to `mov [eax], ecx` (address in EAX, value in ECX). Both are valid `mov r/m32, r32` forms with the same encoding length.
+  - **Saves 2 bytes per match** (drops push + pop, no addition since the retargeted chain has the same length).
+  - **Conditions**: chain starts with fresh-write (`mov`/`lea`/`movsx`/`movzx`/`pop`/`xor self`); chain instrs only write EAX as dest, don't read ECX or ESP; EAX AND ECX both dead after the store (post-retarget state has EAX = address, ECX = chain result, swapped from original).
+  - **Common shape**: `arr[i] = expr` for global array where the address is computed via `mov eax, [ebp - X]; shl eax, 2; add eax, _arr` (multi-instr address) — push_immediate doesn't fire, so the push/pop scaffold survives until my new pass.
+  - **Concrete impact on probe_chain.c**: the inner `g[i] = i + i` loop drops 2 bytes per iteration. 86 fires across the first 49 torture tests where it fired.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (846 total). Pipeline 1734/1734 (100%).

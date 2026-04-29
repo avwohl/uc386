@@ -384,6 +384,7 @@ class PeepholeOptimizer:
             lines = self._pass_mov_zero_to_xor(lines)
             lines = self._pass_store_load_collapse(lines)
             lines = self._pass_right_operand_retarget(lines)
+            lines = self._pass_store_chain_retarget(lines)
             # push_memory runs AFTER right_operand_retarget — that pass
             # consumes inner `push eax / chain / mov ecx,eax / pop eax`
             # save-restore frames, eliminating the inner mov+push
@@ -1961,6 +1962,136 @@ class PeepholeOptimizer:
         ("al", "cl"),
         ("ah", "ch"),
     ]
+
+    def _pass_store_chain_retarget(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Multi-instruction store_collapse via chain retargeting.
+
+        Pattern (forward from `push eax`):
+            push    eax                ← save address
+            <chain that writes EAX (fresh-write at start, no ECX-src refs)>
+            pop     ecx                ← restore address into ECX
+            mov     [ecx], eax         ← store
+
+        Replace with:
+            <chain' (rewritten so EAX-family → ECX-family throughout)>
+            mov     [eax], ecx         ← store: dest=[address-in-eax], src=value-in-ecx
+
+        Saves 2 bytes per match (drops push + pop, no addition since the
+        retargeted chain has the same length).
+
+        Conditions:
+        - Chain length 1+ instructions, all writing EAX as dest.
+        - Chain first instr is a fresh-write (mov/lea/movsx/movzx/pop/xor self).
+        - Chain instrs don't reference ECX (ECX is dead before; we're
+          using it as the new running-value register).
+        - Chain instrs don't reference ESP (the push shifted ESP).
+        - EAX and ECX both dead after the store. Original post-state was
+          EAX = chain result, ECX = address. Retargeted post-state is
+          EAX = address, ECX = chain result. The two are different — if
+          subsequent code reads either, retarget breaks semantics.
+
+        The codegen typically emits this pattern for `*p = expr` where
+        the chain is `expr` and the address `p` is on the stack. After
+        the store the next statement starts fresh (clobbers EAX/ECX).
+        """
+        out = list(lines)
+        i = 0
+        while i < len(out):
+            line = out[i]
+            if not (
+                line.kind == "instr" and line.op == "push"
+                and line.operands.strip().lower() == "eax"
+            ):
+                i += 1
+                continue
+            # Walk forward through chain instrs.
+            chain_indices: list[int] = []
+            j = i + 1
+            max_chain = 12
+            pop_idx: int | None = None
+            store_idx: int | None = None
+            while j < len(out) and len(chain_indices) < max_chain:
+                ln = out[j]
+                if ln.kind in ("blank", "comment"):
+                    j += 1
+                    continue
+                if ln.kind != "instr":
+                    break
+                if (
+                    ln.op == "pop"
+                    and ln.operands.strip().lower() == "ecx"
+                ):
+                    # Check next instr is mov [ecx], eax.
+                    k = j + 1
+                    while (
+                        k < len(out)
+                        and out[k].kind in ("blank", "comment")
+                    ):
+                        k += 1
+                    if (
+                        k < len(out)
+                        and out[k].kind == "instr"
+                        and out[k].op == "mov"
+                        and out[k].operands.replace(" ", "").lower()
+                            == "[ecx],eax"
+                    ):
+                        pop_idx = j
+                        store_idx = k
+                    break
+                # Chain instr: must write EAX, no ECX refs, no ESP refs.
+                if not PeepholeOptimizer._is_chain_eax_writer(ln):
+                    break
+                chain_indices.append(j)
+                j += 1
+            if (
+                pop_idx is None or store_idx is None
+                or not chain_indices
+            ):
+                i += 1
+                continue
+            # Verify chain starts with fresh-write.
+            first_ln = out[chain_indices[0]]
+            if not PeepholeOptimizer._is_fresh_eax_write(first_ln):
+                i += 1
+                continue
+            # Verify EAX and ECX dead after the store.
+            if not self._reg_dead_after(out, store_idx + 1, "eax"):
+                i += 1
+                continue
+            if not self._reg_dead_after(out, store_idx + 1, "ecx"):
+                i += 1
+                continue
+            # Retarget chain instrs (dest + any [eax] in src → ECX).
+            for k in chain_indices:
+                out[k] = self._retarget_instr_eax_to_ecx(out[k])
+            # Replace the store: mov [ecx], eax → mov [eax], ecx.
+            store_line = out[store_idx]
+            new_raw = re.sub(
+                r"\[\s*ecx\s*\]\s*,\s*eax",
+                "[eax], ecx",
+                store_line.raw,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            new_store = Line(
+                raw=new_raw,
+                kind="instr",
+                op="mov",
+                operands="[eax], ecx",
+            )
+            out[store_idx] = new_store
+            # Drop push (i) and pop (pop_idx). Drop in reverse order
+            # so indices stay valid.
+            out.pop(pop_idx)
+            out.pop(i)
+            self.stats["store_chain_retarget"] = (
+                self.stats.get("store_chain_retarget", 0) + 1
+            )
+            # Continue from the position of the dropped push (now
+            # pointing at the first chain instr).
+        return out
 
     @staticmethod
     def _retarget_instr_eax_to_ecx(line: Line) -> Line:
