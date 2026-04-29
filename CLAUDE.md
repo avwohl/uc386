@@ -1358,3 +1358,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Pattern conditions**: REG copy from REGA to REGB (both GP32, REGA != REGB); next instruction uses REGB in addressing; REGB dead after that instruction; REGA isn't being modified by the next instruction. Substitute REGB with REGA in the addressing.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +9 peephole tests (918 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: lea_sib_load_collapse**: extends `lea_load_collapse` to handle (a) non-adjacent lea + load (intermediate independent instructions allowed) and (b) SIB-form addressing `[REG + IDX*SCALE + DISP]`. Pattern `lea REG, [ebp ± N]; <indep>; mov REG2, [REG + IDX*SCALE]` → `<indep>; mov REG2, [ebp ± N + IDX*SCALE]`. Drops the 3-byte lea.
+  - **Common in local array indexing**: `int x[5]; ... s += x[i];` lowers to `lea eax, [ebp - 20]; mov ecx, [i]; mov eax, [eax + ecx*4]; add [s], eax`. After this pass: `mov ecx, [i]; mov eax, [ebp + ecx*4 - 20]; add [s], eax`. Saves 3 bytes per iteration of an array-access loop.
+  - **Conditions**: lea source is `[ebp ± N]`; intermediate lines (up to 8 instructions) don't touch the lea target register; the load uses the lea target as base; the lea target is dead after the load (or is overwritten BY the load, which is the common case).
+  - **Folds disp into addressing**: combined offset `lea_disp + load_disp` is computed at peephole time. The new addressing uses NASM's flexible form `[ebp + ecx*4 - 20]` which assembles to a single sib-with-disp8 or disp32 form.
+  - **Pass order**: runs AFTER `lea_load_collapse` so that pass can handle the simple adjacent + non-SIB case first. My pass picks up the residual: non-adjacent (intermediate instructions present) and SIB-form addressing.
+  - **Sample fire rate**: 8 of 200 random torture tests (9 fires total). Modest but real, especially in array-indexing-heavy code.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (925 total). Pipeline 1734/1734 (100%).

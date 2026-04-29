@@ -8271,3 +8271,117 @@ def test_reg_copy_addr_forward_store_through_pointer():
     assert "mov     ecx, eax" not in out
     assert "mov     dword [eax], 5" in out
     assert opt.stats.get("reg_copy_addr_forward", 0) == 1
+
+
+def test_lea_sib_load_collapse_basic():
+    """Non-adjacent lea + SIB load: `lea eax, [ebp - 20]; <indep>;
+    mov eax, [eax + ecx*4]` → `<indep>; mov eax, [ebp + ecx*4 - 20]`.
+    Saves 3 bytes (drops the lea)."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp - 20]\n"
+        "        mov     ecx, [ebp - 32]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     eax, [ebp - 20]" not in out
+    assert "ebp + ecx*4 - 20" in out
+    assert opt.stats.get("lea_sib_load_collapse", 0) == 1
+
+
+def test_lea_sib_load_collapse_plain_deref():
+    """Non-adjacent lea + plain deref: `lea eax, [ebp - 20]; <indep>;
+    mov eax, [eax]` → `<indep>; mov eax, [ebp - 20]`."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp - 20]\n"
+        "        mov     ecx, 0\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     eax, [ebp - 20]" not in out
+    assert "mov     eax, [ebp - 20]" in out
+    assert opt.stats.get("lea_sib_load_collapse", 0) == 1
+
+
+def test_lea_sib_load_collapse_disp_deref():
+    """Non-adjacent lea + disp deref: `lea eax, [ebp - 20]; <indep>;
+    mov eax, [eax + 8]` → `<indep>; mov eax, [ebp - 12]`."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp - 20]\n"
+        "        mov     ecx, 0\n"
+        "        mov     eax, [eax + 8]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     eax, [ebp - 20]" not in out
+    assert "mov     eax, [ebp - 12]" in out
+    assert opt.stats.get("lea_sib_load_collapse", 0) == 1
+
+
+def test_lea_sib_load_collapse_skips_intermediate_writes_lea_reg():
+    """If an intermediate writes to the lea target, can't fold."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp - 20]\n"
+        "        mov     eax, 0\n"  # writes eax
+        "        mov     eax, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("lea_sib_load_collapse", 0) == 0
+
+
+def test_lea_sib_load_collapse_skips_intermediate_reads_lea_reg():
+    """If an intermediate reads the lea target, the value is being
+    used elsewhere — bail."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp - 20]\n"
+        "        mov     ecx, eax\n"  # reads eax
+        "        mov     edx, [eax + 4]\n"
+        "        xor     eax, eax\n"  # eax dead
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    # The intermediate `mov ecx, eax` reads eax, so we bail.
+    assert opt.stats.get("lea_sib_load_collapse", 0) == 0
+
+
+def test_lea_sib_load_collapse_skips_lea_reg_live_after():
+    """If lea target is live after the load, can't drop the lea."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp - 20]\n"
+        "        mov     ecx, [ebp - 32]\n"
+        "        mov     edx, [eax + ecx*4]\n"  # eax not overwritten
+        "        mov     [_glob], eax\n"  # eax read
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("lea_sib_load_collapse", 0) == 0
+
+
+def test_lea_sib_load_collapse_dest_overwrites_lea_reg():
+    """If the load destination IS the lea reg, the load overwrites
+    the lea result — fine, lea is dead by virtue of overwrite."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp - 20]\n"
+        "        mov     ecx, [ebp - 32]\n"
+        "        mov     eax, [eax + ecx*4]\n"  # eax = dest = lea reg
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     eax" not in out
+    assert opt.stats.get("lea_sib_load_collapse", 0) == 1

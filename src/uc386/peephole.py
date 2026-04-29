@@ -439,6 +439,7 @@ class PeepholeOptimizer:
             lines = self._pass_label_push_collapse(lines)
             lines = self._pass_label_store_collapse(lines)
             lines = self._pass_lea_load_collapse(lines)
+            lines = self._pass_lea_sib_load_collapse(lines)
             lines = self._pass_lea_offset_fold(lines)
             lines = self._pass_lea_forward_to_reg(lines)
             lines = self._pass_lea_store_collapse(lines)
@@ -7838,6 +7839,246 @@ class PeepholeOptimizer:
             )
             continue
         return out
+
+    def _pass_lea_sib_load_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Extension of `lea_load_collapse` that handles SIB-form
+        addressing AND allows intermediate independent instructions.
+
+        Pattern:
+            lea     REG, [ebp ± N]                ; A
+            ... independent intermediate ops ...   ; don't touch REG
+            mov     REG2, [REG + IDX*SCALE]        ; B (or [REG] / [REG + M])
+
+        Rewrite to:
+            ... independent intermediate ops ...
+            mov     REG2, [ebp ± N + IDX*SCALE]    ; (or [ebp ± (N+M)])
+        Drop A.
+
+        Saves 3 bytes per match (drops the 3-byte lea).
+
+        Common in local array indexing:
+            lea     eax, [ebp - 20]      ; address of arr[0]
+            mov     ecx, [ebp - 32]      ; load i
+            mov     eax, [eax + ecx*4]   ; arr[i]
+        Collapses to `mov ecx, [ebp - 32]; mov eax, [ebp - 20 + ecx*4]`.
+
+        Conditions:
+        - Line A: ``lea REG, [ebp ± N]`` (stack-relative base).
+        - Intermediate lines: must not write REG, not read REG (we
+          care about REG's value at line B, not earlier reads, but
+          the existing `lea_load_collapse` runs first for the
+          adjacent case so we only fire when there's at least one
+          intermediate).
+        - Line B: ``mov REG2, [REG ± M]`` (plain or with disp) OR
+          ``mov REG2, [REG + IDX*SCALE]`` (SIB form, possibly with
+          additional disp).
+        - REG dead after line B (or REG == REG2 — overwritten by load).
+        - Combined offset N+M (if any) is representable as imm32.
+        """
+        out = list(lines)
+        i = 0
+        max_intermediate = 8
+        while i < len(out):
+            a = out[i]
+            if not (a.kind == "instr" and a.op == "lea"):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            if ap is None:
+                i += 1
+                continue
+            r1 = ap[0].strip().lower()
+            lea_src = ap[1].strip()
+            if not self._is_general_register(r1):
+                i += 1
+                continue
+            # LEA src must be `[ebp ± N]`.
+            m_lea = re.match(
+                r"^\[\s*ebp\s*([+-])\s*(\d+)\s*\]$",
+                lea_src,
+                re.IGNORECASE,
+            )
+            if m_lea is None:
+                i += 1
+                continue
+            n_disp = int(m_lea.group(2))
+            if m_lea.group(1) == "-":
+                n_disp = -n_disp
+            # Walk forward past independent instructions; find a load
+            # using r1 as base. Bail if any intermediate touches r1.
+            j = i + 1
+            steps = 0
+            while j < len(out) and steps < max_intermediate:
+                ln = out[j]
+                if ln.kind in ("blank", "comment"):
+                    j += 1
+                    continue
+                if ln.kind != "instr":
+                    break
+                # Intermediate must not touch r1 (read or write).
+                if self._references_reg_family(ln.operands, r1):
+                    # If the FIRST encounter of r1 in operands is a
+                    # mov reading [r1...] — that's our target.
+                    if ln.op == "mov" and self._uses_reg_as_base(ln, r1):
+                        break
+                    # Any other reference (write to r1, use as plain
+                    # source register, etc.) — bail.
+                    break
+                steps += 1
+                j += 1
+            else:
+                i += 1
+                continue
+            if j >= len(out):
+                i += 1
+                continue
+            b = out[j]
+            if not (b.kind == "instr" and b.op == "mov"):
+                i += 1
+                continue
+            if not self._uses_reg_as_base(b, r1):
+                i += 1
+                continue
+            # Need at least one intermediate (else lea_load_collapse
+            # would've handled it).
+            if j == i + 1:
+                # Adjacent — let lea_load_collapse handle it (this
+                # pass extends to non-adjacent / SIB).
+                # But also try SIB form for adjacent case.
+                pass
+            bp = _operands_split(b.operands)
+            if bp is None:
+                i += 1
+                continue
+            r2 = bp[0].strip().lower()
+            b_src = bp[1].strip()
+            if not self._is_general_register(r2):
+                i += 1
+                continue
+            # Liveness: r1 dead after line B, OR r1 == r2 (overwritten).
+            if r1 != r2 and not self._reg_dead_after(out, j + 1, r1):
+                i += 1
+                continue
+            # Parse the address inside b_src and substitute.
+            new_b_src = self._fold_lea_into_addr(b_src, r1, n_disp)
+            if new_b_src is None:
+                i += 1
+                continue
+            # Build new line.
+            indent = self._extract_indent(b.raw)
+            new_raw = f"{indent}mov     {r2}, {new_b_src}"
+            new_b = Line(
+                raw=new_raw, kind="instr",
+                op="mov", operands=f"{r2}, {new_b_src}",
+            )
+            out = out[:i] + out[i + 1:j] + [new_b] + out[j + 1:]
+            self.stats["lea_sib_load_collapse"] = (
+                self.stats.get("lea_sib_load_collapse", 0) + 1
+            )
+            # Don't advance i; the substitution may enable more.
+            continue
+        return out
+
+    @staticmethod
+    def _uses_reg_as_base(line: Line, reg: str) -> bool:
+        """Does `line` use `reg` as the BASE register in its memory
+        addressing? Looks for `[reg]`, `[reg + ...]`, `[reg - ...]`.
+        """
+        if line.kind != "instr":
+            return False
+        ops = line.operands
+        for m in re.finditer(r"\[([^\]]+)\]", ops):
+            inner = m.group(1).strip()
+            # Strip optional size prefix (already outside the brackets,
+            # so this loop sees just the inside).
+            # Match a bare reg, or reg followed by + / - / ...
+            m_b = re.match(
+                rf"^\s*({reg})\s*([+\-]|$)",
+                inner,
+                re.IGNORECASE,
+            )
+            if m_b:
+                return True
+        return False
+
+    @staticmethod
+    def _fold_lea_into_addr(
+        b_src: str, lea_reg: str, lea_disp: int,
+    ) -> str | None:
+        """Substitute `[lea_reg + ...]` with `[ebp ± lea_disp + ...]`
+        in `b_src` (the memory operand of a mov/op).
+
+        Handles forms:
+        - `[lea_reg]` → `[ebp ± lea_disp]`
+        - `[lea_reg + M]` → `[ebp ± (lea_disp + M)]`
+        - `[lea_reg + IDX*SCALE]` → `[ebp ± lea_disp + IDX*SCALE]`
+        - `[lea_reg + IDX*SCALE + M]` → `[ebp ± (lea_disp+M) + IDX*SCALE]`
+
+        Preserves any size keyword (dword/word/byte/qword).
+        """
+        s = b_src
+        # Strip size prefix if present.
+        size_kw = ""
+        for prefix in ("dword ", "word ", "byte ", "qword "):
+            if s.lower().startswith(prefix):
+                size_kw = prefix
+                s = s[len(prefix):].lstrip()
+                break
+        if not (s.startswith("[") and s.endswith("]")):
+            return None
+        inner = s[1:-1].strip()
+        # Patterns we accept:
+        # [lea_reg]
+        # [lea_reg + M]
+        # [lea_reg - M]
+        # [lea_reg + IDX*SCALE]
+        # [lea_reg + IDX*SCALE + M]
+        # [lea_reg + IDX*SCALE - M]
+        pat_plain = re.compile(
+            rf"^\s*({lea_reg})\s*$",
+            re.IGNORECASE,
+        )
+        pat_disp = re.compile(
+            rf"^\s*({lea_reg})\s*([+-])\s*(\d+)\s*$",
+            re.IGNORECASE,
+        )
+        pat_sib = re.compile(
+            rf"^\s*({lea_reg})\s*\+\s*(\w+)\s*\*\s*(\d+)"
+            rf"(?:\s*([+-])\s*(\d+))?\s*$",
+            re.IGNORECASE,
+        )
+        def fmt_disp(d: int) -> str:
+            sign = "+" if d >= 0 else "-"
+            return f"ebp {sign} {abs(d)}"
+
+        if pat_plain.match(inner):
+            new_inner = fmt_disp(lea_disp)
+        elif (m := pat_disp.match(inner)):
+            extra = int(m.group(3))
+            if m.group(2) == "-":
+                extra = -extra
+            combined = lea_disp + extra
+            new_inner = fmt_disp(combined)
+        elif (m := pat_sib.match(inner)):
+            idx = m.group(2)
+            scale = int(m.group(3))
+            extra = 0
+            if m.group(4) is not None:
+                extra = int(m.group(5))
+                if m.group(4) == "-":
+                    extra = -extra
+            combined = lea_disp + extra
+            sign = "+" if combined >= 0 else "-"
+            new_inner = (
+                f"ebp + {idx}*{scale} {sign} {abs(combined)}"
+                if combined != 0
+                else f"ebp + {idx}*{scale}"
+            )
+        else:
+            return None
+        return f"{size_kw}[{new_inner}]"
 
     def _pass_lea_offset_fold(
         self, lines: list[Line]
