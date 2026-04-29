@@ -1262,3 +1262,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - Saves 2 bytes per match (drops push + pop).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +3 peephole tests (815 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: index_load_collapse_label**: sister of `index_load_collapse` for label-base global array indexing. Common in `unsigned short g[5]` global short arrays where the codegen emits explicit `shl + add (label) + deref` instead of going directly to SIB form.
+  - **Pattern**: `shl IDX, N; add IDX, LABEL; mov/movsx/movzx DST, [IDX]` → `mov/movsx/movzx DST, [LABEL + IDX*SCALE]`. The SIB byte plus disp32 form supports `[disp32 + idx*scale]` directly, so the explicit shl + add are unneeded.
+  - **Saves ~8 bytes per match** (drops 3-byte shl + 5+-byte add reg, label).
+  - **Concrete impact**: short-array sum loop body 7 instructions → 5 per iteration. Same shape applies to long-array, struct-array, and similar global-array accesses for non-int element sizes where the codegen doesn't emit SIB form directly.
+  - **Conditions**: shl scale ∈ {1, 2, 3} (i.e., element size 2/4/8); add's second operand is a non-register, non-numeric expression (label or label-arithmetic); load's mem operand is plain `[IDX]` (no displacement); IDX dead after the load OR DST == IDX.
+  - **Why a separate pass from `index_load_collapse`?** The structural difference: `index_load_collapse` matches `add BASE_REG, IDX_REG` (BASE is a separate register holding the base address). The new variant matches `add IDX, LABEL` (no separate BASE register; the label embeds in the SIB form's disp32 field).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests (820 total). Pipeline 1734/1734 (100%).

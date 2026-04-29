@@ -6461,3 +6461,94 @@ def test_pop_op_chain_retarget_skips_self_rmw_first():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("pop_op_chain_retarget", 0) == 0
+
+
+# ── index_load_collapse_label ─────────────────────────────────
+
+
+def test_index_load_collapse_label_basic():
+    """`shl ecx, 1; add ecx, _g; movzx ecx, word [ecx]` →
+    `movzx ecx, word [_g + ecx*2]`. Drops shl + add (~8 bytes)."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     ecx, 1\n"
+        "        add     ecx, _g\n"
+        "        movzx   ecx, word [ecx]\n"
+        "        mov     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "shl     ecx, 1" not in out
+    assert "add     ecx, _g" not in out
+    assert "movzx   ecx, word [_g + ecx*2]" in out
+    assert opt.stats.get("index_load_collapse_label") == 1
+
+
+def test_index_load_collapse_label_int_array():
+    """Scale 4 case for int globals."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     ecx, 2\n"
+        "        add     ecx, _g\n"
+        "        mov     ecx, [ecx]\n"
+        "        mov     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ecx, [_g + ecx*4]" in out
+    assert opt.stats.get("index_load_collapse_label") == 1
+
+
+def test_index_load_collapse_label_skips_register_base():
+    """If the second `add` operand is a register (not label), this
+    is the standard `index_load_collapse` pattern, not ours. Bail."""
+    asm = (
+        "_f:\n"
+        "        shl     ecx, 1\n"
+        "        add     ecx, eax\n"  # base is a register
+        "        movzx   ecx, word [ecx]\n"
+        "        mov     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    # The standard index_load_collapse may fire instead — we just
+    # check that OUR new pass didn't fire.
+    assert opt.stats.get("index_load_collapse_label", 0) == 0
+
+
+def test_index_load_collapse_label_skips_numeric_disp():
+    """If the second `add` operand is a numeric literal, this is
+    `disp_load_collapse` territory, not ours. Bail."""
+    asm = (
+        "_f:\n"
+        "        shl     ecx, 1\n"
+        "        add     ecx, 8\n"  # numeric, not label
+        "        movzx   ecx, word [ecx]\n"
+        "        mov     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("index_load_collapse_label", 0) == 0
+
+
+def test_index_load_collapse_label_skips_idx_reused():
+    """If IDX is read after the load (and DST != IDX), the rewrite
+    leaves IDX with its pre-shl value (= original idx) instead of
+    the original code's post-add value (= label + idx*scale). Bail."""
+    asm = (
+        "_f:\n"
+        "        shl     ecx, 1\n"
+        "        add     ecx, _g\n"
+        "        mov     eax, [ecx]\n"  # DST = eax, IDX = ecx
+        "        mov     ebx, ecx\n"  # ECX read after!
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("index_load_collapse_label", 0) == 0

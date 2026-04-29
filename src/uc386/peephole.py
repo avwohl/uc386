@@ -396,6 +396,7 @@ class PeepholeOptimizer:
             lines = self._pass_redundant_xor_zero(lines)
             lines = self._pass_compound_assign_collapse(lines)
             lines = self._pass_index_load_collapse(lines)
+            lines = self._pass_index_load_collapse_label(lines)
             lines = self._pass_disp_load_collapse(lines)
             lines = self._pass_push_disp_collapse(lines)
             lines = self._pass_push_index_collapse(lines)
@@ -3904,6 +3905,160 @@ class PeepholeOptimizer:
                 ) + 1
             )
             # Restart from the rewrite point.
+            continue
+        return out
+
+    def _pass_index_load_collapse_label(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Sister of `index_load_collapse` for label-base global
+        array indexing.
+
+        Pattern:
+            shl IDX, N
+            add IDX, LABEL              ; LABEL is a non-register
+                                        ; symbolic expression
+            mov/movsx/movzx DST, [IDX]
+
+        Rewrite to a SIB-form load with the label as displacement:
+            mov/movsx/movzx DST, [LABEL + IDX*SCALE]
+
+        x86's SIB byte plus disp32 form supports `[disp32 + idx*N]`,
+        so the explicit shl + add are unneeded. Saves ~8 bytes per
+        match (drops shl 3 bytes + add reg, label 5+ bytes; SIB form
+        with disp32 is the same encoding cost as the original mov).
+
+        Common in global short/long arrays (``unsigned short g[5]``)
+        where the codegen emits the explicit address computation
+        instead of going directly to SIB form.
+
+        Conditions:
+        - Three consecutive instr lines.
+        - Line A: ``shl IDX, N`` where N ∈ {1, 2, 3} (scale 2/4/8).
+        - Line B: ``add IDX, X`` where X is a non-register
+          expression (label, label-arithmetic).
+        - Line C: ``mov/movsx/movzx DST, [IDX]`` (no displacement —
+          we'd lose track if the address already had a displacement
+          since IDX would have it folded in).
+        - DST == IDX, OR IDX dead after Line C (we drop the shl, so
+          IDX retains its pre-shl original-index value).
+
+        Restricted to GP 32-bit registers.
+        """
+        SCALE = {1: 2, 2: 4, 3: 8}
+        LOAD_OPS = {"mov", "movsx", "movzx"}
+        out = list(lines)
+        i = 0
+        while i + 2 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            c = out[i + 2]
+            if not (
+                a.kind == "instr" and a.op == "shl"
+                and b.kind == "instr" and b.op == "add"
+                and c.kind == "instr" and c.op in LOAD_OPS
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            if ap is None:
+                i += 1
+                continue
+            idx_reg = ap[0].strip().lower()
+            try:
+                n = int(ap[1].strip())
+            except ValueError:
+                i += 1
+                continue
+            if n not in SCALE:
+                i += 1
+                continue
+            if not self._is_general_register(idx_reg):
+                i += 1
+                continue
+            # Parse line B: `add IDX, LABEL`.
+            bp = _operands_split(b.operands)
+            if bp is None:
+                i += 1
+                continue
+            b_dst = bp[0].strip().lower()
+            b_src = bp[1].strip()
+            if b_dst != idx_reg:
+                i += 1
+                continue
+            # b_src must be a non-register, non-numeric expression
+            # (a label or label-arithmetic). Reject regs and ints.
+            if self._is_general_register(b_src.lower()):
+                i += 1
+                continue
+            try:
+                int(b_src)
+                # It's a numeric literal — treat as plain
+                # disp_load_collapse, not our pattern.
+                i += 1
+                continue
+            except ValueError:
+                pass
+            # Reject if b_src contains `[` (memory ref).
+            if "[" in b_src:
+                i += 1
+                continue
+            # Parse line C.
+            cp = _operands_split(c.operands)
+            if cp is None:
+                i += 1
+                continue
+            dst_reg = cp[0].strip().lower()
+            c_src = cp[1].strip()
+            if not self._is_general_register(dst_reg):
+                i += 1
+                continue
+            size_prefix = ""
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if c_src.lower().startswith(prefix):
+                    size_prefix = c_src[:len(prefix)]
+                    c_src = c_src[len(prefix):].lstrip()
+                    break
+            mem_re = re.match(
+                r"^\[\s*([a-zA-Z]+)\s*\]$",
+                c_src,
+            )
+            if mem_re is None:
+                i += 1
+                continue
+            mem_reg = mem_re.group(1).lower()
+            if mem_reg != idx_reg:
+                i += 1
+                continue
+            # IDX must be dead after, unless DST == IDX.
+            if dst_reg != idx_reg:
+                if not self._reg_dead_after(out, i + 3, idx_reg):
+                    i += 1
+                    continue
+            # Rewrite.
+            indent = self._extract_indent(c.raw)
+            scale = SCALE[n]
+            new_src = (
+                f"{size_prefix}[{b_src} + {idx_reg}*{scale}]"
+            )
+            opname = c.op
+            spacer = " " * max(8 - len(opname), 1)
+            new_raw = (
+                f"{indent}{opname}{spacer}{dst_reg}, {new_src}"
+            )
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op=opname,
+                operands=f"{dst_reg}, {new_src}",
+            )
+            new_out = out[:i] + [new_line] + out[i + 3:]
+            out = new_out
+            self.stats["index_load_collapse_label"] = (
+                self.stats.get(
+                    "index_load_collapse_label", 0
+                ) + 1
+            )
             continue
         return out
 
