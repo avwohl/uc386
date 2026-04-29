@@ -2780,14 +2780,15 @@ def test_char_array_string_init_inferred_size():
 
 
 def test_char_array_string_init_with_padding():
-    # `char t[5] = "hi"` writes h, i, null, then zero-fills the remaining bytes.
+    # `char t[5] = "hi"` writes h, i, null, then zero-fills the
+    # remaining bytes via the widest-store path (`_zero_fill_at`).
     asm = _compile('int main(void) { char t[5] = "hi"; return 0; }')
     assert "sub     esp, 8" in asm  # 5 rounds to 8
     assert "mov     byte [ebp - 8], 104" in asm
     assert "mov     byte [ebp - 7], 105" in asm
     assert "mov     byte [ebp - 6], 0" in asm
-    assert "mov     byte [ebp - 5], 0" in asm
-    assert "mov     byte [ebp - 4], 0" in asm
+    # Trailing 2 bytes zero-fill via single word store (covers -5, -4).
+    assert "mov     word [ebp - 5], 0" in asm
 
 
 def test_char_array_init_from_int_list():

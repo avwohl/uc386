@@ -8647,9 +8647,13 @@ class CodeGenerator:
             for i, byte in enumerate(bytes_to_store):
                 addr = _ebp_addr(base_disp + i * elem_size)
                 out.append(f"        mov     byte {addr}, {byte}")
-            for i in range(len(bytes_to_store), length):
-                addr = _ebp_addr(base_disp + i * elem_size)
-                out.append(f"        mov     byte {addr}, 0")
+            # Bulk zero-fill the trailing bytes via the widest-store
+            # helper (dword/word/byte). Each `char[N]` element is
+            # 1 byte, so the byte count = number of unfilled elements.
+            tail_offset = base_disp + len(bytes_to_store) * elem_size
+            tail_size = (length - len(bytes_to_store)) * elem_size
+            if tail_size > 0:
+                out += self._zero_fill_at(tail_offset, tail_size)
             return out
 
         if isinstance(init, ast.InitializerList):

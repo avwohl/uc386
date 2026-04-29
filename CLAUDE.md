@@ -1120,3 +1120,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - Updated 4 existing label_offset_fold tests that asserted the intermediate `mov eax, _b + 8` form — now the further-collapsed `mov eax, [_b + 8]` is the final state when followed by a deref.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +13 peephole tests (253 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — codegen: char-array string-init tail uses `_zero_fill_at`**: `char arr[N] = "..."` was emitting per-byte `mov byte [m + i], 0` for the trailing zero-fill. Replaced with the existing `_zero_fill_at` helper which picks `mov dword`/`mov word`/`mov byte` for each chunk. Combined with the post-codegen zero_init_collapse (which converts `mov dword [m], 0` to `xor eax, eax; mov [m], eax`), the result is dramatically smaller for char arrays larger than a few bytes.
+  - **probe_strops** (`char buf[32] = "hello"`): 146 → 127 lines (19 lines, ~50 bytes saved on the zero-fill alone). 27 byte stores (each 3 bytes) → 1 byte + 6 dword + 1 word = 8 stores (each 3-5 bytes).
+  - **`char t[5] = "hi"`**: 2 byte stores → 1 word store. Saves 1 byte.
+  - Updated `test_char_array_string_init_with_padding` to expect the new `mov word [m], 0` shape.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. Pipeline 1734/1734 (100%).
