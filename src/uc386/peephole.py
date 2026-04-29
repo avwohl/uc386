@@ -406,6 +406,7 @@ class PeepholeOptimizer:
             lines = self._pass_redundant_eax_load(lines)
             lines = self._pass_redundant_ecx_load(lines)
             lines = self._pass_rmw_collapse(lines)
+            lines = self._pass_rmw_intermediate_collapse(lines)
             lines = self._pass_rmw_mem_src_collapse(lines)
             lines = self._pass_div_mem_form(lines)
             lines = self._pass_mov_test_setcc_movzx_collapse(lines)
@@ -450,6 +451,7 @@ class PeepholeOptimizer:
             lines = self._pass_dead_stack_store(lines)
             lines = self._pass_reg_copy_addr_forward(lines)
             lines = self._pass_value_forward_to_reg(lines)
+            lines = self._pass_xfer_store_collapse(lines)
             lines = self._pass_load_add_xfer_forward(lines)
             lines = self._pass_byte_stores_to_dword(lines)
             lines = self._pass_pop_index_push_collapse(lines)
@@ -3385,6 +3387,184 @@ class PeepholeOptimizer:
             ):
                 return f"cmp     dword {src_mem}, 0"
         return None
+
+    def _pass_rmw_intermediate_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Like rmw_collapse but allows intermediate non-touching
+        instructions between the load and the OP+store pair.
+
+        Pattern: ``mov eax, [m]; ...; OP eax, REG; mov [m], eax``
+        → ``...; OP [m], REG``. Saves 6 bytes per match.
+
+        Intermediate instructions must:
+        - Not read or write EAX (or AX/AL/AH).
+        - Not read or write [m] (alias check via _mem_overlaps).
+        - Not read flags (the OP sets flags; dropping the load+op
+          changes the flag state seen between).
+        - Not be control flow (label/jump/call/ret).
+
+        After the store:
+        - EAX must be dead.
+        - Flags must reflect the OP, not the original chain. Since
+          the rewrite still emits OP, flags are produced. But the
+          flags' VALUE is the same in both versions (`OP eax, REG`
+          and `OP [m], REG` produce identical flag bits because
+          eax was just loaded from [m], so they're computing the
+          same arithmetic).
+
+        OP ∈ {add, sub, and, or, xor}. SRC is a non-EAX register
+        (numeric immediate already covered by basic rmw_collapse;
+        keeping this pass simpler for register sources only).
+
+        Common in `s += head->val` patterns where the rhs needs an
+        intermediate load (e.g. dereferencing through a pointer)."""
+        out = list(lines)
+        i = 0
+        while i < len(out):
+            a = out[i]
+            if not (
+                a.kind == "instr" and a.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            if ap is None:
+                i += 1
+                continue
+            adest, asrc = ap
+            adest_low = adest.strip().lower()
+            asrc_norm = asrc.strip()
+            if adest_low != "eax":
+                i += 1
+                continue
+            if not (
+                asrc_norm.startswith("[") and asrc_norm.endswith("]")
+            ):
+                i += 1
+                continue
+            mem_addr = asrc_norm
+            # Walk forward looking for `OP eax, REG; mov [m], eax`.
+            scan_count = 0
+            j = i + 1
+            op_idx = None
+            while j < len(out) and scan_count <= 8:
+                s = out[j]
+                if s.kind in ("blank", "comment"):
+                    j += 1
+                    continue
+                if s.kind != "instr":
+                    break
+                # Check if this is the candidate OP.
+                if s.op in {"add", "sub", "and", "or", "xor"}:
+                    sp = _operands_split(s.operands)
+                    if sp is not None:
+                        sdst, ssrc = sp
+                        ssrc_norm = ssrc.strip()
+                        if (
+                            sdst.strip().lower() == "eax"
+                            and self._rmw_source_text(ssrc_norm)
+                                is not None
+                            and self._rmw_source_text(ssrc_norm)
+                                != "eax"
+                        ):
+                            # Found candidate OP. Check next is
+                            # the matching store.
+                            k = j + 1
+                            while k < len(out):
+                                if out[k].kind in (
+                                    "blank", "comment"
+                                ):
+                                    k += 1
+                                    continue
+                                break
+                            if k < len(out):
+                                t = out[k]
+                                if t.kind == "instr" and t.op == "mov":
+                                    tp = _operands_split(t.operands)
+                                    if tp is not None:
+                                        tdst, tsrc = tp
+                                        if (
+                                            tdst.strip() == mem_addr
+                                            and tsrc.strip().lower()
+                                                == "eax"
+                                        ):
+                                            op_idx = j
+                                            store_idx = k
+                                            op_line = s
+                                            op_src = ssrc_norm
+                                            break
+                # Otherwise verify intermediate-safe.
+                if self._references_reg_family(s.operands, "eax"):
+                    break
+                if s.op in self._FLAG_READING_OPS:
+                    break
+                # Stores or any mem ref overlapping mem_addr blocks
+                # the rewrite.
+                if (
+                    s.op == "mov"
+                    and self._operands_modify_mem(
+                        s.operands, mem_addr
+                    )
+                ):
+                    break
+                if s.op in (
+                    "ret", "iret", "retf", "retn", "leave", "enter"
+                ):
+                    break
+                if s.op.startswith("j") or s.op == "call":
+                    break
+                # Intermediate that doesn't touch our state — ok.
+                scan_count += 1
+                j += 1
+            if op_idx is None:
+                i += 1
+                continue
+            # EAX must be dead after the store.
+            if not self._reg_dead_after(out, store_idx + 1, "eax"):
+                i += 1
+                continue
+            # Apply: drop line A and the OP line; rewrite the store
+            # as `OP [m], REG`.
+            indent = self._extract_indent(op_line.raw)
+            spacer = " " * (8 - len(op_line.op))
+            new_raw = (
+                f"{indent}{op_line.op}{spacer}dword "
+                f"{mem_addr}, {op_src}"
+            )
+            new_line = Line(
+                raw=new_raw, kind="instr", op=op_line.op,
+                operands=f"dword {mem_addr}, {op_src}",
+            )
+            # Delete in reverse to keep indices valid.
+            del out[store_idx]
+            del out[op_idx]
+            out.insert(op_idx, new_line)
+            del out[i]
+            self.stats["rmw_intermediate_collapse"] = (
+                self.stats.get("rmw_intermediate_collapse", 0) + 1
+            )
+            # Don't advance i.
+        return out
+
+    def _operands_modify_mem(
+        self, operands: str, mem_addr: str
+    ) -> bool:
+        """Does this instruction's operands modify memory location
+        `mem_addr`? Detects `mov [m], src` where m might overlap.
+        Conservative: returns True for any memory-write where overlap
+        is possible."""
+        op_parts = _operands_split(operands)
+        if op_parts is None:
+            return False
+        dest, _ = op_parts
+        d = dest.strip()
+        if d.startswith("[") or any(
+            d.lower().startswith(p)
+            for p in ("dword [", "word [", "byte [", "qword [")
+        ):
+            return self._mem_overlaps(d, mem_addr)
+        return False
 
     def _pass_rmw_collapse(self, lines: list[Line]) -> list[Line]:
         """Collapse ``mov reg, [mem]; OP reg, SRC; mov [mem], reg``
@@ -9331,6 +9511,95 @@ class PeepholeOptimizer:
             out = out[:i] + [new_line] + out[i + 2:]
             self.stats["value_forward_to_reg"] = (
                 self.stats.get("value_forward_to_reg", 0) + 1
+            )
+            continue
+        return out
+
+    def _pass_xfer_store_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``mov R2, R1; mov [m], R2`` into ``mov [m], R1``
+        when R2 is dead after.
+
+        Saves 2 bytes per match (drops the register transfer).
+
+        Common shape: codegen emits `mov eax, edx; mov [m], eax`
+        after `cdq; idiv` to store the remainder via EAX. The
+        transfer through EAX is unnecessary — `mov [m], edx`
+        works directly.
+
+        Conditions:
+        - Two consecutive instr lines.
+        - Line A: ``mov R2, R1`` (R2 != R1, both 32-bit GP regs).
+        - Line B: ``mov [m], R2`` (store R2, plain memory dest).
+        - The memory operand of B doesn't reference R2 (else changing
+          the source register changes the address too).
+        - R2 is dead after line B.
+        """
+        out = list(lines)
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op == "mov"
+                and b.kind == "instr" and b.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            if ap is None or bp is None:
+                i += 1
+                continue
+            r2 = ap[0].strip().lower()
+            r1 = ap[1].strip().lower()
+            if (
+                not self._is_general_register(r2)
+                or not self._is_general_register(r1)
+                or r1 == r2
+            ):
+                i += 1
+                continue
+            b_dst = bp[0].strip()
+            b_src = bp[1].strip().lower()
+            # B must be `mov [m], R2`.
+            if b_src != r2:
+                i += 1
+                continue
+            # Strip optional size prefix to inspect dst.
+            dst_stripped = b_dst
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if dst_stripped.lower().startswith(prefix):
+                    dst_stripped = dst_stripped[len(prefix):].lstrip()
+                    break
+            if not (
+                dst_stripped.startswith("[")
+                and dst_stripped.endswith("]")
+            ):
+                i += 1
+                continue
+            # B's address operand must not reference R2 (else changing
+            # source from R2 to R1 would change the address too — but
+            # we don't change the address, so this would still produce
+            # different semantics).
+            if self._references_reg_family(dst_stripped, r2):
+                i += 1
+                continue
+            # R2 dead after line B.
+            if not self._reg_dead_after(out, i + 2, r2):
+                i += 1
+                continue
+            # Apply: rewrite line B to use R1 as source, drop line A.
+            indent = self._extract_indent(b.raw)
+            new_raw = f"{indent}mov     {b_dst}, {r1}"
+            new_line = Line(
+                raw=new_raw, kind="instr", op="mov",
+                operands=f"{b_dst}, {r1}",
+            )
+            out = out[:i] + [new_line] + out[i + 2:]
+            self.stats["xfer_store_collapse"] = (
+                self.stats.get("xfer_store_collapse", 0) + 1
             )
             continue
         return out

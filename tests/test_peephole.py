@@ -3003,6 +3003,108 @@ def test_rmw_collapse_at_function_call_witness():
     assert "        add     dword [ebp - 4], 1" not in out
 
 
+# ── rmw_intermediate_collapse ─────────────────────────────────────
+
+
+def test_rmw_intermediate_collapse_basic():
+    """`mov eax, [m]; <intermediate>; add eax, REG; mov [m], eax` →
+    `<intermediate>; add [m], REG`. The intermediate sets up REG
+    via memory loads but doesn't touch EAX or [m]."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        mov     ecx, [ebp + 8]\n"  # intermediate (sets ecx)
+        "        mov     ecx, [ecx + 4]\n"  # intermediate (deref ecx)
+        "        add     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The original load+add+store is gone:
+    assert "mov     eax, [ebp - 4]" not in out
+    assert "add     eax, ecx" not in out
+    # Replaced with memory-RMW:
+    assert "add     dword [ebp - 4], ecx" in out
+    assert opt.stats.get("rmw_intermediate_collapse") == 1
+
+
+def test_rmw_intermediate_collapse_skips_when_intermediate_writes_eax():
+    """If an intermediate writes EAX, can't drop the original load."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        mov     eax, [ebp + 8]\n"  # writes EAX!
+        "        add     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("rmw_intermediate_collapse", 0) == 0
+
+
+def test_rmw_intermediate_collapse_skips_when_intermediate_reads_flags():
+    """If an intermediate reads flags, can't fold."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        je      .L_skip\n"  # reads flags
+        "        add     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        ".L_skip:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("rmw_intermediate_collapse", 0) == 0
+
+
+def test_rmw_intermediate_collapse_skips_when_intermediate_modifies_mem():
+    """If intermediate modifies the memory location, can't fold."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        mov     [ebp - 4], 99\n"  # modifies [ebp - 4]
+        "        add     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("rmw_intermediate_collapse", 0) == 0
+
+
+def test_rmw_intermediate_collapse_all_ops():
+    """sub/and/or/xor all work. Use the linked-list-shape intermediate
+    (deref through ecx) which prevents imm_binop_collapse from folding
+    into a single memory operand."""
+    for op in ("sub", "and", "or", "xor"):
+        asm = (
+            "_f:\n"
+            "        mov     eax, [ebp - 4]\n"
+            "        mov     ecx, [ebp + 8]\n"
+            "        mov     ecx, [ecx + 4]\n"  # deref blocks
+                                                # imm_binop_collapse
+            f"        {op}     eax, ecx\n"
+            "        mov     [ebp - 4], eax\n"
+            "        xor     eax, eax\n"
+            "        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        out = opt.optimize(asm)
+        # NASM emits varying whitespace based on op length; just
+        # check op + memory-RMW form exists.
+        assert f"{op}" in out and "dword [ebp - 4], ecx" in out, (
+            f"{op}: {out}"
+        )
+        assert opt.stats.get("rmw_intermediate_collapse") == 1
+
+
 # ── fst_fstp_collapse ────────────────────────────────────────────
 
 
@@ -5350,6 +5452,75 @@ def test_disp_store_collapse_skips_when_intermediate_reads_flags():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("disp_store_collapse", 0) == 0
+
+
+# ── xfer_store_collapse ───────────────────────────────────────────
+
+
+def test_xfer_store_collapse_basic():
+    """`mov eax, edx; mov [m], eax` → `mov [m], edx` when EAX dead."""
+    asm = (
+        "_f:\n"
+        "        cdq\n"
+        "        idiv    dword [ebp + 12]\n"
+        "        mov     eax, edx\n"
+        "        mov     [ebp + 12], eax\n"
+        "        mov     eax, [ebp - 4]\n"  # eax overwritten = dead
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     [ebp + 12], edx" in out
+    out_lines = out.split("\n")
+    has_xfer = any(
+        line.strip() == "mov     eax, edx" for line in out_lines
+    )
+    assert not has_xfer
+    assert opt.stats.get("xfer_store_collapse") == 1
+
+
+def test_xfer_store_collapse_skips_when_r2_live():
+    """If R2 is read after the store, can't drop the transfer."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, edx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        push    eax\n"  # eax read here
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("xfer_store_collapse", 0) == 0
+
+
+def test_xfer_store_collapse_skips_when_dst_uses_r2():
+    """If the store address references R2, the rewrite changes
+    addressing semantics."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, edx\n"
+        "        mov     [eax + 4], eax\n"  # address uses eax
+        "        mov     eax, [ebp - 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("xfer_store_collapse", 0) == 0
+
+
+def test_xfer_store_collapse_with_size_prefix():
+    """Works with explicit size prefix."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, ebx\n"
+        "        mov     dword [ebp - 4], eax\n"
+        "        mov     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     dword [ebp - 4], ebx" in out
+    assert opt.stats.get("xfer_store_collapse") == 1
 
 
 # ── load_add_xfer_forward ─────────────────────────────────────────
