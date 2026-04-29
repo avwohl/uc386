@@ -1240,3 +1240,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Aliasing check**: when push X is memory, the chain must not write to memory aliasing X. Reuses the same logic from `cmp_load_collapse`'s chain extension — first-operand check with `_READ_ONLY_FIRST_MEM` exclusion list and `_mem_disjoint`.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests (806 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: dead_mov_to_reg relaxation for self-register sources**: refines the self-RMW guard. Previously `dead_mov_to_reg` skipped any instruction whose source referenced eax-family (`mov eax, [eax]`, `movsx eax, al`, etc.) on the assumption these were unsafe to drop. Now distinguishes the two cases:
+  - `mov eax, [eax]` (memory deref through eax): the read could have observable side effects (page faults, MMIO), so the conservative skip remains.
+  - `movsx eax, al` / `movzx eax, al` (sub-register read): no memory access, no observable effect. Safe to drop when EAX is dead after.
+  - **Common shape lifted**: `dst[i] = src[i];` lowers to `mov byte [ecx], al; movsx eax, al`, where the `movsx` materializes the C99 assignment-expression value (int promotion of the byte stored). In a for-loop body the value is unused. The pass now drops the redundant movsx, saving 1 instruction per loop iteration in byte-copy loops.
+  - The check became: `not (src_is_self and src_is_mem)` — drop unless source is a self-referential memory read.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +2 peephole tests (808 total). Pipeline 1734/1734 (100%).

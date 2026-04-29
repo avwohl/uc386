@@ -2095,8 +2095,18 @@ class PeepholeOptimizer:
                     dest, src = parts
                     dest_lower = dest.lower()
                     if dest_lower == "eax":
-                        # Source mustn't read EAX — would be self-RMW.
-                        if not self._references_reg_family(src, "eax"):
+                        # When src references eax-family, this is a
+                        # self-RMW. If src is a memory deref (e.g.,
+                        # ``mov eax, [eax]``), the read could have
+                        # observable effects (page faults, MMIO) —
+                        # skip dropping. If src is a sub-register
+                        # (e.g., ``movsx eax, al``), no memory access,
+                        # safe to drop when EAX is dead.
+                        src_is_self = self._references_reg_family(
+                            src, "eax"
+                        )
+                        src_is_mem = "[" in src
+                        if not (src_is_self and src_is_mem):
                             if self._reg_dead_after(lines, i + 1,
                                                      "eax"):
                                 self.stats["dead_mov_to_reg"] = (

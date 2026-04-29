@@ -1455,7 +1455,9 @@ def test_dead_mov_skips_when_value_used():
 
 
 def test_dead_mov_skips_self_referential_load():
-    """`mov eax, [eax]` reads EAX before writing — not safe to drop."""
+    """`mov eax, [eax]` reads EAX as an address — the memory deref
+    could have observable effects (page faults, MMIO). Skip even
+    when EAX is dead after."""
     asm = (
         "_f:\n"
         "        mov     eax, [eax]\n"
@@ -1465,6 +1467,43 @@ def test_dead_mov_skips_self_referential_load():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("dead_mov_to_reg", 0) == 0
+
+
+def test_dead_mov_drops_movsx_self_register():
+    """`movsx eax, al` reads AL (sub-reg of EAX) and writes EAX —
+    no memory access, no observable side effect. Safe to drop when
+    EAX is dead. Common in postfix C99 assignment-expression value
+    materialization (`dst[i] = src[i];` lowers to `mov [ecx], al;
+    movsx eax, al` where the second produces the assignment-
+    expression's int-promoted value, but it's unused).
+    """
+    asm = (
+        "_f:\n"
+        "        movsx   eax, byte [esi]\n"
+        "        mov     byte [ecx], al\n"
+        "        movsx   eax, al\n"  # redundant — value unused
+        "        mov     eax, 5\n"  # overwrite — confirms EAX dead
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The redundant movsx is gone.
+    assert out.count("movsx") == 1
+
+
+def test_dead_mov_drops_movzx_self_register():
+    """Same as above but movzx — also safe to drop."""
+    asm = (
+        "_f:\n"
+        "        movzx   eax, byte [esi]\n"
+        "        mov     byte [ecx], al\n"
+        "        movzx   eax, al\n"
+        "        mov     eax, 5\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert out.count("movzx") == 1
 
 
 def test_dead_mov_call_clobbers_eax():
