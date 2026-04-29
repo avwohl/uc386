@@ -889,3 +889,6 @@ See `README.md` for the public roadmap (Phase 0–6).
   On a representative small program (`probe_size.c`: 3 functions plus main with printf calls): 226 → 190 lines = 16% reduction. binop_collapse fires 8 times (every comparison and every loop-step), store_collapse fires 4 times (one per assignment to `*p` / `arr[i]`).
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +9 peephole tests (33 total); smoke unchanged (422). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: leave_collapse**: replaces every function epilogue's `mov esp, ebp; pop ebp` with the equivalent single-byte `leave` instruction. NASM emits `leave` as 0xC9 (1 byte) vs the 0x89 0xEC 0x5D triple (3 bytes). Saves 1 instruction + 2 bytes per function epilogue. Fires once per function in our codegen — every function uses the standard `push ebp; mov ebp, esp; ...; mov esp, ebp; pop ebp; ret` frame. The pattern matches `mov esp, ebp` followed by `pop ebp` (with blanks/comments tolerated between). Doesn't fire when the pattern is incomplete (e.g., a fragment with `mov esp, ebp; ret`). 4 hits on probe_size.c (one per function); proportional to function count on real programs.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +3 peephole tests (36 total); smoke unchanged (422). Pipeline 1734/1734 (100%).

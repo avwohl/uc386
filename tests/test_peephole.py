@@ -188,7 +188,8 @@ def test_stats_count_jmp_to_next():
 
 def test_real_world_function_end():
     """Every function ends with this pattern when the last statement
-    is `return X;`. Both rewrites should fire."""
+    is `return X;`. All three of dead-after-jmp, jmp-to-next, and
+    leave-collapse should fire."""
     asm = (
         "_f:\n"
         "        push    ebp\n"
@@ -202,13 +203,16 @@ def test_real_world_function_end():
         "        ret\n"
     )
     out = optimize(asm)
-    # Both the dead `xor` and the redundant `jmp` should be gone.
+    # Dead xor + redundant jmp gone.
     assert "xor     eax, eax" not in out
     assert "jmp     .epilogue" not in out
-    # But the real return value computation and the epilogue stay.
+    # Epilogue collapsed to leave + ret.
+    assert "        leave" in out
+    assert "mov     esp, ebp" not in out
+    assert "pop     ebp" not in out
+    # Real return value + label still there.
     assert "mov     eax, 42" in out
     assert ".epilogue:" in out
-    assert "mov     esp, ebp" in out
     assert "ret" in out
 
 
@@ -391,6 +395,55 @@ def test_store_collapse_does_not_fire_on_binop_pattern():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("store_collapse", 0) == 0
+
+
+# ── leave_collapse ───────────────────────────────────────────────
+
+
+def test_leave_collapse_basic():
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        mov     eax, 42\n"
+        "        mov     esp, ebp\n"
+        "        pop     ebp\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        leave" in out
+    assert "mov     esp, ebp" not in out
+    assert "pop     ebp" not in out
+    # The prologue's `push ebp; mov ebp, esp` is left alone.
+    assert "push    ebp" in out
+    assert "mov     ebp, esp" in out
+    assert opt.stats.get("leave_collapse", 0) == 1
+
+
+def test_leave_collapse_does_not_fire_without_pop_ebp():
+    asm = (
+        "_f:\n"
+        "        mov     esp, ebp\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("leave_collapse", 0) == 0
+
+
+def test_leave_collapse_with_intervening_blank():
+    asm = (
+        "_f:\n"
+        "        mov     esp, ebp\n"
+        "\n"
+        "        pop     ebp\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        leave" in out
+    assert opt.stats.get("leave_collapse", 0) == 1
 
 
 # ── Convergence ──────────────────────────────────────────────────

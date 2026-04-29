@@ -17,6 +17,9 @@ Currently implements:
   - store_collapse: drop the push/pop pair around a store (`push eax;
     mov eax, src; pop ecx; mov [ecx], eax`) when src is a
     single-instruction load that doesn't read ECX.
+  - leave_collapse: replace the function epilogue's `mov esp, ebp;
+    pop ebp` with the equivalent single-byte `leave`. Saves 1 instr
+    + 2 bytes per function epilogue.
 
 Patterns to add (see PEEPHOLE_PLAN.md for details): redundant
 mov-to-reg, tail calls, jump threading, multi-instruction right-
@@ -196,6 +199,7 @@ class PeepholeOptimizer:
             lines = self._pass_jmp_to_next_label(lines)
             lines = self._pass_binop_collapse(lines)
             lines = self._pass_store_collapse(lines)
+            lines = self._pass_leave_collapse(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -426,6 +430,41 @@ class PeepholeOptimizer:
                 and e_line.operands.replace(" ", "").lower() == "[ecx],eax"):
             return False
         return True
+
+    def _pass_leave_collapse(self, lines: list[Line]) -> list[Line]:
+        """Replace the function epilogue's `mov esp, ebp; pop ebp` with
+        the single-byte `leave` instruction. NASM emits both encodings
+        equivalently; `leave` is 1 byte (0xC9) vs the 3-byte combination
+        (0x89 0xEC 0x5D)."""
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (line.kind == "instr"
+                    and line.op == "mov"
+                    and line.operands.replace(" ", "").lower() == "esp,ebp"):
+                # Look at the next non-blank/non-comment instr.
+                j = i + 1
+                while j < len(lines) and lines[j].kind in ("blank", "comment"):
+                    j += 1
+                if (j < len(lines)
+                        and lines[j].kind == "instr"
+                        and lines[j].op == "pop"
+                        and lines[j].operands.strip().lower() == "ebp"):
+                    # Build a `leave` line, preserving the original
+                    # leading whitespace from the `mov esp, ebp` line.
+                    leading_ws = re.match(r"^\s*", line.raw).group(0)
+                    leave_raw = f"{leading_ws}leave"
+                    out.append(Line(raw=leave_raw, kind="instr",
+                                    op="leave", operands=""))
+                    self.stats["leave_collapse"] = (
+                        self.stats.get("leave_collapse", 0) + 1
+                    )
+                    i = j + 1
+                    continue
+            out.append(line)
+            i += 1
+        return out
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
         """P-jmp-to-next: `jmp X` immediately (modulo blanks/comments)
