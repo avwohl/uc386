@@ -1086,3 +1086,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Probe**: `struct {int x, y;} *p; return p->y;` lowered as `mov eax, [ebp+8]; add eax, 4; mov eax, [eax]` collapses to `mov eax, [ebp+8]; mov eax, [eax + 4]`. One instruction shorter, 2 bytes saved.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (216 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: push_disp_collapse + push_index_collapse**: extend `disp_load_collapse` and `index_load_collapse` to cover the push variant. Sister passes that fold the address-arithmetic chain into a SIB-form / disp-form push directly.
+  - **push_disp_collapse**: `add REG, DISP; push dword [REG]` → `push dword [REG + DISP]`. Saves 2 bytes per match (3 when DISP fits in imm8). REG must be dead after the push (push reads but doesn't write the operand register).
+  - **push_index_collapse**: `shl IDX, N; add BASE, IDX; push dword [BASE]` → `push dword [BASE + IDX*SCALE]` for SCALE = 2^N ∈ {2, 4, 8}. Saves 4 bytes per match. Both IDX and BASE must be dead after.
+  - **Common shape**: `f(arr[i])` cdecl arg-push. The codegen emits `mov base, p; mov idx, i; shl idx, 2; add base, idx; push dword [base]` — the SIB-form push produces one instruction `push dword [base + idx*4]` instead of three plus the push.
+  - **Probe**: `s += p[i] + p[i+1] + p[i+2]` — the first iteration's `arr[i]` push collapses, subsequent uses already had `[base + idx*scale]` from index_load_collapse since their uses are mov rather than push.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (223 total). Pipeline 1734/1734 (100%).

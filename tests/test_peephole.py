@@ -3882,3 +3882,134 @@ def test_disp_load_collapse_struct_member_pattern():
     assert "add     eax" not in out
     assert "mov     eax, [eax + 4]" in out
     assert opt.stats.get("disp_load_collapse") == 1
+
+
+# ── push_disp_collapse ───────────────────────────────────────────
+
+
+def test_push_disp_collapse_basic():
+    """`add reg, N; push dword [reg]` → `push dword [reg + N]`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        add     eax, 8\n"
+        "        push    dword [eax]\n"
+        "        call    _consumer\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    dword [eax + 8]" in out
+    assert "add     eax, 8" not in out
+    assert opt.stats.get("push_disp_collapse") == 1
+
+
+def test_push_disp_collapse_skips_when_reg_live():
+    """If REG is read after the push, can't drop the add."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        add     eax, 8\n"
+        "        push    dword [eax]\n"
+        "        mov     [ebp - 4], eax\n"  # eax still needed
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_disp_collapse", 0) == 0
+
+
+def test_push_disp_collapse_negative_disp():
+    """Negative DISP collapses with `-` sign."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        add     eax, -16\n"
+        "        push    dword [eax]\n"
+        "        call    _consumer\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    dword [eax - 16]" in out
+    assert opt.stats.get("push_disp_collapse") == 1
+
+
+# ── push_index_collapse ──────────────────────────────────────────
+
+
+def test_push_index_collapse_scale_4():
+    """`shl idx, 2; add base, idx; push dword [base]` →
+    `push dword [base + idx*4]`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, ecx\n"
+        "        push    dword [eax]\n"
+        "        call    _consumer\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    dword [eax + ecx*4]" in out
+    assert "shl     ecx" not in out
+    assert "add     eax, ecx" not in out
+    assert opt.stats.get("push_index_collapse") == 1
+
+
+def test_push_index_collapse_skips_when_base_live():
+    """If BASE is read after the push, can't drop the add."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, ecx\n"
+        "        push    dword [eax]\n"
+        "        mov     [ebp - 4], eax\n"  # eax still needed
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_index_collapse", 0) == 0
+
+
+def test_push_index_collapse_skips_when_idx_live():
+    """If IDX is read after the push, can't drop the shl."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, ecx\n"
+        "        push    dword [eax]\n"
+        "        mov     [ebp - 4], ecx\n"  # ecx still needed
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_index_collapse", 0) == 0
+
+
+def test_push_index_collapse_scale_8():
+    """Scale 8 (long-long arrays)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     ecx, 3\n"
+        "        add     eax, ecx\n"
+        "        push    dword [eax]\n"
+        "        call    _consumer\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    dword [eax + ecx*8]" in out
+    assert opt.stats.get("push_index_collapse") == 1

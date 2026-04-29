@@ -396,6 +396,8 @@ class PeepholeOptimizer:
             lines = self._pass_compound_assign_collapse(lines)
             lines = self._pass_index_load_collapse(lines)
             lines = self._pass_disp_load_collapse(lines)
+            lines = self._pass_push_disp_collapse(lines)
+            lines = self._pass_push_index_collapse(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -3634,6 +3636,175 @@ class PeepholeOptimizer:
                 ) + 1
             )
             # Restart from the rewrite point.
+            continue
+        return out
+
+    def _pass_push_disp_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``add REG, DISP; push dword [REG]`` into
+        ``push dword [REG + DISP]`` using x86's disp addressing form.
+
+        Sister of ``disp_load_collapse`` for the push case. Saves
+        2 bytes per match when DISP fits in imm8, 1 byte for imm32.
+        Common in `push p->member` arg-setup paths.
+
+        Conditions:
+        - Two consecutive instr lines.
+        - Line A: ``add REG, DISP`` (DISP is a numeric literal).
+        - Line B: ``push dword [REG]`` (plain deref, no offset/SIB).
+        - REG dead after Line B (push doesn't write REG).
+        """
+        out = list(lines)
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op == "add"
+                and b.kind == "instr" and b.op == "push"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            if ap is None:
+                i += 1
+                continue
+            reg = ap[0].strip().lower()
+            try:
+                disp = int(ap[1].strip())
+            except ValueError:
+                i += 1
+                continue
+            if not self._is_general_register(reg):
+                i += 1
+                continue
+            # Push source: `[REG]` only (with optional size prefix).
+            b_src = b.operands.strip()
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if b_src.lower().startswith(prefix):
+                    b_src = b_src[len(prefix):].lstrip()
+                    break
+            mem_re = re.match(r"^\[([a-zA-Z]+)\s*\]$", b_src)
+            if mem_re is None:
+                i += 1
+                continue
+            if mem_re.group(1).lower() != reg:
+                i += 1
+                continue
+            # REG dead after the push (push reads but doesn't write).
+            if not self._reg_dead_after(out, i + 2, reg):
+                i += 1
+                continue
+            indent = self._extract_indent(b.raw)
+            sign = "+" if disp >= 0 else "-"
+            new_src = f"dword [{reg} {sign} {abs(disp)}]"
+            new_raw = f"{indent}push    {new_src}"
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op="push",
+                operands=new_src,
+            )
+            out = out[:i] + [new_line] + out[i + 2:]
+            self.stats["push_disp_collapse"] = (
+                self.stats.get("push_disp_collapse", 0) + 1
+            )
+            continue
+        return out
+
+    def _pass_push_index_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``shl IDX, N; add BASE, IDX; push dword [BASE]``
+        into ``push dword [BASE + IDX*SCALE]`` (SCALE = 2^N).
+
+        Sister of ``index_load_collapse`` for the push case. Saves
+        4 bytes per match. Common in cdecl arg-push of array elements
+        like ``f(arr[i])``.
+
+        Conditions:
+        - Three consecutive instr lines.
+        - Line A: ``shl IDX, N`` where N ∈ {1, 2, 3}.
+        - Line B: ``add BASE, IDX`` (different reg).
+        - Line C: ``push dword [BASE]`` (plain deref of BASE).
+        - Both IDX and BASE dead after Line C (push doesn't write
+          either; we drop the shl and add).
+        """
+        SCALE = {1: 2, 2: 4, 3: 8}
+        out = list(lines)
+        i = 0
+        while i + 2 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            c = out[i + 2]
+            if not (
+                a.kind == "instr" and a.op == "shl"
+                and b.kind == "instr" and b.op == "add"
+                and c.kind == "instr" and c.op == "push"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            if ap is None or bp is None:
+                i += 1
+                continue
+            idx_reg = ap[0].strip().lower()
+            try:
+                n = int(ap[1].strip())
+            except ValueError:
+                i += 1
+                continue
+            if n not in SCALE:
+                i += 1
+                continue
+            if not self._is_general_register(idx_reg):
+                i += 1
+                continue
+            base_reg = bp[0].strip().lower()
+            b_src = bp[1].strip().lower()
+            if (
+                not self._is_general_register(base_reg)
+                or b_src != idx_reg
+                or base_reg == idx_reg
+            ):
+                i += 1
+                continue
+            # Push source: `[BASE]` only.
+            c_src = c.operands.strip()
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if c_src.lower().startswith(prefix):
+                    c_src = c_src[len(prefix):].lstrip()
+                    break
+            mem_re = re.match(r"^\[([a-zA-Z]+)\s*\]$", c_src)
+            if mem_re is None:
+                i += 1
+                continue
+            if mem_re.group(1).lower() != base_reg:
+                i += 1
+                continue
+            # IDX and BASE both dead after the push.
+            if not self._reg_dead_after(out, i + 3, idx_reg):
+                i += 1
+                continue
+            if not self._reg_dead_after(out, i + 3, base_reg):
+                i += 1
+                continue
+            indent = self._extract_indent(c.raw)
+            scale = SCALE[n]
+            new_src = f"dword [{base_reg} + {idx_reg}*{scale}]"
+            new_raw = f"{indent}push    {new_src}"
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op="push",
+                operands=new_src,
+            )
+            out = out[:i] + [new_line] + out[i + 3:]
+            self.stats["push_index_collapse"] = (
+                self.stats.get("push_index_collapse", 0) + 1
+            )
             continue
         return out
 
