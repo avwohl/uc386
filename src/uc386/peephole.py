@@ -402,6 +402,7 @@ class PeepholeOptimizer:
             lines = self._pass_self_mov_elimination(lines)
             lines = self._pass_transfer_pop_collapse(lines)
             lines = self._pass_label_load_collapse(lines)
+            lines = self._pass_label_push_collapse(lines)
             lines = self._pass_value_forward_to_reg(lines)
             lines = self._pass_byte_stores_to_dword(lines)
             lines = self._pass_pop_index_push_collapse(lines)
@@ -4602,6 +4603,84 @@ class PeepholeOptimizer:
             op="mov",
             operands=f"dword {addr}, {packed}",
         )
+
+    def _pass_label_push_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``mov REG, LABEL; push dword [REG]`` into
+        ``push dword [LABEL]`` using x86's disp32-absolute push.
+
+        Sister of ``label_load_collapse`` for the push case. Saves
+        1 byte per match. Common in `printf("%d", glob);` arg-setup.
+
+        Conditions:
+        - Two consecutive instr lines.
+        - Line A: ``mov REG, LABEL`` (LABEL is non-numeric, non-mem,
+          non-register expression).
+        - Line B: ``push dword [REG]``.
+        - REG dead after Line B.
+        """
+        out = list(lines)
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op == "mov"
+                and b.kind == "instr" and b.op == "push"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            if ap is None:
+                i += 1
+                continue
+            r1 = ap[0].strip().lower()
+            label = ap[1].strip()
+            if not self._is_general_register(r1):
+                i += 1
+                continue
+            if (
+                "[" in label
+                or self._is_general_register(label.lower())
+            ):
+                i += 1
+                continue
+            try:
+                int(label)
+                i += 1
+                continue
+            except ValueError:
+                pass
+            # Push source: `dword [REG]`.
+            b_op = b.operands.strip()
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if b_op.lower().startswith(prefix):
+                    b_op = b_op[len(prefix):].lstrip()
+                    break
+            mem_re = re.match(r"^\[\s*([a-zA-Z]+)\s*\]$", b_op)
+            if mem_re is None or mem_re.group(1).lower() != r1:
+                i += 1
+                continue
+            # REG dead after.
+            if not self._reg_dead_after(out, i + 2, r1):
+                i += 1
+                continue
+            indent = self._extract_indent(b.raw)
+            new_src = f"dword [{label}]"
+            new_raw = f"{indent}push    {new_src}"
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op="push",
+                operands=new_src,
+            )
+            out = out[:i] + [new_line] + out[i + 2:]
+            self.stats["label_push_collapse"] = (
+                self.stats.get("label_push_collapse", 0) + 1
+            )
+            continue
+        return out
 
     def _pass_value_forward_to_reg(
         self, lines: list[Line]

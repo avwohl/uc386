@@ -4683,3 +4683,65 @@ def test_pop_index_push_collapse_scale_8():
     out = opt.optimize(asm)
     assert "push    dword [ecx + eax*8]" in out
     assert opt.stats.get("pop_index_push_collapse") == 1
+
+
+# ── label_push_collapse ──────────────────────────────────────────
+
+
+def test_label_push_collapse_basic():
+    """`mov eax, _label; push dword [eax]` → `push dword [_label]`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _glob\n"
+        "        push    dword [eax]\n"
+        "        call    _consumer\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    dword [_glob]" in out
+    assert opt.stats.get("label_push_collapse") == 1
+
+
+def test_label_push_collapse_label_arithmetic():
+    """`mov eax, _b + 4; push dword [eax]` → `push dword [_b + 4]`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _b + 4\n"
+        "        push    dword [eax]\n"
+        "        call    _consumer\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    dword [_b + 4]" in out
+    assert opt.stats.get("label_push_collapse") == 1
+
+
+def test_label_push_collapse_skips_when_eax_live():
+    """Can't drop the address load if EAX is read after."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _glob\n"
+        "        push    dword [eax]\n"
+        "        mov     [ebp - 4], eax\n"  # eax live
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("label_push_collapse", 0) == 0
+
+
+def test_label_push_collapse_skips_numeric_imm():
+    """Numeric source isn't a label."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 42\n"
+        "        push    dword [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("label_push_collapse", 0) == 0

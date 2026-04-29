@@ -1145,3 +1145,7 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Conditions**: 4 consecutive instr lines (shl/pop/add/push). IDX dead after the push (post-state of IDX changes from address back to unscaled index).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests (262 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: label_push_collapse**: sister of label_load_collapse for the push case. `mov reg, LABEL; push dword [reg]` → `push dword [LABEL]`. Saves 1 byte per match. Common in `printf("...", glob);` arg-setup paths.
+  - **c-testsuite 00163**: 3 fires for the `bolshevic.a/b/c` printfs. 141 → 138 lines.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests (266 total). Pipeline 1734/1734 (100%).
