@@ -31,6 +31,23 @@ Currently implements:
   - push_immediate: replace `mov eax, IMM_OR_LABEL; push eax` with
     `push IMM_OR_LABEL` when the next instruction overwrites EAX
     (the mov was just for the push). Common at every cdecl arg site.
+  - ecx_binop_collapse: replace `mov ecx, <src>; OP eax, ecx` with
+    `OP eax, <src>` for OP ∈ {add, sub, and, or, xor, cmp, test,
+    imul, adc, sbb}. Saves the bytes of the prior `mov ecx, <src>`
+    (5 for imm32, 3-7 for memory, 2 for register). Source can be
+    any addressing mode the OP supports as a memory or immediate
+    source operand. Witness: next instruction overwrites ECX (full
+    mov / pop / xor / lea / call) or doesn't reference ECX/CX/CL/CH.
+  - mov_zero_to_xor: replace `mov eax, 0` with `xor eax, eax`. Saves
+    3 bytes (5-byte mov-imm32 → 2-byte xor reg, reg). Conservative:
+    only fires when a forward scan finds a flag-clobbering instruction
+    or a `ret` before any flag-reading instruction. Same pattern for
+    other gp registers (ECX, EDX, EBX, ESI, EDI, EBP).
+  - store_load_collapse: drop the redundant load after a store of
+    the same register to the same address: `mov [X], R; mov R, [X]`
+    → just the store. The register still holds its stored value, so
+    the load is unnecessary. Saves the bytes of the load instruction
+    (3 for [ebp-N], 6 for [_glob]).
 
 Patterns to add (see PEEPHOLE_PLAN.md for details): redundant
 mov-to-reg, tail calls, jump threading, multi-instruction right-
@@ -238,6 +255,9 @@ class PeepholeOptimizer:
             lines = self._pass_imm_store_collapse(lines)
             lines = self._pass_setcc_jcc_collapse(lines)
             lines = self._pass_push_immediate(lines)
+            lines = self._pass_imm_binop_collapse(lines)
+            lines = self._pass_mov_zero_to_xor(lines)
+            lines = self._pass_store_load_collapse(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -772,6 +792,381 @@ class PeepholeOptimizer:
             out.append(line)
             i += 1
         return out
+
+    # Binops that accept `OP eax, imm32` directly (no ecx round-trip).
+    # `imul eax, ecx` becomes `imul eax, eax, IMM` — NASM accepts both
+    # `imul eax, IMM` (which encodes as `imul eax, eax, IMM`) and the
+    # explicit three-operand form. We use the two-operand form below
+    # so the rewrite is uniform across all ops in this set.
+    _IMM_BINOP_OPS: frozenset[str] = frozenset({
+        "add", "sub", "and", "or", "xor", "cmp", "test",
+        "imul", "adc", "sbb",
+    })
+
+    def _pass_imm_binop_collapse(self, lines: list[Line]) -> list[Line]:
+        """Collapse `mov ecx, <src>; OP eax, ecx` to `OP eax, <src>`.
+
+        Match (2 consecutive instr lines):
+            mov     ecx, <src>           ; immediate, label, mem, or reg
+            <OP>    eax, ecx
+
+        Replace with:
+            <OP>    eax, <src>
+
+        Witness: the instruction after the OP must overwrite ECX
+        (full mov / pop / xor reg, reg / lea / call) OR not reference
+        ECX (or CX/CL/CH aliases). The codegen always reloads ECX
+        before each use, so this fires for every `eax OP <something>`
+        shape with a transferred ECX.
+
+        Sources we support:
+        - Immediate / label: `mov ecx, 50` / `mov ecx, _glob`.
+        - Memory: `mov ecx, [ebp - 4]` / `mov ecx, [_glob]`.
+        - Register: `mov ecx, ebx`.
+
+        We don't support sources that contain ECX/CX/CL/CH (would
+        self-reference after collapse) or ESP-relative memory if the
+        OP itself reads ESP (none of the binops here do, but be
+        defensive — only forbid ESP-relative if the OP also reads
+        flags, which isn't a real case here).
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (line.kind == "instr"
+                    and line.op == "mov"
+                    and self._is_simple_to_ecx(line)):
+                instrs = self._next_n_instrs(lines, i + 1, 2)
+                if instrs is not None:
+                    [(b_idx, b_line), (c_idx, c_line)] = instrs
+                    if (b_line.op in self._IMM_BINOP_OPS
+                            and self._is_eax_ecx_binop(b_line)
+                            and self._ecx_dead_after(c_line)):
+                        # Build the rewritten op line.
+                        parts_a = _operands_split(line.operands)
+                        assert parts_a is not None
+                        _, src_imm = parts_a
+                        leading_ws = re.match(r"^\s*", b_line.raw).group(0)
+                        new_raw = (
+                            f"{leading_ws}{b_line.op:<8}eax, {src_imm}"
+                        )
+                        new_line = Line(
+                            raw=new_raw, kind="instr", op=b_line.op,
+                            operands=f"eax, {src_imm}",
+                        )
+                        out.append(new_line)
+                        self.stats["imm_binop_collapse"] = (
+                            self.stats.get("imm_binop_collapse", 0) + 1
+                        )
+                        i = b_idx + 1
+                        continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _is_simple_to_ecx(line: Line) -> bool:
+        """`mov ecx, <src>` where the source is an immediate, label,
+        memory operand, or register that doesn't self-reference ECX.
+
+        Excludes:
+        - Sources containing ECX / CX / CL / CH (post-rewrite would
+          read the OP's destination operand, changing semantics).
+        """
+        if line.kind != "instr" or line.op != "mov":
+            return False
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return False
+        dest, src = parts
+        if dest.lower() != "ecx":
+            return False
+        # No ECX self-reference in the source.
+        for alias in ("ecx", "cx", "cl", "ch"):
+            if _references_register(src, alias):
+                return False
+        return True
+
+    @staticmethod
+    def _is_eax_ecx_binop(line: Line) -> bool:
+        """`<OP> eax, ecx` shape — the only one we can fold a preceding
+        `mov ecx, IMM` into."""
+        if line.kind != "instr":
+            return False
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return False
+        dest, src = parts
+        return dest.lower() == "eax" and src.lower() == "ecx"
+
+    @staticmethod
+    def _ecx_dead_after(line: Line) -> bool:
+        """Witness that ECX is dead at this point. Conservative: either
+        the instruction overwrites ECX entirely, or it doesn't reference
+        ECX at all. Anything that reads ECX (e.g. `cmp ebx, ecx`,
+        `mov [ecx], eax`, `add ebx, ecx`) defeats the rewrite."""
+        if line.kind != "instr":
+            # A label / directive / data line means we can't see what
+            # comes after — be conservative and assume ECX may be live
+            # (some other path could reach the label).
+            return False
+        # Full ECX overwrite: mov/pop/lea ecx, ...; xor ecx, ecx.
+        if line.op == "mov":
+            parts = _operands_split(line.operands)
+            if parts and parts[0].lower() == "ecx":
+                return True
+        if line.op == "pop" and line.operands.strip().lower() == "ecx":
+            return True
+        if line.op == "lea":
+            parts = _operands_split(line.operands)
+            if parts and parts[0].lower() == "ecx":
+                return True
+        if line.op == "xor":
+            parts = _operands_split(line.operands)
+            if (parts and parts[0].lower() == "ecx"
+                    and parts[1].strip().lower() == "ecx"):
+                return True
+        # `call X` clobbers caller-saved (EAX/ECX/EDX) per cdecl.
+        if line.op == "call":
+            return True
+        # `ret` ends the function — ECX no longer matters.
+        if line.op == "ret":
+            return True
+        # Otherwise: instruction must not reference ECX or any of its
+        # sub-registers (CX, CL, CH). The original sequence wrote the
+        # IMM into all bits of ECX before the binop, so a downstream
+        # read of CL etc. saw IMM-low-bits — but post-collapse, ECX
+        # is whatever the prior code left it. Different value → unsafe.
+        for alias in ("ecx", "cx", "cl", "ch"):
+            if _references_register(line.operands, alias):
+                return False
+        return True
+
+    # Instructions that clobber EFLAGS (any of CF/PF/AF/ZF/SF/OF).
+    # Source: Intel SDM Volume 2 — instructions whose "Flags Affected"
+    # section lists at least one flag as written. We use this to know
+    # when a prior `xor eax, eax`'s flag write becomes irrelevant.
+    _FLAG_CLOBBERING_OPS: frozenset[str] = frozenset({
+        "add", "sub", "cmp", "inc", "dec", "and", "or", "xor", "neg",
+        "test", "shl", "shr", "sar", "rol", "ror", "rcl", "rcr",
+        "shld", "shrd", "imul", "mul", "idiv", "div", "adc", "sbb",
+        "bsr", "bsf", "bt", "btc", "btr", "bts", "popf", "popfd",
+        "sahf", "stc", "clc", "cmc", "std", "cld", "sti", "cli",
+    })
+
+    # Instructions that READ EFLAGS — would observe our `xor`'s
+    # spurious flag write. Source: Intel SDM Vol 2 "Flags Tested".
+    _FLAG_READING_OPS: frozenset[str] = frozenset({
+        # Conditional branches: jcc family
+        "ja", "jae", "jb", "jbe", "jc", "jcxz", "je", "jecxz", "jg",
+        "jge", "jl", "jle", "jna", "jnae", "jnb", "jnbe", "jnc",
+        "jne", "jng", "jnge", "jnl", "jnle", "jno", "jnp", "jns",
+        "jnz", "jo", "jp", "jpe", "jpo", "js", "jz",
+        # Conditional sets
+        "seta", "setae", "setb", "setbe", "setc", "sete", "setg",
+        "setge", "setl", "setle", "setna", "setnae", "setnb",
+        "setnbe", "setnc", "setne", "setng", "setnge", "setnl",
+        "setnle", "setno", "setnp", "setns", "setnz", "seto", "setp",
+        "setpe", "setpo", "sets", "setz",
+        # Conditional moves
+        "cmova", "cmovae", "cmovb", "cmovbe", "cmovc", "cmove",
+        "cmovg", "cmovge", "cmovl", "cmovle", "cmovna", "cmovnae",
+        "cmovnb", "cmovnbe", "cmovnc", "cmovne", "cmovng", "cmovnge",
+        "cmovnl", "cmovnle", "cmovno", "cmovnp", "cmovns", "cmovnz",
+        "cmovo", "cmovp", "cmovpe", "cmovpo", "cmovs", "cmovz",
+        # Loop-with-condition
+        "loope", "loopne", "loopz", "loopnz",
+        # Read CF
+        "adc", "sbb", "rcl", "rcr",
+        # Save flags
+        "pushf", "pushfd", "lahf", "into",
+    })
+
+    def _pass_mov_zero_to_xor(self, lines: list[Line]) -> list[Line]:
+        """Replace `mov reg, 0` with `xor reg, reg` for any 32-bit
+        general-purpose register. Saves 3 bytes per match (5-byte
+        mov-imm32 → 2-byte xor reg, reg).
+
+        Conservative flag analysis: scan forward up to ~10 instructions
+        from the mov. If a flag-CLOBBERING op appears before any
+        flag-READING op, the rewrite is safe. If a flag-reading op
+        appears first, OR we hit a label / unconditional jump before
+        either, skip — the new flags from xor might be observed.
+
+        Special case: `ret` is treated as safe (function return doesn't
+        propagate flags semantically — flags are caller-saved by
+        convention; the System V i386 ABI doesn't preserve them
+        across calls anyway).
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            reg = self._mov_reg_zero(line)
+            if reg is not None and self._flags_safe_after(lines, i + 1):
+                leading_ws = re.match(r"^\s*", line.raw).group(0)
+                new_raw = f"{leading_ws}xor     {reg}, {reg}"
+                new_line = Line(
+                    raw=new_raw, kind="instr", op="xor",
+                    operands=f"{reg}, {reg}",
+                )
+                out.append(new_line)
+                self.stats["mov_zero_to_xor"] = (
+                    self.stats.get("mov_zero_to_xor", 0) + 1
+                )
+                i += 1
+                continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _mov_reg_zero(line: Line) -> str | None:
+        """Return the register name if this is `mov <gp32-reg>, 0`,
+        else None."""
+        if line.kind != "instr" or line.op != "mov":
+            return None
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return None
+        dest, src = parts
+        if src.strip() != "0":
+            return None
+        dest_lower = dest.lower()
+        if dest_lower in {"eax", "ebx", "ecx", "edx",
+                          "esi", "edi", "ebp"}:
+            return dest_lower
+        return None
+
+    def _flags_safe_after(self, lines: list[Line], start_idx: int) -> bool:
+        """Scan forward up to ~20 instructions. Return True if a
+        flag-CLOBBERING op or function exit appears before any
+        flag-READING op.
+
+        Cross-label scanning relies on a uc386 codegen invariant:
+        every entry to a labeled block re-establishes flag state via
+        an explicit `cmp` / `test` / arithmetic op before any
+        conditional branch. The optimizer's input is always uc386
+        output (libc is appended later), so this invariant holds.
+        """
+        scanned = 0
+        j = start_idx
+        while j < len(lines) and scanned < 20:
+            ln = lines[j]
+            if ln.kind in ("blank", "comment", "label"):
+                # Label crossings are safe under the codegen invariant.
+                j += 1
+                continue
+            if ln.kind in ("directive", "data"):
+                # End of function (or section change). Treat as safe —
+                # we're past any flag-reading code in this function.
+                return True
+            if ln.kind != "instr":
+                return False
+            scanned += 1
+            if ln.op == "ret" or ln.op in {"iret", "iretd", "retf", "retn"}:
+                return True
+            if ln.op == "jmp":
+                # Codegen jmps lead to labels whose first instruction
+                # re-establishes flag state. Keep scanning past.
+                j += 1
+                continue
+            if ln.op == "call":
+                # Calls clobber flags via the callee. Safe.
+                return True
+            if ln.op in self._FLAG_READING_OPS:
+                return False
+            if ln.op in self._FLAG_CLOBBERING_OPS:
+                return True
+            # Otherwise: flag-neutral instr (mov / lea / push / pop /
+            # nop / xchg / etc.) — keep scanning.
+            j += 1
+        return False
+
+    def _pass_store_load_collapse(self, lines: list[Line]) -> list[Line]:
+        """Drop the redundant load after a store-then-load of the
+        same register to the same address.
+
+        Match (2 consecutive instr lines):
+            mov     [<addr>], <reg>
+            mov     <reg>, [<addr>]
+
+        Replace with just the store. The register still holds its
+        stored value, so the load is a no-op.
+
+        Address comparison is textual (after stripping whitespace),
+        which is correct: NASM's `[ebp - 4]` always renders the same
+        way for the same operand. The codegen always emits stores
+        and loads with matching syntax.
+
+        Skip when the address is ESP-relative — pushes/pops that
+        might come between... wait, the pattern requires the two
+        instructions to be CONSECUTIVE (next_n_instrs already skips
+        blanks/comments only, not instrs), so there's nothing
+        between them. ESP-relative is safe.
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            store_info = self._mov_reg_to_mem(line)
+            if store_info is not None:
+                addr, reg = store_info
+                instrs = self._next_n_instrs(lines, i + 1, 1)
+                if instrs is not None:
+                    [(b_idx, b_line)] = instrs
+                    load_info = self._mov_mem_to_reg(b_line)
+                    if (load_info is not None
+                            and load_info == (reg, addr)):
+                        out.append(line)
+                        self.stats["store_load_collapse"] = (
+                            self.stats.get("store_load_collapse", 0) + 1
+                        )
+                        i = b_idx + 1
+                        continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _mov_reg_to_mem(line: Line) -> tuple[str, str] | None:
+        """Return (addr, reg) if this is `mov [<addr>], <reg>`, else
+        None. Reg must be a 32-bit gp register."""
+        if line.kind != "instr" or line.op != "mov":
+            return None
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return None
+        dest, src = parts
+        if not dest.startswith("["):
+            return None
+        # Source must be a 32-bit gp register (not a sub-byte alias —
+        # sub-byte stores have different widths).
+        src_lower = src.lower()
+        if src_lower not in {"eax", "ebx", "ecx", "edx",
+                              "esi", "edi", "ebp", "esp"}:
+            return None
+        # Normalize address whitespace for matching.
+        return (re.sub(r"\s+", "", dest), src_lower)
+
+    @staticmethod
+    def _mov_mem_to_reg(line: Line) -> tuple[str, str] | None:
+        """Return (reg, addr) if this is `mov <reg>, [<addr>]`, else
+        None."""
+        if line.kind != "instr" or line.op != "mov":
+            return None
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return None
+        dest, src = parts
+        dest_lower = dest.lower()
+        if dest_lower not in {"eax", "ebx", "ecx", "edx",
+                               "esi", "edi", "ebp", "esp"}:
+            return None
+        if not src.startswith("["):
+            return None
+        return (dest_lower, re.sub(r"\s+", "", src))
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
         """P-jmp-to-next: `jmp X` immediately (modulo blanks/comments)

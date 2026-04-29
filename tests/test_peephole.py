@@ -7,6 +7,10 @@ from uc386.peephole import PeepholeOptimizer, optimize
 
 
 def test_drops_dead_xor_after_jmp():
+    """The dead `xor eax, eax` after `jmp .epilogue` is removed.
+    The LIVE `mov eax, 0` before the jmp also gets rewritten to
+    `xor eax, eax` (mov_zero_to_xor), so the only xor in the
+    output is the rewritten one immediately before the jmp."""
     asm = (
         "_main:\n"
         "        mov     eax, 0\n"
@@ -16,7 +20,11 @@ def test_drops_dead_xor_after_jmp():
         "        ret\n"
     )
     out = optimize(asm)
-    assert "xor     eax, eax" not in out
+    # Exactly one `xor eax, eax` should remain — the rewritten
+    # live one. The dead one after the jmp is dropped.
+    assert out.count("xor     eax, eax") == 1
+    # And the dead `mov eax, 0` doesn't appear (rewritten to xor).
+    assert "mov     eax, 0" not in out
     assert ".epilogue:" in out  # Label preserved
     assert "ret" in out         # Real epilogue preserved
 
@@ -220,7 +228,9 @@ def test_real_world_function_end():
 
 
 def test_binop_collapse_with_immediate():
-    """The canonical binop right-operand pattern collapses."""
+    """The canonical binop right-operand pattern collapses, and the
+    follow-up imm_binop_collapse folds the `mov ecx, 1; cmp eax, ecx`
+    into a single `cmp eax, 1`."""
     asm = (
         "_f:\n"
         "        mov     eax, [ebp + 8]\n"
@@ -233,17 +243,21 @@ def test_binop_collapse_with_immediate():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    # The 4 stack-machine lines collapse to one `mov ecx, 1`.
+    # The 4 stack-machine lines collapse to one `mov ecx, 1`,
+    # which is then folded into the cmp's immediate operand.
     assert "push    eax" not in out
     assert "mov     ecx, eax" not in out
     assert "pop     eax" not in out
-    assert "mov     ecx, 1" in out
-    # The cmp survives.
-    assert "cmp     eax, ecx" in out
+    assert "mov     ecx, 1" not in out
+    assert "cmp     eax, 1" in out
     assert opt.stats.get("binop_collapse", 0) == 1
+    assert opt.stats.get("imm_binop_collapse", 0) == 1
 
 
 def test_binop_collapse_with_memory_operand():
+    """The 4-line collapse fires; then imm_binop_collapse (now also
+    accepting memory sources) folds `mov ecx, [...]; add eax, ecx`
+    into `add eax, [...]`."""
     asm = (
         "_f:\n"
         "        mov     eax, [ebp - 4]\n"
@@ -256,8 +270,11 @@ def test_binop_collapse_with_memory_operand():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    assert "mov     ecx, [ebp - 8]" in out
+    # The intermediate `mov ecx, [ebp - 8]` gets folded into the add.
+    assert "mov     ecx, [ebp - 8]" not in out
+    assert "add     eax, [ebp - 8]" in out
     assert opt.stats.get("binop_collapse", 0) == 1
+    assert opt.stats.get("imm_binop_collapse", 0) == 1
 
 
 def test_binop_collapse_skips_esp_relative_source():
@@ -714,6 +731,414 @@ def test_push_immediate_skips_memory_source():
     assert opt.stats.get("push_immediate", 0) == 0
 
 
+# ── imm_binop_collapse ───────────────────────────────────────────
+
+
+def test_imm_binop_collapse_cmp():
+    """`mov ecx, IMM; cmp eax, ecx` → `cmp eax, IMM`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        mov     ecx, 50\n"
+        "        cmp     eax, ecx\n"
+        "        jle     .end\n"
+        ".end:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ecx, 50" not in out
+    assert "cmp     eax, 50" in out
+    assert opt.stats.get("imm_binop_collapse", 0) == 1
+
+
+def test_imm_binop_collapse_add():
+    """`mov ecx, 5; add eax, ecx` → `add eax, 5`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        mov     ecx, 5\n"
+        "        add     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     eax, 5" in out
+    assert opt.stats.get("imm_binop_collapse", 0) == 1
+
+
+def test_imm_binop_collapse_label():
+    """Label-as-immediate also folds: `mov ecx, _glob; cmp eax, ecx`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        mov     ecx, _glob\n"
+        "        cmp     eax, ecx\n"
+        "        je      .skip\n"
+        ".skip:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "cmp     eax, _glob" in out
+    assert opt.stats.get("imm_binop_collapse", 0) == 1
+
+
+def test_imm_binop_collapse_test():
+    """`mov ecx, 0xff; test eax, ecx` → `test eax, 0xff`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        mov     ecx, 0xff\n"
+        "        test    eax, ecx\n"
+        "        jz      .skip\n"
+        ".skip:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "test    eax, 0xff" in out
+    assert opt.stats.get("imm_binop_collapse", 0) == 1
+
+
+def test_imm_binop_collapse_imul():
+    """`mov ecx, 3; imul eax, ecx` → `imul eax, 3` (NASM accepts the
+    two-operand form for register*imm)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        mov     ecx, 3\n"
+        "        imul    eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "imul    eax, 3" in out
+    assert opt.stats.get("imm_binop_collapse", 0) == 1
+
+
+def test_imm_binop_collapse_does_not_fire_if_ecx_read_after():
+    """If the next instr reads ECX (e.g. `mov [ecx], eax`), keep the
+    `mov ecx, IMM` so ECX still holds the right value."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 42\n"
+        "        cmp     eax, ecx\n"
+        "        mov     [ecx], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ecx, 42" in out
+    assert opt.stats.get("imm_binop_collapse", 0) == 0
+
+
+def test_imm_binop_collapse_memory_source():
+    """`mov ecx, [ebp - 8]; cmp eax, ecx` folds to `cmp eax, [ebp - 8]`
+    — NASM accepts a memory operand on the right side of cmp/add/etc.
+    Saves 3 bytes (the prior `mov ecx, [...]` is gone)."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        cmp     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "cmp     eax, [ebp - 8]" in out
+    assert "mov     ecx, [ebp - 8]" not in out
+    assert opt.stats.get("imm_binop_collapse", 0) == 1
+
+
+def test_imm_binop_collapse_register_source():
+    """`mov ecx, edx; cmp eax, ecx` folds to `cmp eax, edx`. The
+    `edx` source isn't ECX/CX/CL/CH so it's safe."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, edx\n"
+        "        cmp     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "cmp     eax, edx" in out
+    assert opt.stats.get("imm_binop_collapse", 0) == 1
+
+
+def test_imm_binop_collapse_skips_self_referential_ecx_source():
+    """`mov ecx, [ecx + 4]; cmp eax, ecx` shouldn't fold — the
+    rewrite would become `cmp eax, [ecx + 4]` but ECX has its
+    new value, not its original value."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ecx + 4]\n"
+        "        cmp     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("imm_binop_collapse", 0) == 0
+
+
+def test_imm_binop_collapse_skips_when_cl_read_after():
+    """Sub-register CL reads also block the rewrite. The original
+    sequence wrote IMM-low-bits to CL; post-collapse, CL has whatever
+    it had before. Different state → unsafe."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 3\n"
+        "        add     eax, ecx\n"
+        "        shl     eax, cl\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("imm_binop_collapse", 0) == 0
+
+
+def test_imm_binop_collapse_witness_call_overwrites_ecx():
+    """A `call` overwrites caller-saved registers (EAX, ECX, EDX) per
+    cdecl, so the witness is satisfied."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 100\n"
+        "        cmp     eax, ecx\n"
+        "        call    _other\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "cmp     eax, 100" in out
+    assert opt.stats.get("imm_binop_collapse", 0) == 1
+
+
+# ── mov_zero_to_xor ──────────────────────────────────────────────
+
+
+def test_mov_zero_to_xor_simple():
+    """`mov eax, 0` followed by a store + ret rewrites to `xor`.
+    The mov path through the store is flag-neutral; the ret ends
+    the function so flags don't matter."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 0\n"
+        "        mov     [ebp - 4], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, 0" not in out
+    assert "xor     eax, eax" in out
+    assert opt.stats.get("mov_zero_to_xor", 0) == 1
+
+
+def test_mov_zero_to_xor_followed_by_jmp_then_label_then_ret():
+    """`mov eax, 0; jmp .L; .L: ret` — cross-jmp-and-label scan
+    should still be safe (codegen invariant: flags are never
+    assumed to carry across labels)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 0\n"
+        "        jmp     .epilogue\n"
+        ".epilogue:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, 0" not in out
+    assert "xor     eax, eax" in out
+    assert opt.stats.get("mov_zero_to_xor", 0) == 1
+
+
+def test_mov_zero_to_xor_skips_when_jcc_follows():
+    """`mov eax, 0` followed by `jcc` is unsafe — the jcc reads
+    flags from a previous cmp/test, but xor would clobber them.
+    Don't rewrite."""
+    asm = (
+        "_f:\n"
+        "        cmp     ebx, ecx\n"
+        "        mov     eax, 0\n"
+        "        je      .L\n"
+        ".L:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("mov_zero_to_xor", 0) == 0
+
+
+def test_mov_zero_to_xor_skips_when_setcc_follows():
+    """`mov eax, 0; setcc al; ...` reads flags. Don't rewrite."""
+    asm = (
+        "_f:\n"
+        "        cmp     ebx, ecx\n"
+        "        mov     eax, 0\n"
+        "        sete    al\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("mov_zero_to_xor", 0) == 0
+
+
+def test_mov_zero_to_xor_safe_when_arithmetic_follows():
+    """`mov eax, 0; add eax, ebx` — the add clobbers flags before
+    any read. Safe."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 0\n"
+        "        add     eax, ebx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     eax, eax" in out
+    assert opt.stats.get("mov_zero_to_xor", 0) == 1
+
+
+def test_mov_zero_to_xor_safe_when_call_follows():
+    """`mov eax, 0; call X` — call clobbers flags via callee."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 0\n"
+        "        call    _bar\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     eax, eax" in out
+    assert opt.stats.get("mov_zero_to_xor", 0) == 1
+
+
+def test_mov_zero_to_xor_other_registers():
+    """The pattern fires for any 32-bit gp reg, not just EAX."""
+    asm = (
+        "_f:\n"
+        "        mov     ebx, 0\n"
+        "        mov     [ebp - 4], ebx\n"
+        "        mov     ecx, 0\n"
+        "        mov     [ebp - 8], ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ebx, 0" not in out
+    assert "mov     ecx, 0" not in out
+    assert "xor     ebx, ebx" in out
+    assert "xor     ecx, ecx" in out
+    assert opt.stats.get("mov_zero_to_xor", 0) == 2
+
+
+def test_mov_zero_to_xor_skips_nonzero_immediate():
+    """`mov eax, 1` doesn't rewrite (xor eax, eax produces 0, not 1)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 1\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, 1" in out
+    assert opt.stats.get("mov_zero_to_xor", 0) == 0
+
+
+# ── store_load_collapse ──────────────────────────────────────────
+
+
+def test_store_load_collapse_local():
+    """`mov [ebp - 4], eax; mov eax, [ebp - 4]` → just the store.
+    Common after function-call result is stored to a local then
+    immediately re-used in an expression."""
+    asm = (
+        "_f:\n"
+        "        call    _bar\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        cmp     eax, 45\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Only one occurrence of the address; the load is gone.
+    assert out.count("[ebp - 4]") == 1
+    assert "mov     eax, [ebp - 4]" not in out
+    assert "mov     [ebp - 4], eax" in out
+    assert opt.stats.get("store_load_collapse", 0) == 1
+
+
+def test_store_load_collapse_global():
+    """Globals work the same way: `mov [_var], eax; mov eax, [_var]`
+    → just the store."""
+    asm = (
+        "_f:\n"
+        "        mov     [_counter], eax\n"
+        "        mov     eax, [_counter]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [_counter]" not in out
+    assert "mov     [_counter], eax" in out
+    assert opt.stats.get("store_load_collapse", 0) == 1
+
+
+def test_store_load_collapse_other_registers():
+    """Pattern works for any 32-bit gp register, not just EAX."""
+    asm = (
+        "_f:\n"
+        "        mov     [ebp - 4], ebx\n"
+        "        mov     ebx, [ebp - 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ebx, [ebp - 4]" not in out
+    assert opt.stats.get("store_load_collapse", 0) == 1
+
+
+def test_store_load_collapse_skips_different_register():
+    """`mov [X], eax; mov ecx, [X]` shouldn't fire — different regs.
+    The load is genuine: ECX gets a copy of the just-stored value."""
+    asm = (
+        "_f:\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("store_load_collapse", 0) == 0
+
+
+def test_store_load_collapse_skips_different_address():
+    """`mov [X], eax; mov eax, [Y]` shouldn't fire — different addrs."""
+    asm = (
+        "_f:\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     eax, [ebp - 8]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("store_load_collapse", 0) == 0
+
+
+def test_store_load_collapse_skips_with_intervening_instr():
+    """Anything between the store and the load means the load might
+    be reading a different value than what was just stored."""
+    asm = (
+        "_f:\n"
+        "        mov     [ebp - 4], eax\n"
+        "        call    _other\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("store_load_collapse", 0) == 0
+
+
 # ── Convergence ──────────────────────────────────────────────────
 
 
@@ -755,8 +1180,12 @@ def test_codegen_runs_peephole_by_default():
 
     # Stats populated.
     assert isinstance(gen.peephole_stats, dict)
-    # And the dead xor is gone from the output.
-    assert "xor     eax, eax\n.epilogue:" not in asm
+    # The codegen-emitted `mov eax, 0` for the implicit return is
+    # rewritten to `xor eax, eax` (3 bytes saved). The dead one
+    # after `jmp .epilogue` (if any) is dropped.
+    assert gen.peephole_stats.get("mov_zero_to_xor", 0) >= 1
+    # No bare `mov eax, 0` survives in main.
+    assert "        mov     eax, 0" not in asm
 
 
 def test_codegen_skips_peephole_when_disabled():
