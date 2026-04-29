@@ -2343,26 +2343,27 @@ class PeepholeOptimizer:
         return None
 
     def _pass_rmw_collapse(self, lines: list[Line]) -> list[Line]:
-        """Collapse ``mov reg, [mem]; OP reg, IMM; mov [mem], reg``
-        into ``OP dword [mem], IMM`` when reg is dead after the store.
+        """Collapse ``mov reg, [mem]; OP reg, SRC; mov [mem], reg``
+        into ``OP dword [mem], SRC`` when reg is dead after the store.
 
-        OP ∈ {add, sub, and, or, xor}. x86 supports the
-        ``OP r/m32, imm`` form for all of these. Saves 5 bytes per
-        match (3-byte load + 3-byte op + 3-byte store → single
-        3-4-byte memory-RMW instruction).
+        OP ∈ {add, sub, and, or, xor}. SRC is a numeric immediate or
+        a non-EAX general-purpose register. x86 supports both
+        ``OP r/m32, imm`` and ``OP r/m32, r32`` forms.
+
+        Saves 5 bytes per match (3-byte load + 3-byte op + 3-byte
+        store → single 3-4-byte memory-RMW instruction).
 
         Common in compound assignments to memory locations:
-        ``int x; x += 5;`` lowers to ``mov eax, [mem]; add eax, 5;
-        mov [mem], eax``.
+        ``int x; x += 5;`` (immediate form) and ``x += y;`` (register
+        form, where y has been hoisted into a register).
 
         Conditions:
-        - Line A: ``mov reg, [mem]`` (plain mov; mem must be a memory
+        - Line A: ``mov eax, [mem]`` (plain mov; mem must be a memory
           deref).
-        - Line B: ``OP reg, IMM`` where OP is add/sub/and/or/xor and
-          IMM is a numeric literal (not register, not memory).
-        - Line C: ``mov [mem], reg`` (same mem as line A; same reg).
-        - reg is dead after line C (CFG-aware scan).
-        - Restricted to EAX (matches sister passes).
+        - Line B: ``OP eax, SRC`` where OP is add/sub/and/or/xor and
+          SRC is a numeric literal OR a non-EAX 32-bit register.
+        - Line C: ``mov [mem], eax`` (same mem as line A).
+        - EAX is dead after line C (CFG-aware scan).
         """
         out: list[Line] = []
         i = 0
@@ -2391,12 +2392,13 @@ class PeepholeOptimizer:
                             bp = _operands_split(b.operands)
                             if bp is not None:
                                 bdest, bsrc = bp
-                                imm = self._parse_numeric_immediate(
-                                    bsrc.strip()
+                                bsrc_norm = bsrc.strip()
+                                src_for_rewrite = self._rmw_source_text(
+                                    bsrc_norm
                                 )
                                 if (
                                     bdest.strip().lower() == "eax"
-                                    and imm is not None
+                                    and src_for_rewrite is not None
                                 ):
                                     c = lines[i + 2]
                                     if (
@@ -2420,15 +2422,14 @@ class PeepholeOptimizer:
                                                         line.raw
                                                     )
                                                 )
-                                                # Pad op to 8 chars
-                                                # like other emits.
                                                 spacer = " " * (
                                                     8 - len(b.op)
                                                 )
                                                 new_raw = (
                                                     f"{indent}{b.op}"
                                                     f"{spacer}dword "
-                                                    f"{asrc_norm}, {imm}"
+                                                    f"{asrc_norm}, "
+                                                    f"{src_for_rewrite}"
                                                 )
                                                 new_line = Line(
                                                     raw=new_raw,
@@ -2437,7 +2438,7 @@ class PeepholeOptimizer:
                                                     operands=(
                                                         f"dword "
                                                         f"{asrc_norm}, "
-                                                        f"{imm}"
+                                                        f"{src_for_rewrite}"
                                                     ),
                                                 )
                                                 out.append(new_line)
@@ -2453,6 +2454,29 @@ class PeepholeOptimizer:
             out.append(line)
             i += 1
         return out
+
+    @staticmethod
+    def _rmw_source_text(src: str) -> str | None:
+        """For an `OP eax, src` where the rewrite goes to `OP [mem], src`,
+        decide if `src` is acceptable.
+
+        Acceptable:
+        - numeric immediate (NASM accepts `OP r/m32, imm8` and imm32)
+        - non-EAX 32-bit GP register
+
+        Not acceptable: memory deref (would be mem-mem), EAX itself
+        (the EAX value is stale after we drop the load), labels.
+        """
+        s = src.strip()
+        # Numeric immediate.
+        imm = PeepholeOptimizer._parse_numeric_immediate(s)
+        if imm is not None:
+            return str(imm)
+        # Non-EAX register.
+        sl = s.lower()
+        if sl in {"ebx", "ecx", "edx", "esi", "edi"}:
+            return sl
+        return None
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
         """P-jmp-to-next: `jmp X` immediately (modulo blanks/comments)

@@ -2094,14 +2094,46 @@ def test_rmw_collapse_skips_eax_live_after():
     assert opt.stats.get("rmw_collapse", 0) == 0
 
 
-def test_rmw_collapse_skips_register_immediate():
-    """`add eax, ecx` (register source) needs a different rewrite —
-    `add [mem], ecx` would still work but we restrict to immediates
-    for now to keep the scope tight."""
+def test_rmw_collapse_with_register_source():
+    """`add eax, ecx` (non-EAX register source) folds to `add [mem],
+    ecx` — x86 supports the r/m32, r32 form."""
     asm = (
         "_f:\n"
         "        mov     eax, [ebp - 4]\n"
         "        add     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        add     dword [ebp - 4], ecx" in out
+    assert opt.stats.get("rmw_collapse") == 1
+
+
+def test_rmw_collapse_skips_eax_source():
+    """`add eax, eax` self-doubles — but if the load is dropped, EAX
+    stale → wrong result. Skip this case."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, eax\n"
+        "        mov     [ebp - 4], eax\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("rmw_collapse", 0) == 0
+
+
+def test_rmw_collapse_skips_memory_source():
+    """`add eax, [mem2]` — x86 has no mem-mem op, can't collapse to
+    `add [mem1], [mem2]`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, [ebp - 8]\n"
         "        mov     [ebp - 4], eax\n"
         "        xor     eax, eax\n"
         "        ret\n"
