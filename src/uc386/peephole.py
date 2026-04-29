@@ -222,6 +222,20 @@ def _classify(raw: str) -> Line:
     return Line(raw=raw, kind="directive")
 
 
+_NORETURN_CALL_TARGETS: frozenset[str] = frozenset({
+    # C standard library — guaranteed noreturn.
+    "_abort", "_exit", "__Exit",
+    # C standard setjmp/longjmp — noreturn.
+    "_longjmp", "_siglongjmp",
+    # GCC builtins — wrap the standard funcs.
+    "___builtin_abort", "___builtin_exit",
+    "___builtin_unreachable", "___builtin_trap",
+    "___builtin_longjmp",
+    # POSIX assertion failure handlers — call abort.
+    "___assert_fail", "___assert", "___assert_perror_fail",
+})
+
+
 def _is_unconditional_terminator(line: Line) -> bool:
     """An instruction whose execution never falls through to the next line."""
     if line.kind != "instr":
@@ -235,6 +249,11 @@ def _is_unconditional_terminator(line: Line) -> bool:
     # `iret`, `retf`, `retn` — uncommon in our codegen but be safe.
     if line.op in {"iret", "iretd", "retf", "retn"}:
         return True
+    # `call <noreturn fn>` — control never returns.
+    if line.op == "call":
+        target = (line.operands or "").strip()
+        if target in _NORETURN_CALL_TARGETS:
+            return True
     return False
 
 
@@ -402,6 +421,7 @@ class PeepholeOptimizer:
             lines = self._pass_push_index_collapse(lines)
             lines = self._pass_self_mov_elimination(lines)
             lines = self._pass_transfer_pop_collapse(lines)
+            lines = self._pass_transfer_pop_cmp_collapse(lines)
             lines = self._pass_dup_push_pop_self_op(lines)
             lines = self._pass_push_pop_op_to_memop(lines)
             lines = self._pass_label_load_collapse(lines)
@@ -2741,10 +2761,16 @@ class PeepholeOptimizer:
         that:
         - references EAX (read or write — dest or operand)
         - stores to memory that may alias `mem`
+        - writes to any register used in `mem`'s addressing (e.g., a
+          chain `pop ecx` would invalidate `[eax + ecx*4]` since the
+          collapsed cmp re-evaluates the SIB with the new ECX)
         - is a label, control flow, or call
 
         Returns the cmp/test index on success, None on failure.
         """
+        # Registers used in `mem`'s addressing (other than EAX, which
+        # is already covered by the EAX-reference check).
+        mem_regs = self._regs_in_mem_operand(mem) - {"eax"}
         for k in range(start, len(lines)):
             ln = lines[k]
             if ln.kind == "label":
@@ -2774,6 +2800,14 @@ class PeepholeOptimizer:
                 or op in PeepholeOptimizer._IMPLICIT_REG_USERS
             ):
                 return None
+            # Writes to a register used in `mem`'s addressing — bail.
+            # The collapsed cmp will re-evaluate `mem`'s SIB
+            # expression at the cmp's location, so a chain write to
+            # any of those regs changes which address is read.
+            if mem_regs:
+                dest_reg = self._instr_dest_reg(ln)
+                if dest_reg is not None and dest_reg in mem_regs:
+                    return None
             # Memory write that may alias `mem` — bail. The first
             # operand is the destination for most ALU/move ops; for
             # 1-operand RMW ops (inc/dec/not/neg/pop/setCC) the only
@@ -2792,6 +2826,93 @@ class PeepholeOptimizer:
                         self._strip_size_prefix(mem.strip()),
                     ):
                         return None
+        return None
+
+    @staticmethod
+    def _regs_in_mem_operand(mem: str) -> set[str]:
+        """Extract register names referenced inside the brackets of a
+        memory operand. E.g. `[eax + ecx*4]` → {'eax', 'ecx'}, plus
+        their 16/8-bit aliases. Operand may include size prefix.
+        """
+        # Strip optional size prefix and outer brackets.
+        m = mem.strip()
+        for prefix in ("dword ", "word ", "byte ", "qword "):
+            if m.lower().startswith(prefix):
+                m = m[len(prefix):].lstrip()
+                break
+        if m.startswith("[") and m.endswith("]"):
+            m = m[1:-1]
+        # Find all register-like words.
+        ALL_REGS = {
+            "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+            "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
+            "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh",
+        }
+        # Promote to 32-bit canonical names.
+        SUBREG_TO_32 = {
+            "ax": "eax", "al": "eax", "ah": "eax",
+            "bx": "ebx", "bl": "ebx", "bh": "ebx",
+            "cx": "ecx", "cl": "ecx", "ch": "ecx",
+            "dx": "edx", "dl": "edx", "dh": "edx",
+            "si": "esi", "di": "edi",
+            "bp": "ebp", "sp": "esp",
+        }
+        regs = set()
+        for tok in re.findall(r"\b[a-zA-Z]+\b", m):
+            t = tok.lower()
+            if t in ALL_REGS:
+                regs.add(SUBREG_TO_32.get(t, t))
+        return regs
+
+    @staticmethod
+    def _instr_dest_reg(ln: Line) -> str | None:
+        """Return the canonical 32-bit register name written by this
+        instruction, or None if the dest is memory, the instruction
+        has no dest, or the dest can't be cheaply determined.
+
+        Recognized: pop reg, mov reg, X, lea reg, ..., add/sub/and/or
+        /xor/imul reg, X, inc reg, dec reg, neg reg, not reg, shl/
+        shr/sar reg, ..., setCC reg, movsx/movzx reg, ..., xor reg,
+        reg (write — note this also reads, but it's a write).
+        """
+        if ln.kind != "instr":
+            return None
+        op = ln.op
+        ops = ln.operands or ""
+        SUBREG_TO_32 = {
+            "ax": "eax", "al": "eax", "ah": "eax",
+            "bx": "ebx", "bl": "ebx", "bh": "ebx",
+            "cx": "ecx", "cl": "ecx", "ch": "ecx",
+            "dx": "edx", "dl": "edx", "dh": "edx",
+            "si": "esi", "di": "edi",
+            "bp": "ebp", "sp": "esp",
+        }
+        ALL_REGS = {
+            "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+        } | set(SUBREG_TO_32.keys())
+        # 1-operand ops where the operand is the dest (and a register).
+        if op in {"pop", "inc", "dec", "neg", "not"} and ops:
+            tok = ops.strip().lower()
+            if tok in ALL_REGS:
+                return SUBREG_TO_32.get(tok, tok)
+        # setCC reg: dest is the operand.
+        if op.startswith("set") and len(op) <= 6 and ops:
+            tok = ops.strip().lower()
+            if tok in ALL_REGS:
+                return SUBREG_TO_32.get(tok, tok)
+        # 2-operand ops where dest is the first operand.
+        if op in {"mov", "lea", "add", "sub", "and", "or", "xor",
+                  "imul", "shl", "shr", "sar", "rol", "ror", "sal",
+                  "movsx", "movzx", "adc", "sbb", "cmovz", "cmovnz",
+                  "cmove", "cmovne", "cmovl", "cmovle", "cmovg",
+                  "cmovge", "cmovs", "cmovns", "cmovo", "cmovno",
+                  "cmovb", "cmovbe", "cmova", "cmovae", "cmovc",
+                  "cmovnc", "cmovp", "cmovnp"} and ops:
+            parts = _operands_split(ops)
+            if parts is not None:
+                dest = parts[0].strip().lower()
+                if dest in ALL_REGS:
+                    return SUBREG_TO_32.get(dest, dest)
         return None
 
     # Ops whose first memory operand is a SOURCE (read-only). All
@@ -4838,6 +4959,123 @@ class PeepholeOptimizer:
             out = out[:i] + [new_pop, c] + out[i + 3:]
             self.stats["transfer_pop_collapse"] = (
                 self.stats.get("transfer_pop_collapse", 0) + 1
+            )
+            continue
+        return out
+
+    _ZF_ONLY_FLAG_READERS: frozenset[str] = frozenset({
+        "je", "jne", "jz", "jnz",
+        "sete", "setne", "setz", "setnz",
+        "cmove", "cmovne", "cmovz", "cmovnz",
+    })
+
+    _NON_ZF_FLAG_READERS: frozenset[str] = frozenset({
+        "jl", "jle", "jg", "jge",
+        "js", "jns", "jo", "jno",
+        "jb", "jbe", "ja", "jae",
+        "jc", "jnc", "jp", "jnp", "jpe", "jpo",
+        "setl", "setle", "setg", "setge",
+        "sets", "setns", "seto", "setno",
+        "setb", "setbe", "seta", "setae",
+        "setc", "setnc", "setp", "setnp",
+        "cmovl", "cmovle", "cmovg", "cmovge",
+        "cmovs", "cmovns", "cmovo", "cmovno",
+        "cmovb", "cmovbe", "cmova", "cmovae",
+        "cmovc", "cmovnc", "cmovp", "cmovnp",
+        "adc", "sbb", "rcl", "rcr",
+    })
+
+    _FLAG_CLOBBERS: frozenset[str] = frozenset({
+        "add", "sub", "and", "or", "xor", "cmp", "test",
+        "inc", "dec", "neg", "not_",
+        "shl", "shr", "sar", "rol", "ror", "sal",
+        "imul", "mul", "idiv", "div",
+        "bt", "bts", "btr", "btc",
+        "bsf", "bsr",
+    })
+
+    def _flags_used_only_for_zf(
+        self, lines: list[Line], start_idx: int
+    ) -> bool:
+        """Scan forward from start_idx; return True iff every
+        flag-reader before the first flag-clobber/fence is ZF-only.
+
+        Fences: labels, ret, leave, enter, call, unconditional jmp.
+        After a fence, the cmp's flags are irrelevant.
+        """
+        n = len(lines)
+        for j in range(start_idx, n):
+            line = lines[j]
+            if line.kind == "label":
+                return True
+            if line.kind != "instr":
+                continue
+            op = line.op
+            if op in PeepholeOptimizer._ZF_ONLY_FLAG_READERS:
+                continue
+            if op in PeepholeOptimizer._NON_ZF_FLAG_READERS:
+                return False
+            if op in PeepholeOptimizer._FLAG_CLOBBERS:
+                return True
+            if op in {"ret", "retn", "retf", "iret",
+                      "leave", "enter", "call", "jmp",
+                      "int", "iretd", "sysenter"}:
+                return True
+        return True
+
+    def _pass_transfer_pop_cmp_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse `mov ecx, eax; pop eax; cmp eax, ecx` into
+        `pop ecx; cmp eax, ecx` when the cmp's flags are read only
+        for equality (je/jne/jz/jnz/sete/setne/etc.).
+
+        Operand order matters for cmp: SF/CF/OF flip when arguments
+        swap. ZF is symmetric. So the rewrite is safe iff every
+        flag-reader between the cmp and the next flag-clobber/fence
+        reads only ZF.
+
+        Saves 2 bytes per match (drops the `mov ecx, eax`).
+        """
+        out = list(lines)
+        i = 0
+        while i + 2 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            c = out[i + 2]
+            if not (
+                a.kind == "instr" and a.op == "mov"
+                and a.operands.strip().lower() == "ecx, eax"
+                and b.kind == "instr" and b.op == "pop"
+                and b.operands.strip().lower() == "eax"
+                and c.kind == "instr" and c.op == "cmp"
+            ):
+                i += 1
+                continue
+            cp = _operands_split(c.operands)
+            if cp is None:
+                i += 1
+                continue
+            cdst, csrc = cp
+            if (
+                cdst.strip().lower() != "eax"
+                or csrc.strip().lower() != "ecx"
+            ):
+                i += 1
+                continue
+            if not self._flags_used_only_for_zf(out, i + 3):
+                i += 1
+                continue
+            indent = self._extract_indent(b.raw)
+            new_pop = Line(
+                raw=f"{indent}pop     ecx",
+                kind="instr",
+                op="pop",
+                operands="ecx",
+            )
+            out = out[:i] + [new_pop, c] + out[i + 3:]
+            self.stats["transfer_pop_cmp_collapse"] = (
+                self.stats.get("transfer_pop_cmp_collapse", 0) + 1
             )
             continue
         return out

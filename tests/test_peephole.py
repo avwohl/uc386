@@ -177,6 +177,78 @@ def test_stats_count_dead_after_terminator():
     assert opt.stats.get("dead_after_terminator", 0) == 2
 
 
+def test_dead_after_call_abort():
+    """`call _abort` is noreturn — code after is unreachable.
+    abort/exit/longjmp are recognized as terminators."""
+    asm = (
+        "_f:\n"
+        "        call    _abort\n"
+        "        xor     eax, eax\n"
+        "        mov     ebx, 1\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The xor and mov after call _abort should be dropped.
+    assert "xor     eax, eax" not in out
+    assert "mov     ebx, 1" not in out
+    # The label and following instructions are preserved.
+    assert ".epilogue:" in out
+    assert "leave" in out
+    assert opt.stats.get("dead_after_terminator", 0) >= 2
+
+
+def test_dead_after_call_exit():
+    """`call _exit` is noreturn."""
+    asm = (
+        "_f:\n"
+        "        push    0\n"
+        "        call    _exit\n"
+        "        add     esp, 4\n"
+        "        xor     eax, eax\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     esp, 4" not in out
+    assert "xor     eax, eax" not in out
+    assert ".epilogue:" in out
+
+
+def test_dead_after_call_builtin_unreachable():
+    """`call ___builtin_unreachable` is noreturn."""
+    asm = (
+        "_f:\n"
+        "        call    ___builtin_unreachable\n"
+        "        mov     eax, 1\n"
+        ".end:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, 1" not in out
+    assert opt.stats.get("dead_after_terminator", 0) >= 1
+
+
+def test_dead_after_call_returning_fn():
+    """A regular call (not in noreturn set) is NOT a terminator."""
+    asm = (
+        "_f:\n"
+        "        call    _foo\n"
+        "        mov     eax, 1\n"
+        ".end:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The mov must NOT be dropped — _foo might return.
+    assert "mov     eax, 1" in out
+
+
 def test_stats_count_jmp_to_next():
     asm = (
         "_f:\n"
@@ -281,7 +353,11 @@ def test_binop_collapse_skips_esp_relative_source():
     """`push eax` shifts ESP, so a subsequent `[esp + N]` read targets
     a different byte after collapse. Both binop_collapse and the
     later right_operand_retarget must skip — dropping the push/pop
-    scaffold changes which byte the [esp + N] reads."""
+    scaffold changes which byte the [esp + N] reads.
+
+    Use jl (reads SF/OF) instead of bare ret so transfer_pop_cmp_collapse
+    can't fire either; we want to confirm the ESP-relative source
+    blocks all collapses on this pattern."""
     asm = (
         "_f:\n"
         "        push    eax\n"
@@ -289,6 +365,9 @@ def test_binop_collapse_skips_esp_relative_source():
         "        mov     ecx, eax\n"
         "        pop     eax\n"
         "        cmp     eax, ecx\n"
+        "        jl      .L\n"
+        "        ret\n"
+        ".L:\n"
         "        ret\n"
     )
     opt = PeepholeOptimizer()
@@ -2173,6 +2252,29 @@ def test_cmp_load_collapse_chain_skips_eax_in_chain():
         "        mov     ecx, eax\n"  # reads EAX!
         "        cmp     eax, ecx\n"
         "        jne     .L\n"
+        "        ret\n"
+        ".L:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("cmp_load_collapse", 0) == 0
+
+
+def test_cmp_load_collapse_skips_chain_writes_to_sib_idx_reg():
+    """Regression: the source mem operand `[eax + ecx*4]` references
+    ECX in its addressing. A chain `pop ecx` writes to ECX, which the
+    collapsed cmp would re-read. The collapsed `cmp [eax + ecx*4], X`
+    would read from a different address. Must bail.
+
+    Reproduces a real bug from gcc-c-torture 20000422-1 where the
+    pattern fired and produced incorrect address arithmetic."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        pop     ecx\n"
+        "        cmp     eax, ecx\n"
+        "        je      .L\n"
         "        ret\n"
         ".L:\n"
         "        ret\n"
@@ -4800,6 +4902,188 @@ def test_transfer_pop_collapse_xor():
     assert "pop     ecx" in out
     assert "xor     eax, ecx" in out
     assert opt.stats.get("transfer_pop_collapse") == 1
+
+
+# ── transfer_pop_cmp_collapse ────────────────────────────────────
+
+
+def test_transfer_pop_cmp_collapse_jne():
+    """`mov ecx, eax; pop eax; cmp eax, ecx; jne L` → `pop ecx; cmp; jne L`.
+    ZF is symmetric, so jne sees the same outcome.
+
+    Use a multi-instruction chain so binop_collapse can't fire on
+    push/load/transfer/pop and consume the pattern."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        jne     .L_end\n"
+        "        mov     eax, 1\n"
+        ".L_end:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "pop     ecx" in out
+    assert "cmp     eax, ecx" in out
+    assert opt.stats.get("transfer_pop_cmp_collapse") == 1
+
+
+def test_transfer_pop_cmp_collapse_je():
+    """je is the symmetric inverse of jne — also safe."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        je      .L_eq\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+        ".L_eq:\n"
+        "        mov     eax, 1\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("transfer_pop_cmp_collapse") == 1
+
+
+def test_transfer_pop_cmp_collapse_skips_jl():
+    """jl reads SF and OF — flips when operand order swaps; skip."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        jl      .L_lt\n"
+        "        ret\n"
+        ".L_lt:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("transfer_pop_cmp_collapse", 0) == 0
+
+
+def test_transfer_pop_cmp_collapse_skips_jb():
+    """jb reads CF — flips when operand order swaps; skip."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        jb      .L_lt\n"
+        "        ret\n"
+        ".L_lt:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("transfer_pop_cmp_collapse", 0) == 0
+
+
+def test_transfer_pop_cmp_collapse_setne():
+    """setne reads only ZF — safe."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        setne   al\n"
+        "        movzx   eax, al\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("transfer_pop_cmp_collapse") == 1
+
+
+def test_transfer_pop_cmp_collapse_skips_setl():
+    """setl reads SF and OF — flip when operand order swaps; skip."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        setl    al\n"
+        "        movzx   eax, al\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("transfer_pop_cmp_collapse", 0) == 0
+
+
+def test_transfer_pop_cmp_collapse_chained_jne_safe():
+    """Multiple ZF-only readers between cmp and flag-clobber are safe."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        jne     .L_ne\n"
+        "        sete    al\n"
+        "        movzx   eax, al\n"
+        "        ret\n"
+        ".L_ne:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("transfer_pop_cmp_collapse") == 1
+
+
+def test_transfer_pop_cmp_collapse_skips_mixed_readers():
+    """If a non-ZF reader appears before a fence/clobber, skip."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        jne     .L_skip\n"
+        "        jl      .L_lt\n"
+        ".L_skip:\n"
+        "        ret\n"
+        ".L_lt:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("transfer_pop_cmp_collapse", 0) == 0
 
 
 # ── label_load_collapse ──────────────────────────────────────────
