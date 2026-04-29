@@ -8057,3 +8057,79 @@ def test_rmw_mem_src_collapse_other_reg():
     assert "mov     ecx, [ebp - 8]" in out
     assert "add     [ebp - 4], ecx" in out
     assert opt.stats.get("rmw_mem_src_collapse", 0) == 1
+
+
+def test_dead_stack_store_no_size_prefix_eax():
+    """`mov [ebp - 4], eax; mov [ebp - 4], eax` (no size prefix —
+    NASM infers dword from eax) — first store is dead. Common in
+    chained assigns like `y = x; y += 5; y *= 2;` where each
+    assignment to y is a register store with no explicit size."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     [ebp - 4], eax\n"
+        "        add     eax, 5\n"
+        "        mov     [ebp - 4], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The first `mov [ebp - 4], eax` is dead (overwritten by second).
+    # Both stores have no size prefix.
+    occurrences = out.count("mov     [ebp - 4], eax")
+    assert occurrences == 1, f"Expected 1 store, got {occurrences}: {out}"
+    assert opt.stats.get("dead_stack_store", 0) >= 1
+
+
+def test_dead_stack_store_no_size_prefix_ecx():
+    """Pattern works for any 32-bit GP register, not just eax."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 5\n"
+        "        mov     [ebp - 4], ecx\n"
+        "        mov     ecx, 10\n"
+        "        mov     [ebp - 4], ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    occurrences = out.count("mov     [ebp - 4], ecx")
+    assert occurrences == 1
+    assert opt.stats.get("dead_stack_store", 0) >= 1
+
+
+def test_dead_stack_store_no_size_prefix_skips_subreg():
+    """`mov [ebp - 4], al` (byte) → don't drop subsequent dword
+    store, since the sub-byte-write doesn't fully overwrite the
+    target slot. Conservative."""
+    asm = (
+        "_f:\n"
+        "        mov     [ebp - 4], al\n"  # byte store
+        "        mov     [ebp - 4], eax\n"  # dword store
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    # The byte store isn't recognized as a dword store, so
+    # dead_stack_store doesn't fire.
+    assert opt.stats.get("dead_stack_store", 0) == 0
+
+
+def test_dead_stack_store_chained_three_assigns():
+    """`y = x; y += 5; y *= 2;` — two intermediate stores die."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     [ebp - 4], eax\n"  # y = x (dead)
+        "        add     eax, 5\n"
+        "        mov     [ebp - 4], eax\n"  # y += 5 (dead)
+        "        imul    eax, 2\n"
+        "        mov     [ebp - 4], eax\n"  # y *= 2 (live - final)
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Only the FINAL store survives.
+    occurrences = out.count("mov     [ebp - 4], eax")
+    assert occurrences == 1, f"Expected 1 final store, got {occurrences}"
+    assert opt.stats.get("dead_stack_store", 0) >= 2

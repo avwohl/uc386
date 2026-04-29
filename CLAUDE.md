@@ -1343,3 +1343,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Sample fire rate**: 2 of 200 random torture tests. Modest but real, with the cascade benefit being where the bigger savings come from.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +10 peephole tests (905 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: dead_stack_store extended for sizeless register stores**: the existing `dead_stack_store` pass required an explicit size prefix in `mov dword [ebp ± N], V`. But the codegen often emits the register form `mov [ebp ± N], reg` WITHOUT a size prefix (NASM infers size from the source register). These dead stores weren't being detected. Extended `_stack_store_offset` to also recognize the no-size-prefix form when the source is a 32-bit GP register (sub-registers are conservatively skipped to avoid partial-overwrite confusion).
+  - **Concrete impact**: chained statement assigns like `y = x; y += 5; y *= 2;` lower to three back-to-back `mov [ebp - 4], eax` stores. Before this extension, the first two stores survived as dead code. After: all but the final store are dropped. Saves ~3 bytes per dead intermediate store.
+  - **Sample fire rate**: 2 of 200 random torture tests with this extension. Modest direct impact, but cleaner code (and removes an obvious "why is this dead store still here" issue when reading codegen output).
+  - **Why this matters**: dead_stack_store's job is to catch dead intermediate stores. The codegen sometimes produces them (chained assigns, struct init followed by member overwrite). The pass was working for size-prefixed stores (struct-init `mov dword [m], imm` form) but missing the register-store case. Now both are handled.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests (909 total). Pipeline 1734/1734 (100%).

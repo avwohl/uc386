@@ -8089,25 +8089,52 @@ class PeepholeOptimizer:
 
     @staticmethod
     def _stack_store_offset(line: Line) -> int | None:
-        """If `line` is `mov <size> [ebp ± N], SRC`, return N.
-        Otherwise None."""
+        """If `line` is `mov [ebp ± N], SRC`, return N. The size
+        prefix (`dword`/`word`/`byte`/`qword`) is optional — when
+        omitted, NASM infers the size from the source register
+        (eax/ax/al/ah). Without size and with non-register source,
+        we can't infer; return None.
+
+        Otherwise None.
+        """
         if line.kind != "instr" or line.op != "mov":
             return None
         parts = _operands_split(line.operands)
         if parts is None:
             return None
         dest = parts[0].strip()
+        # Form 1: with explicit size prefix.
         m = re.match(
             r"^(dword|word|byte|qword)\s+\[\s*ebp\s*([+-])\s*(\d+)\s*\]$",
             dest,
             re.IGNORECASE,
         )
-        if m is None:
-            return None
-        n = int(m.group(3))
-        if m.group(2) == "-":
-            n = -n
-        return n
+        if m is not None:
+            n = int(m.group(3))
+            if m.group(2) == "-":
+                n = -n
+            return n
+        # Form 2: no size prefix — `mov [ebp ± N], SRC` where SRC is
+        # a register or a label (label means imm32 → dword, but NASM
+        # actually requires size for that case; in practice the
+        # codegen only emits sizeless form for register sources).
+        m = re.match(
+            r"^\[\s*ebp\s*([+-])\s*(\d+)\s*\]$",
+            dest,
+            re.IGNORECASE,
+        )
+        if m is not None:
+            # Check that the source is a register (size inferred).
+            src = parts[1].strip()
+            if src.lower() in PeepholeOptimizer._GP32:
+                # 32-bit reg → dword store.
+                n = int(m.group(2))
+                if m.group(1) == "-":
+                    n = -n
+                return n
+            # Sub-register → word/byte store; partial overwrites
+            # don't fully kill the prior dword. Conservative: skip.
+        return None
 
     def _dead_stack_store_check(
         self, lines: list[Line], start_idx: int, target_offset: int,
