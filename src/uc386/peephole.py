@@ -108,6 +108,11 @@ Currently implements:
     relative addressing; the original mov+push is 4 bytes. Saves 1
     byte per match. Common in cdecl call-site arg setup, where the
     intermediate register is dead after the push.
+  - jcc_jmp_inversion: collapse `jcc L1; jmp L2; L1:` into
+    `j!cc L2; L1:` (with the cc inverted). Saves 5 bytes per match —
+    drops the unconditional jmp. Common in `if-else` and ternary
+    lowering where one branch is just a fallthrough to L2 after
+    redundant_eax_load eliminates the only instruction.
   - narrowing_load_test_collapse: collapse
     `movsx/movzx eax, byte [SRC]; test eax, eax` into
     `cmp byte [SRC], 0` (and likewise for word). The narrowing load
@@ -350,6 +355,7 @@ class PeepholeOptimizer:
             lines = self._pass_add_one_to_inc(lines)
             lines = self._pass_redundant_test_collapse(lines)
             lines = self._pass_narrowing_load_test_collapse(lines)
+            lines = self._pass_jcc_jmp_inversion(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -3065,6 +3071,98 @@ class PeepholeOptimizer:
             if ln.kind in ("label", "directive", "data"):
                 return None
         return None
+
+    def _pass_jcc_jmp_inversion(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``jcc L1; jmp L2; L1:`` into ``j!cc L2; L1:`` —
+        invert the condition and drop the unconditional jmp. The
+        ``L1:`` label can stay (harmless) or be dropped if no other
+        code references it; we leave it in place for simplicity.
+
+        Saves 5 bytes per match (the dropped `jmp imm32` is 5 bytes;
+        a short `jmp imm8` is 2 bytes — either way, dropping the jmp
+        is a strict win).
+
+        Common in if-else / ternary lowering where one arm collapses
+        to a fall-through after `redundant_eax_load`:
+            jle .L1_false
+            jmp .L_end          ; branch when fallthrough = "true case"
+            .L1_false:
+            mov eax, [b]        ; "false case"
+            .L_end:
+        becomes:
+            jg .L_end             ; invert condition
+            .L1_false:           ; harmless leftover
+            mov eax, [b]
+            .L_end:
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            # Match jcc.
+            if (
+                line.kind == "instr"
+                and line.op.startswith("j")
+                and line.op != "jmp"
+                and line.op[1:] in self._CC_INVERSE
+            ):
+                cc = line.op[1:]
+                jcc_target = line.operands.strip()
+                # Look for the next instr line (skip blanks/comments).
+                j_idx = i + 1
+                while (
+                    j_idx < len(lines)
+                    and lines[j_idx].kind in ("blank", "comment")
+                ):
+                    j_idx += 1
+                if (
+                    j_idx < len(lines)
+                    and lines[j_idx].kind == "instr"
+                    and lines[j_idx].op == "jmp"
+                ):
+                    jmp_line = lines[j_idx]
+                    jmp_target = jmp_line.operands.strip()
+                    # Look for the label after the jmp.
+                    k_idx = j_idx + 1
+                    while (
+                        k_idx < len(lines)
+                        and lines[k_idx].kind in ("blank", "comment")
+                    ):
+                        k_idx += 1
+                    if (
+                        k_idx < len(lines)
+                        and lines[k_idx].kind == "label"
+                        and lines[k_idx].label == jcc_target
+                    ):
+                        # Match! Rewrite jcc with inverted CC and
+                        # the jmp's target.
+                        inv_cc = self._CC_INVERSE[cc]
+                        indent = self._extract_indent(line.raw)
+                        new_op = f"j{inv_cc}"
+                        spacer = " " * max(8 - len(new_op), 1)
+                        new_raw = (
+                            f"{indent}{new_op}{spacer}{jmp_target}"
+                        )
+                        new_line = Line(
+                            raw=new_raw,
+                            kind="instr",
+                            op=new_op,
+                            operands=jmp_target,
+                        )
+                        out.append(new_line)
+                        # Drop the jmp (between i and j_idx, also
+                        # drop any blanks/comments between).
+                        # Keep the label and continue from there.
+                        self.stats["jcc_jmp_inversion"] = (
+                            self.stats.get("jcc_jmp_inversion", 0) + 1
+                        )
+                        i = j_idx + 1
+                        continue
+            out.append(line)
+            i += 1
+        return out
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
         """P-jmp-to-next: `jmp X` immediately (modulo blanks/comments)

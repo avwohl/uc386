@@ -2832,6 +2832,117 @@ def test_narrowing_load_test_collapse_skips_full_dword_load():
     assert opt.stats.get("cmp_load_collapse", 0) == 1
 
 
+# ── jcc_jmp_inversion ────────────────────────────────────────────
+
+
+def test_jcc_jmp_inversion_basic():
+    """`jle L1; jmp L2; L1:` → `jg L2; L1:`."""
+    asm = (
+        "_f:\n"
+        "        cmp     eax, ebx\n"
+        "        jle     .L1\n"
+        "        jmp     .L2\n"
+        ".L1:\n"
+        "        mov     eax, ebx\n"
+        ".L2:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "jg      .L2" in out
+    assert "jmp     .L2" not in out
+    assert opt.stats.get("jcc_jmp_inversion") == 1
+
+
+def test_jcc_jmp_inversion_je_to_jne():
+    """`je L1; jmp L2; L1:` → `jne L2; L1:`."""
+    asm = (
+        "_f:\n"
+        "        cmp     eax, 0\n"
+        "        je      .L1\n"
+        "        jmp     .L2\n"
+        ".L1:\n"
+        "        mov     eax, 1\n"
+        ".L2:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "jne     .L2" in out
+    assert opt.stats.get("jcc_jmp_inversion") == 1
+
+
+def test_jcc_jmp_inversion_jb_to_jae():
+    """Unsigned: `jb L1; jmp L2; L1:` → `jae L2; L1:`."""
+    asm = (
+        "_f:\n"
+        "        cmp     eax, ebx\n"
+        "        jb      .L1\n"
+        "        jmp     .L2\n"
+        ".L1:\n"
+        "        mov     eax, 1\n"
+        ".L2:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "jae     .L2" in out
+    assert opt.stats.get("jcc_jmp_inversion") == 1
+
+
+def test_jcc_jmp_inversion_skips_when_label_not_target():
+    """The label after jmp must match the jcc's target."""
+    asm = (
+        "_f:\n"
+        "        cmp     eax, ebx\n"
+        "        jle     .L1\n"
+        "        jmp     .L2\n"
+        ".OTHER:\n"  # not L1 — pattern shouldn't match
+        "        mov     eax, ebx\n"
+        ".L2:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("jcc_jmp_inversion", 0) == 0
+
+
+def test_jcc_jmp_inversion_tolerates_blanks_between():
+    """Blanks/comments between jcc, jmp, and label are OK."""
+    asm = (
+        "_f:\n"
+        "        cmp     eax, ebx\n"
+        "        jle     .L1\n"
+        "        ; comment\n"
+        "        jmp     .L2\n"
+        "        ; another comment\n"
+        ".L1:\n"
+        "        mov     eax, ebx\n"
+        ".L2:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "jg      .L2" in out
+    assert opt.stats.get("jcc_jmp_inversion") == 1
+
+
+def test_jcc_jmp_inversion_skips_jmp_jmp():
+    """Two consecutive jmp's aren't a jcc-jmp pattern."""
+    asm = (
+        "_f:\n"
+        "        jmp     .L1\n"
+        "        jmp     .L2\n"
+        ".L1:\n"
+        "        ret\n"
+        ".L2:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("jcc_jmp_inversion", 0) == 0
+
+
 # ── redundant_eax_load: read-only ops + jcc fall-through ─────────
 
 

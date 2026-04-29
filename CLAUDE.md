@@ -1042,3 +1042,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - Verified end-to-end on `int max(int a, int b) { return a > b ? a : b; }` — the `mov eax, [ebp+8]; cmp eax, [ebp+12]; jle .else; mov eax, [ebp+8]; jmp .end; .else: ...` chain now drops the second load. Saves 3 bytes per qualifying ternary.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (178 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: jcc_jmp_inversion**: collapse `jcc L1; jmp L2; L1:` into `j!cc L2; L1:` — invert the condition and drop the unconditional jmp. Saves 5 bytes per match (the dropped `jmp imm32` is 5 bytes; `jmp imm8` is 2; either way, dropping is a strict win).
+  - **Common shape**: ternary `cond ? a : b` lowering. After `redundant_eax_load` drops the redundant load on the true branch, the true branch becomes empty (just a `jmp .L_end`). The result is `jle .L_else; jmp .L_end; .L_else: <code>; .L_end:` — exactly the inversion target. Now collapses to `jg .L_end; .L_else: <code>; .L_end:`.
+  - The `.L_else:` label is left in place (harmless — no other reference, but dropping it would require label-reference counting which isn't worth the complexity).
+  - Combined with redundant_eax_load slice: `int max(int a, int b) { return a > b ? a : b; }` previously took ~12 instructions, now takes 7 (saving 8 bytes per qualifying ternary).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (184 total). Pipeline 1734/1734 (100%).
