@@ -4268,6 +4268,99 @@ def test_zero_init_collapse_single_store():
     assert opt.stats.get("zero_init_collapse") == 1
 
 
+def test_dual_zero_init_consolidate_basic():
+    """Pattern `xor eax, eax; xor edx, edx; mov [m1], eax; mov [m2], edx`
+    consolidates to `xor eax, eax; mov [m1], eax; mov [m2], eax`. The
+    `xor edx, edx` is dropped because EDX is dead after the chain
+    (overwritten by `mov edx, X` later)."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        xor     edx, edx\n"
+        "        mov     [ebp - 8], eax\n"
+        "        mov     [ebp - 4], edx\n"
+        "        mov     edx, 1\n"  # overwrites edx (dead before)
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     edx, edx" not in out
+    assert "mov     [ebp - 4], eax" in out
+    assert opt.stats.get("dual_zero_init_consolidate") == 1
+
+
+def test_dual_zero_init_consolidate_chain_of_stores():
+    """Multiple LL inits in a row: 6 stores from 2 xor regs collapse
+    to 6 stores from 1 xor reg."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        xor     edx, edx\n"
+        "        mov     [ebp - 8], eax\n"
+        "        mov     [ebp - 4], edx\n"
+        "        mov     [ebp - 16], eax\n"
+        "        mov     [ebp - 12], edx\n"
+        "        mov     [ebp - 24], eax\n"
+        "        mov     [ebp - 20], edx\n"
+        "        mov     edx, 1\n"  # witness
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     edx, edx" not in out
+    # All 3 EDX stores rewritten to use EAX.
+    assert out.count("eax\n") >= 6
+
+
+def test_dual_zero_init_consolidate_skips_when_edx_live_at_ret():
+    """If EDX is live at ret (might be LL return value), don't drop the
+    xor."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        xor     edx, edx\n"
+        "        mov     [ebp - 8], eax\n"
+        "        mov     [ebp - 4], edx\n"
+        "        ret\n"  # ret reads EDX (LL return value possible)
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     edx, edx" in out
+    assert opt.stats.get("dual_zero_init_consolidate", 0) == 0
+
+
+def test_dual_zero_init_consolidate_skips_when_no_edx_store():
+    """If the chain has only EAX stores, no consolidation needed."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        xor     edx, edx\n"
+        "        mov     [ebp - 8], eax\n"
+        "        mov     edx, 1\n"  # not a store of edx
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("dual_zero_init_consolidate", 0) == 0
+
+
+def test_dual_zero_init_consolidate_skips_when_chain_breaks():
+    """If a non-store instruction appears between the xors and the
+    desired stores, the chain breaks. Bail."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        xor     edx, edx\n"
+        "        add     eax, 5\n"  # breaks the chain
+        "        mov     [ebp - 8], eax\n"
+        "        mov     [ebp - 4], edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("dual_zero_init_consolidate", 0) == 0
+
+
 def test_zero_init_collapse_recognizes_hex_zero():
     """`mov dword [m], 0x00000000` is the same as `mov dword [m], 0` —
     the codegen sometimes emits the hex form. Both should fire

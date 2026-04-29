@@ -419,6 +419,7 @@ class PeepholeOptimizer:
             lines = self._pass_jcc_jmp_inversion(lines)
             lines = self._pass_zero_init_collapse(lines)
             lines = self._pass_redundant_xor_zero(lines)
+            lines = self._pass_dual_zero_init_consolidate(lines)
             lines = self._pass_compound_assign_collapse(lines)
             lines = self._pass_index_load_collapse(lines)
             lines = self._pass_index_load_collapse_label(lines)
@@ -6018,6 +6019,152 @@ class PeepholeOptimizer:
                     zero_regs.discard(r)
             out.append(line)
         return out
+
+    def _pass_dual_zero_init_consolidate(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Consolidate `xor REG_A, REG_A; xor REG_B, REG_B; <stores from
+        REG_A or REG_B>` into a single xor + stores all using REG_A.
+
+        Common after long-long zero init: codegen emits
+            xor eax, eax
+            xor edx, edx
+            mov [m1], eax
+            mov [m2], edx
+            mov [m3], eax
+            mov [m4], edx
+            ...
+        REG_B (= EDX in the LL case) holds 0 from the second xor, but
+        any other zero reg can serve the same stores. After rewriting
+        all `mov [m], REG_B` to `mov [m], REG_A`, the second xor is
+        dead — drop it.
+
+        Saves 2 bytes per fire (the dropped xor).
+
+        Conditions for the rewrite chain (after the two xors):
+        - Each line is `mov [m], REG_A` or `mov [m], REG_B` (no other
+          ops, no other regs).
+        - Chain ends at the next non-matching instruction OR at any
+          control-flow boundary (label, jump, call, ret).
+        - REG_B is dead after the chain (no forward uses in the basic
+          block). The exact subsequent value of REG_B doesn't matter;
+          if it gets read before being written, that read would have
+          gotten 0 from the now-dropped xor — so we conservatively bail
+          when there's any read.
+        """
+        out = list(lines)
+        i = 0
+        while i < len(out):
+            # Find an `xor REG_A, REG_A` line.
+            line_a = out[i]
+            reg_a = self._xor_reg_self(line_a)
+            if reg_a is None:
+                i += 1
+                continue
+            # Find the next instr line; must be `xor REG_B, REG_B`.
+            j = i + 1
+            while j < len(out) and out[j].kind in ("blank", "comment"):
+                j += 1
+            if j >= len(out):
+                i += 1
+                continue
+            line_b = out[j]
+            reg_b = self._xor_reg_self(line_b)
+            if reg_b is None or reg_b == reg_a:
+                i += 1
+                continue
+            # Walk forward collecting `mov [m], REG_A` or `mov [m], REG_B`
+            # stores. Stop at any other instruction.
+            k = j + 1
+            store_indices = []
+            uses_reg_b = False
+            while k < len(out):
+                ln = out[k]
+                if ln.kind in ("blank", "comment"):
+                    k += 1
+                    continue
+                if ln.kind != "instr":
+                    break
+                if not (ln.op == "mov"
+                        and self._is_store_from_reg(ln, reg_a, reg_b)):
+                    break
+                # Track whether this store reads REG_B.
+                parts = _operands_split(ln.operands)
+                if parts is not None:
+                    _dest, src = parts
+                    if src.strip().lower() == reg_b:
+                        uses_reg_b = True
+                store_indices.append(k)
+                k += 1
+            # Need at least one `mov [m], REG_B` to make the rewrite
+            # worthwhile (else there's nothing to consolidate).
+            if not uses_reg_b:
+                i += 1
+                continue
+            # Check REG_B is dead after the chain.
+            if not self._reg_dead_after(out, k, reg_b):
+                i += 1
+                continue
+            # Rewrite each store-from-REG_B to use REG_A.
+            for idx in store_indices:
+                ln = out[idx]
+                parts = _operands_split(ln.operands)
+                if parts is None:
+                    continue
+                dest, src = parts
+                if src.strip().lower() != reg_b:
+                    continue
+                indent = self._extract_indent(ln.raw)
+                new_raw = f"{indent}mov     {dest.strip()}, {reg_a}"
+                out[idx] = Line(
+                    raw=new_raw, kind="instr", op="mov",
+                    operands=f"{dest.strip()}, {reg_a}",
+                )
+            # Drop the `xor REG_B, REG_B` at index j.
+            del out[j]
+            self.stats["dual_zero_init_consolidate"] = (
+                self.stats.get("dual_zero_init_consolidate", 0) + 1
+            )
+            # Advance past the rewritten chain.
+            i = j  # j now points to first store (or next line)
+        return out
+
+    @staticmethod
+    def _xor_reg_self(line: Line) -> str | None:
+        """Return reg name (lowercase) if this is `xor reg, reg` for a
+        GP32 reg, else None."""
+        if line.kind != "instr" or line.op != "xor":
+            return None
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return None
+        a, b = parts
+        al = a.strip().lower()
+        bl = b.strip().lower()
+        if al == bl and al in {
+            "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp",
+        }:
+            return al
+        return None
+
+    @staticmethod
+    def _is_store_from_reg(line: Line, *regs: str) -> bool:
+        """Return True if this is `mov [<addr>], <reg>` where reg is
+        one of the given GP32 regs (case-insensitive)."""
+        if line.kind != "instr" or line.op != "mov":
+            return False
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return False
+        dest, src = parts
+        dest_text = dest.strip()
+        if "[" not in dest_text or not dest_text.endswith("]"):
+            return False
+        # Strip optional size keyword.
+        if dest_text.lower().startswith(("byte ", "word ", "dword ", "qword ")):
+            return False  # sub-word stores excluded (different reg)
+        src_low = src.strip().lower()
+        return src_low in {r.lower() for r in regs}
 
     # Commutative two-operand binops where `OP eax, ecx` and
     # `OP ecx, eax` produce identical EAX results. imul (two-operand
