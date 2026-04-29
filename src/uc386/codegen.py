@@ -3251,11 +3251,42 @@ class CodeGenerator:
 
         body = self._compound(fn.body, ctx)
 
+        # `-finstrument-functions`: gating flag computed up front so
+        # `skip_frame` can see it. Body emission (later) re-uses this.
+        instrument = (
+            getattr(self, "_instrument_enabled", False)
+            and fn.name not in self._instrument_no_skip
+        )
+        # Skip the EBP frame when nothing in the body actually uses
+        # it: no params (would be at [ebp + N]), no locals (would be
+        # at [ebp - N]), no VLAs (need ESP cleanup via `mov esp, ebp`),
+        # no nested-fn trampoline (uses ECX→[ebp]-relative static link),
+        # no instrumentation (pushes [ebp + 4] for caller addr), and
+        # not returning a struct/complex/vector/int128 (those use a
+        # hidden retptr param at [ebp + 8] via the cdecl-style ABI).
+        # Saves 4 bytes per qualifying function (push ebp, mov ebp esp,
+        # leave).
+        rt = fn.return_type
+        uses_retptr = (
+            isinstance(rt, ast.StructType)
+            or isinstance(rt, ast.ComplexType)
+            or isinstance(rt, ast.ArrayType)  # vectors
+            or (isinstance(rt, ast.BasicType) and rt.name == "int128")
+        )
+        skip_frame = (
+            ctx.frame_size == 0
+            and not ctx.has_vla
+            and len(fn.params) == 0
+            and ctx.trampoline_static_link_disp is None
+            and not instrument
+            and not uses_retptr
+        )
         out = [f"_{fn.name}:"]
-        out.append("        push    ebp")
-        out.append("        mov     ebp, esp")
-        if ctx.frame_size:
-            out.append(f"        sub     esp, {ctx.frame_size}")
+        if not skip_frame:
+            out.append("        push    ebp")
+            out.append("        mov     ebp, esp")
+            if ctx.frame_size:
+                out.append(f"        sub     esp, {ctx.frame_size}")
         # Lifted nested fn with nonlocal gotos: ECX was set by the
         # trampoline (or direct caller) to the address of our outer's
         # buf-array. Save it into the static-link slot before any code
@@ -3373,10 +3404,7 @@ class CodeGenerator:
                 out.append("        test    eax, eax")
                 out.append(f"        jnz     {user_target}")
         # `-finstrument-functions`: enter call after prologue setup.
-        instrument = (
-            getattr(self, "_instrument_enabled", False)
-            and fn.name not in self._instrument_no_skip
-        )
+        # `instrument` was already computed before the prologue.
         if instrument:
             out.append("        push    dword [ebp + 4]")
             out.append(f"        push    _{fn.name}")
@@ -3428,8 +3456,9 @@ class CodeGenerator:
             out.append("        add     esp, 8")
             out += ret_restore
         # `mov esp, ebp` reclaims any sub-esp-allocated VLA storage.
-        out.append("        mov     esp, ebp")
-        out.append("        pop     ebp")
+        if not skip_frame:
+            out.append("        mov     esp, ebp")
+            out.append("        pop     ebp")
         out.append("        ret")
         return out
 

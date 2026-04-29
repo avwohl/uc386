@@ -921,3 +921,6 @@ See `README.md` for the public roadmap (Phase 0–6).
   - Hello-world: 95 → 91 bytes (4 bytes via push_immediate's 1-byte saving + dead_after_terminator's 3-byte xor elimination).
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +5 peephole tests (51 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Skip EBP frame for trivial leaf functions**: when a function has no params, no locals, no VLAs, no nested-fn trampoline, no instrumentation, and doesn't return a struct/complex/vector/int128 (which use the retptr ABI requiring [ebp + 8] access), skip the entire `push ebp; mov ebp, esp; ... mov esp, ebp; pop ebp` frame. Saves 4 bytes per qualifying function. 4 torture failures during integration (`pr43784`, `20020810-1`, `20131127-1`, `pr60017`) — all struct-returning functions with no source-level params; the codegen emits a hidden `__retptr__` param that lives at [ebp + 8] which my predicate hadn't excluded. Fix: also gate on the retptr-using return types. Hello-world: 91 → 87 bytes (`_main` no longer has a frame; just `push _str; call _printf; add esp, 4; mov eax, 0; ret`).
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. Pipeline 1734/1734 (100%).
