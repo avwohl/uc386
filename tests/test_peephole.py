@@ -1589,6 +1589,60 @@ def test_mov_zero_to_xor_skips_nonzero_immediate():
     assert opt.stats.get("mov_zero_to_xor", 0) == 0
 
 
+def test_mov_zero_to_xor_recognizes_hex_zero():
+    """`mov edx, 0x00000000` is the same as `mov edx, 0`. The codegen's
+    long-long path emits the hex form for zero high-halves; we should
+    recognize and rewrite it the same way."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, 0x00000000\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     edx, edx" in out
+    assert opt.stats.get("mov_zero_to_xor", 0) == 1
+
+
+def test_mov_zero_to_xor_recognizes_short_hex_zero():
+    """`mov eax, 0x0` should also recognize."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 0x0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     eax, eax" in out
+    assert opt.stats.get("mov_zero_to_xor", 0) == 1
+
+
+def test_mov_zero_to_xor_recognizes_uppercase_hex_zero():
+    """`mov ebx, 0X00` (uppercase X) should also recognize."""
+    asm = (
+        "_f:\n"
+        "        mov     ebx, 0X00\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     ebx, ebx" in out
+    assert opt.stats.get("mov_zero_to_xor", 0) == 1
+
+
+def test_mov_zero_to_xor_skips_nonzero_hex_immediate():
+    """`mov eax, 0x00000001` is NOT zero — must NOT rewrite."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 0x00000001\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, 0x00000001" in out
+    assert opt.stats.get("mov_zero_to_xor", 0) == 0
+
+
 # ── store_load_collapse ──────────────────────────────────────────
 
 
@@ -4212,6 +4266,39 @@ def test_zero_init_collapse_single_store():
     assert "xor     eax, eax" in out
     assert "mov     [ebp - 4], eax" in out
     assert opt.stats.get("zero_init_collapse") == 1
+
+
+def test_zero_init_collapse_recognizes_hex_zero():
+    """`mov dword [m], 0x00000000` is the same as `mov dword [m], 0` —
+    the codegen sometimes emits the hex form. Both should fire
+    zero_init_collapse the same way."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 8], 0x00000000\n"
+        "        mov     dword [ebp - 4], 0x00000000\n"
+        "        mov     eax, 1\n"  # witness
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     eax, eax" in out
+    assert "mov     [ebp - 8], eax" in out
+    assert "mov     [ebp - 4], eax" in out
+    assert opt.stats.get("zero_init_collapse") == 2
+
+
+def test_zero_init_collapse_skips_nonzero_hex():
+    """`mov dword [m], 0x00000001` is NOT zero — must NOT rewrite."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 4], 0x00000001\n"
+        "        mov     eax, 1\n"  # witness
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     dword [ebp - 4], 0x00000001" in out
+    assert opt.stats.get("zero_init_collapse", 0) == 0
 
 
 def test_zero_init_collapse_byte_form():

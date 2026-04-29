@@ -1527,15 +1527,28 @@ class PeepholeOptimizer:
     @staticmethod
     def _mov_reg_zero(line: Line) -> str | None:
         """Return the register name if this is `mov <gp32-reg>, 0`,
-        else None."""
+        else None.
+
+        Recognizes both decimal `0` and hex `0x0` / `0x00000000` forms.
+        The codegen sometimes emits the hex form (notably the long-long
+        path's high-half clear `mov edx, 0x00000000`).
+        """
         if line.kind != "instr" or line.op != "mov":
             return None
         parts = _operands_split(line.operands)
         if parts is None:
             return None
         dest, src = parts
-        if src.strip() != "0":
-            return None
+        src_text = src.strip()
+        if src_text != "0":
+            # Hex zero: 0x followed by all-zero digits.
+            low = src_text.lower()
+            if not (
+                low.startswith("0x")
+                and len(low) > 2
+                and all(c == "0" for c in low[2:])
+            ):
+                return None
         dest_lower = dest.lower()
         if dest_lower in {"eax", "ebx", "ecx", "edx",
                           "esi", "edi", "ebp"}:
@@ -4844,15 +4857,27 @@ class PeepholeOptimizer:
     def _is_zero_imm_store(line: Line) -> bool:
         """Return True if this is ``mov <byte|word|dword> [m], 0``.
         Only sized memory destinations are recognized (NASM requires
-        the size keyword for memory + immediate stores)."""
+        the size keyword for memory + immediate stores).
+
+        Recognizes both decimal `0` and hex `0x0` / `0x00000000` forms
+        for the source — the codegen sometimes emits hex zero (notably
+        in long-long zero-init patterns).
+        """
         if line.kind != "instr" or line.op != "mov":
             return False
         parts = _operands_split(line.operands)
         if parts is None:
             return False
         dest, src = parts
-        if src.strip() != "0":
-            return False
+        src_text = src.strip()
+        if src_text != "0":
+            low = src_text.lower()
+            if not (
+                low.startswith("0x")
+                and len(low) > 2
+                and all(c == "0" for c in low[2:])
+            ):
+                return False
         m = re.match(
             r"^(byte|word|dword)\s+\[.*\]\s*$",
             dest.strip(),
