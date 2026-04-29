@@ -401,6 +401,8 @@ class PeepholeOptimizer:
             lines = self._pass_push_index_collapse(lines)
             lines = self._pass_self_mov_elimination(lines)
             lines = self._pass_transfer_pop_collapse(lines)
+            lines = self._pass_label_load_collapse(lines)
+            lines = self._pass_value_forward_to_reg(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -4251,6 +4253,219 @@ class PeepholeOptimizer:
             out = out[:i] + [new_pop, c] + out[i + 3:]
             self.stats["transfer_pop_collapse"] = (
                 self.stats.get("transfer_pop_collapse", 0) + 1
+            )
+            continue
+        return out
+
+    def _pass_label_load_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``mov REG1, LABEL; mov REG2, [REG1]`` into
+        ``mov REG2, [LABEL]`` using x86's disp32 absolute addressing.
+
+        Saves 1 byte per match (5+2=7 bytes → 6 bytes for disp32-
+        absolute mov). Common in global-variable access where the
+        codegen emits a label load followed by a deref.
+
+        Also handles the scaled-index case:
+        ``mov REG1, LABEL; mov REG2, [REG1 + IDX*SCALE]`` →
+        ``mov REG2, [LABEL + IDX*SCALE]``. Saves 1 byte (drops the
+        REG1 load; the SIB-form mov adds disp32 to the addressing
+        mode).
+
+        Conditions:
+        - Two consecutive instr lines.
+        - Line A: ``mov REG1, LABEL`` where LABEL is a non-numeric,
+          non-memory expression (label or label-arithmetic).
+        - Line B: ``mov REG2, [REG1]`` or ``mov REG2, [REG1 + IDX*SCALE]``
+          (no offset on REG1).
+        - REG1 either == REG2 (overwritten by the load) or dead
+          after Line B.
+        """
+        out = list(lines)
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op == "mov"
+                and b.kind == "instr" and b.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            if ap is None or bp is None:
+                i += 1
+                continue
+            r1 = ap[0].strip().lower()
+            label = ap[1].strip()
+            r2 = bp[0].strip().lower()
+            src = bp[1].strip()
+            if (
+                not self._is_general_register(r1)
+                or not self._is_general_register(r2)
+            ):
+                i += 1
+                continue
+            # LABEL must not be a number, register, or memory ref.
+            if (
+                "[" in label
+                or self._is_general_register(label.lower())
+            ):
+                i += 1
+                continue
+            try:
+                int(label)
+                # numeric — that's `mov reg, IMM`. Not a label.
+                i += 1
+                continue
+            except ValueError:
+                pass
+            # Source: `[REG1]` or `[REG1 + IDX*SCALE]`. Strip size.
+            src_stripped = src
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if src_stripped.lower().startswith(prefix):
+                    src_stripped = src_stripped[
+                        len(prefix):
+                    ].lstrip()
+                    break
+            # Plain `[REG1]`.
+            m_plain = re.match(
+                r"^\[\s*([a-zA-Z]+)\s*\]$", src_stripped
+            )
+            # SIB form `[REG1 + IDX*SCALE]`.
+            m_sib = re.match(
+                r"^\[\s*([a-zA-Z]+)\s*\+\s*"
+                r"([a-zA-Z]+)\s*\*\s*([1248])\s*\]$",
+                src_stripped,
+            )
+            if m_plain:
+                base = m_plain.group(1).lower()
+                sib_tail = ""
+            elif m_sib:
+                base = m_sib.group(1).lower()
+                idx = m_sib.group(2).lower()
+                scale = m_sib.group(3)
+                # Don't fire when idx == r1 (the SIB also references
+                # r1). Reordering: if idx is the label-loaded reg, we
+                # can't rewrite — the index would be the label value.
+                if idx == r1:
+                    i += 1
+                    continue
+                sib_tail = f" + {idx}*{scale}"
+            else:
+                i += 1
+                continue
+            if base != r1:
+                i += 1
+                continue
+            # Liveness: r1 dead after B (or r1 == r2).
+            if r1 != r2 and not self._reg_dead_after(
+                out, i + 2, r1
+            ):
+                i += 1
+                continue
+            # Build rewrite: `mov r2, [LABEL[+ idx*scale]]`.
+            indent = self._extract_indent(b.raw)
+            new_src = f"[{label}{sib_tail}]"
+            new_raw = f"{indent}mov     {r2}, {new_src}"
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op="mov",
+                operands=f"{r2}, {new_src}",
+            )
+            out = out[:i] + [new_line] + out[i + 2:]
+            self.stats["label_load_collapse"] = (
+                self.stats.get("label_load_collapse", 0) + 1
+            )
+            continue
+        return out
+
+    def _pass_value_forward_to_reg(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``mov REG1, SRC; mov REG2, REG1`` into
+        ``mov REG2, SRC`` when REG1 is dead after.
+
+        Saves 2 bytes per match (drops the `mov reg2, reg1` transfer;
+        the new `mov reg2, SRC` is the same length as the original
+        `mov reg1, SRC`).
+
+        Common after label_offset_fold leaves
+        ``mov eax, _label + N; mov ebx, eax`` — the first instruction's
+        value is being forwarded through EAX to EBX, but EAX is dead
+        after.
+
+        Conditions:
+        - Two consecutive instr lines.
+        - Line A: ``mov REG1, SRC`` where SRC is not a memory operand
+          (immediates, labels, label-arithmetic, register sources).
+        - Line B: ``mov REG2, REG1`` (register copy).
+        - REG1 != REG2 (else line B is a self-mov, handled by
+          self_mov_elimination).
+        - REG1 dead after line B.
+        """
+        out = list(lines)
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op == "mov"
+                and b.kind == "instr" and b.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            if ap is None or bp is None:
+                i += 1
+                continue
+            r1 = ap[0].strip().lower()
+            src = ap[1].strip()
+            b_dst = bp[0].strip().lower()
+            b_src = bp[1].strip().lower()
+            if (
+                not self._is_general_register(r1)
+                or not self._is_general_register(b_dst)
+            ):
+                i += 1
+                continue
+            # Line B must be a register copy from r1.
+            if b_src != r1 or b_dst == r1:
+                i += 1
+                continue
+            # SRC must NOT be a memory operand. Memory sources work
+            # in principle but x86 doesn't have a `mov [m], [m]` form;
+            # `mov ebx, [m]` is the same length as `mov eax, [m]`, so
+            # no savings issue, BUT the pass would collide with
+            # store_load_collapse and others. Keep simple.
+            if "[" in src:
+                i += 1
+                continue
+            # SRC must not be the target register either (would be
+            # forwarding `mov r2, r2` which is a self-mov).
+            if src.lower() == b_dst:
+                i += 1
+                continue
+            # REG1 dead after line B.
+            if not self._reg_dead_after(out, i + 2, r1):
+                i += 1
+                continue
+            # Rewrite: replace lines A and B with `mov b_dst, src`.
+            indent = self._extract_indent(a.raw)
+            new_raw = f"{indent}mov     {b_dst}, {src}"
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op="mov",
+                operands=f"{b_dst}, {src}",
+            )
+            out = out[:i] + [new_line] + out[i + 2:]
+            self.stats["value_forward_to_reg"] = (
+                self.stats.get("value_forward_to_reg", 0) + 1
             )
             continue
         return out

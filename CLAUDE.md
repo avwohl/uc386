@@ -1112,3 +1112,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Probe**: `s += p[i] + p[i+1] + p[i+2]` — the binop tail of each `+` collapses. 3 fires on probe_chain.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (240 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: label_load_collapse + value_forward_to_reg**: two related passes targeting the global-access patterns that survive label_offset_fold.
+  - **label_load_collapse**: `mov reg1, LABEL; mov reg2, [reg1]` → `mov reg2, [LABEL]`. The disp32-absolute mov form is 1 byte shorter (5 bytes vs 5+2=7). Also handles SIB form: `mov reg1, LABEL; mov reg2, [reg1 + idx*scale]` → `mov reg2, [LABEL + idx*scale]`. REG1 must be dead after, or REG1 == REG2.
+  - **value_forward_to_reg**: `mov reg1, SRC; mov reg2, reg1` → `mov reg2, SRC` when REG1 is dead after. Saves 2 bytes per match (drops the register-copy). SRC can be any non-memory operand: immediate, label, label-arithmetic. Memory sources are excluded to avoid double-firing with other passes.
+  - **Common shape**: after label_offset_fold turns `mov eax, _b; add eax, 8` into `mov eax, _b + 8`, the trailing `mov eax, [eax]` collapses via label_load_collapse, OR the trailing `mov ebx, eax` collapses via value_forward. Both are common in global-array access patterns.
+  - **20040705-1.c**: 8778 → 8733 lines. 36 value_forward fires + 9 label_load fires. Total 45 instructions / 81 bytes saved on this single test.
+  - Updated 4 existing label_offset_fold tests that asserted the intermediate `mov eax, _b + 8` form — now the further-collapsed `mov eax, [_b + 8]` is the final state when followed by a deref.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +13 peephole tests (253 total). Pipeline 1734/1734 (100%).

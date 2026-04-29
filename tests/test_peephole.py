@@ -1780,7 +1780,9 @@ def test_label_offset_fold_basic_add():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    assert "        mov     eax, _b + 8" in out
+    # label_offset_fold produces `mov eax, _b + 8`, then
+    # label_load_collapse fuses with the deref to `mov eax, [_b + 8]`.
+    assert "        mov     eax, [_b + 8]" in out
     assert "add     eax, 8" not in out
     assert opt.stats.get("label_offset_fold") == 1
 
@@ -1795,7 +1797,8 @@ def test_label_offset_fold_basic_sub():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    assert "        mov     eax, _b - 4" in out
+    # label_offset_fold + label_load_collapse compose.
+    assert "        mov     eax, [_b - 4]" in out
     assert "sub     eax, 4" not in out
     assert opt.stats.get("label_offset_fold") == 1
 
@@ -1890,9 +1893,10 @@ def test_label_offset_fold_handles_label_arithmetic_source():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    # NASM accepts nested label-arithmetic.
+    # NASM accepts nested label-arithmetic. label_load_collapse
+    # then fuses with the deref.
     assert opt.stats.get("label_offset_fold") == 1
-    assert "        mov     eax, _b + 4 + 4" in out
+    assert "        mov     eax, [_b + 4 + 4]" in out
 
 
 def test_label_offset_fold_dot_label():
@@ -1907,7 +1911,8 @@ def test_label_offset_fold_dot_label():
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
     assert opt.stats.get("label_offset_fold") == 1
-    assert "        mov     eax, .L1_target + 16" in out
+    # label_load_collapse fuses with the deref.
+    assert "        mov     eax, [.L1_target + 16]" in out
 
 
 def test_label_offset_fold_works_with_any_register():
@@ -4305,3 +4310,212 @@ def test_transfer_pop_collapse_xor():
     assert "pop     ecx" in out
     assert "xor     eax, ecx" in out
     assert opt.stats.get("transfer_pop_collapse") == 1
+
+
+# ── label_load_collapse ──────────────────────────────────────────
+
+
+def test_label_load_collapse_basic():
+    """`mov eax, _label; mov ecx, [eax]` → `mov ecx, [_label]`
+    when EAX is dead after."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _glob\n"
+        "        mov     ecx, [eax]\n"
+        "        mov     eax, ecx\n"  # eax overwritten (dead before)
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ecx, [_glob]" in out
+    assert opt.stats.get("label_load_collapse") == 1
+
+
+def test_label_load_collapse_same_reg():
+    """`mov eax, _label; mov eax, [eax]` → `mov eax, [_label]`
+    (no liveness check needed since the second mov overwrites)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _glob\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [_glob]" in out
+    assert opt.stats.get("label_load_collapse") == 1
+
+
+def test_label_load_collapse_label_arithmetic():
+    """The label can be a label-arithmetic expression."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _b + 8\n"
+        "        mov     ecx, [eax]\n"
+        "        mov     eax, ecx\n"  # eax overwritten
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ecx, [_b + 8]" in out
+    assert opt.stats.get("label_load_collapse") == 1
+
+
+def test_label_load_collapse_sib():
+    """SIB form: `mov eax, _label; mov ecx, [eax + ecx*4]` →
+    `mov ecx, [_label + ecx*4]`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _arr\n"
+        "        mov     ecx, [eax + ecx*4]\n"
+        "        mov     eax, ecx\n"  # eax overwritten
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The new mov uses ecx as both dest and idx — that's OK in
+    # x86 (the read of ecx happens before the write).
+    assert "mov     ecx, [_arr + ecx*4]" in out
+    assert opt.stats.get("label_load_collapse") == 1
+
+
+def test_label_load_collapse_skips_when_eax_live():
+    """If EAX is read after the deref, can't drop the address load."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _glob\n"
+        "        mov     ecx, [eax]\n"
+        "        mov     edx, eax\n"  # eax live after
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("label_load_collapse", 0) == 0
+
+
+def test_label_load_collapse_skips_numeric_imm():
+    """If the source is a numeric immediate, don't fold (NASM
+    can't dereference an arbitrary integer in disp32 form without
+    losing semantics — the numeric value is the address but more
+    typically a misaddressed pointer)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 42\n"
+        "        mov     ecx, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("label_load_collapse", 0) == 0
+
+
+def test_label_load_collapse_skips_existing_offset():
+    """Source has [eax + N] (not just [eax]) — skip."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _glob\n"
+        "        mov     ecx, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    # disp form doesn't match — the source must be `[eax]` or
+    # `[eax + idx*scale]`, not `[eax + N]`.
+    assert opt.stats.get("label_load_collapse", 0) == 0
+
+
+# ── value_forward_to_reg ─────────────────────────────────────────
+
+
+def test_value_forward_to_reg_label():
+    """`mov eax, _label; mov ebx, eax` → `mov ebx, _label`
+    when EAX is dead after."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _glob\n"
+        "        mov     ebx, eax\n"
+        "        mov     eax, ecx\n"  # eax overwritten, dead
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ebx, _glob" in out
+    assert "mov     eax, _glob" not in out
+    assert opt.stats.get("value_forward_to_reg") == 1
+
+
+def test_value_forward_to_reg_label_arithmetic():
+    """`mov eax, _b + 8; mov ebx, eax` → `mov ebx, _b + 8`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _b + 8\n"
+        "        mov     ebx, eax\n"
+        "        mov     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ebx, _b + 8" in out
+    assert opt.stats.get("value_forward_to_reg") == 1
+
+
+def test_value_forward_to_reg_immediate():
+    """Numeric immediate also forwards."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 42\n"
+        "        mov     ebx, eax\n"
+        "        mov     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ebx, 42" in out
+    assert opt.stats.get("value_forward_to_reg") == 1
+
+
+def test_value_forward_to_reg_skips_when_eax_live():
+    """If EAX is read after the transfer, can't drop."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _glob\n"
+        "        mov     ebx, eax\n"
+        "        push    eax\n"  # eax still needed
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("value_forward_to_reg", 0) == 0
+
+
+def test_value_forward_to_reg_skips_memory_source():
+    """Memory sources aren't handled by this pass — skip to avoid
+    double-firing with other passes."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        mov     ebx, eax\n"
+        "        mov     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("value_forward_to_reg", 0) == 0
+
+
+def test_value_forward_to_reg_skips_self_mov():
+    """`mov eax, X; mov eax, eax` — the second is a self-mov, not
+    a transfer."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 42\n"
+        "        mov     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # value_forward shouldn't fire — self_mov_elimination drops
+    # the second mov instead.
+    assert opt.stats.get("value_forward_to_reg", 0) == 0
+    # And the self-mov is gone.
+    assert "mov     eax, eax" not in out
