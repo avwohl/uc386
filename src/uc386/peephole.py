@@ -108,6 +108,11 @@ Currently implements:
     relative addressing; the original mov+push is 4 bytes. Saves 1
     byte per match. Common in cdecl call-site arg setup, where the
     intermediate register is dead after the push.
+  - disp_load_collapse: collapse `add REG, DISP; mov DST, [REG]`
+    into `mov DST, [REG + DISP]` using x86's disp32 addressing.
+    Saves 1-2 bytes per match. Common in `p->member` struct member
+    access for non-zero offsets, where the codegen emits explicit
+    `add reg, offset` before dereference.
   - index_load_collapse: collapse the array-index address-
     computation chain `shl IDX, N; add BASE, IDX; mov DST, [BASE]`
     into a single `mov DST, [BASE + IDX*SCALE]` using x86's SIB
@@ -390,6 +395,7 @@ class PeepholeOptimizer:
             lines = self._pass_redundant_xor_zero(lines)
             lines = self._pass_compound_assign_collapse(lines)
             lines = self._pass_index_load_collapse(lines)
+            lines = self._pass_disp_load_collapse(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -3399,6 +3405,106 @@ class PeepholeOptimizer:
         "bp": "ebp",
         "sp": "esp",
     }
+
+    def _pass_disp_load_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``add REG, DISP; mov DST, [REG]`` into
+        ``mov DST, [REG + DISP]`` using x86's disp addressing form.
+
+        Saves bytes:
+        - DISP fits in imm8 (-128..127): save 2 bytes (add 3 bytes
+          + mov 2 bytes → mov 3 bytes).
+        - DISP needs imm32: save 1 byte (add 5/6 bytes + mov 2 bytes
+          → mov 6 bytes).
+
+        Common in `p->member` struct member access where the
+        codegen emits an explicit `add reg, offset` before the
+        dereference, even for small offsets.
+
+        Conditions:
+        - Two consecutive instr lines.
+        - Line A: ``add REG, DISP`` (DISP is a numeric literal).
+        - Line B: ``mov DST, [REG]`` (plain deref of REG, no
+          existing offset/SIB).
+        - REG either == DST (overwritten by the load) or dead after
+          line B.
+        """
+        out = list(lines)
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op == "add"
+                and b.kind == "instr" and b.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            if ap is None or bp is None:
+                i += 1
+                continue
+            reg = ap[0].strip().lower()
+            try:
+                disp = int(ap[1].strip())
+            except ValueError:
+                i += 1
+                continue
+            if not self._is_general_register(reg):
+                i += 1
+                continue
+            dst_reg = bp[0].strip().lower()
+            src = bp[1].strip()
+            if not self._is_general_register(dst_reg):
+                i += 1
+                continue
+            # Source must be `[REG]` (no offset, no SIB).
+            src_stripped = src
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if src_stripped.lower().startswith(prefix):
+                    src_stripped = src_stripped[
+                        len(prefix):
+                    ].lstrip()
+                    break
+            mem_re = re.match(
+                r"^\[([a-zA-Z]+)\s*\]$", src_stripped
+            )
+            if mem_re is None:
+                i += 1
+                continue
+            mem_reg = mem_re.group(1).lower()
+            if mem_reg != reg:
+                i += 1
+                continue
+            # Liveness: REG dead after line B (we drop the add).
+            # If REG == DST, the mov overwrites REG anyway — safe.
+            if reg != dst_reg and not self._reg_dead_after(
+                out, i + 2, reg
+            ):
+                i += 1
+                continue
+            # Build the rewritten mov.
+            indent = self._extract_indent(b.raw)
+            sign = "+" if disp >= 0 else "-"
+            new_src = f"[{reg} {sign} {abs(disp)}]"
+            new_raw = f"{indent}mov     {dst_reg}, {new_src}"
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op="mov",
+                operands=f"{dst_reg}, {new_src}",
+            )
+            new_out = out[:i] + [new_line] + out[i + 2:]
+            out = new_out
+            self.stats["disp_load_collapse"] = (
+                self.stats.get(
+                    "disp_load_collapse", 0
+                ) + 1
+            )
+            continue
+        return out
 
     def _pass_index_load_collapse(
         self, lines: list[Line]

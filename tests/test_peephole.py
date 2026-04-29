@@ -3772,3 +3772,113 @@ def test_narrowing_load_test_collapse_strlen_pattern():
     # The pointer is now read as `cmp byte [eax], 0` directly.
     assert "cmp     byte [eax], 0" in out
     assert "movsx" not in out
+
+
+# ── disp_load_collapse ───────────────────────────────────────────
+
+
+def test_disp_load_collapse_basic():
+    """`add reg, N; mov reg, [reg]` → `mov reg, [reg + N]`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        add     eax, 4\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [eax + 4]" in out
+    assert "add     eax, 4" not in out
+    assert opt.stats.get("disp_load_collapse") == 1
+
+
+def test_disp_load_collapse_distinct_dst():
+    """`add base, N; mov dst, [base]` works when base is dead after."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        add     ecx, 12\n"
+        "        mov     eax, [ecx]\n"
+        "        ret\n"  # ecx dead after the mov
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [ecx + 12]" in out
+    assert opt.stats.get("disp_load_collapse") == 1
+
+
+def test_disp_load_collapse_skips_when_base_live_distinct():
+    """If base is live after and dst != base, the add can't be dropped."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        add     ecx, 12\n"
+        "        mov     eax, [ecx]\n"
+        "        mov     [ebp - 4], ecx\n"  # ecx still needed
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("disp_load_collapse", 0) == 0
+
+
+def test_disp_load_collapse_negative_disp():
+    """Negative DISP collapses with `-` sign in the operand."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        add     eax, -8\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [eax - 8]" in out
+    assert opt.stats.get("disp_load_collapse") == 1
+
+
+def test_disp_load_collapse_rejects_existing_offset():
+    """If the load already has `[reg + N]`, can't add more displacement."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        add     eax, 4\n"
+        "        mov     eax, [eax + 8]\n"  # already has offset
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("disp_load_collapse", 0) == 0
+
+
+def test_disp_load_collapse_rejects_non_literal_disp():
+    """If DISP isn't a numeric literal (e.g. a label), skip."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        add     eax, _some_label\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("disp_load_collapse", 0) == 0
+
+
+def test_disp_load_collapse_struct_member_pattern():
+    """The canonical `p->y` pattern: load p, add offset, deref."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        add     eax, 4\n"
+        "        mov     eax, [eax]\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Three instr lines collapsed into two:
+    assert "add     eax" not in out
+    assert "mov     eax, [eax + 4]" in out
+    assert opt.stats.get("disp_load_collapse") == 1

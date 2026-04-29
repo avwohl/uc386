@@ -1079,3 +1079,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **sumarr loop body**: 6 instructions → 4 instructions. The `mov eax, [ebp + 8]; mov ecx, [ebp - 8]; shl ecx, 2; add eax, ecx; mov eax, [eax]; add [ebp - 4], eax` chain becomes `mov eax, [ebp + 8]; mov ecx, [ebp - 8]; mov eax, [eax + ecx*4]; add [ebp - 4], eax`. Combined with `compound_assign_collapse` (drops the push/pop framing) and `index_load_collapse`, the inner loop is now ~6 bytes instead of ~14 bytes per iteration.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (209 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: disp_load_collapse**: collapse `add REG, DISP; mov DST, [REG]` into `mov DST, [REG + DISP]` using x86's disp addressing form. Saves 2 bytes per match when DISP fits in imm8 (-128..127), 1 byte for imm32. Common in `p->member` struct access where the codegen emits an explicit `add reg, offset` before the deref.
+  - **Conditions**: two consecutive instr lines. Line A is `add REG, DISP` with a numeric literal DISP. Line B is `mov DST, [REG]` (plain deref of REG, no existing offset or SIB). REG either == DST (overwritten by the load) or dead after line B.
+  - **Rejected forms**: non-literal DISP (label like `add eax, _glob`); existing offset on the deref (`mov eax, [eax + 8]`); REG live after with REG ≠ DST.
+  - **Liveness uses `_reg_dead_after`** (CFG-aware), so the pass crosses labels and conditional jumps under the codegen invariant that no register is assumed live across labels.
+  - **Probe**: `struct {int x, y;} *p; return p->y;` lowered as `mov eax, [ebp+8]; add eax, 4; mov eax, [eax]` collapses to `mov eax, [ebp+8]; mov eax, [eax + 4]`. One instruction shorter, 2 bytes saved.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (216 total). Pipeline 1734/1734 (100%).
