@@ -4965,6 +4965,27 @@ def test_sizeof_array_in_arithmetic_decays_to_pointer():
     assert "mov     eax, 80" not in asm
 
 
+def test_vector_in_boolean_context():
+    # `if (v)` for a GCC-extension vector value should test "any
+    # element non-zero". Previously fell through to
+    # `_eval_expr_to_eax` which returned the vector's address — a
+    # non-zero pointer that was always truthy. Even an all-zero
+    # vector tested as true. Fix: in `_eval_to_bool_eax`, OR all
+    # the vector's dwords together and setne.
+    asm = _compile(
+        "typedef int v4si __attribute__((vector_size(16)));\n"
+        "int main(void) {\n"
+        "    v4si zero = {0, 0, 0, 0};\n"
+        "    return zero ? 100 : 200;\n"
+        "}\n"
+    )
+    # The fix introduces an OR-loop + setne sequence in main.
+    # The zero vector in the ternary's condition should evaluate
+    # to 0 — branch to 200.
+    assert "setne" in asm
+    assert "mov     eax, 200" in asm
+
+
 def test_global_bool_init_from_float():
     # Global `_Bool g = 0.5` previously raised because the global
     # init path used `_const_eval` (integer-only). Now bool

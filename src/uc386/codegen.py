@@ -13581,6 +13581,22 @@ class CodeGenerator:
             out.append("        or      eax, [ecx + 8]")
             out.append("        or      eax, [ecx + 12]")
             return out
+        if (
+            isinstance(ty, ast.ArrayType)
+            and getattr(ty, "is_vector", False)
+        ):
+            # GCC vector in boolean context — true if any element is
+            # non-zero. Take address, OR all dwords together, setne.
+            # (Vectors are aligned + multiple-of-4 in size on i386.)
+            size = self._size_of(ty)
+            out = self._vector_value_address(expr, ctx)
+            out.append("        mov     ecx, eax")
+            out.append("        xor     eax, eax")
+            for off in range(0, size, 4):
+                out.append(f"        or      eax, [ecx + {off}]")
+            out.append("        setne   al")
+            out.append("        movzx   eax, al")
+            return out
         if isinstance(ty, ast.ComplexType):
             # `if (c)` for complex — true if either half is non-zero.
             # Materialize into a stack temp, then OR-or-FUCOMP both halves.
