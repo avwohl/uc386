@@ -4986,6 +4986,60 @@ def test_vector_in_boolean_context():
     assert "mov     eax, 200" in asm
 
 
+def test_while_loop_condition_invalidates_pre_loop_copies():
+    # `int *p = head; while (p) { ...; p = next; }` had the
+    # optimizer's copy-prop cache `_copies = {p: head}` rewrite
+    # the loop condition's `p` back to `head` — making the loop
+    # run forever (or against an unmutated pre-loop value).
+    # Fix: clear caches BEFORE optimizing the condition (in
+    # WhileStmt and ForStmt), since the condition re-evaluates
+    # each iteration with potentially-mutated state.
+    from uc_core.ast_optimizer import ASTOptimizer
+    src = (
+        "extern void *malloc(unsigned);\n"
+        "extern void free(void *);\n"
+        "struct N { int v; struct N *next; };\n"
+        "void cleanup(struct N *head) {\n"
+        "    struct N *p = head;\n"
+        "    while (p) {\n"
+        "        struct N *next = p->next;\n"
+        "        free(p);\n"
+        "        p = next;\n"
+        "    }\n"
+        "}\n"
+        "int main(void) { cleanup(0); return 0; }\n"
+    )
+    tokens = list(Lexer(src, "test.c").tokenize())
+    unit = Parser(tokens).parse()
+    unit = ASTOptimizer(3).optimize(unit)
+    asm = CodeGenerator().generate(unit)
+    # Find the while-loop body in `_cleanup`. The loop's `test`
+    # of the controlling expression should reference `p`'s slot,
+    # not `head`'s slot. With a single param `head` at [ebp + 8]
+    # and a local `p` allocated, the test should NOT be of head's
+    # slot. Easier check: the .L_while_top label's first load is
+    # of the same slot the body's `p = next` writes to.
+    cs_start = asm.index("_cleanup:")
+    cs_end = asm.index("\n.epilogue:", cs_start)
+    cs = asm[cs_start:cs_end]
+    while_top = cs.index(".L")
+    # Verify: there's no rewrite of the condition to use [ebp+8]
+    # (head, the param). Buggy form had `mov eax, [ebp + 8]` in
+    # the loop top.
+    while_section = cs[while_top:]
+    # The first `mov eax, [...]` after the .L_while_top label
+    # should NOT be from [ebp+8]. Easiest: assert the loop top
+    # loads from a negative ebp offset (a local).
+    import re
+    first_load = re.search(r'\.L\w+_while_top:\s*\n\s*mov\s+eax,\s*\[ebp\s*([+-])\s*(\d+)\]', cs)
+    assert first_load is not None, "expected loop-top mov from [ebp - N]"
+    sign = first_load.group(1)
+    assert sign == "-", (
+        f"loop top loads from [ebp + {first_load.group(2)}] (param head); "
+        f"should load from [ebp - N] (local p)"
+    )
+
+
 def test_global_bool_init_from_float():
     # Global `_Bool g = 0.5` previously raised because the global
     # init path used `_const_eval` (integer-only). Now bool
