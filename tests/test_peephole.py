@@ -499,6 +499,102 @@ def test_store_chain_retarget_skips_non_fresh_first():
     assert opt.stats.get("store_chain_retarget", 0) == 0
 
 
+# ── shl_add_label_to_lea ─────────────────────────────────────────
+
+
+def test_shl_add_label_to_lea_basic():
+    """`shl eax, 2; add eax, _g` → `lea eax, [_g + eax*4]`.
+    Saves 1 instruction, 1 byte."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        shl     eax, 2\n"
+        "        add     eax, _g\n"
+        "        push    eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     eax, [_g + eax*4]" in out
+    assert "shl     eax, 2" not in out
+    assert "add     eax, _g" not in out
+    assert opt.stats.get("shl_add_label_to_lea") == 1
+
+
+def test_shl_add_label_to_lea_scale_2():
+    """N=1 produces SCALE=2."""
+    asm = (
+        "_f:\n"
+        "        shl     ecx, 1\n"
+        "        add     ecx, _arr\n"
+        "        push    ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     ecx, [_arr + ecx*2]" in out
+
+
+def test_shl_add_label_to_lea_scale_8():
+    """N=3 produces SCALE=8."""
+    asm = (
+        "_f:\n"
+        "        shl     edx, 3\n"
+        "        add     edx, _arr\n"
+        "        push    edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     edx, [_arr + edx*8]" in out
+
+
+def test_shl_add_label_to_lea_skips_non_label():
+    """add with imm32 source (not a label) — skip; label_offset_fold
+    handles different patterns. `shl + add IMM` doesn't fold via this
+    pass."""
+    asm = (
+        "_f:\n"
+        "        shl     eax, 2\n"
+        "        add     eax, 100\n"
+        "        push    eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("shl_add_label_to_lea", 0) == 0
+
+
+def test_shl_add_label_to_lea_skips_diff_reg():
+    """Different reg in shl vs add — skip."""
+    asm = (
+        "_f:\n"
+        "        shl     eax, 2\n"
+        "        add     ecx, _g\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("shl_add_label_to_lea", 0) == 0
+
+
+def test_shl_add_label_to_lea_skips_when_flags_read():
+    """If flags after the add are read (e.g., by jcc), don't rewrite —
+    lea doesn't set flags."""
+    asm = (
+        "_f:\n"
+        "        shl     eax, 2\n"
+        "        add     eax, _g\n"
+        "        jz      .L\n"  # reads ZF
+        "        ret\n"
+        ".L:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("shl_add_label_to_lea", 0) == 0
+
+
 def test_store_chain_retarget_chain_with_eax_in_src_ok():
     """Chain instrs after the first may reference [eax] — these get
     retargeted to [ecx] in the rewrite, preserving semantics. Use

@@ -417,6 +417,11 @@ class PeepholeOptimizer:
             lines = self._pass_compound_assign_collapse(lines)
             lines = self._pass_index_load_collapse(lines)
             lines = self._pass_index_load_collapse_label(lines)
+            # Runs AFTER index_load_collapse_label so that pass can
+            # consume the `shl + add LABEL + load` pattern entirely
+            # (saves more bytes). My pass picks up the remaining cases
+            # where the shl + add LABEL isn't followed by a load.
+            lines = self._pass_shl_add_label_to_lea(lines)
             lines = self._pass_disp_load_collapse(lines)
             lines = self._pass_push_disp_collapse(lines)
             lines = self._pass_push_index_collapse(lines)
@@ -2861,6 +2866,98 @@ class PeepholeOptimizer:
                                     self.stats["label_offset_fold"] = (
                                         self.stats.get(
                                             "label_offset_fold", 0
+                                        ) + 1
+                                    )
+                                    i += 2
+                                    continue
+            out.append(line)
+            i += 1
+        return out
+
+    def _pass_shl_add_label_to_lea(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``shl REG, N; add REG, LABEL`` (where N ∈ {1, 2, 3})
+        into ``lea REG, [LABEL + REG*SCALE]`` (where SCALE = 2^N).
+
+        x86 supports the SIB form `[disp32 + idx*scale]` (no base) for
+        lea, encoded as `8D /r SIB disp32` = 7 bytes. The original
+        sequence is `shl reg, imm8` (3 bytes) + `add reg, imm32` (5
+        bytes for label) = 8 bytes. So the lea form saves 1 byte and
+        1 instruction per match.
+
+        Common in global-array address computation:
+        ``mov eax, [ebp - 4]; shl eax, 2; add eax, _g`` → an indexed
+        address into _g, scaled by 4 (int element size). After my pass:
+        ``mov eax, [ebp - 4]; lea eax, [_g + eax*4]``.
+
+        Conditions:
+        - Line 1: ``shl REG, N`` where N ∈ {1, 2, 3}.
+        - Line 2: ``add REG, LABEL`` where LABEL is non-numeric,
+          non-memory (a label or label-arithmetic).
+        - Same REG.
+        - Flags after the add are dead (lea doesn't set flags; the
+          original shl + add did).
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (
+                i + 1 < len(lines)
+                and line.kind == "instr"
+                and line.op == "shl"
+            ):
+                parts = _operands_split(line.operands)
+                if parts is not None:
+                    reg, count = parts
+                    reg_low = reg.strip().lower()
+                    count_str = count.strip()
+                    if (
+                        self._is_general_register(reg_low)
+                        and count_str in ("1", "2", "3")
+                    ):
+                        scale = 2 ** int(count_str)
+                        nxt = lines[i + 1]
+                        if (
+                            nxt.kind == "instr"
+                            and nxt.op == "add"
+                        ):
+                            nxt_parts = _operands_split(nxt.operands)
+                            if nxt_parts is not None:
+                                ndest, nsrc = nxt_parts
+                                ndest_low = ndest.strip().lower()
+                                nsrc_norm = nsrc.strip()
+                                if (
+                                    ndest_low == reg_low
+                                    and self._is_label_like(nsrc_norm)
+                                    and self._flags_safe_after(
+                                        lines, i + 2
+                                    )
+                                ):
+                                    indent = self._extract_indent(
+                                        line.raw
+                                    )
+                                    new_src = (
+                                        f"[{nsrc_norm} + "
+                                        f"{reg_low}*{scale}]"
+                                    )
+                                    new_raw = (
+                                        f"{indent}lea     "
+                                        f"{reg.strip()}, {new_src}"
+                                    )
+                                    new_line = Line(
+                                        raw=new_raw,
+                                        kind="instr",
+                                        op="lea",
+                                        operands=(
+                                            f"{reg.strip()}, {new_src}"
+                                        ),
+                                    )
+                                    out.append(new_line)
+                                    self.stats["shl_add_label_to_lea"] = (
+                                        self.stats.get(
+                                            "shl_add_label_to_lea", 0
                                         ) + 1
                                     )
                                     i += 2

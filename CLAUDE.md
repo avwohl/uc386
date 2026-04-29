@@ -1293,3 +1293,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete impact on probe_chain.c**: the inner `g[i] = i + i` loop drops 2 bytes per iteration. 86 fires across the first 49 torture tests where it fired.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (846 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: shl_add_label_to_lea**: collapse `shl REG, N; add REG, LABEL` (where N ∈ {1, 2, 3}) into `lea REG, [LABEL + REG*SCALE]` (SCALE = 2^N). Common in global-array address computation when `index_load_collapse_label` doesn't fire (because no immediate load/push follows the addressing chain).
+  - **Pattern**: `shl reg, 2; add reg, _g` (8 bytes: 3 + 5) → `lea reg, [_g + reg*4]` (7 bytes).
+  - **Saves 1 byte and 1 instruction per match.**
+  - **Pass order**: runs AFTER `index_load_collapse_label` so that pass can consume the larger `shl + add LABEL + load` pattern entirely (saves more bytes since it drops 3 instructions and folds into the load). My pass picks up the residual cases where `add LABEL` isn't followed by a load.
+  - **Conditions**: same reg in shl and add; LABEL is non-numeric/non-memory; flags after the add must be dead (lea doesn't set flags).
+  - **Concrete impact**: probe_chain.c's `g[i] = i + i` loop — the address computation `mov eax, [ebp - 4]; shl eax, 2; add eax, _g` becomes `mov eax, [ebp - 4]; lea eax, [_g + eax*4]`. 805 hits across the first 91 torture tests where the textual pattern existed.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (852 total). Pipeline 1734/1734 (100%).
