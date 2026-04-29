@@ -279,7 +279,9 @@ def test_binop_collapse_with_memory_operand():
 
 def test_binop_collapse_skips_esp_relative_source():
     """`push eax` shifts ESP, so a subsequent `[esp + N]` read targets
-    a different byte after collapse. Don't fire."""
+    a different byte after collapse. Both binop_collapse and the
+    later right_operand_retarget must skip — dropping the push/pop
+    scaffold changes which byte the [esp + N] reads."""
     asm = (
         "_f:\n"
         "        push    eax\n"
@@ -291,8 +293,9 @@ def test_binop_collapse_skips_esp_relative_source():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    # Pattern must NOT fire — the [esp + N] is push-relative.
+    # Neither pattern may fire.
     assert opt.stats.get("binop_collapse", 0) == 0
+    assert opt.stats.get("right_operand_retarget", 0) == 0
     assert "push    eax" in out
     assert "pop     eax" in out
 
@@ -1137,6 +1140,144 @@ def test_store_load_collapse_skips_with_intervening_instr():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("store_load_collapse", 0) == 0
+
+
+# ── right_operand_retarget ───────────────────────────────────────
+
+
+def test_right_operand_retarget_chain_2():
+    """`push eax; mov eax, A; add eax, B; mov ecx, eax; pop eax` →
+    `mov ecx, A; add ecx, B` — the entire push/RHS-chain/copy/pop
+    scaffold collapses, since after retarget the chain only writes
+    ECX and EAX is preserved naturally."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp + 12]\n"
+        "        add     eax, [ebp - 4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ecx, [ebp + 12]" in out
+    assert "add     ecx, [ebp - 4]" in out
+    assert "        mov     ecx, eax" not in out
+    # The push/pop pair is gone too — entire scaffold collapsed.
+    assert "push    eax" not in out
+    assert "pop     eax" not in out
+    assert opt.stats.get("right_operand_retarget", 0) == 1
+
+
+def test_right_operand_retarget_chain_3():
+    """3-instruction chain ending in movsx (which references [eax]
+    in source) gets fully retargeted, including the [eax] → [ecx]
+    rewrite of the source operand."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ebp + 12]\n"
+        "        add     eax, [ebp - 4]\n"
+        "        movsx   eax, byte [eax]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "movsx   ecx, byte [ecx]" in out
+    assert "mov     ecx, [ebp + 12]" in out
+    assert "        mov     ecx, eax" not in out
+    assert opt.stats.get("right_operand_retarget", 0) == 1
+
+
+def test_right_operand_retarget_skips_when_chain_reads_ecx():
+    """If a chain instruction's source references ECX, retargeting
+    would self-reference. Skip."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, ecx\n"     # reads ECX!
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("right_operand_retarget", 0) == 0
+
+
+def test_right_operand_retarget_skips_when_chain_starts_rmw():
+    """If the chain's first instruction is a RMW (e.g., `add eax, X`)
+    rather than a fresh write, the chain depends on EAX's prior
+    value. Retargeting would compute the wrong thing. Skip."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        add     eax, [ebp - 4]\n"  # RMW — reads EAX from before push
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("right_operand_retarget", 0) == 0
+
+
+def test_right_operand_retarget_skips_no_push_eax():
+    """Without a `push eax` chain-start marker, we can't safely
+    determine where the RHS chain begins. Skip."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 12]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("right_operand_retarget", 0) == 0
+
+
+def test_right_operand_retarget_skips_esp_relative_source():
+    """If the chain reads `[esp + N]`, dropping the push/pop scaffold
+    that surrounds it would change which byte the load targets."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [esp + 4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("right_operand_retarget", 0) == 0
+
+
+def test_right_operand_retarget_lea_chain():
+    """`lea eax, [...]` is a fresh EAX write — eligible chain start."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        lea     eax, [_glob]\n"
+        "        add     eax, [ebp - 4]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        cmp     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     ecx, [_glob]" in out
+    assert opt.stats.get("right_operand_retarget", 0) == 1
 
 
 # ── Convergence ──────────────────────────────────────────────────

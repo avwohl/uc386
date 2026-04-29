@@ -48,6 +48,12 @@ Currently implements:
     → just the store. The register still holds its stored value, so
     the load is unnecessary. Saves the bytes of the load instruction
     (3 for [ebp-N], 6 for [_glob]).
+  - right_operand_retarget: collapse the RHS-chain-then-copy pattern
+    `push eax; <chain of EAX-writing ops>; mov ecx, eax; pop eax`
+    by retargeting every instruction in the chain to write ECX
+    instead. The `mov ecx, eax` becomes redundant and is dropped.
+    Saves 2 bytes per binop with a non-trivial right-hand side
+    (e.g. `a[i] cmp b[i]` where each side dereferences an array).
 
 Patterns to add (see PEEPHOLE_PLAN.md for details): redundant
 mov-to-reg, tail calls, jump threading, multi-instruction right-
@@ -258,6 +264,7 @@ class PeepholeOptimizer:
             lines = self._pass_imm_binop_collapse(lines)
             lines = self._pass_mov_zero_to_xor(lines)
             lines = self._pass_store_load_collapse(lines)
+            lines = self._pass_right_operand_retarget(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -1167,6 +1174,252 @@ class PeepholeOptimizer:
         if not src.startswith("["):
             return None
         return (dest_lower, re.sub(r"\s+", "", src))
+
+    def _pass_right_operand_retarget(self, lines: list[Line]) -> list[Line]:
+        """Retarget the binop RHS chain from EAX to ECX, then drop
+        the entire `push eax / pop eax / mov ecx, eax` save/restore
+        scaffold — EAX is preserved naturally because the retargeted
+        chain only writes ECX.
+
+        Match (looking back from `mov ecx, eax; pop eax`):
+            push    eax                   ← LHS save (chain start marker)
+            <fresh EAX write>             ← chain instr 1: mov/lea/pop/xor
+            <EAX read-or-RMW>*            ← chain instrs 2..N: any op
+                                            with dest=eax that doesn't
+                                            read ECX/CX/CL/CH.
+            mov     ecx, eax              ← redundant copy
+            pop     eax                   ← restore LHS (also redundant)
+
+        Replace with:
+            <retargeted chain instr 1>    ← dest changed to ECX
+            <retargeted chain instrs 2..N> ← dest + [eax]→[ecx] in src
+
+        Saves 4 bytes per binop with non-trivial RHS: 1 (push eax) +
+        2 (mov ecx, eax) + 1 (pop eax) = 4. The chain's running value
+        now lives in ECX from the start; EAX's LHS value is preserved
+        across the chain because no chain instruction touches EAX.
+
+        Conditions:
+        - All instructions in the chain must write EAX as their dest.
+        - Source operands must not reference ECX/CX/CL/CH (else the
+          retargeted version would self-reference).
+        - The chain's first instruction must be a "fresh write"
+          (mov / lea / pop / xor reg+reg / call) — otherwise the
+          chain depends on EAX's prior value (the LHS), which post-
+          retarget wouldn't be in ECX.
+        - Bound the backward scan at 12 instructions (any reasonable
+          RHS chain).
+        """
+        out = list(lines)
+        i = 0
+        while i < len(out):
+            line = out[i]
+            if not (line.kind == "instr"
+                    and line.op == "mov"
+                    and line.operands.replace(" ", "").lower()
+                        == "ecx,eax"):
+                i += 1
+                continue
+            # Next instr must be `pop eax`.
+            instrs_after = self._next_n_instrs(out, i + 1, 1)
+            if (instrs_after is None
+                    or instrs_after[0][1].op != "pop"
+                    or instrs_after[0][1].operands.strip().lower()
+                        != "eax"):
+                i += 1
+                continue
+            pop_idx = instrs_after[0][0]
+            # Backward scan to find the chain.
+            chain_info = self._find_rhs_chain(out, i)
+            if chain_info is None:
+                i += 1
+                continue
+            push_idx, chain_indices = chain_info
+            # Retarget every chain instruction (dest + src EAX → ECX
+            # for all aliases).
+            for k in chain_indices:
+                out[k] = self._retarget_instr_eax_to_ecx(out[k])
+            # Drop in this order (back to front so indices stay valid):
+            # pop_idx > i > push_idx (always true).
+            out.pop(pop_idx)
+            out.pop(i)
+            out.pop(push_idx)
+            self.stats["right_operand_retarget"] = (
+                self.stats.get("right_operand_retarget", 0) + 1
+            )
+            # Next iteration: start scanning from where push was
+            # (now occupied by the first chain instruction).
+            i = push_idx
+            continue
+        return out
+
+    @staticmethod
+    def _find_rhs_chain(
+        out: list[Line], mov_ecx_idx: int,
+    ) -> tuple[int, list[int]] | None:
+        """Backward-scan from mov_ecx_idx looking for a chain of
+        EAX-writing instructions terminated by `push eax`. Return
+        (push_eax_index, chain_indices_in_source_order), or None."""
+        chain: list[int] = []
+        j = mov_ecx_idx - 1
+        bound = max(0, mov_ecx_idx - 12)
+        while j >= bound:
+            ln = out[j]
+            if ln.kind in ("blank", "comment"):
+                j -= 1
+                continue
+            if ln.kind != "instr":
+                return None  # label/directive — basic block boundary
+            # `push eax` is the chain-start marker.
+            if (ln.op == "push"
+                    and ln.operands.strip().lower() == "eax"):
+                if not chain:
+                    return None  # empty chain — nothing to retarget
+                # Chain must start with a fresh EAX write (the first
+                # chain instr in source order is at chain[-1] since
+                # we built it backward).
+                first_ln = out[chain[-1]]
+                if not PeepholeOptimizer._is_fresh_eax_write(first_ln):
+                    return None
+                return (j, list(reversed(chain)))
+            # Otherwise this should be a chain instruction.
+            if not PeepholeOptimizer._is_chain_eax_writer(ln):
+                return None
+            chain.append(j)
+            j -= 1
+        return None
+
+    @staticmethod
+    def _is_chain_eax_writer(line: Line) -> bool:
+        """Is this an instruction that writes EAX as its destination
+        and doesn't read ECX/CX/CL/CH? Eligible for retargeting to
+        ECX. Also rejects ESP-relative sources because the surrounding
+        push/pop that bracket the chain affect ESP — dropping them
+        changes [esp + N] semantics."""
+        if line.kind != "instr":
+            return False
+        parts = _operands_split(line.operands)
+        if parts is None:
+            # Single-operand or no-operand — must inspect by op.
+            # neg/not/imul (one-op form) have a single operand.
+            if line.op in {"neg", "not", "inc", "dec",
+                           "mul", "imul", "div", "idiv"}:
+                operand = line.operands.strip().lower()
+                if operand == "eax":
+                    # Unary on EAX — writes EAX.
+                    if PeepholeOptimizer._references_ecx(operand):
+                        return False
+                    return True
+            return False
+        dest, src = parts
+        dest_lower = dest.lower()
+        if dest_lower != "eax":
+            return False
+        # Source mustn't reference ECX. (Sources that reference [eax]
+        # are fine — they'll be rewritten in retarget.)
+        if PeepholeOptimizer._references_ecx(src):
+            return False
+        # Source mustn't be ESP-relative. The retarget drops the
+        # push/pop scaffold that surrounds the chain; if the chain
+        # reads `[esp + N]`, dropping the push (which decremented
+        # ESP by 4) changes which byte is read. Conservative skip.
+        if _references_register(src, "esp"):
+            return False
+        # cmp/test read EAX without writing — exclude.
+        if line.op in {"cmp", "test"}:
+            return False
+        # `xchg eax, X` swaps — read+write both. Skip.
+        if line.op == "xchg":
+            return False
+        # `cdq` writes EDX based on EAX's sign. EAX unchanged. Skip.
+        if line.op == "cdq":
+            return False
+        return True
+
+    @staticmethod
+    def _is_fresh_eax_write(line: Line) -> bool:
+        """Does this instruction write EAX without reading it first
+        (a fresh write rather than a read-modify-write)? The source
+        operand must NOT reference EAX/AX/AL/AH — otherwise the
+        instruction depends on EAX's prior value and isn't fresh."""
+        if line.kind != "instr":
+            return False
+        if line.op in {"mov", "lea", "movsx", "movzx"}:
+            parts = _operands_split(line.operands)
+            if parts and parts[0].lower() == "eax":
+                src = parts[1]
+                if PeepholeOptimizer._references_eax_low_high(src):
+                    return False
+                return True
+            return False
+        if line.op == "pop" and line.operands.strip().lower() == "eax":
+            return True
+        if line.op == "xor":
+            parts = _operands_split(line.operands)
+            if (parts and parts[0].lower() == "eax"
+                    and parts[1].strip().lower() == "eax"):
+                return True
+            return False
+        if line.op == "call":
+            # Direct call clobbers EAX with the callee's return value.
+            # No EAX read at the call site (cdecl args are on stack).
+            # Indirect call `call eax` reads EAX — exclude.
+            operand = line.operands.strip().lower()
+            if operand in {"eax", "ax", "al", "ah"}:
+                return False
+            if "[" in operand and "eax" in operand:
+                # `call [eax + N]` reads EAX as part of the address.
+                return False
+            return True
+        return False
+
+    @staticmethod
+    def _references_ecx(text: str) -> bool:
+        """Does `text` reference ECX or any of its aliases (CX/CL/CH)?"""
+        for alias in ("ecx", "cx", "cl", "ch"):
+            if _references_register(text, alias):
+                return True
+        return False
+
+    @staticmethod
+    def _references_eax_low_high(text: str) -> bool:
+        """Does `text` reference EAX or any of its aliases (AX/AL/AH)?"""
+        for alias in ("eax", "ax", "al", "ah"):
+            if _references_register(text, alias):
+                return True
+        return False
+
+    # Mapping from EAX-family register names to ECX-family equivalents.
+    # Order matters for the substitution: `eax` first so we don't
+    # accidentally match the `ax` inside `eax`. (Word-boundary `\b`
+    # would also handle this, but explicit ordering is safer.)
+    _EAX_TO_ECX_ALIASES: list[tuple[str, str]] = [
+        ("eax", "ecx"),
+        ("ax", "cx"),
+        ("al", "cl"),
+        ("ah", "ch"),
+    ]
+
+    @staticmethod
+    def _retarget_instr_eax_to_ecx(line: Line) -> Line:
+        """Rewrite every EAX-family register reference in operands and
+        raw line to the corresponding ECX-family register (eax→ecx,
+        ax→cx, al→cl, ah→ch). The chain's running value lives in
+        ECX after retarget; any `[eax]` becomes `[ecx]` for the same
+        reason."""
+        new_operands = line.operands
+        new_raw = line.raw
+        for old, new in PeepholeOptimizer._EAX_TO_ECX_ALIASES:
+            new_operands = re.sub(
+                rf"\b{old}\b", new, new_operands, flags=re.IGNORECASE
+            )
+            new_raw = re.sub(
+                rf"\b{old}\b", new, new_raw, flags=re.IGNORECASE
+            )
+        return Line(
+            raw=new_raw, kind=line.kind, op=line.op,
+            operands=new_operands,
+        )
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
         """P-jmp-to-next: `jmp X` immediately (modulo blanks/comments)

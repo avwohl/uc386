@@ -932,3 +932,13 @@ See `README.md` for the public roadmap (Phase 0–6).
   Cumulative result on the `_strncmp_test` probe: each `cmp eax, ecx` paired with `mov ecx, [ebp + N]` collapsed to `cmp eax, [ebp + N]`; same for the seven `add eax, ecx; mov ecx, [ebp - 4]` pairs in pointer arithmetic; `xor eax, eax` replaces `mov eax, 0` four times; the redundant `mov eax, [ebp - 4]` after the call's store is dropped.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +18 peephole tests (510 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: right_operand_retarget**: the multi-instruction binop RHS chain now retargets directly to ECX, dropping the entire `push eax / chain / mov ecx, eax / pop eax` save/restore scaffold. Saves 4 bytes per binop with non-trivial RHS (push + mov + pop = 4 bytes total).
+  - Match (looking back from `mov ecx, eax; pop eax`): `push eax` followed by N >= 1 chain instructions, all of which write EAX as their dest. The chain's first instruction must be a "fresh write" (mov / lea / pop / xor reg+reg / call) — not a RMW that reads EAX's prior value (the LHS).
+  - Each chain instruction's source operand must not reference ECX/CX/CL/CH (else retargeting would self-reference) or `[esp + N]` (else dropping the surrounding push/pop changes which byte is read).
+  - cmp/test/xchg/cdq are excluded (read EAX without writing, or have unusual semantics under retarget).
+  - The retarget pass replaces `eax`/`ax`/`al`/`ah` in operands with `ecx`/`cx`/`cl`/`ch` respectively, so any sub-byte aliasing is handled correctly.
+  - Drops the `mov ecx, eax` step, the leading `push eax`, AND the trailing `pop eax`. EAX is preserved naturally because the retargeted chain only writes ECX.
+  - Most common shape lifted: pointer-arithmetic + byte deref (`a[i]`) where each operand expands to `mov; add; movsx`. Without retarget that's `push eax; mov; add; movsx; mov ecx, eax; pop eax` (6 instr); with retarget: `mov; add; movsx` to ecx (3 instr).
+  - probe_misc: 2483 → 2353 bytes ASM (-130 bytes); 188 → 180 bytes COM (-8 bytes after libc dedup).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (517 total). Pipeline 1734/1734 (100%). Total benchmark size reduction climbs to 27.1%.
