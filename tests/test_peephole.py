@@ -4837,3 +4837,97 @@ def test_label_store_collapse_skips_when_src_uses_reg():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("label_store_collapse", 0) == 0
+
+
+# ── lea_load_collapse ────────────────────────────────────────────
+
+
+def test_lea_load_collapse_basic():
+    """`lea eax, [ebp - 12]; mov eax, [eax]` →
+    `mov eax, [ebp - 12]`."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp - 12]\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [ebp - 12]" in out
+    assert "lea" not in out
+    assert opt.stats.get("lea_load_collapse") == 1
+
+
+def test_lea_load_collapse_with_offset():
+    """`lea eax, [ebp - 12]; mov eax, [eax + 4]` →
+    `mov eax, [ebp - 8]`."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp - 12]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [ebp - 8]" in out
+    assert "lea" not in out
+    assert opt.stats.get("lea_load_collapse") == 1
+
+
+def test_lea_load_collapse_distinct_regs():
+    """`lea ecx, [ebp - 12]; mov eax, [ecx + 4]` works when ecx
+    is dead after."""
+    asm = (
+        "_f:\n"
+        "        lea     ecx, [ebp - 12]\n"
+        "        mov     eax, [ecx + 4]\n"
+        "        xor     ecx, ecx\n"  # ecx overwritten
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [ebp - 8]" in out
+    assert opt.stats.get("lea_load_collapse") == 1
+
+
+def test_lea_load_collapse_skips_when_reg_live():
+    """If REG is read after, can't drop the lea."""
+    asm = (
+        "_f:\n"
+        "        lea     ecx, [ebp - 12]\n"
+        "        mov     eax, [ecx]\n"
+        "        mov     [ebp - 4], ecx\n"  # ecx still needed
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("lea_load_collapse", 0) == 0
+
+
+def test_lea_load_collapse_negative_combined_offset():
+    """`lea eax, [ebp + 4]; mov eax, [eax - 12]` →
+    `mov eax, [ebp - 8]`. Combined offset: 4 + (-12) = -8."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp + 4]\n"
+        "        mov     eax, [eax - 12]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [ebp - 8]" in out
+    assert opt.stats.get("lea_load_collapse") == 1
+
+
+def test_lea_load_collapse_size_keyword():
+    """Size keyword on the load is preserved."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp - 12]\n"
+        "        mov     eax, byte [eax + 1]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, byte [ebp - 11]" in out
+    assert opt.stats.get("lea_load_collapse") == 1

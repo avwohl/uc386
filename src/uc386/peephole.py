@@ -404,6 +404,7 @@ class PeepholeOptimizer:
             lines = self._pass_label_load_collapse(lines)
             lines = self._pass_label_push_collapse(lines)
             lines = self._pass_label_store_collapse(lines)
+            lines = self._pass_lea_load_collapse(lines)
             lines = self._pass_value_forward_to_reg(lines)
             lines = self._pass_byte_stores_to_dword(lines)
             lines = self._pass_pop_index_push_collapse(lines)
@@ -4773,6 +4774,125 @@ class PeepholeOptimizer:
             out = out[:i] + [new_line] + out[i + 2:]
             self.stats["label_store_collapse"] = (
                 self.stats.get("label_store_collapse", 0) + 1
+            )
+            continue
+        return out
+
+    def _pass_lea_load_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``lea REG, [ebp ± N]; mov REG2, [REG + M]`` (or
+        ``[REG]``) into ``mov REG2, [ebp ± (N+M)]``.
+
+        Saves 2-3 bytes per match by eliminating the LEA and folding
+        the offset arithmetic into the load's addressing. Common in
+        local struct member access where the codegen emits an
+        explicit `lea` to compute the struct base, then `mov reg,
+        [base + offset]` for each member.
+
+        Conditions:
+        - Two consecutive instr lines.
+        - Line A: ``lea REG, [ebp ± N]`` (stack-relative base).
+        - Line B: ``mov REG2, [REG]`` or ``mov REG2, [REG + M]``
+          (plain or offset deref of REG).
+        - REG dead after Line B (or REG == REG2).
+        - Combined offset N+M is representable as a signed 32-bit
+          displacement (always true for sane stack frames).
+        """
+        out = list(lines)
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op == "lea"
+                and b.kind == "instr" and b.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            if ap is None or bp is None:
+                i += 1
+                continue
+            r1 = ap[0].strip().lower()
+            lea_src = ap[1].strip()
+            r2 = bp[0].strip().lower()
+            b_src = bp[1].strip()
+            if (
+                not self._is_general_register(r1)
+                or not self._is_general_register(r2)
+            ):
+                i += 1
+                continue
+            # LEA src must be `[ebp ± N]` (stack-relative).
+            m_lea = re.match(
+                r"^\[\s*ebp\s*([+-])\s*(\d+)\s*\]$",
+                lea_src,
+                re.IGNORECASE,
+            )
+            if m_lea is None:
+                i += 1
+                continue
+            n_disp = int(m_lea.group(2))
+            if m_lea.group(1) == "-":
+                n_disp = -n_disp
+            # Mov src: `[REG]` or `[REG + M]` or `[REG - M]`.
+            b_src_stripped = b_src
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if b_src_stripped.lower().startswith(prefix):
+                    b_src_stripped = b_src_stripped[
+                        len(prefix):
+                    ].lstrip()
+                    break
+            m_plain = re.match(
+                r"^\[\s*([a-zA-Z]+)\s*\]$", b_src_stripped
+            )
+            m_disp = re.match(
+                r"^\[\s*([a-zA-Z]+)\s*([+-])\s*(\d+)\s*\]$",
+                b_src_stripped,
+            )
+            if m_plain:
+                base = m_plain.group(1).lower()
+                m_disp_val = 0
+            elif m_disp:
+                base = m_disp.group(1).lower()
+                m_disp_val = int(m_disp.group(3))
+                if m_disp.group(2) == "-":
+                    m_disp_val = -m_disp_val
+            else:
+                i += 1
+                continue
+            if base != r1:
+                i += 1
+                continue
+            # Liveness: REG dead after, or REG == REG2.
+            if r1 != r2 and not self._reg_dead_after(
+                out, i + 2, r1
+            ):
+                i += 1
+                continue
+            # Build combined offset.
+            combined = n_disp + m_disp_val
+            sign = "+" if combined >= 0 else "-"
+            new_src = f"[ebp {sign} {abs(combined)}]"
+            # Preserve the size keyword from the original mov.
+            size_kw = ""
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if b_src.lower().startswith(prefix):
+                    size_kw = prefix
+                    break
+            indent = self._extract_indent(b.raw)
+            new_raw = f"{indent}mov     {r2}, {size_kw}{new_src}"
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op="mov",
+                operands=f"{r2}, {size_kw}{new_src}",
+            )
+            out = out[:i] + [new_line] + out[i + 2:]
+            self.stats["lea_load_collapse"] = (
+                self.stats.get("lea_load_collapse", 0) + 1
             )
             continue
         return out

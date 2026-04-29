@@ -1155,3 +1155,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Conditions**: REG dead after, SRC must not reference REG.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (272 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: lea_load_collapse**: `lea REG, [ebp ± N]; mov REG2, [REG + M]` (or `[REG]`) → `mov REG2, [ebp ± (N+M)]`. Saves 2-3 bytes per match by eliminating the LEA and folding the offset arithmetic into the load.
+  - **Common shape**: local struct member access. Codegen emits `lea reg, [ebp - struct_base]` to materialize the struct's address, then `mov reg, [reg + member_offset]` for each member. This collapses to a direct stack-relative load.
+  - **probe_struct2** (6 struct members summed): 44 → 33 lines (25% reduction). Each `lea + mov [reg + N]` pair collapses to `mov [ebp + offset]`.
+  - **Conditions**: REG dead after, or REG == REG2. Combined offset (N + M) folded at compile time.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (278 total). Pipeline 1734/1734 (100%).
