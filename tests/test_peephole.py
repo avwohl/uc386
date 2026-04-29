@@ -7721,3 +7721,169 @@ def test_div_mem_form_label_memory():
     out = opt.optimize(asm)
     assert "idiv    dword [_glob]" in out
     assert opt.stats.get("div_mem_form", 0) == 1
+
+
+def test_mov_test_setcc_movzx_collapse_eq():
+    """`mov eax, [m]; test eax, eax; sete al; movzx eax, al` →
+    `cmp dword [m], 0; sete al; movzx eax, al`. Saves 1 byte."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        test    eax, eax\n"
+        "        sete    al\n"
+        "        movzx   eax, al\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "cmp     dword [ebp + 8], 0" in out
+    assert "test    eax, eax" not in out
+    assert "mov     eax, [ebp + 8]" not in out
+    assert "sete    al" in out
+    assert "movzx   eax, al" in out
+    assert opt.stats.get("mov_test_setcc_movzx_collapse", 0) == 1
+
+
+def test_mov_test_setcc_movzx_collapse_all_setcc_variants():
+    """All standard setCC variants fire."""
+    for setcc in ["sete", "setne", "setl", "setg", "setle", "setge",
+                   "seta", "setb", "setae", "setbe", "sets", "setns"]:
+        asm = (
+            "_f:\n"
+            "        mov     eax, [ebp + 8]\n"
+            "        test    eax, eax\n"
+            f"        {setcc:<8}al\n"
+            "        movzx   eax, al\n"
+            "        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        out = opt.optimize(asm)
+        assert "cmp     dword [ebp + 8], 0" in out
+        assert opt.stats.get("mov_test_setcc_movzx_collapse", 0) == 1
+
+
+def test_mov_test_setcc_movzx_collapse_other_reg():
+    """Pattern fires for any GP32 source register, not just EAX."""
+    for reg in ["ebx", "ecx", "edx", "esi", "edi"]:
+        asm = (
+            "_f:\n"
+            f"        mov     {reg}, [ebp + 8]\n"
+            f"        test    {reg}, {reg}\n"
+            "        sete    al\n"
+            "        movzx   eax, al\n"
+            "        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        out = opt.optimize(asm)
+        assert "cmp     dword [ebp + 8], 0" in out
+        assert opt.stats.get("mov_test_setcc_movzx_collapse", 0) == 1
+
+
+def test_mov_test_setcc_movzx_collapse_skips_register_source():
+    """Source must be memory, not a register (no `[...]`)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, ebx\n"  # source is reg
+        "        test    eax, eax\n"
+        "        sete    al\n"
+        "        movzx   eax, al\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("mov_test_setcc_movzx_collapse", 0) == 0
+
+
+def test_mov_test_setcc_movzx_collapse_skips_test_different_reg():
+    """`test ecx, ecx` after `mov eax, [m]` — different reg, skip."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        test    ecx, ecx\n"  # different reg
+        "        sete    al\n"
+        "        movzx   eax, al\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("mov_test_setcc_movzx_collapse", 0) == 0
+
+
+def test_mov_test_setcc_movzx_collapse_skips_setcc_other_reg():
+    """`setCC bl` (not al) — skip. The movzx reads only AL; if
+    setCC writes elsewhere, we'd break the chain."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        test    eax, eax\n"
+        "        sete    bl\n"  # not al
+        "        movzx   eax, al\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("mov_test_setcc_movzx_collapse", 0) == 0
+
+
+def test_mov_test_setcc_movzx_collapse_skips_other_movzx():
+    """`movzx ebx, al` (not eax) — skip. The full pattern
+    requires the final dest to be EAX."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        test    eax, eax\n"
+        "        sete    al\n"
+        "        movzx   ebx, al\n"  # not eax
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("mov_test_setcc_movzx_collapse", 0) == 0
+
+
+def test_mov_test_setcc_movzx_collapse_skips_movzx_from_other_reg():
+    """`movzx eax, bl` (not al) — skip. Only AL is the canonical
+    setCC destination."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        test    eax, eax\n"
+        "        sete    al\n"
+        "        movzx   eax, bl\n"  # from bl
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("mov_test_setcc_movzx_collapse", 0) == 0
+
+
+def test_mov_test_setcc_movzx_collapse_skips_mem_with_eax():
+    """If [m] references EAX (e.g., `[eax + 4]`), we'd need EAX to
+    be loaded first. Skip."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [eax + 4]\n"  # mem references eax
+        "        test    eax, eax\n"
+        "        sete    al\n"
+        "        movzx   eax, al\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("mov_test_setcc_movzx_collapse", 0) == 0
+
+
+def test_mov_test_setcc_movzx_collapse_global_memory():
+    """Global memory `[_glob]` works (no register references)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [_glob]\n"
+        "        test    eax, eax\n"
+        "        sete    al\n"
+        "        movzx   eax, al\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "cmp     dword [_glob], 0" in out
+    assert opt.stats.get("mov_test_setcc_movzx_collapse", 0) == 1

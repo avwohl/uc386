@@ -1326,3 +1326,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Pass order**: runs after rmw_collapse and before shift_const_imm. Independent of both — div uses a fixed register pair (edx:eax for dividend, single reg for divisor), distinct from rmw and shift patterns.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +10 peephole tests (885 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: mov_test_setcc_movzx_collapse**: collapse the 4-instruction boolean-materialize pattern `mov reg, [m]; test reg, reg; setCC al; movzx eax, al` into `cmp dword [m], 0; setCC al; movzx eax, al`. Saves 1 byte per match. Common in `x == 0`, `x != 0`, `x > 0`, `!x`, etc. used in expression context (assigned to var, returned, used in arithmetic).
+  - **Why is this safe?** The `mov reg, [m]` loads [m] into reg (full width), then `test reg, reg` sets ZF/SF based on reg. `setCC al` writes AL based on flags; `movzx eax, al` zero-extends AL into EAX. The high bits of reg/EAX after the mov/test/setCC are [m]'s high bytes, but movzx discards them — so the intermediate full-EAX-load is unused. `cmp dword [m], 0` produces equivalent flags (both test for [m] == 0 with SF = high bit of [m], CF=OF=0).
+  - **All standard setCC variants supported**: sete/setne/setl/setg/setle/setge/seta/setb/setae/setbe/sets/setns/seto/setno/setp/setnp plus aliases (setz/setnz/setc/setnc/setpe/setpo).
+  - **Any GP32 source register** for the original load — typically EAX, but earlier passes (right_operand_retarget) may rewrite to ECX/EBX/etc.
+  - **[m] must not reference EAX** since the rewrite uses memory addressing and EAX is the final destination via setCC + movzx.
+  - **Sample fire rate**: 5 fires across 200 random torture tests (one per matching test). Modest but real. Combined with `cmp_load_collapse` (which handles `mov reg, [m]; cmp reg, X; jcc` for control flow), this completes coverage of the load-then-test idiom for both branch and value contexts.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +10 peephole tests (895 total). Pipeline 1734/1734 (100%).

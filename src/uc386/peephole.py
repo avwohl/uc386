@@ -407,6 +407,7 @@ class PeepholeOptimizer:
             lines = self._pass_redundant_ecx_load(lines)
             lines = self._pass_rmw_collapse(lines)
             lines = self._pass_div_mem_form(lines)
+            lines = self._pass_mov_test_setcc_movzx_collapse(lines)
             lines = self._pass_shift_const_imm(lines)
             lines = self._pass_same_memory_operand_reuse(lines)
             lines = self._pass_fst_fstp_collapse(lines)
@@ -3441,6 +3442,149 @@ class PeepholeOptimizer:
         if sl in {"ebx", "ecx", "edx", "esi", "edi"}:
             return sl
         return None
+
+    def _pass_mov_test_setcc_movzx_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse the 4-instruction boolean-materialize pattern:
+
+            mov     reg, [m]      ; load value
+            test    reg, reg      ; check for zero
+            setCC   al            ; set bool based on flags
+            movzx   eax, al       ; zero-extend to 32-bit
+
+        into:
+
+            cmp     dword [m], 0  ; equivalent flags
+            setCC   al
+            movzx   eax, al
+
+        Saves 1 byte per match. ``mov reg, [ebp ± N]; test reg, reg``
+        is 3 + 2 = 5 bytes; ``cmp dword [ebp ± N], 0`` is 4 bytes.
+
+        Common in `x == 0`, `x != 0`, `x > 0`, `!x`, etc. when used
+        in expression context (assigned to a variable, returned, used
+        in arithmetic). When used in a control-flow context (`if`,
+        `while`), `cmp_load_collapse` already handles `mov reg, [m];
+        cmp reg, X; jcc` patterns.
+
+        Why is this safe?
+        - Original: `mov` loads [m] into reg (full width); `test`
+          sets ZF/SF based on reg; `setCC al` writes AL based on
+          flags; `movzx eax, al` zero-extends AL into EAX.
+        - The high bits of EAX after `mov`/`test`/`setCC al` are
+          [m]'s high bytes, but `movzx` discards them. So the
+          intermediate full-EAX-load is unused.
+        - Replacement: `cmp dword [m], 0` sets ZF/SF identically (both
+          test for [m] == 0 and produce SF = high bit of [m]). EAX is
+          unchanged before `setCC al`, but `movzx` writes EAX from AL
+          alone — final result is the same boolean.
+
+        Conditions:
+        - Line A: `mov reg, [m]` where reg is a GP32, [m] is mem.
+        - Line B: `test reg, reg` (same reg).
+        - Line C: `setCC al` (any setCC variant: sete, setne, setl,
+          setg, setle, setge, seta, setb, setae, setbe, sets, setns,
+          seto, setno, setp, setnp).
+        - Line D: `movzx eax, al`.
+        - reg can be ANY GP32 (typically EAX, but could be others
+          via earlier passes). The replacement uses memory addressing,
+          so reg's value is no longer needed.
+        - [m] must not reference EAX (we'll be reading [m] but EAX
+          will be the final destination via setCC + movzx).
+        """
+        out: list[Line] = []
+        i = 0
+        setcc_ops = {
+            "sete", "setne", "setl", "setg", "setle", "setge",
+            "seta", "setb", "setae", "setbe",
+            "sets", "setns", "seto", "setno",
+            "setp", "setnp", "setz", "setnz", "setc", "setnc",
+            "setpe", "setpo",
+        }
+        while i < len(lines):
+            line = lines[i]
+            if (
+                i + 3 < len(lines)
+                and line.kind == "instr"
+                and line.op == "mov"
+            ):
+                ap = _operands_split(line.operands)
+                if ap is not None:
+                    a_dst, a_src = ap
+                    a_dst_low = a_dst.strip().lower()
+                    a_src_norm = a_src.strip()
+                    if (
+                        a_dst_low in PeepholeOptimizer._GP32
+                        and a_src_norm.startswith("[")
+                        and a_src_norm.endswith("]")
+                        and not _references_register(a_src_norm, "eax")
+                    ):
+                        b = lines[i + 1]
+                        c = lines[i + 2]
+                        d = lines[i + 3]
+                        # Line B: `test reg, reg` (same reg)
+                        is_test = (
+                            b.kind == "instr"
+                            and b.op == "test"
+                            and self._is_test_reg_reg(b, a_dst_low)
+                        )
+                        # Line C: `setCC al`
+                        is_setcc_al = (
+                            c.kind == "instr"
+                            and c.op in setcc_ops
+                            and c.operands.strip().lower() == "al"
+                        )
+                        # Line D: `movzx eax, al`
+                        is_movzx = (
+                            d.kind == "instr"
+                            and d.op == "movzx"
+                            and d.operands.replace(" ", "").lower()
+                                == "eax,al"
+                        )
+                        if is_test and is_setcc_al and is_movzx:
+                            indent = self._extract_indent(line.raw)
+                            spacer = " " * max(1, 8 - len("cmp"))
+                            new_a_raw = (
+                                f"{indent}cmp{spacer}"
+                                f"dword {a_src_norm}, 0"
+                            )
+                            new_a = Line(
+                                raw=new_a_raw, kind="instr",
+                                op="cmp",
+                                operands=f"dword {a_src_norm}, 0",
+                            )
+                            # Drop B (test); keep C and D.
+                            out.append(new_a)
+                            out.append(c)
+                            out.append(d)
+                            self.stats[
+                                "mov_test_setcc_movzx_collapse"
+                            ] = (
+                                self.stats.get(
+                                    "mov_test_setcc_movzx_collapse",
+                                    0,
+                                ) + 1
+                            )
+                            i += 4
+                            continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _is_test_reg_reg(line: Line, reg: str) -> bool:
+        """Is `line` a `test REG, REG` for the given register?"""
+        if line.op != "test":
+            return False
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return False
+        a, b = parts
+        return (
+            a.strip().lower() == reg.lower()
+            and b.strip().lower() == reg.lower()
+        )
 
     def _pass_div_mem_form(self, lines: list[Line]) -> list[Line]:
         """Collapse ``mov reg, [m]; <ext>; div/idiv reg`` to
