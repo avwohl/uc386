@@ -4829,3 +4829,46 @@ def test_va_arg_strength_reduce_safety():
     # ap is at [ebp - 4] (first local).
     advances = da.count("add     dword [ebp - 4], 4")
     assert advances == 1, f"expected 1 va_arg advance, got {advances}"
+
+
+def test_member_access_with_side_effect_object_not_strength_reduced():
+    # `make().x * 2` was being strength-reduced to
+    # `make().x + make().x` because `_expr_has_side_effects` had
+    # no `Member` case — it fell through to `return False` even
+    # when the object expression was a function call. Result: the
+    # call ran twice, doubling the side effects.
+    from uc_core.ast_optimizer import ASTOptimizer
+    src = (
+        "struct S { int x; };\n"
+        "extern struct S make(void);\n"
+        "int main(void) { return make().x * 2; }\n"
+    )
+    tokens = list(Lexer(src, "test.c").tokenize())
+    unit = Parser(tokens).parse()
+    unit = ASTOptimizer(3).optimize(unit)
+    asm = CodeGenerator().generate(unit)
+    # Buggy form has 2 calls to _make; fixed form has 1.
+    assert asm.count("call    _make") == 1, (
+        f"expected 1 call to _make, got {asm.count('call    _make')}"
+    )
+
+
+def test_compound_literal_with_side_effect_init_not_strength_reduced():
+    # `(struct S){side()}.x * 2` was being strength-reduced to
+    # `(struct S){side()}.x + (struct S){side()}.x` because
+    # `_expr_has_side_effects` had no `Compound` case. Member is
+    # now handled (recurses into obj = Compound), but Compound
+    # itself still needed to recurse into its initializer list.
+    from uc_core.ast_optimizer import ASTOptimizer
+    src = (
+        "extern int side(void);\n"
+        "struct S { int x; };\n"
+        "int main(void) { return (struct S){side()}.x * 2; }\n"
+    )
+    tokens = list(Lexer(src, "test.c").tokenize())
+    unit = Parser(tokens).parse()
+    unit = ASTOptimizer(3).optimize(unit)
+    asm = CodeGenerator().generate(unit)
+    assert asm.count("call    _side") == 1, (
+        f"expected 1 call to _side, got {asm.count('call    _side')}"
+    )
