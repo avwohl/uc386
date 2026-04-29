@@ -406,6 +406,7 @@ class PeepholeOptimizer:
             lines = self._pass_redundant_eax_load(lines)
             lines = self._pass_redundant_ecx_load(lines)
             lines = self._pass_rmw_collapse(lines)
+            lines = self._pass_div_mem_form(lines)
             lines = self._pass_shift_const_imm(lines)
             lines = self._pass_same_memory_operand_reuse(lines)
             lines = self._pass_fst_fstp_collapse(lines)
@@ -3440,6 +3441,116 @@ class PeepholeOptimizer:
         if sl in {"ebx", "ecx", "edx", "esi", "edi"}:
             return sl
         return None
+
+    def _pass_div_mem_form(self, lines: list[Line]) -> list[Line]:
+        """Collapse ``mov reg, [m]; <ext>; div/idiv reg`` to
+        ``<ext>; div/idiv [m]``.
+
+        Pattern (3 consecutive instr lines):
+            mov     reg, [m]    ; reg ∈ {ebx, ecx, esi, edi}, [m] is mem
+            <ext>               ; cdq (idiv) or xor edx, edx (div)
+            div/idiv reg
+
+        Rewrite to:
+            <ext>
+            div/idiv dword [m]
+
+        Saves 2 bytes per match: drops the 3-byte ``mov reg, [m]``;
+        gains 1 byte for the mem-form div/idiv (modrm/sib/disp).
+
+        Common in `a / b` and `a % b` for non-constant divisor.
+
+        Conditions:
+        - Line A: ``mov REG, [m]`` where REG is a GP32 != EAX/EDX/ESP,
+          [m] is a memory deref.
+        - Line B: ``cdq`` (paired with idiv) or ``xor edx, edx``
+          (paired with div for unsigned).
+        - Line C: ``idiv REG`` or ``div REG`` (matching B).
+        - REG dead after C (we drop its only def).
+        - [m] doesn't reference EAX or EDX (those are involved in
+          div/idiv as the dividend).
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (
+                i + 2 < len(lines)
+                and line.kind == "instr"
+                and line.op == "mov"
+            ):
+                ap = _operands_split(line.operands)
+                if ap is not None:
+                    a_dst, a_src = ap
+                    a_dst_low = a_dst.strip().lower()
+                    a_src_norm = a_src.strip()
+                    if (
+                        a_dst_low in {"ebx", "ecx", "esi", "edi"}
+                        and a_src_norm.startswith("[")
+                        and a_src_norm.endswith("]")
+                        and not _references_register(a_src_norm, "eax")
+                        and not _references_register(a_src_norm, "edx")
+                    ):
+                        b = lines[i + 1]
+                        c = lines[i + 2]
+                        # Match B + C as a paired (ext, div) op.
+                        is_idiv = (
+                            b.kind == "instr"
+                            and b.op == "cdq"
+                            and c.kind == "instr"
+                            and c.op == "idiv"
+                            and c.operands.strip().lower() == a_dst_low
+                        )
+                        is_div = (
+                            b.kind == "instr"
+                            and b.op == "xor"
+                            and self._is_xor_zero_idiom(b, "edx")
+                            and c.kind == "instr"
+                            and c.op == "div"
+                            and c.operands.strip().lower() == a_dst_low
+                        )
+                        if (
+                            (is_idiv or is_div)
+                            and self._reg_dead_after(
+                                lines, i + 3, a_dst_low,
+                            )
+                        ):
+                            indent_c = self._extract_indent(c.raw)
+                            spacer_c = " " * max(1, 8 - len(c.op))
+                            new_c_operands = f"dword {a_src_norm}"
+                            new_c_raw = (
+                                f"{indent_c}{c.op}{spacer_c}"
+                                f"{new_c_operands}"
+                            )
+                            new_c = Line(
+                                raw=new_c_raw, kind="instr",
+                                op=c.op, operands=new_c_operands,
+                            )
+                            # Skip A (the mov), keep B (ext), replace C.
+                            out.append(b)
+                            out.append(new_c)
+                            self.stats["div_mem_form"] = (
+                                self.stats.get("div_mem_form", 0) + 1
+                            )
+                            i += 3
+                            continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _is_xor_zero_idiom(line: Line, reg: str) -> bool:
+        """Is `line` a `xor reg, reg` zero-idiom for the given reg?"""
+        if line.op != "xor":
+            return False
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return False
+        a, b = parts
+        return (
+            a.strip().lower() == reg.lower()
+            and b.strip().lower() == reg.lower()
+        )
 
     def _pass_shift_const_imm(self, lines: list[Line]) -> list[Line]:
         """Collapse ``mov ecx, IMM; <shift> reg, cl`` into

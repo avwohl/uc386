@@ -1317,3 +1317,12 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Synergy with `right_operand_retarget`**: after my pass collapses to `shl eax, N`, the chain becomes a 2-instruction EAX-writing chain (`mov eax, [x]; shl eax, N`). retarget then rewrites the chain to write ECX directly, dropping the surrounding push/pop save-frame.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +11 peephole tests (875 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: div_mem_form**: collapse `mov reg, [m]; <ext>; div/idiv reg` into `<ext>; div/idiv [m]`. The codegen lowers division by loading the divisor into a scratch register first; x86's div/idiv accept a memory-form divisor directly. Saves 2 bytes per match (drops the 3-byte `mov reg, [m]`; gains 1 byte for the mem-form div/idiv).
+  - **Both signed and unsigned**: `mov reg, [m]; cdq; idiv reg` → `cdq; idiv [m]`; `mov reg, [m]; xor edx, edx; div reg` → `xor edx, edx; div [m]`.
+  - **Restricted to scratch regs** ebx/ecx/esi/edi for the source (not eax/edx — those hold the dividend).
+  - **Restricted to memory operands not referencing eax/edx** (those get clobbered before the div reads).
+  - **Sample fire rate**: 6 of 200 random torture tests (28 fires total). About 4-5 fires per matching test — solid impact for arithmetic-heavy programs.
+  - **Concrete example**: `int divtest(int a, int b) { return a / b; }` lowers to `mov eax, [ebp+8]; mov ecx, [ebp+12]; cdq; idiv ecx`. After my pass: `mov eax, [ebp+8]; cdq; idiv dword [ebp+12]`. One instruction shorter, 2 bytes saved per division.
+  - **Pass order**: runs after rmw_collapse and before shift_const_imm. Independent of both — div uses a fixed register pair (edx:eax for dividend, single reg for divisor), distinct from rmw and shift patterns.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +10 peephole tests (885 total). Pipeline 1734/1734 (100%).

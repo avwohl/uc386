@@ -7566,3 +7566,158 @@ def test_shift_const_imm_hex_imm():
     out = opt.optimize(asm)
     assert "shl     eax, 16" in out
     assert opt.stats.get("shift_const_imm", 0) == 1
+
+
+def test_div_mem_form_idiv():
+    """`mov ecx, [m]; cdq; idiv ecx` → `cdq; idiv [m]`. Saves 2 bytes."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp + 12]\n"
+        "        cdq\n"
+        "        idiv    ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "idiv    dword [ebp + 12]" in out
+    assert "mov     ecx, [ebp + 12]" not in out
+    assert opt.stats.get("div_mem_form", 0) == 1
+
+
+def test_div_mem_form_div_unsigned():
+    """`mov ecx, [m]; xor edx, edx; div ecx` → `xor edx, edx; div [m]`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp + 12]\n"
+        "        xor     edx, edx\n"
+        "        div     ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "div     dword [ebp + 12]" in out
+    assert "mov     ecx, [ebp + 12]" not in out
+    assert opt.stats.get("div_mem_form", 0) == 1
+
+
+def test_div_mem_form_other_regs():
+    """Works for ebx/esi/edi too."""
+    for reg in ["ebx", "esi", "edi"]:
+        asm = (
+            "_f:\n"
+            f"        mov     {reg}, [ebp + 12]\n"
+            f"        cdq\n"
+            f"        idiv    {reg}\n"
+            "        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        out = opt.optimize(asm)
+        assert "idiv    dword [ebp + 12]" in out
+        assert opt.stats.get("div_mem_form", 0) == 1
+
+
+def test_div_mem_form_skips_eax_edx():
+    """Source register can't be EAX or EDX (those hold the dividend)."""
+    for reg in ["eax", "edx"]:
+        asm = (
+            "_f:\n"
+            f"        mov     {reg}, [ebp + 12]\n"
+            "        cdq\n"
+            f"        idiv    {reg}\n"
+            "        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        opt.optimize(asm)
+        assert opt.stats.get("div_mem_form", 0) == 0
+
+
+def test_div_mem_form_skips_mem_references_eax():
+    """If [m] references EAX (e.g., `[eax + 4]`), the rewrite would
+    read from eax AFTER cdq has clobbered EDX (and idiv reads
+    EDX:EAX). Bail."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [eax + 4]\n"  # [m] references eax
+        "        cdq\n"
+        "        idiv    ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("div_mem_form", 0) == 0
+
+
+def test_div_mem_form_skips_mem_references_edx():
+    """If [m] references EDX, similar issue: cdq clobbers EDX before
+    idiv reads [m]."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [edx + 4]\n"  # [m] references edx
+        "        cdq\n"
+        "        idiv    ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("div_mem_form", 0) == 0
+
+
+def test_div_mem_form_skips_mismatched_pair():
+    """`xor edx, edx` paired with `idiv` doesn't fire (signed div
+    needs cdq, not xor). Conservative."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 12]\n"
+        "        xor     edx, edx\n"
+        "        idiv    ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("div_mem_form", 0) == 0
+
+
+def test_div_mem_form_skips_reg_live_after():
+    """If REG is read after the idiv, dropping the load breaks."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 12]\n"
+        "        cdq\n"
+        "        idiv    ecx\n"
+        "        mov     edx, ecx\n"  # ECX live after
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("div_mem_form", 0) == 0
+
+
+def test_div_mem_form_skips_register_source():
+    """Source must be memory (with `[...]`), not a register."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, ebx\n"  # source is reg
+        "        cdq\n"
+        "        idiv    ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("div_mem_form", 0) == 0
+
+
+def test_div_mem_form_label_memory():
+    """Label memory `[_glob]` works (no register references)."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [_glob]\n"
+        "        cdq\n"
+        "        idiv    ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "idiv    dword [_glob]" in out
+    assert opt.stats.get("div_mem_form", 0) == 1
