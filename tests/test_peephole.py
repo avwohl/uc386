@@ -446,6 +446,91 @@ def test_leave_collapse_with_intervening_blank():
     assert opt.stats.get("leave_collapse", 0) == 1
 
 
+# ── imm_store_collapse ───────────────────────────────────────────
+
+
+def test_imm_store_collapse_zero():
+    """`mov eax, 0; mov [...], eax; mov eax, 1` collapses the first
+    two lines into a direct memory-immediate store."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 0\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     eax, 1\n"
+        "        mov     [ebp - 8], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # First store collapses (line C = `mov eax, 1` is the witness).
+    assert "        mov     dword [ebp - 4], 0" in out
+    # Second store doesn't collapse (no witness EAX overwrite after).
+    # That's fine — the witness requirement is the safety guarantee.
+    assert opt.stats.get("imm_store_collapse", 0) >= 1
+
+
+def test_imm_store_collapse_label_source():
+    """A label-immediate (e.g., a string literal address) is also a
+    valid constant for the direct memory store form."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _str0\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        mov     dword [ebp - 4], _str0" in out
+    assert opt.stats.get("imm_store_collapse", 0) == 1
+
+
+def test_imm_store_collapse_skips_memory_source():
+    """`mov eax, [src]; mov [dst], eax` is NOT a `mem-imm` candidate
+    because mem-mem moves don't exist on x86. NASM would reject the
+    rewrite."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        mov     [ebp - 8], eax\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("imm_store_collapse", 0) == 0
+
+
+def test_imm_store_collapse_requires_eax_overwrite_witness():
+    """Without a `mov eax, X` after the store, EAX might be live
+    (e.g., the assignment expression's value is being used). Skip."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 0\n"
+        "        mov     [ebp - 4], eax\n"
+        "        cmp     eax, 0\n"  # reads EAX!
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("imm_store_collapse", 0) == 0
+
+
+def test_imm_store_collapse_skips_register_source():
+    """`mov eax, ecx` to a temporary EAX shouldn't be folded — ECX
+    might be live and the immediate-form mov can't take a register."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("imm_store_collapse", 0) == 0
+
+
 # ── Convergence ──────────────────────────────────────────────────
 
 

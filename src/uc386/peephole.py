@@ -20,6 +20,10 @@ Currently implements:
   - leave_collapse: replace the function epilogue's `mov esp, ebp;
     pop ebp` with the equivalent single-byte `leave`. Saves 1 instr
     + 2 bytes per function epilogue.
+  - imm_store_collapse: replace `mov eax, IMM; mov [addr], eax;
+    mov eax, X` with `mov dword [addr], IMM; mov eax, X`. The
+    immediate-store form is one NASM instruction; the EAX overwrite
+    in the third line confirms EAX was dead.
 
 Patterns to add (see PEEPHOLE_PLAN.md for details): redundant
 mov-to-reg, tail calls, jump threading, multi-instruction right-
@@ -200,6 +204,7 @@ class PeepholeOptimizer:
             lines = self._pass_binop_collapse(lines)
             lines = self._pass_store_collapse(lines)
             lines = self._pass_leave_collapse(lines)
+            lines = self._pass_imm_store_collapse(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -428,6 +433,115 @@ class PeepholeOptimizer:
             return False
         if not (e_line.op == "mov"
                 and e_line.operands.replace(" ", "").lower() == "[ecx],eax"):
+            return False
+        return True
+
+    def _pass_imm_store_collapse(self, lines: list[Line]) -> list[Line]:
+        """Collapse `mov eax, IMM; mov [addr], eax; mov eax, X` to
+        `mov dword [addr], IMM; mov eax, X`.
+
+        The third instruction is the witness that EAX was dead after
+        the store — its rewrite of EAX makes the load-via-EAX
+        unnecessary. NASM accepts `mov dword [addr], IMM` directly.
+
+        Conditions:
+        - Line A: `mov eax, src` where src is a constant expression
+          (no `[` — i.e., not a memory load, not a register-to-EAX
+          where the register might be live).
+        - Line B: `mov [addr], eax` — a 4-byte store from EAX.
+        - Line C: `mov eax, anything` — confirms EAX is dead.
+
+        We don't fold without the witness — without line C we can't
+        be sure EAX wasn't live for a comparison/return/etc.
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (line.kind == "instr" and line.op == "mov"
+                    and self._is_imm_to_eax(line)):
+                instrs = self._next_n_instrs(lines, i + 1, 2)
+                if instrs is not None and self._matches_imm_store(instrs, line):
+                    [(b_idx, b_line), (c_idx, _c)] = instrs
+                    parts_a = _operands_split(line.operands)
+                    assert parts_a is not None
+                    _, src_imm = parts_a
+                    parts_b = _operands_split(b_line.operands)
+                    assert parts_b is not None
+                    addr, _ = parts_b
+                    leading_ws = re.match(r"^\s*", line.raw).group(0)
+                    new_raw = f"{leading_ws}mov     dword {addr}, {src_imm}"
+                    new_line = Line(
+                        raw=new_raw, kind="instr", op="mov",
+                        operands=f"dword {addr}, {src_imm}",
+                    )
+                    out.append(new_line)
+                    self.stats["imm_store_collapse"] = (
+                        self.stats.get("imm_store_collapse", 0) + 1
+                    )
+                    # Skip past line A (i) and line B (b_idx). Keep
+                    # line C in place (the witness mov-eax) since the
+                    # caller might want it.
+                    i = b_idx + 1
+                    continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _is_imm_to_eax(line: Line) -> bool:
+        """Is this a `mov eax, <constant-expr>` (immediate or label,
+        but not a memory deref or register source)?"""
+        if line.kind != "instr" or line.op != "mov":
+            return False
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return False
+        dest, src = parts
+        if dest.lower() != "eax":
+            return False
+        # Reject memory derefs (would need NASM mem-mem move which
+        # doesn't exist on x86) and register sources (could alias EAX
+        # itself or be a live register).
+        if "[" in src:
+            return False
+        # Reject bare register names — they might be live elsewhere.
+        regs = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+                "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
+                "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"}
+        if src.lower() in regs:
+            return False
+        return True
+
+    @staticmethod
+    def _matches_imm_store(
+        instrs: list[tuple[int, Line]],
+        a_line: Line,
+    ) -> bool:
+        """Verify line B (`mov [addr], eax`) and line C (`mov eax, X`)."""
+        b_line = instrs[0][1]
+        c_line = instrs[1][1]
+        if b_line.op != "mov":
+            return False
+        parts_b = _operands_split(b_line.operands)
+        if parts_b is None:
+            return False
+        b_dest, b_src = parts_b
+        # Destination must be a memory ref.
+        if not b_dest.startswith("["):
+            return False
+        # Source must be EAX (not a sub-register — those need narrower
+        # store widths and a different rewrite).
+        if b_src.strip().lower() != "eax":
+            return False
+        # Line C must be `mov eax, anything` — the EAX overwrite witness.
+        if c_line.op != "mov":
+            return False
+        parts_c = _operands_split(c_line.operands)
+        if parts_c is None:
+            return False
+        c_dest, _c_src = parts_c
+        if c_dest.lower() != "eax":
             return False
         return True
 
