@@ -959,3 +959,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - 950512-1.c: 4986 → 3765 bytes ASM (-1221 bytes, 24.5% reduction).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. Pipeline 1734/1734 (100%).
+- **2026-04-29 — libc data DCE — selective .data and .bss inclusion**: extended the libc transitive-closure walk to cover data labels alongside functions. Previously the bundled libc unconditionally embedded ALL of `.data` (24 bytes: __heap_ptr, _stdin/_stdout/_stderr, _perror_suffix) and `.bss` (160 bytes runtime, 1 MB virtual heap). Now each data label is reached only when something in the closure references it.
+  - **`LibcDataLabel.deps`**: data labels track their own `_*` references too. `__heap_ptr: dd __heap` adds `__heap` as a dep so closure picks it up.
+  - **`emit()` is selective**: `.data` and `.bss` sections are emitted only when at least one of their labels is in the needed set. Hello-world (only `_puts`) drops both sections entirely.
+  - **Hello.com: 94 → 70 bytes** (-24 bytes — exactly the dead `.data` block). Programs that DO use the data labels (printf with stdio, malloc with heap, etc.) include them as needed.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. Pipeline 1734/1734 (100%).

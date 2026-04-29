@@ -61,13 +61,17 @@ class LibcFunction:
 
 @dataclass
 class LibcDataLabel:
-    """A label in `.data` or `.bss`. Always included in the output —
-    they're typically small (heap pointer, file table, etc.) and the
-    code that uses them references them by name."""
+    """A label in `.data` or `.bss`. Subject to the transitive-closure
+    walk like functions — included only when reachable from a referenced
+    symbol."""
 
     name: str
     section: str  # ".data" or ".bss"
     source: list[str]
+
+    deps: set[str] = field(default_factory=set)
+    """Direct references to other libc symbols. Data labels can
+    reference others (e.g. `__heap_ptr: dd __heap`)."""
 
 
 @dataclass
@@ -94,44 +98,67 @@ class ParsedLibc:
 
     def transitive_closure(self, initial: set[str]) -> set[str]:
         """Walk `deps` starting from `initial`, returning the set of
-        function names transitively needed.
+        all libc symbol names (functions + data/bss labels) transitively
+        needed.
 
         `initial` is the set of names referenced by user code (e.g.,
         derived from `extern _printf` declarations). Names not present
-        in `self.functions` are ignored (probably user-defined or
-        truly unused references).
+        in `self.functions` or `self.data_labels` are ignored (probably
+        user-defined or truly unused references).
+
+        Data labels can themselves reference other libc symbols (e.g.
+        `__heap_ptr: dd __heap` references `__heap`). Those references
+        are tracked too.
         """
         needed: set[str] = set()
-        worklist = [n for n in initial if n in self.functions]
+        worklist = [n for n in initial
+                    if n in self.functions or n in self.data_labels]
         while worklist:
             name = worklist.pop()
             if name in needed:
                 continue
             needed.add(name)
-            fn = self.functions[name]
-            for dep in fn.deps:
-                if dep in self.functions and dep not in needed:
+            if name in self.functions:
+                deps = self.functions[name].deps
+            elif name in self.data_labels:
+                deps = self.data_labels[name].deps
+            else:
+                continue
+            for dep in deps:
+                if dep in needed:
+                    continue
+                if dep in self.functions or dep in self.data_labels:
                     worklist.append(dep)
         return needed
 
-    def emit(self, needed_funcs: set[str]) -> str:
-        """Produce the asm text containing only `needed_funcs` plus
-        always-included data/bss sections.
+    def emit(self, needed: set[str]) -> str:
+        """Produce the asm text containing only `needed` symbols
+        (functions + data/bss labels).
 
         Functions are emitted in their original order from the source.
+        Data and BSS sections are emitted only when they have at
+        least one needed label.
         """
         out: list[str] = []
         out.extend(self.header)
         # Functions in original order.
         for name, fn in self.functions.items():
-            if name in needed_funcs:
+            if name in needed:
                 out.extend(fn.source)
-        # Data section: emit everything (small, and dependency-tracking
-        # data references would add complexity for little win).
-        if self.data_section_lines:
-            out.extend(self.data_section_lines)
-        if self.bss_section_lines:
-            out.extend(self.bss_section_lines)
+        # Data section: emit only needed labels.
+        needed_data = [d for n, d in self.data_labels.items()
+                       if d.section == ".data" and n in needed]
+        if needed_data:
+            out.append("        section .data")
+            for d in needed_data:
+                out.extend(d.source)
+        # BSS section: emit only needed labels.
+        needed_bss = [d for n, d in self.data_labels.items()
+                      if d.section == ".bss" and n in needed]
+        if needed_bss:
+            out.append("        section .bss")
+            for d in needed_bss:
+                out.extend(d.source)
         return "\n".join(out) + "\n"
 
 
@@ -267,6 +294,10 @@ def parse_libc(text: str) -> ParsedLibc:
             continue
 
     finalize_func()
+    # Extract deps for each data label.
+    for label in data_labels.values():
+        label.deps = _extract_deps(label.source)
+        label.deps.discard(label.name)  # don't self-reference
     return ParsedLibc(
         header=header,
         functions=functions,
