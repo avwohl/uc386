@@ -1918,6 +1918,124 @@ def test_label_offset_fold_works_with_any_register():
         assert opt.stats.get("label_offset_fold") == 1
 
 
+# ── cmp_load_collapse ────────────────────────────────────────────
+
+
+def test_cmp_load_collapse_basic():
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        cmp     eax, 5\n"
+        "        jne     .L1\n"
+        "        mov     eax, 1\n"
+        "        ret\n"
+        ".L1:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        cmp     dword [ebp + 8], 5" in out
+    assert "        mov     eax, [ebp + 8]\n        cmp" not in out
+    assert opt.stats.get("cmp_load_collapse") == 1
+
+
+def test_cmp_load_collapse_skips_eax_used_after():
+    """If EAX is read after the cmp (and not freshly overwritten),
+    the load must survive."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        cmp     eax, 5\n"
+        "        jne     .L1\n"
+        "        push    eax\n"  # EAX read
+        "        ret\n"
+        ".L1:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("cmp_load_collapse", 0) == 0
+
+
+def test_cmp_load_collapse_skips_mem_mem_cmp():
+    """x86 has no `cmp mem, mem` form — skip when cmp src is a memory
+    reference."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        cmp     eax, [ebp - 4]\n"
+        "        jne     .L1\n"
+        "        mov     eax, 1\n"
+        "        ret\n"
+        ".L1:\n"
+        "        mov     eax, 2\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("cmp_load_collapse", 0) == 0
+
+
+def test_cmp_load_collapse_with_register_src():
+    """`cmp [mem], reg` is a valid x86 form."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        cmp     eax, ecx\n"
+        "        jne     .L1\n"
+        "        mov     eax, 1\n"
+        "        ret\n"
+        ".L1:\n"
+        "        mov     eax, 2\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        cmp     dword [ebp + 8], ecx" in out
+    assert opt.stats.get("cmp_load_collapse") == 1
+
+
+def test_cmp_load_collapse_with_jcc_branching():
+    """The CFG-aware liveness scan must follow BOTH branches of the
+    jcc to verify EAX is dead on each."""
+    # Both branches eventually overwrite EAX → dead.
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        cmp     eax, 0\n"
+        "        je      .L_zero\n"
+        "        mov     eax, 1\n"
+        "        ret\n"
+        ".L_zero:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        cmp     dword [ebp + 8], 0" in out
+    assert opt.stats.get("cmp_load_collapse") == 1
+
+
+def test_cmp_load_collapse_one_branch_uses_eax():
+    """If one branch reads EAX (e.g. uses it in a return), the
+    pattern must NOT fire."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        cmp     eax, 0\n"
+        "        je      .L_zero\n"
+        "        ret\n"  # EAX is the return value!
+        ".L_zero:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    # The fallthrough `ret` makes EAX live (return value).
+    assert opt.stats.get("cmp_load_collapse", 0) == 0
+
+
 # ── Convergence ──────────────────────────────────────────────────
 
 

@@ -76,6 +76,10 @@ Currently implements:
     `mov reg, imm32` and dropping the 3-byte add/sub. Saves 3 bytes
     per match. Common in pointer arithmetic on globals
     (`mov eax, _g; add eax, 8` for `g[2]`).
+  - cmp_load_collapse: collapse `mov reg, [mem]; cmp reg, X` into
+    `cmp dword [mem], X` when reg is dead after. Saves 2-3 bytes
+    per match. Common in `if (var == X)` and `if (var)` (the
+    latter via `cmp_zero_to_test`'s output).
 
 Patterns to add (see PEEPHOLE_PLAN.md for details): tail calls,
 jump threading, multi-instruction right-operand retargeting.
@@ -235,18 +239,22 @@ def _jmp_target(line: Line) -> str | None:
     indirect / unrecognized."""
     if line.kind != "instr" or line.op != "jmp":
         return None
+    return _branch_target(line)
+
+
+def _branch_target(line: Line) -> str | None:
+    """Return the target label of any direct branch (jmp/jcc) — i.e.
+    the operand is a literal label name. Returns None for indirect
+    branches (`jmp eax`, `jmp [_tbl]`) or unparseable operands.
+    """
+    if line.kind != "instr":
+        return None
     operand = line.operands.strip()
-    # Indirect jumps: `jmp eax`, `jmp [eax]`, `jmp [_table + eax*4]`.
-    # We don't optimize those.
     if not operand or operand[0] in "[":
         return None
-    # Register operand: `jmp eax`. Single bare identifier that's a 32-bit
-    # general-purpose register.
     if operand.lower() in {"eax", "ebx", "ecx", "edx", "esi", "edi",
                            "ebp", "esp"}:
         return None
-    # Treat the rest as a label name. NASM allows `jmp _foo` and
-    # `jmp .local`. No spaces in labels.
     if re.fullmatch(r"\.?[A-Za-z_][A-Za-z0-9_]*", operand):
         return operand
     return None
@@ -291,6 +299,7 @@ class PeepholeOptimizer:
             lines = self._pass_prologue_to_enter(lines)
             lines = self._pass_redundant_eax_load(lines)
             lines = self._pass_label_offset_fold(lines)
+            lines = self._pass_cmp_load_collapse(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -1752,11 +1761,29 @@ class PeepholeOptimizer:
                     visited_labels | frozenset({target}),
                     depth + 1,
                 )
-            # Conditional jumps split control flow — for accurate
-            # liveness we'd need to check both successors. Conservative:
-            # bail.
+            # Conditional jumps split control flow. Both successors
+            # must reach a pure-write before any read. Recurse on the
+            # target path; continue scanning the fallthrough.
             if ln.op.startswith("j") and ln.op != "jmp":
-                return False
+                target = _branch_target(ln)
+                if target is None:
+                    return False  # indirect/unparseable — bail
+                if target in visited_labels:
+                    return False  # loop — bail
+                target_idx = self._find_label_idx(lines, target)
+                if target_idx is None:
+                    return False
+                # Target path: must be dead.
+                target_dead = self._reg_dead_after(
+                    lines, target_idx + 1, reg32,
+                    visited_labels | frozenset({target}),
+                    depth + 1,
+                )
+                if not target_dead:
+                    return False
+                # Fallthrough path: keep scanning.
+                j += 1
+                continue
             # `call <label>` clobbers caller-saved regs (EAX/ECX/EDX).
             if ln.op == "call":
                 operand = ln.operands.strip().lower()
@@ -2210,6 +2237,105 @@ class PeepholeOptimizer:
             return int(s, 0)
         except ValueError:
             return None
+
+    def _pass_cmp_load_collapse(self, lines: list[Line]) -> list[Line]:
+        """Collapse ``mov reg, [mem]; cmp reg, X`` into
+        ``cmp dword [mem], X`` when ``reg`` is dead after. Also
+        handles ``mov reg, [mem]; test reg, reg`` → ``cmp dword
+        [mem], 0`` (test r,r and cmp r,0 set the same flags for
+        standard Jcc).
+
+        x86 supports ``cmp r/m32, imm`` and ``cmp r/m32, r32``
+        directly, so the load can be elided. Saves 2-3 bytes per
+        match.
+
+        Conditions:
+        - First line is ``mov reg, [mem]`` (plain mov, no movsx/movzx;
+          source must be a memory deref).
+        - Second line is ``cmp reg, X`` (X not a memory ref) OR
+          ``test reg, reg`` (zero-test).
+        - reg is dead after the cmp/test (CFG-aware scan).
+
+        Restricted to EAX for now: most cmp+load chains funnel through
+        EAX, and limiting scope keeps the safety analysis simple.
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (
+                i + 1 < len(lines)
+                and line.kind == "instr"
+                and line.op == "mov"
+            ):
+                parts = _operands_split(line.operands)
+                if parts is not None:
+                    dest, src = parts
+                    dest_low = dest.strip().lower()
+                    src_norm = src.strip()
+                    if (
+                        dest_low == "eax"
+                        and src_norm.startswith("[")
+                        and src_norm.endswith("]")
+                    ):
+                        nxt = lines[i + 1]
+                        new_cmp = self._collapse_cmp_with_load(
+                            nxt, src_norm
+                        )
+                        if new_cmp is not None and self._reg_dead_after(
+                            lines, i + 2, "eax"
+                        ):
+                            indent = self._extract_indent(line.raw)
+                            new_raw = f"{indent}{new_cmp}"
+                            new_line = Line(
+                                raw=new_raw,
+                                kind="instr",
+                                op="cmp",
+                                operands=new_cmp.split(
+                                    None, 1
+                                )[1] if " " in new_cmp else "",
+                            )
+                            out.append(new_line)
+                            self.stats["cmp_load_collapse"] = (
+                                self.stats.get(
+                                    "cmp_load_collapse", 0
+                                ) + 1
+                            )
+                            i += 2
+                            continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _collapse_cmp_with_load(
+        nxt: Line, src_mem: str
+    ) -> str | None:
+        """If `nxt` is `cmp eax, X` (X non-memory) or `test eax, eax`,
+        return the replacement instruction text. Otherwise None."""
+        if nxt.kind != "instr":
+            return None
+        if nxt.op == "cmp":
+            np = _operands_split(nxt.operands)
+            if np is None:
+                return None
+            cdest, csrc = np
+            if cdest.strip().lower() != "eax":
+                return None
+            if "[" in csrc:
+                return None
+            return f"cmp     dword {src_mem}, {csrc.strip()}"
+        if nxt.op == "test":
+            np = _operands_split(nxt.operands)
+            if np is None:
+                return None
+            d, s = np
+            if (
+                d.strip().lower() == "eax"
+                and s.strip().lower() == "eax"
+            ):
+                return f"cmp     dword {src_mem}, 0"
+        return None
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
         """P-jmp-to-next: `jmp X` immediately (modulo blanks/comments)
