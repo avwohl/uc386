@@ -405,6 +405,9 @@ class PeepholeOptimizer:
             lines = self._pass_label_push_collapse(lines)
             lines = self._pass_label_store_collapse(lines)
             lines = self._pass_lea_load_collapse(lines)
+            lines = self._pass_lea_offset_fold(lines)
+            lines = self._pass_lea_forward_to_reg(lines)
+            lines = self._pass_lea_store_collapse(lines)
             lines = self._pass_value_forward_to_reg(lines)
             lines = self._pass_byte_stores_to_dword(lines)
             lines = self._pass_pop_index_push_collapse(lines)
@@ -4893,6 +4896,260 @@ class PeepholeOptimizer:
             out = out[:i] + [new_line] + out[i + 2:]
             self.stats["lea_load_collapse"] = (
                 self.stats.get("lea_load_collapse", 0) + 1
+            )
+            continue
+        return out
+
+    def _pass_lea_offset_fold(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``lea REG, [ebp ± N]; add REG, M`` (or ``sub REG,
+        M``) into ``lea REG, [ebp ± (N ± M)]``.
+
+        Saves 3 bytes per match (drops the add/sub). LEA doesn't set
+        flags, while add/sub does — so the rewrite is only safe when
+        the add's flags are dead.
+
+        Conditions:
+        - Two consecutive instr lines.
+        - Line A: ``lea REG, [ebp ± N]`` (stack-relative).
+        - Line B: ``add REG, M`` or ``sub REG, M`` (numeric M).
+        - Flags after Line B must be safe (dead before any reader).
+        """
+        out = list(lines)
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op == "lea"
+                and b.kind == "instr" and b.op in ("add", "sub")
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            if ap is None or bp is None:
+                i += 1
+                continue
+            r1 = ap[0].strip().lower()
+            lea_src = ap[1].strip()
+            b_dst = bp[0].strip().lower()
+            if not self._is_general_register(r1) or b_dst != r1:
+                i += 1
+                continue
+            try:
+                imm = int(bp[1].strip())
+            except ValueError:
+                i += 1
+                continue
+            # LEA src must be `[ebp ± N]`.
+            m = re.match(
+                r"^\[\s*ebp\s*([+-])\s*(\d+)\s*\]$",
+                lea_src,
+                re.IGNORECASE,
+            )
+            if m is None:
+                i += 1
+                continue
+            n_disp = int(m.group(2))
+            if m.group(1) == "-":
+                n_disp = -n_disp
+            # Apply the add/sub.
+            if b.op == "add":
+                combined = n_disp + imm
+            else:
+                combined = n_disp - imm
+            # Flags must be dead after line B (LEA doesn't set flags
+            # but add/sub does; if flags were used by a downstream
+            # Jcc, dropping the add changes behavior).
+            if not self._flags_safe_after(out, i + 2):
+                i += 1
+                continue
+            sign = "+" if combined >= 0 else "-"
+            new_src = f"[ebp {sign} {abs(combined)}]"
+            indent = self._extract_indent(a.raw)
+            new_raw = f"{indent}lea     {r1}, {new_src}"
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op="lea",
+                operands=f"{r1}, {new_src}",
+            )
+            out = out[:i] + [new_line] + out[i + 2:]
+            self.stats["lea_offset_fold"] = (
+                self.stats.get("lea_offset_fold", 0) + 1
+            )
+            continue
+        return out
+
+    def _pass_lea_forward_to_reg(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``lea REG1, BASE; mov REG2, REG1`` into
+        ``lea REG2, BASE`` when REG1 is dead after.
+
+        Saves 2 bytes per match (drops the register copy). Common
+        after the codegen emits an address-into-EAX then transfers
+        to a different register for further use.
+
+        Conditions:
+        - Two consecutive instr lines.
+        - Line A: ``lea REG1, BASE``.
+        - Line B: ``mov REG2, REG1`` (register copy).
+        - REG1 != REG2.
+        - REG1 dead after line B.
+        """
+        out = list(lines)
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op == "lea"
+                and b.kind == "instr" and b.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            if ap is None or bp is None:
+                i += 1
+                continue
+            r1 = ap[0].strip().lower()
+            base = ap[1].strip()
+            b_dst = bp[0].strip().lower()
+            b_src = bp[1].strip().lower()
+            if (
+                not self._is_general_register(r1)
+                or not self._is_general_register(b_dst)
+                or b_src != r1
+                or b_dst == r1
+            ):
+                i += 1
+                continue
+            if not self._reg_dead_after(out, i + 2, r1):
+                i += 1
+                continue
+            indent = self._extract_indent(a.raw)
+            new_raw = f"{indent}lea     {b_dst}, {base}"
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op="lea",
+                operands=f"{b_dst}, {base}",
+            )
+            out = out[:i] + [new_line] + out[i + 2:]
+            self.stats["lea_forward_to_reg"] = (
+                self.stats.get("lea_forward_to_reg", 0) + 1
+            )
+            continue
+        return out
+
+    def _pass_lea_store_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``lea REG, [ebp ± N]; mov <size> [REG + M], SRC``
+        (or ``[REG]``) into ``mov <size> [ebp ± (N+M)], SRC``.
+
+        Saves 3 bytes per match. Common in local struct member
+        assignment where the codegen emits an explicit `lea` to
+        compute the struct base, then `mov [base + offset], value`
+        for each member.
+
+        Conditions:
+        - Two consecutive instr lines.
+        - Line A: ``lea REG, [ebp ± N]`` (stack-relative base).
+        - Line B: ``mov <size> [REG]`` or ``mov <size> [REG + M]``
+          with SRC.
+        - REG dead after line B.
+        - SRC must not reference REG.
+        """
+        out = list(lines)
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op == "lea"
+                and b.kind == "instr" and b.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            if ap is None or bp is None:
+                i += 1
+                continue
+            r1 = ap[0].strip().lower()
+            lea_src = ap[1].strip()
+            b_dst = bp[0].strip()
+            b_src = bp[1].strip()
+            if not self._is_general_register(r1):
+                i += 1
+                continue
+            # LEA src must be `[ebp ± N]`.
+            m_lea = re.match(
+                r"^\[\s*ebp\s*([+-])\s*(\d+)\s*\]$",
+                lea_src,
+                re.IGNORECASE,
+            )
+            if m_lea is None:
+                i += 1
+                continue
+            n_disp = int(m_lea.group(2))
+            if m_lea.group(1) == "-":
+                n_disp = -n_disp
+            # Mov dest must be `<size> [REG]` or `<size> [REG ± M]`.
+            m_dst_plain = re.match(
+                r"^(dword|word|byte|qword)\s+\[\s*([a-zA-Z]+)\s*\]$",
+                b_dst,
+                re.IGNORECASE,
+            )
+            m_dst_disp = re.match(
+                r"^(dword|word|byte|qword)\s+\[\s*([a-zA-Z]+)"
+                r"\s*([+-])\s*(\d+)\s*\]$",
+                b_dst,
+                re.IGNORECASE,
+            )
+            if m_dst_plain:
+                size_kw = m_dst_plain.group(1).lower()
+                base_reg = m_dst_plain.group(2).lower()
+                m_disp_val = 0
+            elif m_dst_disp:
+                size_kw = m_dst_disp.group(1).lower()
+                base_reg = m_dst_disp.group(2).lower()
+                m_disp_val = int(m_dst_disp.group(4))
+                if m_dst_disp.group(3) == "-":
+                    m_disp_val = -m_disp_val
+            else:
+                i += 1
+                continue
+            if base_reg != r1:
+                i += 1
+                continue
+            # SRC must not reference REG.
+            if self._references_reg_family(b_src, r1):
+                i += 1
+                continue
+            # REG dead after line B.
+            if not self._reg_dead_after(out, i + 2, r1):
+                i += 1
+                continue
+            combined = n_disp + m_disp_val
+            sign = "+" if combined >= 0 else "-"
+            new_dst = f"{size_kw} [ebp {sign} {abs(combined)}]"
+            indent = self._extract_indent(b.raw)
+            new_raw = f"{indent}mov     {new_dst}, {b_src}"
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op="mov",
+                operands=f"{new_dst}, {b_src}",
+            )
+            out = out[:i] + [new_line] + out[i + 2:]
+            self.stats["lea_store_collapse"] = (
+                self.stats.get("lea_store_collapse", 0) + 1
             )
             continue
         return out

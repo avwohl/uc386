@@ -1161,3 +1161,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Conditions**: REG dead after, or REG == REG2. Combined offset (N + M) folded at compile time.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (278 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: lea_offset_fold + lea_forward_to_reg + lea_store_collapse**: three more LEA-related collapses. Together with `lea_load_collapse`, they handle most of the structural `lea reg, [ebp+N]` patterns the codegen emits.
+  - **lea_offset_fold**: `lea reg, [ebp ± N]; add reg, M` → `lea reg, [ebp ± (N+M)]`. Saves 3 bytes (drops the add). Only safe when add's flags are dead.
+  - **lea_forward_to_reg**: `lea reg1, BASE; mov reg2, reg1` → `lea reg2, BASE`. Saves 2 bytes. Common when codegen address-once pattern materializes the address into EAX then transfers to a destination register.
+  - **lea_store_collapse**: `lea reg, [ebp ± N]; mov <size> [reg + M], SRC` → `mov <size> [ebp ± (N+M)], SRC`. Saves 3 bytes. Sister of lea_load_collapse for the store case.
+  - **probe_struct_more** (3-member struct + 2 member assignments + sum call): 47 → 43 lines after my prior slices, → 43 lines after these slices (`lea_store_collapse` and `lea_forward_to_reg` together drop the explicit address-load + transfer + store chain). The two `p.x = 100; p.y = 200;` assignments now lower as direct stack-slot stores.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (285 total). Pipeline 1734/1734 (100%).

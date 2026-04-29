@@ -4931,3 +4931,114 @@ def test_lea_load_collapse_size_keyword():
     out = opt.optimize(asm)
     assert "mov     eax, byte [ebp - 11]" in out
     assert opt.stats.get("lea_load_collapse") == 1
+
+
+# ── lea_offset_fold ──────────────────────────────────────────────
+
+
+def test_lea_offset_fold_add():
+    """`lea reg, [ebp - N]; add reg, M` → `lea reg, [ebp - (N - M)]`."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp - 12]\n"
+        "        add     eax, 4\n"
+        "        mov     [ebp - 4], eax\n"  # flags dead by here
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     eax, [ebp - 8]" in out
+    assert "add     eax, 4" not in out
+    assert opt.stats.get("lea_offset_fold") == 1
+
+
+def test_lea_offset_fold_skips_when_flags_read():
+    """If flags are read before being clobbered, can't drop add."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp - 12]\n"
+        "        add     eax, 4\n"
+        "        je      .L1\n"  # reads flags
+        ".L1:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("lea_offset_fold", 0) == 0
+
+
+# ── lea_forward_to_reg ───────────────────────────────────────────
+
+
+def test_lea_forward_to_reg_basic():
+    """`lea eax, [ebp - 12]; mov ecx, eax` → `lea ecx, [ebp - 12]`."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp - 12]\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, edx\n"  # eax dead before
+        "        mov     [ecx], 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     ecx, [ebp - 12]" in out
+    assert opt.stats.get("lea_forward_to_reg") == 1
+
+
+def test_lea_forward_to_reg_skips_when_eax_live():
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp - 12]\n"
+        "        mov     ecx, eax\n"
+        "        push    eax\n"  # eax live
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("lea_forward_to_reg", 0) == 0
+
+
+# ── lea_store_collapse ───────────────────────────────────────────
+
+
+def test_lea_store_collapse_basic():
+    """`lea reg, [ebp - N]; mov dword [reg], V` → `mov dword [ebp - N], V`."""
+    asm = (
+        "_f:\n"
+        "        lea     ecx, [ebp - 12]\n"
+        "        mov     dword [ecx], 100\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     dword [ebp - 12], 100" in out
+    assert "lea" not in out
+    assert opt.stats.get("lea_store_collapse") == 1
+
+
+def test_lea_store_collapse_with_offset():
+    """`lea reg, [ebp - 12]; mov dword [reg + 4], V` → `mov dword [ebp - 8], V`."""
+    asm = (
+        "_f:\n"
+        "        lea     ecx, [ebp - 12]\n"
+        "        mov     dword [ecx + 4], 200\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     dword [ebp - 8], 200" in out
+    assert opt.stats.get("lea_store_collapse") == 1
+
+
+def test_lea_store_collapse_skips_when_src_uses_reg():
+    """SRC referencing REG can't be folded."""
+    asm = (
+        "_f:\n"
+        "        lea     ecx, [ebp - 12]\n"
+        "        mov     dword [ecx], ecx\n"  # SRC uses ECX
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("lea_store_collapse", 0) == 0
