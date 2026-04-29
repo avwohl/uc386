@@ -2160,7 +2160,10 @@ def test_rmw_collapse_skips_mismatched_addresses():
 
 def test_rmw_collapse_at_function_call_witness():
     """A function call that clobbers EAX makes the load-store-call
-    pattern eligible for collapse."""
+    pattern eligible for collapse. After rmw_collapse fires, the
+    follow-up add_one_to_inc pass converts the resulting
+    `add dword [mem], 1` → `inc dword [mem]` for an additional
+    1-byte saving."""
     asm = (
         "_f:\n"
         "        mov     eax, [ebp - 4]\n"
@@ -2171,8 +2174,11 @@ def test_rmw_collapse_at_function_call_witness():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    assert "        add     dword [ebp - 4], 1" in out
+    # rmw_collapse fired (load-add-store → memory-RMW)...
     assert opt.stats.get("rmw_collapse") == 1
+    # ...and add_one_to_inc then folded the +1 into inc.
+    assert "        inc     dword [ebp - 4]" in out
+    assert "        add     dword [ebp - 4], 1" not in out
 
 
 # ── fst_fstp_collapse ────────────────────────────────────────────
@@ -2425,17 +2431,61 @@ def test_add_one_to_inc_skips_imm_other_than_1():
     assert opt.stats.get("add_one_to_inc", 0) == 0
 
 
-def test_add_one_to_inc_skips_memory_dest():
-    """`add [mem], 1` is a different beast — `inc dword [mem]` is the
-    same encoded length so skip (not a savings)."""
+def test_add_one_to_inc_memory_dest():
+    """`add dword [mem], 1` → `inc dword [mem]` saves 1 byte
+    (4 bytes → 3 bytes for ebp-relative addressing)."""
     asm = (
         "_f:\n"
         "        add     dword [ebp - 4], 1\n"
         "        ret\n"
     )
     opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "inc     dword [ebp - 4]" in out
+    assert "add     dword [ebp - 4], 1" not in out
+    assert opt.stats.get("add_one_to_inc", 0) == 1
+
+
+def test_add_one_to_inc_memory_byte():
+    """Byte-form memory inc/dec also saves 1 byte."""
+    asm = (
+        "_f:\n"
+        "        add     byte [eax], 1\n"
+        "        sub     byte [eax], 1\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "inc     byte [eax]" in out
+    assert "dec     byte [eax]" in out
+    assert opt.stats.get("add_one_to_inc", 0) == 2
+
+
+def test_add_one_to_inc_memory_unsized_skips():
+    """Without a NASM size keyword we can't safely emit `inc [mem]`
+    (NASM rejects it), so skip."""
+    asm = (
+        "_f:\n"
+        "        add     [ebp - 4], 1\n"  # malformed but defensive
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
     opt.optimize(asm)
-    # We don't transform memory operands.
+    assert opt.stats.get("add_one_to_inc", 0) == 0
+
+
+def test_add_one_to_inc_memory_skips_when_cf_live():
+    """Memory inc/dec must also skip when CF is live (jc, jb, etc.)."""
+    asm = (
+        "_f:\n"
+        "        add     dword [ebp - 4], 1\n"
+        "        jc      .overflow\n"
+        "        ret\n"
+        ".overflow:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
     assert opt.stats.get("add_one_to_inc", 0) == 0
 
 
@@ -2664,3 +2714,197 @@ def test_codegen_skips_peephole_when_disabled():
     # The dead `xor eax, eax / .epilogue:` pattern survives unoptimized.
     assert "        xor     eax, eax\n.epilogue:" in asm
     assert gen.peephole_stats == {}
+
+
+# ── narrowing_load_test_collapse ─────────────────────────────────
+
+
+def test_narrowing_load_test_collapse_movsx_byte():
+    """`movsx eax, byte [SRC]; test eax, eax` → `cmp byte [SRC], 0`.
+    EAX must be dead after the test (here: both branches overwrite
+    EAX before any read)."""
+    asm = (
+        "_f:\n"
+        "        movsx   eax, byte [esi]\n"
+        "        test    eax, eax\n"
+        "        jz      .end\n"
+        "        mov     eax, 1\n"  # overwrites EAX
+        "        ret\n"
+        ".end:\n"
+        "        xor     eax, eax\n"  # also overwrites EAX
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "cmp     byte [esi], 0" in out
+    assert "movsx" not in out
+    assert opt.stats.get("narrowing_load_test_collapse") == 1
+
+
+def test_narrowing_load_test_collapse_movzx_byte():
+    """`movzx eax, byte [SRC]` is also handled."""
+    asm = (
+        "_f:\n"
+        "        movzx   eax, byte [ebp - 4]\n"
+        "        test    eax, eax\n"
+        "        jnz     .yes\n"
+        "        mov     eax, [ebp - 8]\n"  # overwrites EAX
+        "        ret\n"
+        ".yes:\n"
+        "        mov     eax, [ebp - 12]\n"  # overwrites EAX
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "cmp     byte [ebp - 4], 0" in out
+    assert opt.stats.get("narrowing_load_test_collapse") == 1
+
+
+def test_narrowing_load_test_collapse_word():
+    """Word-form variant: `movsx eax, word [...]; test eax, eax`."""
+    asm = (
+        "_f:\n"
+        "        movsx   eax, word [edi]\n"
+        "        test    eax, eax\n"
+        "        jz      .end\n"
+        "        mov     eax, 5\n"
+        "        ret\n"
+        ".end:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "cmp     word [edi], 0" in out
+    assert opt.stats.get("narrowing_load_test_collapse") == 1
+
+
+def test_narrowing_load_test_collapse_skips_when_eax_live():
+    """If EAX is read after the test, the load can't be dropped."""
+    asm = (
+        "_f:\n"
+        "        movsx   eax, byte [esi]\n"
+        "        test    eax, eax\n"
+        "        mov     [ebp - 4], eax\n"  # uses EAX
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("narrowing_load_test_collapse", 0) == 0
+
+
+def test_narrowing_load_test_collapse_skips_non_eax_dest():
+    """Restricted to EAX dest for now."""
+    asm = (
+        "_f:\n"
+        "        movsx   ecx, byte [esi]\n"
+        "        test    ecx, ecx\n"
+        "        jz      .end\n"
+        "        ret\n"
+        ".end:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("narrowing_load_test_collapse", 0) == 0
+
+
+def test_narrowing_load_test_collapse_skips_full_dword_load():
+    """Plain ``mov eax, [mem]; test eax, eax`` is handled by
+    cmp_load_collapse (becomes ``cmp dword [mem], 0``); this pass
+    should not double-fire on it."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [esi]\n"
+        "        test    eax, eax\n"
+        "        jz      .end\n"
+        "        mov     eax, 1\n"
+        "        ret\n"
+        ".end:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # cmp_load_collapse handles this — the result is dword cmp, not byte.
+    assert "cmp     dword [esi], 0" in out
+    assert opt.stats.get("narrowing_load_test_collapse", 0) == 0
+    assert opt.stats.get("cmp_load_collapse", 0) == 1
+
+
+def test_narrowing_load_test_collapse_skips_signed_jcc():
+    """Regression: torture's doloop-1 uses
+    ``unsigned char z; --z > 0`` which expands to
+    ``movzx eax, byte; setg; ...; test eax, eax; jnz``. The setcc-jcc
+    collapse turns this into ``movzx eax, byte; cmp eax, 0; jg`` —
+    wait, actually after several other passes the chain becomes
+    ``movzx eax, byte; test eax, eax; jg``. If we'd rewrite that to
+    ``cmp byte, 0; jg``, the byte's signed comparison gives the wrong
+    answer for z=255 (treats 0xFF as -1, jg false; original treats
+    0x000000FF as 255, jg true).
+
+    The pass restricts itself to jz/jnz/je/jne (only ZF read) so the
+    rewrite never applies in the signed-Jcc case."""
+    asm = (
+        "_f:\n"
+        "        movzx   eax, byte [ebp - 4]\n"
+        "        test    eax, eax\n"
+        "        jg      .top\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+        ".top:\n"
+        "        mov     eax, 1\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("narrowing_load_test_collapse", 0) == 0
+
+
+def test_narrowing_load_test_collapse_skips_unsigned_jcc():
+    """Same restriction for unsigned Jcc — `ja`/`jb` read CF, which
+    differs between byte cmp and dword cmp/test."""
+    asm = (
+        "_f:\n"
+        "        movzx   eax, byte [esi]\n"
+        "        test    eax, eax\n"
+        "        ja      .top\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+        ".top:\n"
+        "        mov     eax, 1\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("narrowing_load_test_collapse", 0) == 0
+
+
+def test_narrowing_load_test_collapse_strlen_pattern():
+    """The classic `while (*p)` byte-pointer loop ends up tighter:
+    no movsx, just cmp byte through the pointer."""
+    asm = (
+        "_strlen:\n"
+        "        enter   4, 0\n"
+        "        xor     eax, eax\n"
+        "        mov     [ebp - 4], eax\n"
+        ".top:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        movsx   eax, byte [eax]\n"
+        "        test    eax, eax\n"
+        "        jz      .end\n"
+        "        inc     dword [ebp + 8]\n"
+        "        inc     dword [ebp - 4]\n"
+        "        jmp     .top\n"
+        ".end:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The narrowing-load collapse fires once for the byte-deref.
+    assert opt.stats.get("narrowing_load_test_collapse") == 1
+    # The pointer is now read as `cmp byte [eax], 0` directly.
+    assert "cmp     byte [eax], 0" in out
+    assert "movsx" not in out

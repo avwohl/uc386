@@ -94,13 +94,23 @@ Currently implements:
     fmulp / fdivp (the fsubrp/fdivrp swapped variants get their own
     rewrites).
   - add_one_to_inc: `add reg, 1` → `inc reg` (and `sub reg, 1` →
-    `dec reg`). Saves 2 bytes per match. inc/dec leave CF unchanged
-    while add/sub set CF; the rewrite is safe only when CF is dead
-    after (no `jc/jnc/ja/jb/...` reads it before being overwritten).
+    `dec reg`). Saves 2 bytes per register match, 1 byte per memory
+    match (`add dword [mem], 1` → `inc dword [mem]`, etc., for byte/
+    word/dword forms). inc/dec leave CF unchanged while add/sub set
+    CF; the rewrite is safe only when CF is dead after (no
+    `jc/jnc/ja/jb/...` reads it before being overwritten).
   - redundant_test_collapse: drop `test reg, reg` immediately after
     a flag-setting arithmetic op on the same reg. Common after
     `and eax, MASK; test eax, eax; jcc` — the AND already set ZF/SF
     based on its result, so the test is redundant. Saves 2 bytes.
+  - narrowing_load_test_collapse: collapse
+    `movsx/movzx eax, byte [SRC]; test eax, eax` into
+    `cmp byte [SRC], 0` (and likewise for word). The narrowing load
+    only sets EAX; the test then checks for zero. Direct `cmp <size>
+    [SRC], 0` produces the same flags (a zero-extended/sign-extended
+    byte/word is zero iff the byte/word itself is zero). Saves 2
+    bytes per match. Common in string/byte loops:
+    `while (*p) p++;` → `... cmp byte [eax], 0; jz end ...`.
 
 Patterns to add (see PEEPHOLE_PLAN.md for details): tail calls,
 jump threading, multi-instruction right-operand retargeting.
@@ -326,6 +336,7 @@ class PeepholeOptimizer:
             lines = self._pass_fpu_op_collapse(lines)
             lines = self._pass_add_one_to_inc(lines)
             lines = self._pass_redundant_test_collapse(lines)
+            lines = self._pass_narrowing_load_test_collapse(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -2630,8 +2641,14 @@ class PeepholeOptimizer:
 
     def _pass_add_one_to_inc(self, lines: list[Line]) -> list[Line]:
         """``add reg, 1`` → ``inc reg`` (and ``sub reg, 1`` →
-        ``dec reg``). Saves 2 bytes per match (3-byte add-imm8 → 1-byte
-        inc-reg).
+        ``dec reg``). Saves 2 bytes per register match (3-byte add-imm8
+        → 1-byte inc-reg).
+
+        Also handles ``add <size> [mem], 1`` → ``inc <size> [mem]``
+        for byte/word/dword sizes — saves 1 byte per match in 32-bit
+        mode (e.g., ``add dword [ebp + 8], 1`` is 4 bytes,
+        ``inc dword [ebp + 8]`` is 3 bytes; same 1-byte delta for byte
+        and word forms).
 
         ``inc``/``dec`` leave CF unchanged while ``add``/``sub`` set
         CF. The rewrite is safe only when CF is dead after — no
@@ -2645,7 +2662,8 @@ class PeepholeOptimizer:
         op (which clobbers flags), so the conservative check still
         fires often.
 
-        Applies to all 8 32-bit GP registers.
+        Applies to all 8 32-bit GP registers and to memory operands
+        with explicit `byte`/`word`/`dword` size.
         """
         out: list[Line] = []
         for i, line in enumerate(lines):
@@ -2656,21 +2674,31 @@ class PeepholeOptimizer:
                 parts = _operands_split(line.operands)
                 if parts is not None:
                     dest, src = parts
-                    dest_low = dest.strip().lower()
+                    dest_stripped = dest.strip()
+                    dest_low = dest_stripped.lower()
+                    is_reg = self._is_general_register(dest_low)
+                    is_sized_mem = self._is_sized_memory_operand(
+                        dest_stripped
+                    )
                     if (
-                        self._is_general_register(dest_low)
+                        (is_reg or is_sized_mem)
                         and src.strip() == "1"
                         and self._flags_safe_after(lines, i + 1)
                     ):
                         new_op = "inc" if line.op == "add" else "dec"
                         indent = self._extract_indent(line.raw)
                         spacer = " " * (8 - len(new_op))
-                        new_raw = f"{indent}{new_op}{spacer}{dest_low}"
+                        # Preserve original spacing/casing for memory
+                        # operands; canonicalize register name.
+                        new_dest = (
+                            dest_low if is_reg else dest_stripped
+                        )
+                        new_raw = f"{indent}{new_op}{spacer}{new_dest}"
                         new_line = Line(
                             raw=new_raw,
                             kind="instr",
                             op=new_op,
-                            operands=dest_low,
+                            operands=new_dest,
                         )
                         out.append(new_line)
                         self.stats["add_one_to_inc"] = (
@@ -2679,6 +2707,22 @@ class PeepholeOptimizer:
                         continue
             out.append(line)
         return out
+
+    @staticmethod
+    def _is_sized_memory_operand(text: str) -> bool:
+        """Return True if `text` is a NASM sized memory operand like
+        ``dword [ebp + 8]`` / ``byte [eax]`` / ``word [_glob]``.
+
+        Matches the size keyword (byte/word/dword/qword) followed by
+        whitespace and a bracketed memory expression. Not strict on
+        the bracket contents (any `[...]`).
+        """
+        m = re.match(
+            r"^(byte|word|dword|qword)\s+\[.*\]\s*$",
+            text,
+            re.IGNORECASE,
+        )
+        return m is not None
 
     # Instructions whose ZF/SF are set based on the result AND which
     # ALSO clear OF and CF — the same flag state as `test reg, reg`.
@@ -2768,6 +2812,139 @@ class PeepholeOptimizer:
                 return i
             if ln.kind in ("label", "directive", "data"):
                 return None  # block boundary
+        return None
+
+    # Match `byte [...]` or `word [...]` (with optional whitespace).
+    _NARROWING_LOAD_SRC_RE = re.compile(
+        r"^(byte|word)\s+(\[.*\])\s*$",
+        re.IGNORECASE,
+    )
+
+    # Jcc's that read ONLY ZF — they're flag-state-invariant under
+    # the byte-vs-dword cmp difference. Any other Jcc (jl/jg/ja/jb/
+    # js/jno/etc.) reads SF, OF, or CF, whose values DO differ between
+    # `test eax, eax` (after movzx of byte 0xFF: SF=0, since EAX bit
+    # 31 = 0) and `cmp byte [...], 0` (8-bit subtraction of 0 from
+    # 0xFF: SF=1). So the rewrite is unsafe for non-ZF Jcc.
+    _ZF_ONLY_JCC: frozenset[str] = frozenset({
+        "jz", "jnz", "je", "jne",
+    })
+
+    def _pass_narrowing_load_test_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``movsx/movzx eax, byte/word [SRC]; test eax, eax;
+        j[n]z LBL`` into ``cmp byte/word [SRC], 0; j[n]z LBL``.
+
+        The narrowing load fills EAX with a sign- or zero-extended
+        byte/word from memory. ``test eax, eax`` then checks the result
+        for zero. A sign- or zero-extended byte/word is zero iff the
+        source byte/word is itself zero — so the same ZF state results
+        from a direct ``cmp <size> [SRC], 0`` against the narrow memory
+        operand.
+
+        Restricted to ZF-only Jcc (jz/jnz/je/jne). For signed Jcc
+        (jl/jg/jge/jle) or unsigned Jcc (jb/ja/jae/jbe), the byte
+        comparison sets SF/OF/CF differently than the dword comparison
+        does on a movzx-extended value: e.g., for byte 0xFF, byte cmp
+        sets SF=1 (8-bit MSB) while ``test eax, eax`` after movzx sets
+        SF=0 (32-bit MSB of 0x000000FF). Caught a regression in
+        torture's ``doloop-1`` where ``unsigned char z; --z > 0`` used
+        ``movzx; cmp; setg; ...; jnz`` — the inner setg-chain collapses
+        to ``cmp byte; jg``, which gives the wrong answer for z=255.
+        Restricting to ZF-only Jcc avoids the trap.
+
+        Saves 2 bytes per match.
+
+        Conditions:
+        - First line is ``movsx eax, byte/word [SRC]`` or
+          ``movzx eax, byte/word [SRC]``.
+        - Second line is ``test eax, eax``.
+        - Third line is a ZF-only Jcc (jz/jnz/je/jne).
+        - EAX is dead after the test (CFG-aware scan via
+          `_reg_dead_after`).
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (
+                i + 2 < len(lines)
+                and line.kind == "instr"
+                and line.op in ("movsx", "movzx")
+            ):
+                parts = _operands_split(line.operands)
+                if parts is not None:
+                    dest, src = parts
+                    if dest.strip().lower() == "eax":
+                        m = self._NARROWING_LOAD_SRC_RE.match(
+                            src.strip()
+                        )
+                        if m is not None:
+                            size = m.group(1).lower()
+                            mem = m.group(2)
+                            nxt = lines[i + 1]
+                            jcc_line = self._next_instr_after(
+                                lines, i + 2
+                            )
+                            if (
+                                nxt.kind == "instr"
+                                and nxt.op == "test"
+                                and jcc_line is not None
+                                and jcc_line.op in self._ZF_ONLY_JCC
+                            ):
+                                np = _operands_split(nxt.operands)
+                                if (
+                                    np is not None
+                                    and np[0].strip().lower() == "eax"
+                                    and np[1].strip().lower() == "eax"
+                                    and self._reg_dead_after(
+                                        lines, i + 2, "eax"
+                                    )
+                                ):
+                                    indent = self._extract_indent(
+                                        line.raw
+                                    )
+                                    new_raw = (
+                                        f"{indent}cmp     "
+                                        f"{size} {mem}, 0"
+                                    )
+                                    new_line = Line(
+                                        raw=new_raw,
+                                        kind="instr",
+                                        op="cmp",
+                                        operands=(
+                                            f"{size} {mem}, 0"
+                                        ),
+                                    )
+                                    out.append(new_line)
+                                    self.stats[
+                                        "narrowing_load_test_collapse"
+                                    ] = (
+                                        self.stats.get(
+                                            "narrowing_load_test_collapse",
+                                            0,
+                                        ) + 1
+                                    )
+                                    i += 2
+                                    continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _next_instr_after(
+        lines: list[Line], start: int
+    ) -> "Line | None":
+        """Return the next ``instr`` line at or after `start`, skipping
+        blanks/comments. Returns None at labels/directives/data (basic-
+        block boundaries) or end-of-list."""
+        for j in range(start, len(lines)):
+            ln = lines[j]
+            if ln.kind == "instr":
+                return ln
+            if ln.kind in ("label", "directive", "data"):
+                return None
         return None
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
