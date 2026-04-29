@@ -1366,3 +1366,12 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Sample fire rate**: 8 of 200 random torture tests (9 fires total). Modest but real, especially in array-indexing-heavy code.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (925 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: value_forward_to_reg handles memory sources**: extends `value_forward_to_reg` to allow memory sources in addition to immediates / labels / register sources. Pattern `mov reg1, [m]; mov reg2, reg1` collapses to `mov reg2, [m]` when reg1 is dead after. The new memory load is the same encoded width as the original (NASM uses the same modrm encoding regardless of dest register), so we drop the 2-byte register transfer for free.
+  - **Safety**: rejects when the memory source references the destination register (would cause the load address to change after substitution since reg2's old value would now be the index). The dest-of-line-A case is handled correctly because line A's load reads the address operands BEFORE writing reg1, so dropping line A leaves reg1's old value intact for line B's read (when src references reg1, reg1 must be dead so we can drop line A entirely).
+  - **Cascades** with several existing passes:
+    - `label_load_collapse` produces `mov ecx, [_glob]; mov eax, ecx; ret` after collapsing `mov eax, _glob; mov ecx, [eax]; mov eax, ecx`. The new pass folds the trailing transfer to `mov eax, [_glob]; ret`.
+    - `index_load_collapse_label` produces `mov ecx, [ebp - 8]; mov ecx, [_g + ecx*4]; mov eax, ecx; ret`. The new pass collapses to `mov ecx, [ebp - 8]; mov eax, [_g + ecx*4]; ret`.
+    - `store_collapse` produces `mov eax, [ebp - 4]; mov ecx, eax; mov eax, 42; ...` after rewriting the push/pop save/restore. The new pass folds to `mov ecx, [ebp - 4]; mov eax, 42; ...`.
+  - **Modest fire rate** in real codegen: 3 fires across 49 random torture tests (3 lines / ~6 bytes saved). Most patterns where `mov reg1, [mem]; mov reg2, reg1` would appear are already collapsed earlier by `redundant_eax_load`, `redundant_ecx_load`, `right_operand_retarget`, or `reg_copy_addr_forward` — the leftover cases mostly land in chains where the prior passes don't fire.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. 471 peephole tests, 913 unit tests total. Pipeline 1734/1734 (100%).

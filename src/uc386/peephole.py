@@ -8744,14 +8744,15 @@ class PeepholeOptimizer:
             if b_src != r1 or b_dst == r1:
                 i += 1
                 continue
-            # SRC must NOT be a memory operand. Memory sources work
-            # in principle but x86 doesn't have a `mov [m], [m]` form;
-            # `mov ebx, [m]` is the same length as `mov eax, [m]`, so
-            # no savings issue, BUT the pass would collide with
-            # store_load_collapse and others. Keep simple.
+            # SRC may be a memory operand. The rewrite `mov reg2, [m]`
+            # is the same width as the original `mov reg1, [m]`, so
+            # we drop the 2-byte register transfer for free. Memory
+            # source must not reference REG2 (would self-reference
+            # after substitution).
             if "[" in src:
-                i += 1
-                continue
+                if _references_register(src, b_dst):
+                    i += 1
+                    continue
             # SRC must not be the target register either (would be
             # forwarding `mov r2, r2` which is a self-mov).
             if src.lower() == b_dst:

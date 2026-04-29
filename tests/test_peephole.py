@@ -811,7 +811,13 @@ def test_binop_collapse_handles_chain_of_binops():
 
 
 def test_store_collapse_with_immediate():
-    """Store-through-pointer with literal value drops push/pop pair."""
+    """Store-through-pointer with literal value drops push/pop pair.
+
+    Cascades with value_forward_to_reg: the `mov eax, [ebp - 4];
+    mov ecx, eax` chain (where store_collapse inserted the transfer)
+    folds further to `mov ecx, [ebp - 4]` since EAX is overwritten
+    by the next `mov eax, 42`.
+    """
     asm = (
         "_f:\n"
         "        mov     eax, [ebp - 4]\n"
@@ -825,11 +831,11 @@ def test_store_collapse_with_immediate():
     out = opt.optimize(asm)
     assert "push    eax" not in out
     assert "pop     ecx" not in out
+    # After the cascade, the address loads directly into ECX.
+    assert "mov     ecx, [ebp - 4]" in out
     # The value-load and store survive.
     assert "mov     eax, 42" in out
     assert "mov     [ecx], eax" in out
-    # And we picked up a `mov ecx, eax` to save the address.
-    assert "mov     ecx, eax" in out
     assert opt.stats.get("store_collapse", 0) == 1
 
 
@@ -5464,7 +5470,12 @@ def test_transfer_pop_cmp_collapse_skips_mixed_readers():
 
 def test_label_load_collapse_basic():
     """`mov eax, _label; mov ecx, [eax]` → `mov ecx, [_label]`
-    when EAX is dead after."""
+    when EAX is dead after.
+
+    Cascades with value_forward_to_reg: the trailing `mov eax, ecx`
+    gets folded into the load (`mov ecx, [_glob]; mov eax, ecx` →
+    `mov eax, [_glob]`), so the final form drops both intermediates.
+    """
     asm = (
         "_f:\n"
         "        mov     eax, _glob\n"
@@ -5474,7 +5485,7 @@ def test_label_load_collapse_basic():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    assert "mov     ecx, [_glob]" in out
+    assert "mov     eax, [_glob]" in out
     assert opt.stats.get("label_load_collapse") == 1
 
 
@@ -5494,7 +5505,8 @@ def test_label_load_collapse_same_reg():
 
 
 def test_label_load_collapse_label_arithmetic():
-    """The label can be a label-arithmetic expression."""
+    """The label can be a label-arithmetic expression. Cascades with
+    value_forward_to_reg the same as the basic case."""
     asm = (
         "_f:\n"
         "        mov     eax, _b + 8\n"
@@ -5504,13 +5516,14 @@ def test_label_load_collapse_label_arithmetic():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    assert "mov     ecx, [_b + 8]" in out
+    assert "mov     eax, [_b + 8]" in out
     assert opt.stats.get("label_load_collapse") == 1
 
 
 def test_label_load_collapse_sib():
     """SIB form: `mov eax, _label; mov ecx, [eax + ecx*4]` →
-    `mov ecx, [_label + ecx*4]`."""
+    `mov ecx, [_label + ecx*4]`. Cascades with value_forward_to_reg
+    when EAX is overwritten by a register copy from ECX."""
     asm = (
         "_f:\n"
         "        mov     eax, _arr\n"
@@ -5520,9 +5533,10 @@ def test_label_load_collapse_sib():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    # The new mov uses ecx as both dest and idx — that's OK in
-    # x86 (the read of ecx happens before the write).
-    assert "mov     ecx, [_arr + ecx*4]" in out
+    # The cascaded form folds the value-forward into the load;
+    # the new `mov eax, [_arr + ecx*4]` reads the original (pre-A)
+    # ECX as the index, same as the original line.
+    assert "mov     eax, [_arr + ecx*4]" in out
     assert opt.stats.get("label_load_collapse") == 1
 
 
@@ -5635,14 +5649,34 @@ def test_value_forward_to_reg_skips_when_eax_live():
     assert opt.stats.get("value_forward_to_reg", 0) == 0
 
 
-def test_value_forward_to_reg_skips_memory_source():
-    """Memory sources aren't handled by this pass — skip to avoid
-    double-firing with other passes."""
+def test_value_forward_to_reg_handles_memory_source():
+    """Memory sources fold the same way: `mov reg1, [m]; mov reg2, reg1`
+    becomes `mov reg2, [m]` when reg1 is dead. The new load is the
+    same encoded width, so we drop the 2-byte register transfer."""
     asm = (
         "_f:\n"
         "        mov     eax, [ebp - 4]\n"
         "        mov     ebx, eax\n"
         "        mov     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("value_forward_to_reg", 0) == 1
+    # `mov ebx, eax` folded into `mov ebx, [ebp - 4]`.
+    assert "mov     ebx, [ebp - 4]" in out
+    # The original `mov eax, [ebp - 4]` is gone.
+    assert "mov     eax, [ebp - 4]" not in out
+
+
+def test_value_forward_to_reg_skips_when_memory_references_dest():
+    """If the memory source references the destination register, we
+    can't substitute (the new load would self-reference and read a
+    different address)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ecx]\n"
+        "        mov     ecx, eax\n"
         "        ret\n"
     )
     opt = PeepholeOptimizer()
@@ -7144,7 +7178,8 @@ def test_index_load_collapse_label_basic():
 
 
 def test_index_load_collapse_label_int_array():
-    """Scale 4 case for int globals."""
+    """Scale 4 case for int globals. Cascades with value_forward_to_reg
+    when the loaded ECX is forwarded to EAX."""
     asm = (
         "_f:\n"
         "        mov     ecx, [ebp - 8]\n"
@@ -7156,7 +7191,10 @@ def test_index_load_collapse_label_int_array():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    assert "mov     ecx, [_g + ecx*4]" in out
+    # After cascade: `mov ecx, [ebp - 8]; mov eax, [_g + ecx*4]; ret`.
+    # The `mov ecx, [_g + ecx*4]; mov eax, ecx` pair folds via
+    # value_forward_to_reg.
+    assert "mov     eax, [_g + ecx*4]" in out
     assert opt.stats.get("index_load_collapse_label") == 1
 
 
