@@ -4268,6 +4268,73 @@ def test_zero_init_collapse_single_store():
     assert opt.stats.get("zero_init_collapse") == 1
 
 
+def test_add_esp_to_pop_4():
+    """`add esp, 4` after a call collapses to `pop ecx` (saves 2
+    bytes — 3-byte add → 1-byte pop). ECX is caller-saved so dead
+    after the call by convention."""
+    asm = (
+        "_f:\n"
+        "        push    5\n"
+        "        call    _foo\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     esp, 4" not in out
+    assert "pop     ecx" in out
+    assert opt.stats.get("add_esp_to_pop") == 1
+
+
+def test_add_esp_to_pop_8():
+    """`add esp, 8` collapses to two consecutive `pop ecx` (saves 1
+    byte — 3-byte add → 2 × 1-byte pops)."""
+    asm = (
+        "_f:\n"
+        "        push    5\n"
+        "        push    6\n"
+        "        call    _foo\n"
+        "        add     esp, 8\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     esp, 8" not in out
+    assert out.count("pop     ecx") == 2
+    assert opt.stats.get("add_esp_to_pop") == 1
+
+
+def test_add_esp_to_pop_skips_when_ecx_live():
+    """If ECX is read after the add esp, the rewrite would clobber its
+    value. Bail."""
+    asm = (
+        "_f:\n"
+        "        push    5\n"
+        "        call    _foo\n"
+        "        add     esp, 4\n"
+        "        mov     edx, ecx\n"  # ECX read here
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     esp, 4" in out
+    assert opt.stats.get("add_esp_to_pop", 0) == 0
+
+
+def test_add_esp_to_pop_skips_large_imm():
+    """`add esp, 16` is shorter than 4 pops; don't rewrite."""
+    asm = (
+        "_f:\n"
+        "        call    _foo\n"
+        "        add     esp, 16\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     esp, 16" in out
+    assert opt.stats.get("add_esp_to_pop", 0) == 0
+
+
 def test_narrow_store_reload_collapse_word():
     """`mov word [m], ax; movsx eax, word [m]` collapses to
     `mov word [m], ax; movsx eax, ax`. Saves 1 byte."""
@@ -7143,7 +7210,14 @@ def test_push_pop_op_to_memop_factorial_imul():
     """The recursive `n * factorial(n - 1)` shape: codegen pushes n
     (an ebp-relative param) before the recursive call, then pops it
     back into ECX after the call. Drops the push/pop and uses memory
-    operand directly: `imul eax, dword [ebp + 8]`."""
+    operand directly: `imul eax, dword [ebp + 8]`.
+
+    Note: `add_esp_to_pop` runs before this pass and rewrites
+    `add esp, 4` (the call arg cleanup) to `pop ecx`. So the chain
+    after that pass has TWO `pop ecx` lines: one for cleanup, one
+    for restoring n. push_pop_op_to_memop folds the OUTER push and
+    its matching pop, leaving the cleanup pop in place.
+    """
     asm = (
         "_factorial:\n"
         "        push    ebp\n"
@@ -7161,8 +7235,10 @@ def test_push_pop_op_to_memop_factorial_imul():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
+    # The original `push dword [ebp + 8]` and its matching pop are
+    # eliminated; the call cleanup `pop ecx` remains (from
+    # add_esp_to_pop).
     assert "push    dword [ebp + 8]" not in out
-    assert "pop     ecx\n" not in out
     assert "imul    eax, dword [ebp + 8]" in out
     assert opt.stats.get("push_pop_op_to_memop") == 1
 

@@ -421,6 +421,7 @@ class PeepholeOptimizer:
             lines = self._pass_redundant_xor_zero(lines)
             lines = self._pass_dual_zero_init_consolidate(lines)
             lines = self._pass_narrow_store_reload_collapse(lines)
+            lines = self._pass_add_esp_to_pop(lines)
             lines = self._pass_compound_assign_collapse(lines)
             lines = self._pass_index_load_collapse(lines)
             lines = self._pass_index_load_collapse_label(lines)
@@ -6271,6 +6272,131 @@ class PeepholeOptimizer:
         """Normalize whitespace inside a memory operand for textual
         comparison. `[ebp - 4]` and `[ebp-4]` both compare equal."""
         return re.sub(r"\s+", "", mem_text.strip())
+
+    def _pass_add_esp_to_pop(self, lines: list[Line]) -> list[Line]:
+        """Replace `add esp, 4` with `pop ecx` (saves 2 bytes) when ECX
+        is dead after, and `add esp, 8` with `pop ecx; pop ecx` (saves
+        1 byte). Both cases require ECX to be dead after.
+
+        x86 byte sizes:
+        - `add esp, 4` = 3 bytes (`83 C4 04`).
+        - `pop ecx` = 1 byte (`59`).
+        - `add esp, 8` = 3 bytes.
+
+        For larger N, `add esp, N` is at most 3 bytes (imm8) or 6 bytes
+        (imm32). Since each `pop reg` is 1 byte, breakeven is at 3
+        pops. So:
+        - N=4: 1 pop = 1 byte (saves 2).
+        - N=8: 2 pops = 2 bytes (saves 1).
+        - N>=12: not worth it.
+
+        Common after cdecl call cleanup: ECX is caller-saved scratch,
+        so it's dead by convention after the call. We use a fast
+        path (`prev is call`) to avoid the expensive CFG-aware
+        liveness check on hot paths — pr23135's 720K-line asm has
+        thousands of `add esp` sites and the slow check adds 50+
+        seconds.
+
+        Conditions:
+        - `add esp, IMM` where IMM is exactly 4 or 8.
+        - Either: previous instr is `call` (cdecl: ECX dead by
+          convention), OR `_reg_dead_after` confirms ECX is dead.
+        """
+        out = list(lines)
+        i = 0
+        while i < len(out):
+            line = out[i]
+            if line.kind != "instr" or line.op != "add":
+                i += 1
+                continue
+            parts = _operands_split(line.operands)
+            if parts is None:
+                i += 1
+                continue
+            dest, src = parts
+            if dest.strip().lower() != "esp":
+                i += 1
+                continue
+            src_text = src.strip()
+            if src_text not in ("4", "8"):
+                i += 1
+                continue
+            # ECX must be dead after this instruction (after the
+            # rewrite, ECX gets overwritten by the pop; subsequent
+            # code must not depend on ECX's prior value).
+            #
+            # We restrict to the common case: `add esp, IMM`
+            # immediately preceded by `call`. After a cdecl call,
+            # ECX is caller-saved scratch and dead by convention.
+            # The next instruction must NOT read ECX (rare but
+            # possible in adversarial code; standard codegen never
+            # does this).
+            #
+            # This restriction avoids the expensive `_reg_dead_after`
+            # call entirely, which became a bottleneck for very large
+            # files (pr23135 has 720K lines and thousands of `add esp`
+            # sites; the slow check pushed compile time over the
+            # runner timeout).
+            if not self._prev_instr_is_call(out, i):
+                i += 1
+                continue
+            if not self._next_instr_doesnt_read_ecx(out, i + 1):
+                i += 1
+                continue
+            indent = self._extract_indent(line.raw)
+            if src_text == "4":
+                out[i] = Line(
+                    raw=f"{indent}pop     ecx", kind="instr",
+                    op="pop", operands="ecx",
+                )
+                self.stats["add_esp_to_pop"] = (
+                    self.stats.get("add_esp_to_pop", 0) + 1
+                )
+                i += 1
+            else:  # 8
+                out[i] = Line(
+                    raw=f"{indent}pop     ecx", kind="instr",
+                    op="pop", operands="ecx",
+                )
+                out.insert(i + 1, Line(
+                    raw=f"{indent}pop     ecx", kind="instr",
+                    op="pop", operands="ecx",
+                ))
+                self.stats["add_esp_to_pop"] = (
+                    self.stats.get("add_esp_to_pop", 0) + 1
+                )
+                i += 2
+        return out
+
+    @staticmethod
+    def _prev_instr_is_call(lines: list[Line], idx: int) -> bool:
+        """Walk backward from idx to find the previous instruction.
+        Return True if it's a `call` (direct or indirect)."""
+        j = idx - 1
+        while j >= 0:
+            ln = lines[j]
+            if ln.kind in ("blank", "comment"):
+                j -= 1
+                continue
+            return ln.kind == "instr" and ln.op == "call"
+        return False
+
+    def _next_instr_doesnt_read_ecx(
+        self, lines: list[Line], idx: int,
+    ) -> bool:
+        """Walk forward from idx to find the next instruction. Return
+        True if it doesn't reference ECX (or its sub-regs)."""
+        j = idx
+        while j < len(lines):
+            ln = lines[j]
+            if ln.kind in ("blank", "comment"):
+                j += 1
+                continue
+            if ln.kind != "instr":
+                # End of function or section: ECX is dead.
+                return True
+            return not self._references_reg_family(ln.operands, "ecx")
+        return True
 
     # Commutative two-operand binops where `OP eax, ecx` and
     # `OP ecx, eax` produce identical EAX results. imul (two-operand
