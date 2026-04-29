@@ -5005,6 +5005,111 @@ def test_pop_index_load_collapse_skips_when_idx_live_and_dst_diff():
     assert opt.stats.get("pop_index_load_collapse", 0) == 0
 
 
+# ── sib_const_index_fold ─────────────────────────────────────────
+
+
+def test_sib_const_index_fold_basic():
+    """`mov ecx, 1; mov eax, [eax + ecx*4]` → `mov eax, [eax + 4]`.
+    The constant index gets folded into the displacement."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 1\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [eax + 4]" in out
+    assert "mov     ecx, 1" not in out
+    assert opt.stats.get("sib_const_index_fold") == 1
+
+
+def test_sib_const_index_fold_with_displacement():
+    """`mov ecx, 2; mov eax, [eax + ecx*4 + 8]` →
+    `mov eax, [eax + 16]` (2*4 + 8)."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 2\n"
+        "        mov     eax, [eax + ecx*4 + 8]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [eax + 16]" in out
+    assert opt.stats.get("sib_const_index_fold") == 1
+
+
+def test_sib_const_index_fold_zero_index():
+    """`mov ecx, 0; mov eax, [eax + ecx*4]` → `mov eax, [eax]`.
+    Zero displacement collapses to plain deref."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 0\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [eax]" in out
+    assert opt.stats.get("sib_const_index_fold") == 1
+
+
+def test_sib_const_index_fold_skips_when_idx_live():
+    """If IDX != DST and IDX is read after the load, can't drop
+    the const-load."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 5\n"
+        "        mov     edx, [eax + ecx*4]\n"  # DST=edx, not ecx
+        "        mov     [_glob], ecx\n"  # ECX live!
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("sib_const_index_fold", 0) == 0
+
+
+def test_sib_const_index_fold_skips_when_base_eq_idx():
+    """If BASE == IDX, dropping the const-load changes BASE's
+    value too — unsafe."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 3\n"
+        "        mov     edx, [eax + eax*4]\n"  # BASE=IDX=eax
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("sib_const_index_fold", 0) == 0
+
+
+def test_sib_const_index_fold_negative_displacement():
+    """`mov ecx, 3; mov eax, [eax + ecx*4 - 8]` →
+    `mov eax, [eax + 4]` (3*4 - 8 = 4)."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 3\n"
+        "        mov     eax, [eax + ecx*4 - 8]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [eax + 4]" in out
+
+
+def test_sib_const_index_fold_negative_result_disp():
+    """`mov ecx, 1; mov eax, [eax + ecx*4 - 16]` → `[eax - 12]`."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, 1\n"
+        "        mov     eax, [eax + ecx*4 - 16]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [eax - 12]" in out
+
+
 # ── push_pop_to_mov ──────────────────────────────────────────────
 
 

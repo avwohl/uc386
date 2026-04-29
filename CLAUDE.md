@@ -1192,3 +1192,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **probe_branch**: `mov dword [ebp - 8], -5` directly emitted instead of `mov eax, -5; mov [ebp - 8], eax`. Saves 5 bytes per pre-loop init. Same shape applies to any var-init-followed-by-loop pattern.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +2 peephole tests (314 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: sib_const_index_fold**: fold a constant index loaded immediately before a SIB-form load into the displacement.
+  - **Pattern**: `mov IDX, IMM; mov DST, [BASE + IDX*SCALE]` (or with displacement) → `mov DST, [BASE + (IMM*SCALE [+/-] DISP)]`. Drops the 5-byte `mov reg, imm32`.
+  - **Also matches `xor IDX, IDX`** as `IMM=0` since `mov_zero_to_xor` runs earlier in the pipeline and converts `mov ecx, 0` to `xor ecx, ecx`.
+  - **Common shape**: `arr[1]` lowers as `mov ecx, 1; mov eax, [eax + ecx*4]` (the codegen emits a constant index for known-literal subscripts). Now folds to `mov eax, [eax + 4]`.
+  - **Constraints**: BASE != IDX (otherwise BASE's value would change after dropping the const-load), IDX dead after (unless IDX == DST, then load target overwrites IDX naturally).
+  - **20040218-1.c**: `_xb` and `_xw` each save 5 bytes per `arr[1]` access (3 occurrences).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite still 100%**. +7 peephole tests (321 total). Pipeline 1734/1734 (100%).

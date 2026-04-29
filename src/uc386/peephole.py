@@ -414,6 +414,7 @@ class PeepholeOptimizer:
             lines = self._pass_pop_index_push_collapse(lines)
             lines = self._pass_pop_index_load_collapse(lines)
             lines = self._pass_push_pop_to_mov(lines)
+            lines = self._pass_sib_const_index_fold(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -4939,6 +4940,170 @@ class PeepholeOptimizer:
                 self.stats.get("push_pop_to_mov", 0) + 1
             )
             # Don't advance i (might match again from the same i).
+            continue
+        return out
+
+    def _pass_sib_const_index_fold(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Fold a constant-index SIB-form load. When the index
+        register is loaded with a constant immediately before a
+        SIB-form load that uses it, fold the constant into the
+        displacement.
+
+        Pattern (with optional displacement):
+            mov IDX, IMM
+            mov DST, [BASE + IDX*SCALE]
+            mov DST, [BASE + IDX*SCALE + DISP]
+            mov DST, [BASE + IDX*SCALE - DISP]
+
+        Rewrite (drop the index load; fold IMM*SCALE into disp):
+            mov DST, [BASE + (IMM*SCALE)]
+            mov DST, [BASE + (IMM*SCALE + DISP)]
+            mov DST, [BASE + (IMM*SCALE - DISP)]
+
+        When the new displacement is 0, emit `[BASE]`. When BASE is
+        the same register as IDX (rare), the rewrite is unsafe
+        (BASE's value would change after the rewrite drops the
+        const-load) and we bail.
+
+        Saves 5 bytes per match (drops 5-byte `mov reg, imm32`).
+
+        Conditions:
+        - Two consecutive instr lines.
+        - Line A: ``mov IDX, IMM`` where IDX is a 32-bit GP reg
+          and IMM is a numeric literal.
+        - Line B: ``mov DST, [BASE + IDX*SCALE [DISP]]`` (with
+          DISP optional, ±N form).
+        - IDX dead after Line B (unless IDX == DST, in which
+          case the load target overwrites IDX naturally).
+        """
+        SCALE_VALUES = {1, 2, 4, 8}
+        out = list(lines)
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr"
+                and a.op in {"mov", "xor"}
+                and b.kind == "instr" and b.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            if ap is None or bp is None:
+                i += 1
+                continue
+            idx_reg = ap[0].strip().lower()
+            if not self._is_general_register(idx_reg):
+                i += 1
+                continue
+            # Determine constant value of idx_reg.
+            if a.op == "xor":
+                # `xor reg, reg` zeros the register.
+                if ap[1].strip().lower() != idx_reg:
+                    i += 1
+                    continue
+                imm_val = 0
+            else:
+                # `mov reg, IMM` — must be a numeric literal.
+                imm_str = ap[1].strip()
+                try:
+                    if imm_str.lower().startswith("0x"):
+                        imm_val = int(imm_str, 16)
+                    elif imm_str.lower().startswith("-0x"):
+                        imm_val = -int(imm_str[1:], 16)
+                    else:
+                        imm_val = int(imm_str)
+                except ValueError:
+                    i += 1
+                    continue
+            # Parse Line B.
+            dst_reg = bp[0].strip().lower()
+            b_src = bp[1].strip()
+            if not self._is_general_register(dst_reg):
+                i += 1
+                continue
+            # Strip size prefix.
+            size_prefix = ""
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if b_src.lower().startswith(prefix):
+                    size_prefix = b_src[:len(prefix)]
+                    b_src = b_src[len(prefix):].lstrip()
+                    break
+            # Match SIB form.
+            sib_re = re.match(
+                r"^\[\s*([a-zA-Z]+)\s*\+\s*([a-zA-Z]+)\s*\*"
+                r"\s*(\d+)"
+                r"(?:\s*([+-])\s*(\d+))?"
+                r"\s*\]$",
+                b_src,
+            )
+            if sib_re is None:
+                i += 1
+                continue
+            base_reg = sib_re.group(1).lower()
+            sib_idx = sib_re.group(2).lower()
+            try:
+                scale = int(sib_re.group(3))
+            except ValueError:
+                i += 1
+                continue
+            if scale not in SCALE_VALUES:
+                i += 1
+                continue
+            disp_sign = sib_re.group(4)
+            disp_str = sib_re.group(5)
+            disp = 0
+            if disp_str is not None:
+                try:
+                    disp = int(disp_str)
+                except ValueError:
+                    i += 1
+                    continue
+                if disp_sign == "-":
+                    disp = -disp
+            # SIB index reg must match our IDX.
+            if sib_idx != idx_reg:
+                i += 1
+                continue
+            # BASE must NOT be IDX (otherwise BASE's value changes
+            # after we drop the const-load).
+            if base_reg == idx_reg:
+                i += 1
+                continue
+            if not self._is_general_register(base_reg):
+                i += 1
+                continue
+            # IDX dead after, unless DST == IDX.
+            if dst_reg != idx_reg:
+                if not self._reg_dead_after(out, i + 2, idx_reg):
+                    i += 1
+                    continue
+            # Compute new displacement.
+            new_disp = imm_val * scale + disp
+            indent = self._extract_indent(b.raw)
+            if new_disp == 0:
+                new_src = f"{size_prefix}[{base_reg}]"
+            elif new_disp > 0:
+                new_src = (
+                    f"{size_prefix}[{base_reg} + {new_disp}]"
+                )
+            else:
+                new_src = (
+                    f"{size_prefix}[{base_reg} - {-new_disp}]"
+                )
+            new_raw = f"{indent}mov     {dst_reg}, {new_src}"
+            new_line = Line(
+                raw=new_raw, kind="instr", op="mov",
+                operands=f"{dst_reg}, {new_src}",
+            )
+            out = out[:i] + [new_line] + out[i + 2:]
+            self.stats["sib_const_index_fold"] = (
+                self.stats.get("sib_const_index_fold", 0) + 1
+            )
             continue
         return out
 
