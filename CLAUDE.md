@@ -1008,3 +1008,8 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **20021120-1.c**: 43011 → 40611 bytes (−2400 bytes). 96 collapses; combined with other passes the total peephole savings on this FPU-heavy test is 8196 bytes (48807 → 40611, 16.8% reduction).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (581 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: imm_binop_collapse uses CFG-aware liveness**: replaced `imm_binop_collapse`'s narrow `_ecx_dead_after(c_line)` check (which bailed on labels) with `_reg_dead_after(lines, b_idx + 1, "ecx")`. The smarter helper crosses labels under the codegen invariant (no register assumed live across labels), so `mov ecx, [mem]; OP eax, ecx; .epilogue: ...` now collapses correctly to `OP eax, [mem]`.
+  - **Concrete win on `_sq` from probe_multifn**: the body `int v = x; return v * v;` was emitting `mov eax, [ebp+8]; mov [ebp-4], eax; mov ecx, [ebp+8]; imul eax, ecx; .epilogue: ...`. The `mov ecx, [ebp+8]; imul eax, ecx; .epilogue:` was being missed because the `.epilogue:` label tripped the narrow witness check. Now the imul collapses to `imul eax, [ebp+8]` directly. Saves 3 bytes per qualifying call site.
+  - Aggregate torture savings: 20.83% → 20.97% (+0.14 percentage points across 267 tests).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. Pipeline 1734/1734 (100%).

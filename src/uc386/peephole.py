@@ -954,12 +954,15 @@ class PeepholeOptimizer:
             if (line.kind == "instr"
                     and line.op == "mov"
                     and self._is_simple_to_ecx(line)):
-                instrs = self._next_n_instrs(lines, i + 1, 2)
+                # Find the next instruction line (the binop).
+                instrs = self._next_n_instrs(lines, i + 1, 1)
                 if instrs is not None:
-                    [(b_idx, b_line), (c_idx, c_line)] = instrs
+                    [(b_idx, b_line)] = instrs
                     if (b_line.op in self._IMM_BINOP_OPS
                             and self._is_eax_ecx_binop(b_line)
-                            and self._ecx_dead_after(c_line)):
+                            and self._reg_dead_after(
+                                lines, b_idx + 1, "ecx"
+                            )):
                         # Build the rewritten op line.
                         parts_a = _operands_split(line.operands)
                         assert parts_a is not None
