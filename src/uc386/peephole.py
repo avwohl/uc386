@@ -108,6 +108,14 @@ Currently implements:
     relative addressing; the original mov+push is 4 bytes. Saves 1
     byte per match. Common in cdecl call-site arg setup, where the
     intermediate register is dead after the push.
+  - compound_assign_collapse: collapse the codegen's compound-
+    assignment frame `push dword [m]; <chain>; mov ecx, eax;
+    pop eax; OP eax, ecx; mov [m], eax` into a single in-place
+    `OP [m], eax`. The chain must not modify [m] or perform stack
+    manipulation, and ECX must be dead after the store. Saves 8
+    bytes per match (drops the push/pop framing + transfer + store).
+    Common in `x += rhs` / `x -= rhs` etc. for slot-typed lvalues
+    where the rhs computation can't be reduced via simpler passes.
   - redundant_xor_zero: drop `xor reg, reg` when reg is already
     zero from a recent `xor reg, reg` and nothing modified it
     since. Saves 2 bytes per match. Common after zero_init_collapse
@@ -373,6 +381,7 @@ class PeepholeOptimizer:
             lines = self._pass_jcc_jmp_inversion(lines)
             lines = self._pass_zero_init_collapse(lines)
             lines = self._pass_redundant_xor_zero(lines)
+            lines = self._pass_compound_assign_collapse(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -3382,6 +3391,272 @@ class PeepholeOptimizer:
         "bp": "ebp",
         "sp": "esp",
     }
+
+    # Compound-assign binops (used by _pass_compound_assign_collapse).
+    # imul is excluded — `imul r/m32` (one-operand) writes EDX:EAX,
+    # not the obvious in-place form.
+    _COMPOUND_BINOPS: frozenset[str] = frozenset({
+        "add", "sub", "and", "or", "xor",
+    })
+
+    def _pass_compound_assign_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse the compound-assignment frame into an in-place
+        memory-RMW.
+
+        Match (looking from a final ``mov [m], eax``):
+            push    dword [m]              ; L_push
+            ... chain ...                   ; produces value in EAX
+            mov     ecx, eax                ; L_pop - 3
+            pop     eax                     ; L_pop - 2
+            <OP>    eax, ecx                ; L_pop - 1
+            mov     [m], eax                ; L_pop
+
+        Replace with:
+            ... chain ...                   ; unchanged
+            <OP>    [m], eax                ; in-place RMW
+
+        Drops the entire framing (push, mov ecx eax, pop, OP eax ecx,
+        mov [m] eax) — saves 8 bytes per match.
+
+        Conditions:
+        - L_push must be ``push dword [m]`` with same `m` as the final
+          store.
+        - The chain (between L_push and L_pop - 3) must not modify
+          [m] (no stores to that address) and must be stack-balanced
+          (no other push/pop or sub/add esp).
+        - ECX must be dead after L_pop (typically true since ECX is
+          a scratch register in our codegen).
+
+        Common in compound assignments to slot-typed lvalues where
+        the rhs computation isn't reducible via simpler passes (e.g.,
+        `s += p[i]` where p[i] requires multi-instruction array
+        indexing).
+        """
+        out = list(lines)
+        i = 0
+        while i < len(out):
+            line = out[i]
+            if (
+                line.kind == "instr"
+                and line.op == "mov"
+                and self._is_eax_to_mem_store(line)
+            ):
+                # The mov [m], eax is line i. Look back for the
+                # frame pattern.
+                store_dest = self._mem_dest(line)
+                if store_dest is None:
+                    i += 1
+                    continue
+                match = self._match_compound_assign_frame(
+                    out, i, store_dest
+                )
+                if match is None:
+                    i += 1
+                    continue
+                push_idx, op_str = match
+                # Verify ECX dead after the store.
+                if not self._reg_dead_after(out, i + 1, "ecx"):
+                    i += 1
+                    continue
+                # Rewrite: drop push, mov ecx eax, pop eax, OP eax
+                # ecx, mov [m] eax — replace with `OP [m], eax`.
+                indent = self._extract_indent(line.raw)
+                spacer = " " * max(8 - len(op_str), 1)
+                new_raw = (
+                    f"{indent}{op_str}{spacer}{store_dest}, eax"
+                )
+                new_line = Line(
+                    raw=new_raw,
+                    kind="instr",
+                    op=op_str,
+                    operands=f"{store_dest}, eax",
+                )
+                # Drop lines push_idx, i-3, i-2, i-1, i; insert
+                # new_line at i-3's old position. The chain (between
+                # push_idx+1 and i-4) is preserved.
+                # Build the new list.
+                new_out = []
+                # Keep everything before push_idx.
+                new_out.extend(out[:push_idx])
+                # Skip push_idx; keep chain (push_idx+1 .. i-4).
+                new_out.extend(out[push_idx + 1: i - 3])
+                # Insert the rewritten op.
+                new_out.append(new_line)
+                # Skip the framing tail (i-3, i-2, i-1, i); keep
+                # everything after i.
+                new_out.extend(out[i + 1:])
+                self.stats["compound_assign_collapse"] = (
+                    self.stats.get(
+                        "compound_assign_collapse", 0
+                    ) + 1
+                )
+                out = new_out
+                # Restart from the rewrite point (chain start).
+                i = push_idx
+                continue
+            i += 1
+        return out
+
+    @staticmethod
+    def _is_eax_to_mem_store(line: Line) -> bool:
+        """Is this ``mov [...], eax``?"""
+        if line.kind != "instr" or line.op != "mov":
+            return False
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return False
+        dest, src = parts
+        if "[" not in dest:
+            return False
+        if src.strip().lower() != "eax":
+            return False
+        return True
+
+    @staticmethod
+    def _mem_dest(line: Line) -> str | None:
+        """Extract the memory operand from ``mov [...], eax``."""
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return None
+        dest, _ = parts
+        return dest.strip()
+
+    def _match_compound_assign_frame(
+        self,
+        lines: list[Line],
+        store_idx: int,
+        store_dest: str,
+    ) -> tuple[int, str] | None:
+        """Look back from `store_idx` for the compound-assign frame.
+
+        Expects (going backward from store_idx):
+            store_idx - 1: ``OP eax, ecx`` (OP in _COMPOUND_BINOPS).
+            store_idx - 2: ``pop eax``.
+            store_idx - 3: ``mov ecx, eax``.
+            ...chain (no stack manipulation, no [m] modification)...
+            push_idx: ``push dword [m]`` matching store_dest.
+
+        Returns (push_idx, op_str) on match, None otherwise. The
+        chain is identified as `push_idx+1 .. store_idx-4`.
+        """
+        # Walk back through the framing tail.
+        ops_at = lambda j: (
+            lines[j] if 0 <= j < len(lines) else None
+        )
+        # store_idx - 1: OP eax, ecx.
+        op_line = ops_at(store_idx - 1)
+        if op_line is None or op_line.kind != "instr":
+            return None
+        if op_line.op not in self._COMPOUND_BINOPS:
+            return None
+        op_parts = _operands_split(op_line.operands)
+        if op_parts is None:
+            return None
+        if (
+            op_parts[0].strip().lower() != "eax"
+            or op_parts[1].strip().lower() != "ecx"
+        ):
+            return None
+        op_str = op_line.op
+        # store_idx - 2: pop eax.
+        pop_line = ops_at(store_idx - 2)
+        if (
+            pop_line is None
+            or pop_line.kind != "instr"
+            or pop_line.op != "pop"
+            or pop_line.operands.strip().lower() != "eax"
+        ):
+            return None
+        # store_idx - 3: mov ecx, eax.
+        xfer_line = ops_at(store_idx - 3)
+        if (
+            xfer_line is None
+            or xfer_line.kind != "instr"
+            or xfer_line.op != "mov"
+        ):
+            return None
+        xfer_parts = _operands_split(xfer_line.operands)
+        if xfer_parts is None:
+            return None
+        if (
+            xfer_parts[0].strip().lower() != "ecx"
+            or xfer_parts[1].strip().lower() != "eax"
+        ):
+            return None
+        # Walk back from store_idx - 4 to find the matching push.
+        # The chain must be stack-balanced (no other push/pop / esp
+        # adjustment) and must not modify store_dest's memory.
+        push_target = f"dword {store_dest}"
+        for j in range(store_idx - 4, -1, -1):
+            ln = lines[j]
+            if ln.kind != "instr":
+                if ln.kind == "label":
+                    return None  # crossed a basic-block boundary
+                continue
+            # Found the push?
+            if (
+                ln.op == "push"
+                and ln.operands.strip().lower()
+                == push_target.lower()
+            ):
+                return (j, op_str)
+            # Stack manipulation — bail.
+            if ln.op in {"push", "pop"}:
+                return None
+            if (
+                ln.op in ("add", "sub")
+                and ln.operands.strip().lower().startswith("esp,")
+            ):
+                return None
+            if ln.op == "call":
+                return None  # call clobbers ECX/EDX, also stack
+            # Memory write to store_dest — bail.
+            mod_parts = _operands_split(ln.operands or "")
+            if mod_parts is not None:
+                m_dest, _ = mod_parts
+                if (
+                    "[" in m_dest
+                    and self._mem_overlaps(
+                        m_dest.strip(), store_dest
+                    )
+                ):
+                    return None
+        return None
+
+    @staticmethod
+    def _mem_overlaps(addr1: str, addr2: str) -> bool:
+        """Conservative overlap check: True if two memory operands
+        could refer to the same bytes. Disjoint ebp-relative memory
+        operands return False; everything else returns True (be
+        defensive).
+
+        For our pattern (we want to detect modification of `addr2`
+        within the chain), a False return means "definitely
+        disjoint, safe to ignore"."""
+        # Strip optional size keyword.
+        def strip(text: str) -> str:
+            t = text.strip()
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if t.lower().startswith(prefix):
+                    t = t[len(prefix):].lstrip()
+            return t.lower()
+
+        a, b = strip(addr1), strip(addr2)
+        if a == b:
+            return True
+        # Both ebp-rel literal? Disjoint if different offsets.
+        ebp_re = re.compile(
+            r"^\[ebp\s*([+-])\s*(\d+)\]$"
+        )
+        ma, mb = ebp_re.match(a), ebp_re.match(b)
+        if ma and mb:
+            sa = (1 if ma.group(1) == "+" else -1) * int(ma.group(2))
+            sb = (1 if mb.group(1) == "+" else -1) * int(mb.group(2))
+            return sa == sb
+        # Conservative: assume overlap.
+        return True
 
     def _pass_redundant_xor_zero(
         self, lines: list[Line]

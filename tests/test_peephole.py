@@ -2840,6 +2840,138 @@ def test_narrowing_load_test_collapse_skips_full_dword_load():
     assert opt.stats.get("cmp_load_collapse", 0) == 1
 
 
+# ── compound_assign_collapse ─────────────────────────────────────
+
+
+def test_compound_assign_collapse_basic():
+    """The codegen's compound-assign frame collapses to in-place RMW.
+
+    Pattern:
+        push    dword [m]
+        ... chain ending with value in eax ...
+        mov     ecx, eax
+        pop     eax
+        add     eax, ecx
+        mov     [m], eax
+
+    becomes:
+        ... chain ...
+        add     [m], eax
+    """
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp - 4]\n"
+        "        mov     eax, [ebp + 8]\n"  # chain: load rhs
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        add     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     eax, 0\n"  # ECX dead witness
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     [ebp - 4], eax" in out
+    assert "push    dword [ebp - 4]" not in out
+    assert "pop     eax" not in out
+    assert opt.stats.get("compound_assign_collapse") == 1
+
+
+def test_compound_assign_collapse_subtract():
+    """Sub variant — `s -= rhs`."""
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp - 4]\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        sub     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "sub     [ebp - 4], eax" in out
+    assert opt.stats.get("compound_assign_collapse") == 1
+
+
+def test_compound_assign_collapse_skips_when_chain_modifies_m():
+    """If the chain modifies [m], we can't collapse — the saved
+    value would be stale."""
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp - 4]\n"
+        "        mov     dword [ebp - 4], 99\n"  # modifies [m]!
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        add     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("compound_assign_collapse", 0) == 0
+
+
+def test_compound_assign_collapse_skips_when_chain_has_call():
+    """A `call` in the chain clobbers ECX (cdecl)."""
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp - 4]\n"
+        "        call    _g\n"  # clobbers ecx
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        add     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("compound_assign_collapse", 0) == 0
+
+
+def test_compound_assign_collapse_skips_when_ecx_live():
+    """If ECX is live after the store (read by subsequent code),
+    we can't drop the `mov ecx, eax` step."""
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp - 4]\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        add     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     [ebp - 8], ecx\n"  # reads ECX!
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("compound_assign_collapse", 0) == 0
+
+
+def test_compound_assign_collapse_global_destination():
+    """Global memory (`[_var]`) also works."""
+    asm = (
+        "_f:\n"
+        "        push    dword [_glob]\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, eax\n"
+        "        pop     eax\n"
+        "        add     eax, ecx\n"
+        "        mov     [_glob], eax\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     [_glob], eax" in out
+    assert opt.stats.get("compound_assign_collapse") == 1
+
+
 # ── redundant_xor_zero ───────────────────────────────────────────
 
 

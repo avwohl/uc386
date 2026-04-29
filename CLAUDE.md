@@ -1066,3 +1066,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Conservative on read+write ops**: any 2-operand op with a tracked reg as dest (add, sub, and, or, xor with different src, etc.) and any single-operand op (inc, dec, neg, etc.) invalidates the tracked reg.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (196 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: compound_assign_collapse**: collapse the codegen's compound-assignment frame `push dword [m]; <chain>; mov ecx, eax; pop eax; OP eax, ecx; mov [m], eax` into a single in-place `OP [m], eax`. Saves 8 bytes per match (drops the push, transfer, pop, op, and store framing — replaces with a single memory-RMW).
+  - **Common shape**: every compound assignment to a slot-typed lvalue where the rhs computation isn't reducible via simpler passes. E.g., `s += p[i]` requires multi-instruction array indexing (load p, load i, shl 2, add, deref) that doesn't fit `right_operand_retarget`'s "chain all-writes-to-eax" criterion.
+  - **Conditions**: matches `mov [m], eax` with the surrounding 4-line tail (mov ecx eax; pop eax; OP eax ecx; mov [m] eax) AND a matching `push dword [m]` earlier in the same basic block. Chain must be stack-balanced (no other push/pop, no `add esp, N` / `sub esp, N`) and must not modify [m] (no stores to the same address). ECX must be dead after the store (typically true since ECX is a scratch register in our codegen).
+  - **Op coverage**: add, sub, and, or, xor (the standard compound ops). `*=` / `<<=` / `>>=` use different framings.
+  - **Disjoint-mem aliasing check**: chain modifications to [m] are detected via `_mem_overlaps`. Two ebp-relative literal offsets are disjoint when offsets differ; everything else (register-base derefs, label addresses) conservatively overlaps.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (202 total). Pipeline 1734/1734 (100%).
