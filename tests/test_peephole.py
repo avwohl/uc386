@@ -2352,6 +2352,110 @@ def test_fpu_op_collapse_bare_pop_form():
     assert opt.stats.get("fpu_op_collapse") == 1
 
 
+# ── add_one_to_inc ───────────────────────────────────────────────
+
+
+def test_add_one_to_inc_basic():
+    asm = (
+        "_f:\n"
+        "        add     eax, 1\n"
+        "        mov     [ebp - 4], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        inc     eax" in out
+    assert "add     eax, 1" not in out
+    assert opt.stats.get("add_one_to_inc") == 1
+
+
+def test_sub_one_to_dec():
+    asm = (
+        "_f:\n"
+        "        sub     ecx, 1\n"
+        "        cmp     ecx, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        dec     ecx" in out
+    assert opt.stats.get("add_one_to_inc") == 1
+
+
+def test_add_one_to_inc_skips_when_carry_read():
+    """`jc` reads CF — `inc` doesn't set CF, so the rewrite changes
+    behavior. Must skip."""
+    asm = (
+        "_f:\n"
+        "        add     eax, 1\n"
+        "        jc      .L1\n"
+        "        ret\n"
+        ".L1:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("add_one_to_inc", 0) == 0
+
+
+def test_add_one_to_inc_safe_after_cmp():
+    """`cmp` overwrites all flags including CF — `add`'s CF is dead."""
+    asm = (
+        "_f:\n"
+        "        add     ebx, 1\n"
+        "        cmp     ebx, eax\n"
+        "        je      .L1\n"
+        ".L1:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        inc     ebx" in out
+    assert opt.stats.get("add_one_to_inc") == 1
+
+
+def test_add_one_to_inc_skips_imm_other_than_1():
+    asm = (
+        "_f:\n"
+        "        add     eax, 2\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("add_one_to_inc", 0) == 0
+
+
+def test_add_one_to_inc_skips_memory_dest():
+    """`add [mem], 1` is a different beast — `inc dword [mem]` is the
+    same encoded length so skip (not a savings)."""
+    asm = (
+        "_f:\n"
+        "        add     dword [ebp - 4], 1\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    # We don't transform memory operands.
+    assert opt.stats.get("add_one_to_inc", 0) == 0
+
+
+def test_add_one_to_inc_all_registers():
+    """Pattern fires for any of the 8 32-bit GP regs."""
+    for reg in ("eax", "ebx", "ecx", "edx", "esi", "edi"):
+        asm = (
+            "_f:\n"
+            f"        add     {reg}, 1\n"
+            f"        cmp     {reg}, eax\n"
+            "        je      .L1\n"
+            ".L1:\n"
+            "        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        out = opt.optimize(asm)
+        assert f"        inc     {reg}" in out, f"{reg}: {out}"
+        assert opt.stats.get("add_one_to_inc") == 1
+
+
 # ── Convergence ──────────────────────────────────────────────────
 
 

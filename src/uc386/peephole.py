@@ -93,6 +93,10 @@ Currently implements:
     state, 2 bytes saved per match. Applies to faddp / fsubp /
     fmulp / fdivp (the fsubrp/fdivrp swapped variants get their own
     rewrites).
+  - add_one_to_inc: `add reg, 1` → `inc reg` (and `sub reg, 1` →
+    `dec reg`). Saves 2 bytes per match. inc/dec leave CF unchanged
+    while add/sub set CF; the rewrite is safe only when CF is dead
+    after (no `jc/jnc/ja/jb/...` reads it before being overwritten).
 
 Patterns to add (see PEEPHOLE_PLAN.md for details): tail calls,
 jump threading, multi-instruction right-operand retargeting.
@@ -316,6 +320,7 @@ class PeepholeOptimizer:
             lines = self._pass_rmw_collapse(lines)
             lines = self._pass_fst_fstp_collapse(lines)
             lines = self._pass_fpu_op_collapse(lines)
+            lines = self._pass_add_one_to_inc(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -2617,6 +2622,58 @@ class PeepholeOptimizer:
             return True
         no_space = ops.replace(" ", "")
         return no_space in {"st1,st0", "st(1),st(0)"}
+
+    def _pass_add_one_to_inc(self, lines: list[Line]) -> list[Line]:
+        """``add reg, 1`` → ``inc reg`` (and ``sub reg, 1`` →
+        ``dec reg``). Saves 2 bytes per match (3-byte add-imm8 → 1-byte
+        inc-reg).
+
+        ``inc``/``dec`` leave CF unchanged while ``add``/``sub`` set
+        CF. The rewrite is safe only when CF is dead after — no
+        ``jc/jnc/ja/jb/jae/jbe/setc/setnc/setb/setbe/etc.`` reads CF
+        before flags are overwritten by another flag-clobberer or the
+        function exits.
+
+        Conservative: uses `_flags_safe_after` which bails on any
+        flag-reader (not just CF readers). Most uc386 codegen patterns
+        do `add reg, 1` followed by `test`/`cmp`/another arithmetic
+        op (which clobbers flags), so the conservative check still
+        fires often.
+
+        Applies to all 8 32-bit GP registers.
+        """
+        out: list[Line] = []
+        for i, line in enumerate(lines):
+            if (
+                line.kind == "instr"
+                and line.op in ("add", "sub")
+            ):
+                parts = _operands_split(line.operands)
+                if parts is not None:
+                    dest, src = parts
+                    dest_low = dest.strip().lower()
+                    if (
+                        self._is_general_register(dest_low)
+                        and src.strip() == "1"
+                        and self._flags_safe_after(lines, i + 1)
+                    ):
+                        new_op = "inc" if line.op == "add" else "dec"
+                        indent = self._extract_indent(line.raw)
+                        spacer = " " * (8 - len(new_op))
+                        new_raw = f"{indent}{new_op}{spacer}{dest_low}"
+                        new_line = Line(
+                            raw=new_raw,
+                            kind="instr",
+                            op=new_op,
+                            operands=dest_low,
+                        )
+                        out.append(new_line)
+                        self.stats["add_one_to_inc"] = (
+                            self.stats.get("add_one_to_inc", 0) + 1
+                        )
+                        continue
+            out.append(line)
+        return out
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
         """P-jmp-to-next: `jmp X` immediately (modulo blanks/comments)

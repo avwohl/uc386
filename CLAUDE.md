@@ -1013,3 +1013,7 @@ See `README.md` for the public roadmap (Phase 0–6).
   - Aggregate torture savings: 20.83% → 20.97% (+0.14 percentage points across 267 tests).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: add_one_to_inc**: `add reg, 1` → `inc reg` (and `sub reg, 1` → `dec reg`) when CF is dead after. Saves 2 bytes per match (3-byte add-imm8 → 1-byte inc-reg). The catch: `inc`/`dec` leave CF unchanged, while `add`/`sub` clobber it — so the rewrite is safe only when no `jc/jnc/ja/jb/...` reads CF before flags are overwritten. Conservative implementation uses `_flags_safe_after`, which bails on any flag-reader (not just CF readers); good enough for uc386 codegen since most `add reg, 1` sites are followed by `test`/`cmp`/another arithmetic op.
+  - Memory-form (`add dword [mem], 1`) is intentionally not transformed — `inc dword [mem]` is the same encoded length, no savings. Only the register form `add reg, 1` benefits.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (588 total). Pipeline 1734/1734 (100%).
