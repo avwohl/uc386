@@ -2840,6 +2840,113 @@ def test_narrowing_load_test_collapse_skips_full_dword_load():
     assert opt.stats.get("cmp_load_collapse", 0) == 1
 
 
+# ── redundant_xor_zero ───────────────────────────────────────────
+
+
+def test_redundant_xor_zero_basic():
+    """`xor eax, eax; mov [m], eax; xor eax, eax` — drop the second
+    xor, eax already 0."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        mov     [ebp - 4], eax\n"
+        "        xor     eax, eax\n"
+        "        mov     [ebp - 8], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Only one `xor eax, eax` should remain.
+    assert out.count("xor     eax, eax") == 1
+    assert opt.stats.get("redundant_xor_zero") == 1
+
+
+def test_redundant_xor_zero_preserves_first():
+    """The first xor stays — it's the actual zero-setter."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        mov     [ebp - 4], eax\n"
+        "        xor     eax, eax\n"  # redundant
+        "        mov     [ebp - 8], eax\n"
+        "        xor     eax, eax\n"  # also redundant
+        "        mov     [ebp - 12], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert out.count("xor     eax, eax") == 1
+    assert opt.stats.get("redundant_xor_zero") == 2
+
+
+def test_redundant_xor_zero_invalidates_after_eax_write():
+    """A write to EAX (e.g., `mov eax, X`) invalidates the 'zero'
+    state. The next `xor eax, eax` is then NOT redundant.
+
+    We keep both intermediate instructions live by having them
+    used downstream so dead_mov_to_reg doesn't drop them."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        mov     [ebp - 4], eax\n"  # uses eax (live)
+        "        mov     eax, [ebp + 8]\n"  # writes eax with a non-zero value
+        "        mov     [ebp - 8], eax\n"  # uses eax (live)
+        "        xor     eax, eax\n"  # NOT redundant
+        "        mov     [ebp - 12], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_xor_zero", 0) == 0
+
+
+def test_redundant_xor_zero_invalidates_at_label():
+    """Labels are control-flow merge points — multiple incoming
+    paths could leave EAX in different states."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        ".target:\n"
+        "        xor     eax, eax\n"  # NOT redundant — could be entry from another path
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_xor_zero", 0) == 0
+
+
+def test_redundant_xor_zero_invalidates_after_call():
+    """Calls clobber EAX (return value)."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        call    _g\n"
+        "        xor     eax, eax\n"  # NOT redundant
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_xor_zero", 0) == 0
+
+
+def test_redundant_xor_zero_per_register():
+    """Tracking is per-register: zero state for ECX is independent
+    of EAX."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        xor     ecx, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     [ebp - 8], ecx\n"
+        "        xor     eax, eax\n"  # redundant
+        "        xor     ecx, ecx\n"  # redundant
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_xor_zero") == 2
+
+
 # ── zero_init_collapse ───────────────────────────────────────────
 
 

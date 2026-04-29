@@ -108,6 +108,11 @@ Currently implements:
     relative addressing; the original mov+push is 4 bytes. Saves 1
     byte per match. Common in cdecl call-site arg setup, where the
     intermediate register is dead after the push.
+  - redundant_xor_zero: drop `xor reg, reg` when reg is already
+    zero from a recent `xor reg, reg` and nothing modified it
+    since. Saves 2 bytes per match. Common after zero_init_collapse
+    fires twice in a function prologue, leaving back-to-back
+    `xor eax, eax` instructions.
   - zero_init_collapse: replace 1+ adjacent `mov <size> [m], 0`
     stores with `xor eax, eax` + per-store `mov [m], <eax/ax/al>`.
     Saves 2 bytes per dword-zero store (7 bytes → 3 bytes per store
@@ -367,6 +372,7 @@ class PeepholeOptimizer:
             lines = self._pass_narrowing_load_test_collapse(lines)
             lines = self._pass_jcc_jmp_inversion(lines)
             lines = self._pass_zero_init_collapse(lines)
+            lines = self._pass_redundant_xor_zero(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -3362,6 +3368,152 @@ class PeepholeOptimizer:
         if m is None:
             return ("", text)
         return (m.group(1), m.group(2))
+
+    # Map sub-register name → enclosing 32-bit register. Writing to
+    # any sub-register changes the 32-bit reg's value, so we must
+    # invalidate the "is zero" state for the enclosing reg.
+    _SUBREG_TO_GP32: dict[str, str] = {
+        "ax": "eax", "al": "eax", "ah": "eax",
+        "bx": "ebx", "bl": "ebx", "bh": "ebx",
+        "cx": "ecx", "cl": "ecx", "ch": "ecx",
+        "dx": "edx", "dl": "edx", "dh": "edx",
+        "si": "esi",
+        "di": "edi",
+        "bp": "ebp",
+        "sp": "esp",
+    }
+
+    def _pass_redundant_xor_zero(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Drop ``xor reg, reg`` when reg is already known to be zero
+        from a recent prior ``xor reg, reg`` and nothing modified it
+        since.
+
+        Tracks a per-register "is zero" state forward through a
+        single basic block. Invalidated by:
+        - Any write to the reg (mov, add, sub, xor with another src,
+          inc, dec, neg, shl, etc.).
+        - A label (control-flow merge — multiple incoming paths
+          might have different states).
+        - Unconditional jmp / ret / leave / enter (next instr is
+          unreachable as fall-through).
+        - Calls (preserve EBX/ESI/EDI/EBP per cdecl, but clobber
+          EAX/ECX/EDX).
+
+        Conditional jumps (jcc) preserve the state on the fall-
+        through path; the taken path's state is forgotten (we don't
+        track per-target zero states like redundant_eax_load does).
+
+        Saves 2 bytes per match (xor reg, reg is `33 modrm` for the
+        gp 32-bit registers = 2 bytes).
+        """
+        out: list[Line] = []
+        zero_regs: set[str] = set()
+        # Caller-saved regs that get clobbered by `call`.
+        CALLER_SAVED = {"eax", "ecx", "edx"}
+        for line in lines:
+            if line.kind != "instr":
+                if line.kind == "label":
+                    zero_regs = set()
+                out.append(line)
+                continue
+            op = line.op
+            ops = line.operands
+            # Detect `xor reg, reg`: drop if reg is already 0.
+            if op == "xor":
+                parts = _operands_split(ops)
+                if parts is not None:
+                    a, b = parts
+                    al = a.strip().lower()
+                    bl = b.strip().lower()
+                    if al == bl and self._is_general_register(al):
+                        if al in zero_regs:
+                            self.stats[
+                                "redundant_xor_zero"
+                            ] = (
+                                self.stats.get(
+                                    "redundant_xor_zero", 0
+                                ) + 1
+                            )
+                            continue
+                        zero_regs.add(al)
+                        out.append(line)
+                        continue
+            # Other instructions: invalidate any reg they write.
+            # `mov [...], reg` doesn't write reg (just reads).
+            # `mov reg, X` writes reg.
+            if op == "mov":
+                parts = _operands_split(ops)
+                if parts is not None:
+                    dest, _ = parts
+                    dest_low = dest.strip().lower()
+                    # Direct 32-bit reg write.
+                    if (
+                        self._is_general_register(dest_low)
+                        and dest_low in zero_regs
+                    ):
+                        zero_regs.discard(dest_low)
+                    # Sub-register write (al/ah/ax/bl/bh/bx/etc.) —
+                    # invalidates the enclosing 32-bit reg.
+                    elif dest_low in self._SUBREG_TO_GP32:
+                        gp32 = self._SUBREG_TO_GP32[dest_low]
+                        zero_regs.discard(gp32)
+                # `mov [...], reg` — no reg-dest write, preserve.
+                out.append(line)
+                continue
+            # cmp/test/push: read-only on regs.
+            if op in {"cmp", "test", "push"}:
+                out.append(line)
+                continue
+            # Calls: clobber caller-saved regs.
+            if op == "call":
+                for r in CALLER_SAVED:
+                    zero_regs.discard(r)
+                out.append(line)
+                continue
+            # Unconditional jumps / returns: invalidate everything.
+            if op in {"jmp", "ret", "iret", "iretd", "retf",
+                      "retn", "leave", "enter"}:
+                zero_regs = set()
+                out.append(line)
+                continue
+            # Conditional jumps (jcc): preserve state on fallthrough.
+            if op.startswith("j"):
+                out.append(line)
+                continue
+            # Instructions that may write a tracked reg. Conservative:
+            # if any tracked reg appears in operands as dest (or
+            # appears at all for read+write ops), invalidate.
+            # For 2-operand ops: dest is first operand.
+            parts = _operands_split(ops)
+            if parts is not None:
+                dest, _ = parts
+                dest_stripped = dest.strip().lower()
+                if (
+                    self._is_general_register(dest_stripped)
+                    and dest_stripped in zero_regs
+                ):
+                    zero_regs.discard(dest_stripped)
+                elif dest_stripped in self._SUBREG_TO_GP32:
+                    gp32 = self._SUBREG_TO_GP32[dest_stripped]
+                    zero_regs.discard(gp32)
+            # Single-operand ops (inc/dec/neg/not/idiv/etc.): operand
+            # is dest+source.
+            else:
+                op_stripped = ops.strip().lower()
+                if self._is_general_register(op_stripped):
+                    zero_regs.discard(op_stripped)
+                elif op_stripped in self._SUBREG_TO_GP32:
+                    gp32 = self._SUBREG_TO_GP32[op_stripped]
+                    zero_regs.discard(gp32)
+            # `cdq` writes EDX; `lodsd` writes EAX; etc. — implicit
+            # writers. Conservative: clear all caller-saved regs.
+            if op in PeepholeOptimizer._IMPLICIT_REG_USERS:
+                for r in CALLER_SAVED:
+                    zero_regs.discard(r)
+            out.append(line)
+        return out
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
         """P-jmp-to-next: `jmp X` immediately (modulo blanks/comments)
