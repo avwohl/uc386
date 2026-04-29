@@ -1149,3 +1149,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **c-testsuite 00163**: 3 fires for the `bolshevic.a/b/c` printfs. 141 → 138 lines.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests (266 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: label_store_collapse**: sister of label_load_collapse / label_push_collapse for the store case. `mov reg, LABEL; mov <size> [reg], SRC` → `mov <size> [LABEL], SRC`. Saves 1 byte per match.
+  - **Common shape**: `glob = constant;` patterns. The codegen first loads the label address into a register, then stores via the register. The disp32-absolute store form skips the address load.
+  - **c-testsuite 00163**: 3 fires for the `bolshevic.a/b/c = ...` assignments. 138 → 135 lines.
+  - **Conditions**: REG dead after, SRC must not reference REG.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (272 total). Pipeline 1734/1734 (100%).

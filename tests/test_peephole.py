@@ -4745,3 +4745,95 @@ def test_label_push_collapse_skips_numeric_imm():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("label_push_collapse", 0) == 0
+
+
+# ── label_store_collapse ─────────────────────────────────────────
+
+
+def test_label_store_collapse_dword_imm():
+    """`mov eax, _label; mov dword [eax], IMM` → `mov dword [_label], IMM`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _glob\n"
+        "        mov     dword [eax], 42\n"
+        "        xor     eax, eax\n"  # eax dead before this
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     dword [_glob], 42" in out
+    assert opt.stats.get("label_store_collapse") == 1
+
+
+def test_label_store_collapse_label_arithmetic():
+    """`mov ecx, _label + N; mov dword [ecx], IMM`."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, _b + 4\n"
+        "        mov     dword [ecx], 100\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     dword [_b + 4], 100" in out
+    assert opt.stats.get("label_store_collapse") == 1
+
+
+def test_label_store_collapse_word_byte():
+    """Also works for word and byte stores."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _glob\n"
+        "        mov     word [eax], 0x1234\n"
+        "        mov     ecx, _other\n"
+        "        mov     byte [ecx], 1\n"
+        "        xor     eax, eax\n"  # eax dead before this
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     word [_glob], 0x1234" in out
+    assert "mov     byte [_other], 1" in out
+    assert opt.stats.get("label_store_collapse") == 2
+
+
+def test_label_store_collapse_skips_when_reg_live():
+    """If REG is read after the store, can't drop."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _glob\n"
+        "        mov     dword [eax], 42\n"
+        "        push    eax\n"  # eax live
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("label_store_collapse", 0) == 0
+
+
+def test_label_store_collapse_register_source():
+    """Source can be a different register."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _glob\n"
+        "        mov     dword [eax], ecx\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     dword [_glob], ecx" in out
+    assert opt.stats.get("label_store_collapse") == 1
+
+
+def test_label_store_collapse_skips_when_src_uses_reg():
+    """If SRC references REG, can't fold."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _glob\n"
+        "        mov     dword [eax], eax\n"  # SRC uses EAX
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("label_store_collapse", 0) == 0

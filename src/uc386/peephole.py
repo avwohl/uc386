@@ -403,6 +403,7 @@ class PeepholeOptimizer:
             lines = self._pass_transfer_pop_collapse(lines)
             lines = self._pass_label_load_collapse(lines)
             lines = self._pass_label_push_collapse(lines)
+            lines = self._pass_label_store_collapse(lines)
             lines = self._pass_value_forward_to_reg(lines)
             lines = self._pass_byte_stores_to_dword(lines)
             lines = self._pass_pop_index_push_collapse(lines)
@@ -4678,6 +4679,100 @@ class PeepholeOptimizer:
             out = out[:i] + [new_line] + out[i + 2:]
             self.stats["label_push_collapse"] = (
                 self.stats.get("label_push_collapse", 0) + 1
+            )
+            continue
+        return out
+
+    def _pass_label_store_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``mov REG, LABEL; mov <size> [REG], SRC`` into
+        ``mov <size> [LABEL], SRC`` using x86's disp32-absolute store.
+
+        Sister of ``label_load_collapse`` for the store case. Saves
+        1 byte per match. Common in `glob = constant;` patterns where
+        the codegen first loads the label address then stores into it.
+
+        Conditions:
+        - Two consecutive instr lines.
+        - Line A: ``mov REG, LABEL`` (LABEL is non-numeric, non-mem,
+          non-register expression).
+        - Line B: ``mov <size> [REG], SRC`` (size in dword/word/byte;
+          plain `[REG]` deref, no offset/SIB).
+        - REG dead after Line B.
+        """
+        out = list(lines)
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op == "mov"
+                and b.kind == "instr" and b.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            if ap is None or bp is None:
+                i += 1
+                continue
+            r1 = ap[0].strip().lower()
+            label = ap[1].strip()
+            b_dst = bp[0].strip()
+            b_src = bp[1].strip()
+            if not self._is_general_register(r1):
+                i += 1
+                continue
+            if (
+                "[" in label
+                or self._is_general_register(label.lower())
+            ):
+                i += 1
+                continue
+            try:
+                int(label)
+                i += 1
+                continue
+            except ValueError:
+                pass
+            # Line B's dest must be `<size> [REG]` (with size keyword).
+            m = re.match(
+                r"^(dword|word|byte|qword)\s+\[\s*([a-zA-Z]+)\s*\]$",
+                b_dst,
+                re.IGNORECASE,
+            )
+            if m is None:
+                i += 1
+                continue
+            size_kw = m.group(1).lower()
+            mem_reg = m.group(2).lower()
+            if mem_reg != r1:
+                i += 1
+                continue
+            # SRC must not reference REG (else dropping the address
+            # load breaks). E.g. `mov reg, LABEL; mov [reg], reg`
+            # is `*LABEL = LABEL` which doesn't make sense to fold
+            # without further analysis.
+            if self._references_reg_family(b_src, r1):
+                i += 1
+                continue
+            # REG dead after line B.
+            if not self._reg_dead_after(out, i + 2, r1):
+                i += 1
+                continue
+            indent = self._extract_indent(b.raw)
+            new_dst = f"{size_kw} [{label}]"
+            new_raw = f"{indent}mov     {new_dst}, {b_src}"
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op="mov",
+                operands=f"{new_dst}, {b_src}",
+            )
+            out = out[:i] + [new_line] + out[i + 2:]
+            self.stats["label_store_collapse"] = (
+                self.stats.get("label_store_collapse", 0) + 1
             )
             continue
         return out
