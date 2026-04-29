@@ -2554,22 +2554,26 @@ class PeepholeOptimizer:
             return None
 
     def _pass_cmp_load_collapse(self, lines: list[Line]) -> list[Line]:
-        """Collapse ``mov reg, [mem]; cmp reg, X`` into
-        ``cmp dword [mem], X`` when ``reg`` is dead after. Also
-        handles ``mov reg, [mem]; test reg, reg`` → ``cmp dword
-        [mem], 0`` (test r,r and cmp r,0 set the same flags for
-        standard Jcc).
+        """Collapse ``mov reg, [mem]; ...chain...; cmp reg, X`` into
+        ``...chain...; cmp dword [mem], X`` when ``reg`` is dead
+        after the cmp AND the chain doesn't read/write reg or write
+        to [mem]. Also handles ``mov reg, [mem]; ...chain...; test
+        reg, reg`` → ``...chain...; cmp dword [mem], 0`` (test r,r
+        and cmp r,0 set the same flags for standard Jcc).
 
         x86 supports ``cmp r/m32, imm`` and ``cmp r/m32, r32``
         directly, so the load can be elided. Saves 2-3 bytes per
-        match.
+        match (drops the mov; cmp gains a memory operand of equal
+        or 1-byte-larger encoding).
 
-        Conditions:
-        - First line is ``mov reg, [mem]`` (plain mov, no movsx/movzx;
-          source must be a memory deref).
-        - Second line is ``cmp reg, X`` (X not a memory ref) OR
-          ``test reg, reg`` (zero-test).
-        - reg is dead after the cmp/test (CFG-aware scan).
+        The fast path matches the immediate-adjacent shape (chain
+        length 0). The slow path walks forward through a chain,
+        bailing on:
+        - any instruction that reads or writes EAX (we'd lose the
+          loaded value or the chain would clobber it).
+        - any memory store that may alias [mem].
+        - any control flow (label, jmp, ret, call) — calls clobber
+          EAX per cdecl.
 
         Restricted to EAX for now: most cmp+load chains funnel through
         EAX, and limiting scope keeps the safety analysis simple.
@@ -2579,8 +2583,7 @@ class PeepholeOptimizer:
         while i < len(lines):
             line = lines[i]
             if (
-                i + 1 < len(lines)
-                and line.kind == "instr"
+                line.kind == "instr"
                 and line.op == "mov"
             ):
                 parts = _operands_split(line.operands)
@@ -2593,34 +2596,123 @@ class PeepholeOptimizer:
                         and src_norm.startswith("[")
                         and src_norm.endswith("]")
                     ):
-                        nxt = lines[i + 1]
-                        new_cmp = self._collapse_cmp_with_load(
-                            nxt, src_norm
+                        # Find the cmp/test at the end of the chain.
+                        cmp_idx = self._find_cmp_after_load(
+                            lines, i + 1, src_norm
                         )
-                        if new_cmp is not None and self._reg_dead_after(
-                            lines, i + 2, "eax"
-                        ):
-                            indent = self._extract_indent(line.raw)
-                            new_raw = f"{indent}{new_cmp}"
-                            new_line = Line(
-                                raw=new_raw,
-                                kind="instr",
-                                op="cmp",
-                                operands=new_cmp.split(
-                                    None, 1
-                                )[1] if " " in new_cmp else "",
+                        if cmp_idx is not None:
+                            new_cmp = self._collapse_cmp_with_load(
+                                lines[cmp_idx], src_norm
                             )
-                            out.append(new_line)
-                            self.stats["cmp_load_collapse"] = (
-                                self.stats.get(
-                                    "cmp_load_collapse", 0
-                                ) + 1
-                            )
-                            i += 2
-                            continue
+                            if (
+                                new_cmp is not None
+                                and self._reg_dead_after(
+                                    lines, cmp_idx + 1, "eax"
+                                )
+                            ):
+                                indent = self._extract_indent(
+                                    line.raw
+                                )
+                                new_raw = f"{indent}{new_cmp}"
+                                new_line = Line(
+                                    raw=new_raw,
+                                    kind="instr",
+                                    op="cmp",
+                                    operands=new_cmp.split(
+                                        None, 1
+                                    )[1] if " " in new_cmp else "",
+                                )
+                                # Emit chain (between mov and cmp),
+                                # then the new cmp. Drop mov + old
+                                # cmp.
+                                for k in range(i + 1, cmp_idx):
+                                    out.append(lines[k])
+                                out.append(new_line)
+                                self.stats["cmp_load_collapse"] = (
+                                    self.stats.get(
+                                        "cmp_load_collapse", 0
+                                    ) + 1
+                                )
+                                i = cmp_idx + 1
+                                continue
             out.append(line)
             i += 1
         return out
+
+    def _find_cmp_after_load(
+        self, lines: list[Line], start: int, mem: str
+    ) -> int | None:
+        """Walk forward from `start` looking for `cmp eax, X` (X non-
+        memory) or `test eax, eax`. Bail on any chain instruction
+        that:
+        - references EAX (read or write — dest or operand)
+        - stores to memory that may alias `mem`
+        - is a label, control flow, or call
+
+        Returns the cmp/test index on success, None on failure.
+        """
+        for k in range(start, len(lines)):
+            ln = lines[k]
+            if ln.kind == "label":
+                return None
+            if ln.kind != "instr":
+                continue
+            op = ln.op
+            # Found the cmp/test?
+            if op in ("cmp", "test"):
+                opp = _operands_split(ln.operands or "")
+                if opp is None:
+                    return None
+                d, s = opp
+                if d.strip().lower() == "eax":
+                    return k
+                # Some other cmp/test — bail conservatively.
+                return None
+            # Control flow / call — bail.
+            if op in ("ret", "iret", "iretd", "retf", "retn",
+                      "leave", "enter", "call"):
+                return None
+            if op == "jmp" or op.startswith("j"):
+                return None
+            # Any reference to EAX (or sub-regs) — bail.
+            if (
+                _references_register(ln.operands or "", "eax")
+                or op in PeepholeOptimizer._IMPLICIT_REG_USERS
+            ):
+                return None
+            # Memory write that may alias `mem` — bail. The first
+            # operand is the destination for most ALU/move ops; for
+            # 1-operand RMW ops (inc/dec/not/neg/pop/setCC) the only
+            # operand is the dest. Skip known read-only ops where
+            # first operand is just a source.
+            ops_text = ln.operands or ""
+            if ops_text and op not in self._READ_ONLY_FIRST_MEM:
+                first_op = (
+                    ops_text.split(",", 1)[0].strip()
+                    if "," in ops_text
+                    else ops_text.strip()
+                )
+                if "[" in first_op:
+                    if not self._mem_disjoint(
+                        self._strip_size_prefix(first_op),
+                        self._strip_size_prefix(mem.strip()),
+                    ):
+                        return None
+        return None
+
+    # Ops whose first memory operand is a SOURCE (read-only). All
+    # other ops with a memory first operand write to it.
+    _READ_ONLY_FIRST_MEM: frozenset[str] = frozenset({
+        "cmp", "test",
+        "lea",  # dest is reg; mem only as effective addr (read-only)
+        "push",
+        # Single-operand mul/div/idiv/imul: mem operand is source,
+        # result lands in EDX:EAX (caught by IMPLICIT_REG_USERS).
+        "mul", "div", "idiv", "imul",
+        # Conditional jumps with mem target — control flow, but
+        # they're already bailed on at the control-flow check above.
+        # Listed here for completeness.
+    })
 
     @staticmethod
     def _collapse_cmp_with_load(
