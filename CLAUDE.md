@@ -952,3 +952,10 @@ See `README.md` for the public roadmap (Phase 0–6).
     - probe_loop: 1136 → 1105 bytes ASM (-31 bytes).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +12 peephole tests (529 total). Pipeline 1734/1734 (100%). Total benchmark size reduction stays at 27.7%.
+- **2026-04-29 — Phase A peephole: push_immediate generalized to any register + LL push fold**: extended `push_immediate` to fire on any 32-bit gp reg (not just EAX) and to allow up to 10 reg-neutral instructions between the `mov reg, IMM` and the `push reg`. The witness scan also looks past reg-neutral instructions for the reg-overwrite.
+  - Switched from an explicit allow-list of "operand-only" ops to a deny-list of "implicit-reg-users" (cdq/idiv/lodsd/repe/loop/xlat/pushf/etc.). Most x86 instructions have explicit operands; only this small set has implicit register references. The deny-list approach lets setCC/cmovCC/bsf/bswap/etc. pass through as reg-neutral when their explicit operands don't reference our tracked reg.
+  - Added `cdq` as a pure-write witness for EDX (cdq writes EDX based on EAX's sign — pure write to EDX, no EDX read).
+  - LL-push idiom collapse: `mov eax, lo; mov edx, hi; push edx; push eax` → `push hi; push lo`. Saves 8 bytes per LL-imm push (each `mov reg, imm32` is 5 bytes, gone). Common in calls passing long-long literal args.
+  - 950512-1.c: 4986 → 3765 bytes ASM (-1221 bytes, 24.5% reduction).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. Pipeline 1734/1734 (100%).

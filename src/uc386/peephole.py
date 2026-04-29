@@ -609,79 +609,135 @@ class PeepholeOptimizer:
         return out
 
     def _pass_push_immediate(self, lines: list[Line]) -> list[Line]:
-        """Replace `mov eax, IMM_OR_LABEL; push eax` with `push X`
-        when the next instruction overwrites EAX.
+        """Replace `mov <reg>, IMM_OR_LABEL; ... ; push <reg>;
+        <reg-write>` with `... ; push IMM_OR_LABEL; <reg-write>`.
 
-        The codegen emits `mov eax, X; push eax` for every cdecl arg
+        The codegen emits `mov reg, X; push reg` for every cdecl arg
         push. NASM's `push imm8` / `push imm32` instructions skip the
-        EAX round-trip entirely. The next instruction must overwrite
-        EAX for the rewrite to be safe (otherwise EAX's value-after-
-        push is observable).
+        register round-trip entirely. The instruction after `push reg`
+        must overwrite the register for the rewrite to be safe.
 
-        Conditions:
-        - First instr: `mov eax, src` where src has no `[` (constant).
-        - Second instr: `push eax`.
-        - Third instr (witness): writes EAX (mov eax, * / xor eax, eax
-          / call * / etc.).
+        Up to 4 "reg-neutral" instructions may sit between the mov
+        and the push — they must not read OR write the register's
+        family (EAX/AX/AL/AH for EAX, etc.). This catches the LL-push
+        pattern `mov eax, lo; mov edx, hi; push edx; push eax` which
+        becomes `mov edx, hi; push edx; push lo` (and recurses on
+        the EDX form to give `push hi; push lo`).
+
+        Works for EAX, EBX, ECX, EDX, ESI, EDI, EBP. ESP excluded
+        (used as stack pointer; rewrites would break alignment).
         """
-        def overwrites_eax(line: Line) -> bool:
+        SUPPORTED_REGS = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp"}
+
+        def overwrites_reg(line: Line, reg32: str) -> bool:
+            return PeepholeOptimizer._is_pure_reg_write(line, reg32)
+
+        def is_reg_neutral(line: Line, reg32: str) -> bool:
+            """Doesn't read or write the register family. May touch
+            other state."""
             if line.kind != "instr":
                 return False
-            # `call X` clobbers EAX (caller-saved in cdecl).
             if line.op == "call":
-                return True
-            # `xor eax, eax` (and other xor reg, reg) clobbers.
-            if line.op == "xor":
-                parts = _operands_split(line.operands)
-                if parts and parts[0].lower() == "eax":
-                    return True
+                # Direct calls clobber EAX/ECX/EDX. For other regs
+                # they're preserved. But indirect calls or any call
+                # might invalidate analysis; conservative: block.
                 return False
-            # `mov eax, anything` overwrites.
-            if line.op == "mov":
-                parts = _operands_split(line.operands)
-                if parts and parts[0].lower() == "eax":
-                    return True
+            if line.op in {"ret", "iret", "iretd", "retf", "retn",
+                            "jmp"} or line.op.startswith("j"):
                 return False
-            # `lea eax, ...` overwrites.
-            if line.op == "lea":
-                parts = _operands_split(line.operands)
-                if parts and parts[0].lower() == "eax":
-                    return True
+            if not PeepholeOptimizer._has_explicit_operands_only(line):
                 return False
-            # `pop eax` overwrites.
-            if line.op == "pop":
-                if line.operands.strip().lower() == "eax":
-                    return True
+            if PeepholeOptimizer._references_reg_family(
+                    line.operands, reg32):
                 return False
-            return False
+            return True
 
-        out: list[Line] = []
+        def is_imm_or_label_to_reg(line: Line, reg32: str) -> bool:
+            if line.kind != "instr" or line.op != "mov":
+                return False
+            parts = _operands_split(line.operands)
+            if parts is None:
+                return False
+            dest, src = parts
+            if dest.lower() != reg32:
+                return False
+            if "[" in src:
+                return False
+            regs = {"eax", "ebx", "ecx", "edx", "esi", "edi",
+                    "ebp", "esp",
+                    "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
+                    "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"}
+            if src.lower() in regs:
+                return False
+            return True
+
+        out = list(lines)
         i = 0
-        while i < len(lines):
-            line = lines[i]
-            if (line.kind == "instr" and line.op == "mov"
-                    and _is_imm_or_label_to_eax(line)):
-                instrs = self._next_n_instrs(lines, i + 1, 2)
-                if instrs is not None:
-                    [(b_idx, b_line), (c_idx, c_line)] = instrs
-                    if (b_line.op == "push"
-                            and b_line.operands.strip().lower() == "eax"
-                            and overwrites_eax(c_line)):
-                        # Build `push <src>`. Preserve indentation.
-                        parts = _operands_split(line.operands)
-                        assert parts is not None
-                        _, src = parts
-                        leading_ws = re.match(r"^\s*", line.raw).group(0)
-                        new_raw = f"{leading_ws}push    {src}"
-                        new_line = Line(raw=new_raw, kind="instr",
-                                        op="push", operands=src)
-                        out.append(new_line)
-                        self.stats["push_immediate"] = (
-                            self.stats.get("push_immediate", 0) + 1
-                        )
-                        i = b_idx + 1  # Skip past the push; keep witness
-                        continue
-            out.append(line)
+        while i < len(out):
+            line = out[i]
+            if (line.kind == "instr" and line.op == "mov"):
+                parts = _operands_split(line.operands)
+                if parts is not None:
+                    dest, src = parts
+                    reg32 = dest.lower()
+                    if (reg32 in SUPPORTED_REGS
+                            and is_imm_or_label_to_reg(line, reg32)):
+                        # Find the matching `push <reg>` within the
+                        # next 5 instructions, where each intermediate
+                        # is reg-neutral.
+                        push_idx: int | None = None
+                        witness_idx: int | None = None
+                        neutrals = 0
+                        for j_offset, ln in enumerate(
+                                out[i + 1:], start=i + 1):
+                            if ln.kind in ("blank", "comment"):
+                                continue
+                            if ln.kind != "instr":
+                                break
+                            if (ln.op == "push"
+                                    and ln.operands.strip().lower()
+                                    == reg32):
+                                push_idx = j_offset
+                                # Find the witness — scan past
+                                # reg-neutral instrs (up to 10).
+                                w_neutrals = 0
+                                for k_offset, kln in enumerate(
+                                        out[j_offset + 1:],
+                                        start=j_offset + 1):
+                                    if kln.kind in ("blank", "comment"):
+                                        continue
+                                    if kln.kind != "instr":
+                                        break
+                                    if overwrites_reg(kln, reg32):
+                                        witness_idx = k_offset
+                                        break
+                                    if not is_reg_neutral(kln, reg32):
+                                        break
+                                    w_neutrals += 1
+                                    if w_neutrals > 10:
+                                        break
+                                break
+                            if not is_reg_neutral(ln, reg32):
+                                break
+                            neutrals += 1
+                            if neutrals > 10:
+                                break
+                        if (push_idx is not None
+                                and witness_idx is not None):
+                            push_line = out[push_idx]
+                            leading_ws = re.match(
+                                r"^\s*", push_line.raw,
+                            ).group(0)
+                            new_raw = f"{leading_ws}push    {src}"
+                            out[push_idx] = Line(
+                                raw=new_raw, kind="instr",
+                                op="push", operands=src,
+                            )
+                            out.pop(i)
+                            self.stats["push_immediate"] = (
+                                self.stats.get("push_immediate", 0) + 1
+                            )
+                            continue
             i += 1
         return out
 
@@ -1539,20 +1595,48 @@ class PeepholeOptimizer:
                     return False
             if reg32 in {"eax", "ecx", "edx"}:
                 return True
+        # `cdq` sign-extends EAX into EDX — pure write to EDX (doesn't
+        # read EDX's prior value, only EAX's).
+        if line.op == "cdq" and reg32 == "edx":
+            return True
         return False
 
-    # Instructions whose operands enumerate the registers they touch.
-    # Anything outside this list is treated conservatively as a read
-    # of any reg we're tracking (because of implicit reg references —
-    # e.g. cdq reads EAX, idiv reads EDX:EAX, lodsd reads ESI, etc.).
-    _EXPLICIT_OPERAND_OPS: frozenset[str] = frozenset({
-        "mov", "lea", "movsx", "movzx", "movsxd",
-        "push", "pop",
-        "add", "sub", "and", "or", "xor", "cmp", "test",
-        "imul", "neg", "not",
-        "shl", "shr", "sar", "sal", "rol", "ror",
-        "inc", "dec",
-        "nop", "leave",
+    # Instructions known to reference registers IMPLICITLY (beyond
+    # what's in the operand string). Used to know when our reg-
+    # tracking peepholes need to bail. Examples: cdq reads EAX, idiv
+    # reads EDX:EAX, lodsd reads ESI, rep* reads ECX.
+    _IMPLICIT_REG_USERS: frozenset[str] = frozenset({
+        # Sign/zero extension family
+        "cdq", "cwde", "cwd", "cbw", "cqo", "cdqe",
+        # One-operand mul/div implicitly read/write EDX:EAX
+        "mul", "div", "idiv",  # (one-operand form)
+        # String operations: read/write ESI, EDI, ECX
+        "movsb", "movsw", "movsd",  # NB: movsd here is the
+                                       # string instr, not SSE.
+                                       # NASM uses `movsd` for both
+                                       # but in 32-bit mode without
+                                       # operands it's the string op.
+        "lodsb", "lodsw", "lodsd",
+        "stosb", "stosw", "stosd",
+        "scasb", "scasw", "scasd",
+        "cmpsb", "cmpsw", "cmpsd",
+        # Repeat prefixes (read ECX)
+        "rep", "repe", "repne", "repnz", "repz",
+        # Loop instructions
+        "loop", "loope", "loopne", "loopnz", "loopz",
+        # XLAT reads AL, EBX
+        "xlat", "xlatb",
+        # Flag ops
+        "pushf", "pushfd", "popf", "popfd", "lahf", "sahf",
+        # bswap reads+writes a reg (single operand, but the operand
+        # form is fine — we'll detect via the operand string)
+        # enter/leave touch ESP/EBP
+        "enter",  # leave is in the explicit-fine list
+        # FPU instructions (don't touch gp regs by themselves)
+        # but `fnstsw ax` writes AX
+        "fnstsw", "fstsw",
+        # int / iret / sysenter / sysexit — system calls
+        "int", "into", "int1", "int3",
     })
 
     @staticmethod
@@ -1561,7 +1645,15 @@ class PeepholeOptimizer:
         explicit operands (and not on implicit register references)?
         Used to know when scanning past an instruction without
         finding the tracked reg in the operand string is safe."""
-        return line.op in PeepholeOptimizer._EXPLICIT_OPERAND_OPS
+        if line.op in PeepholeOptimizer._IMPLICIT_REG_USERS:
+            return False
+        # `fistp` and friends? FPU instructions don't touch gp regs.
+        # An instruction starting with `f` (FPU) is fine.
+        if line.op.startswith("f"):
+            # Excludes the few `f*` we listed in _IMPLICIT_REG_USERS
+            # like fnstsw — those are caught above.
+            return True
+        return True
 
     def _reg_dead_after(
         self, lines: list[Line], start_idx: int, reg32: str,
