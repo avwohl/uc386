@@ -909,3 +909,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - +19 libc_split tests covering parsing, dep extraction, transitive closure (with cycles), emit, and integration with the real libc file.
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +19 libc_split tests (461 total smoke + peephole + libc_split). Pipeline 1734/1734 (100%).
+- **2026-04-29 — `_start` skips FPU/BSS init when not needed**: the entry stub used to unconditionally emit FPU control-word setup (4 lines) and BSS zero-init (6 lines) before calling main. New `_needs_fpu_init` and `_needs_bss_init` predicates skip each block when the program doesn't need it.
+  - **`_needs_bss_init`**: checks for at least one non-noinit uninitialized global. Hello-world has none → BSS init dropped.
+  - **`_needs_fpu_init`**: checks for any user-visible (non-builtin) function or global with float/double/long-double/complex type. Filters out `__builtin_isinff` and the 16 other auto-registered builtin sigs that would otherwise trip the check on every program. `_type_uses_float` walks types recursively (struct members, array elements, pointee) with cycle protection for self-referential structs (`struct list { list *next; ... };`).
+  - **Hello-world: 123 → 91 bytes** (32 bytes saved). With selective libc + this, hello-world's `_start` is 3 instructions: `call _main; mov ah, 4Ch; int 21h`.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. Pipeline 1734/1734 (100%).

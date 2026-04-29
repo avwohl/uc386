@@ -2768,24 +2768,103 @@ class CodeGenerator:
         # `__start`) reaches the entry stub.
         # _start also re-zeroes the non-noinit BSS range so a recursive
         # `_start()` call from main (`__attribute__((noinit))` test
-        # idiom) re-runs main with a clean slate.
-        return [
+        # idiom) re-runs main with a clean slate. Skip both the FPU
+        # init (when no float-typed globals/locals exist) and the BSS
+        # init (when no uninitialized non-noinit globals exist).
+        out = [
             "_start:",
             "__start:",
-            "        sub     esp, 4",
-            "        mov     word [esp], 0x027F",
-            "        fldcw   [esp]",
-            "        add     esp, 4",
-            "        cld",
-            "        xor     eax, eax",
-            "        mov     edi, _bss_zero_start",
-            "        mov     ecx, _bss_zero_end",
-            "        sub     ecx, edi",
-            "        rep     stosb",
+        ]
+        if self._needs_fpu_init():
+            out.extend([
+                "        sub     esp, 4",
+                "        mov     word [esp], 0x027F",
+                "        fldcw   [esp]",
+                "        add     esp, 4",
+            ])
+        if self._needs_bss_init():
+            out.extend([
+                "        cld",
+                "        xor     eax, eax",
+                "        mov     edi, _bss_zero_start",
+                "        mov     ecx, _bss_zero_end",
+                "        sub     ecx, edi",
+                "        rep     stosb",
+            ])
+        out.extend([
             "        call    _main",
             "        mov     ah, 4Ch",
             "        int     21h",
-        ]
+        ])
+        return out
+
+    def _needs_bss_init(self) -> bool:
+        """True iff there's at least one non-noinit uninitialized global.
+        When false, `_bss_zero_start == _bss_zero_end` and the rep stosb
+        loop would write 0 bytes — skip the setup."""
+        for name in self._globals:
+            if name in self._global_inits:
+                continue  # initialized → goes in .data, not .bss
+            if name in self._noinit_globals:
+                continue  # noinit → not zeroed
+            return True
+        return False
+
+    def _needs_fpu_init(self) -> bool:
+        """True iff any float/double-typed user-visible declaration
+        exists. The codegen pre-registers a bunch of builtin/libc
+        signatures (`__builtin_isinff` etc.) which would always trigger
+        a naive scan; filter those out — they're only emitted if the
+        user actually calls them (and the user-call would still fire
+        the predicate via its own argument types/operands).
+
+        Conservative within that filter: any user-defined or non-
+        builtin-extern function that mentions float in its signature
+        means we likely emit FPU ops somewhere."""
+        def is_builtin_name(n: str) -> bool:
+            return n.startswith("__builtin_") or n.startswith("___builtin_")
+
+        # User globals.
+        for ty in self._globals.values():
+            if self._type_uses_float(ty):
+                return True
+        # Non-builtin function param/return types.
+        for name, ret_ty in self._func_return_types.items():
+            if is_builtin_name(name):
+                continue
+            if self._type_uses_float(ret_ty):
+                return True
+        for name, params in self._func_param_types.items():
+            if is_builtin_name(name):
+                continue
+            for ty in params:
+                if self._type_uses_float(ty):
+                    return True
+        return False
+
+    def _type_uses_float(self, ty, seen: set | None = None) -> bool:
+        """Does this type contain a float/double anywhere — directly,
+        in array elements, struct members, or pointee? `seen` tracks
+        struct names to avoid infinite recursion through self-
+        referential types like `struct list { struct list *next; ... };`.
+        """
+        if seen is None:
+            seen = set()
+        if isinstance(ty, ast.BasicType):
+            return ty.name in ("float", "double", "long double")
+        if isinstance(ty, ast.ArrayType):
+            return self._type_uses_float(ty.base_type, seen)
+        if isinstance(ty, ast.PointerType):
+            return self._type_uses_float(ty.base_type, seen)
+        if isinstance(ty, ast.ComplexType):
+            return True  # always float-family
+        if isinstance(ty, ast.StructType):
+            if ty.name in seen:
+                return False
+            seen.add(ty.name)
+            members = self._structs.get(ty.name, [])
+            return any(self._type_uses_float(m[1], seen) for m in members)
+        return False
 
     # ---- functions ------------------------------------------------------
 
