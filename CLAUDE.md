@@ -1205,3 +1205,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **20040218-1.c `_yb`**: 4 instructions for `arr[1]` access collapsed to 1 instruction. Saves ~8 bytes per such access.
 
   **Result: 463/463 torture --full sample passing, 50/50 specific tests, 765 unit tests, 1514/1514 compile-only**. +2 peephole tests (323 total).
+- **2026-04-29 — peephole fix: disabled imm_store_collapse CFG-aware fallback + extended compound_assign_collapse with EAX reload**: a couple of follow-ups to the recent slice work.
+  - **imm_store_collapse CFG-aware fallback DISABLED** (regression fix). The CFG-aware path was incorrectly causing 2 torture --full failures (strcmp-1, strncmp-1) — root cause unclear but the fast-path-only behavior is conservatively correct. Investigation pending; the CFG-aware fallback may be re-introduced once the bug is understood.
+  - **compound_assign_collapse: EAX-live case now adds `mov eax, [m]` reload** instead of bailing. The canonical 4-line tail leaves `EAX = lhs OP rhs = new [m]`; my collapse to `OP [m], eax` leaves `EAX = rhs`. Insert `mov eax, [m]` to restore the canonical post-state. Net savings: 4 instructions dropped, 1 added = 3 net per match. With cascading effects (rmw_collapse can fire on the new mov-and-store pattern), the actual savings are larger.
+  - **probe_arr_compound** loop body: from 13 instructions per iteration (with both compound assigns) down to 5 — `mov eax, [ebp - 8]; mov eax, [_g + eax*4]; add [ebp - 4], eax; and dword [ebp - 4], 65535; (loop step)`. The second compound assign collapsed to a direct in-place RMW because the first compound's reload + rmw_collapse worked together.
+
+  **Result: 994/994 torture --full sample, 765 unit tests, all 1514/1514 compile-only torture passing**. Pipeline 1734/1734 (100%) — strcmp-1, strncmp-1 fixed.

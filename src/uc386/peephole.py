@@ -1017,46 +1017,10 @@ class PeepholeOptimizer:
                     )
                     i = b_idx + 1
                     continue
-                # Slow path: CFG-aware liveness — check Line B (next
-                # instr is `mov [m], eax`) and EAX dead after.
-                next_instrs = self._next_n_instrs(lines, i + 1, 1)
-                if next_instrs is not None:
-                    [(b_idx, b_line)] = next_instrs
-                    if (
-                        b_line.op == "mov"
-                        and self._is_eax_to_mem_store(b_line)
-                        and self._reg_dead_after(
-                            lines, b_idx + 1, "eax"
-                        )
-                    ):
-                        parts_a = _operands_split(line.operands)
-                        assert parts_a is not None
-                        _, src_imm = parts_a
-                        addr = self._mem_dest(b_line)
-                        if addr is not None:
-                            leading_ws = re.match(
-                                r"^\s*", line.raw
-                            ).group(0)
-                            new_raw = (
-                                f"{leading_ws}mov     dword "
-                                f"{addr}, {src_imm}"
-                            )
-                            new_line = Line(
-                                raw=new_raw, kind="instr", op="mov",
-                                operands=(
-                                    f"dword {addr}, {src_imm}"
-                                ),
-                            )
-                            out_list.append(new_line)
-                            self.stats[
-                                "imm_store_collapse"
-                            ] = (
-                                self.stats.get(
-                                    "imm_store_collapse", 0
-                                ) + 1
-                            )
-                            i = b_idx + 1
-                            continue
+                # CFG-aware fallback DISABLED — was causing
+                # strcmp-1/strncmp-1 regressions. Investigation
+                # pending. Until then, only the immediate-witness
+                # fast path fires.
             out_list.append(line)
             i += 1
         return out_list
@@ -3939,18 +3903,13 @@ class PeepholeOptimizer:
                 if not self._reg_dead_after(out, i + 1, "ecx"):
                     i += 1
                     continue
-                # Verify EAX dead after the store. Otherwise, code
-                # downstream relied on EAX = [m]'s NEW value (the
-                # canonical 4-line tail leaves EAX = lhs OP rhs);
-                # after the in-place RMW, EAX holds rhs only, which
-                # differs. A common trap: ``store_load_collapse``
-                # already dropped a subsequent ``mov eax, [m]``
-                # because the original store made it redundant —
-                # if we now collapse, downstream EAX reads see
-                # rhs instead of the in-memory new value.
-                if not self._reg_dead_after(out, i + 1, "eax"):
-                    i += 1
-                    continue
+                # Determine if EAX is dead after the store. If yes,
+                # we can drop the framing entirely. If no, we drop
+                # the framing AND insert ``mov eax, [m]`` to restore
+                # EAX = new [m] value (the canonical tail leaves
+                # EAX = lhs OP rhs = new [m]; the reload restores
+                # this for downstream consumers).
+                eax_dead = self._reg_dead_after(out, i + 1, "eax")
                 # Rewrite: drop push, framing tail, mov [m] eax —
                 # replace with ``OP [m], eax`` in place of the tail.
                 indent = self._extract_indent(line.raw)
@@ -3968,12 +3927,27 @@ class PeepholeOptimizer:
                 # inclusive — exclusive slice end = i - tail_count + 1.
                 # For tail_count=4 (canonical) this is i - 3; for
                 # tail_count=3 (commutative short form) it's i - 2.
+                replace_lines = [new_line]
+                # If EAX is live, append `mov eax, [m]` to reload.
+                # Lets downstream code see EAX = new [m] value,
+                # matching the canonical tail's post-state.
+                if not eax_dead:
+                    reload_raw = (
+                        f"{indent}mov     eax, {store_dest}"
+                    )
+                    reload_line = Line(
+                        raw=reload_raw,
+                        kind="instr",
+                        op="mov",
+                        operands=f"eax, {store_dest}",
+                    )
+                    replace_lines.append(reload_line)
                 new_out = []
                 new_out.extend(out[:push_idx])
                 new_out.extend(
                     out[push_idx + 1: i - tail_count + 1]
                 )
-                new_out.append(new_line)
+                new_out.extend(replace_lines)
                 new_out.extend(out[i + 1:])
                 self.stats["compound_assign_collapse"] = (
                     self.stats.get(
