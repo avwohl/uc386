@@ -1099,3 +1099,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Saves 3 bytes per match** (typical: `mov ecx, [ebp - N]` is 3 bytes for ebp-relative).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (229 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: self_mov_elimination + torture compile timeout bump**: drop `mov REG, REG` (dst == src) — these are no-ops on x86 with no flag changes. Saves 2 bytes per match.
+  - **Common shape**: after `right_operand_retarget` rewrites a binop chain, sometimes the retargeting leaves a stale `mov ecx, ecx` if the chain's natural endpoint already wrote to ECX. Specifically the `pop ecx; add esp, 4; mov ecx, ecx; add eax, ecx` shape that was visible 162 times in `20040705-1.c` alone.
+  - **Conservative**: only fires for plain GP register-to-register movs where dst == src after lowercasing. Sub-register self-movs (e.g. `mov al, al`) aren't matched.
+  - **20040705-1.c**: 8904 → 8778 lines (126 lines saved, 1.4%). All 162 `mov ecx, ecx` instances dropped.
+  - **Compile timeout bump**: bumped `run_gcc_torture.py`'s compile timeout from 15s to 30s. Tests like pr23135 take ~12-13s of peephole time (very large generated asm: 720K lines from a 4KB source) and were flaking under load. The slice itself doesn't change perf measurably (12.34s pre-slice → 12.25s post-slice on pr23135).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests (234 total). Pipeline 1734/1734 (100%).

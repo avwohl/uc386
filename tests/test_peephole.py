@@ -4113,3 +4113,78 @@ def test_redundant_ecx_load_through_jcc_fallthrough():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("redundant_ecx_load") == 1
+
+
+# ── self_mov_elimination ─────────────────────────────────────────
+
+
+def test_self_mov_elimination_basic():
+    """`mov reg, reg` (dst == src) is a no-op — drop it."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ecx, ecx" not in out
+    assert opt.stats.get("self_mov_elimination") == 1
+
+
+def test_self_mov_elimination_after_pop():
+    """The common pattern: `pop ecx; add esp, 4; mov ecx, ecx`."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        push    eax\n"
+        "        call    _other\n"
+        "        pop     ecx\n"
+        "        add     esp, 4\n"
+        "        mov     ecx, ecx\n"
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ecx, ecx" not in out
+    assert opt.stats.get("self_mov_elimination") == 1
+
+
+def test_self_mov_elimination_eax():
+    """`mov eax, eax` also dropped."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, eax" not in out
+    assert opt.stats.get("self_mov_elimination") == 1
+
+
+def test_self_mov_elimination_keeps_distinct_regs():
+    """`mov eax, ecx` (dst != src) is NOT dropped."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, ecx" in out
+    assert opt.stats.get("self_mov_elimination", 0) == 0
+
+
+def test_self_mov_elimination_keeps_mov_with_memory():
+    """`mov [eax], eax` (memory dest) is NOT dropped."""
+    asm = (
+        "_f:\n"
+        "        mov     [eax], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     [eax], eax" in out
+    assert opt.stats.get("self_mov_elimination", 0) == 0

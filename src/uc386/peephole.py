@@ -399,6 +399,7 @@ class PeepholeOptimizer:
             lines = self._pass_disp_load_collapse(lines)
             lines = self._pass_push_disp_collapse(lines)
             lines = self._pass_push_index_collapse(lines)
+            lines = self._pass_self_mov_elimination(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -4170,6 +4171,46 @@ class PeepholeOptimizer:
             if op in PeepholeOptimizer._IMPLICIT_REG_USERS:
                 for r in CALLER_SAVED:
                     zero_regs.discard(r)
+            out.append(line)
+        return out
+
+    def _pass_self_mov_elimination(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Drop `mov REG, REG` where dst and src are the same register
+        — these are no-ops on x86 (no flag changes, no value change).
+
+        Saves 2 bytes per match. Common after right_operand_retarget
+        leaves a stale `mov ecx, ecx` (or other self-mov) when the
+        retargeted chain ends with the same register the codegen would
+        have transferred to.
+
+        Conservative: only matches plain register-to-register movs
+        where the operand strings are identical (after lowercasing).
+        Doesn't drop `mov al, al` / `mov ah, ah` etc. (sub-register
+        movs are the same shape but might be uncommon — keep simple).
+        """
+        out: list[Line] = []
+        for line in lines:
+            if (
+                line.kind == "instr"
+                and line.op == "mov"
+            ):
+                parts = _operands_split(line.operands)
+                if parts is not None:
+                    dest, src = parts
+                    dest_low = dest.strip().lower()
+                    src_low = src.strip().lower()
+                    if (
+                        dest_low == src_low
+                        and self._is_general_register(dest_low)
+                    ):
+                        self.stats["self_mov_elimination"] = (
+                            self.stats.get(
+                                "self_mov_elimination", 0
+                            ) + 1
+                        )
+                        continue
             out.append(line)
         return out
 

@@ -55,7 +55,7 @@ def run_test(c_file: Path, *, compile_only: bool = True) -> tuple[str, str]:
     try:
         result = subprocess.run(
             cc_cmd, capture_output=True, text=True,
-            cwd=UC386_DIR, timeout=15,
+            cwd=UC386_DIR, timeout=30,
         )
     except subprocess.TimeoutExpired:
         return "compile", "compile timed out"
