@@ -108,6 +108,11 @@ Currently implements:
     relative addressing; the original mov+push is 4 bytes. Saves 1
     byte per match. Common in cdecl call-site arg setup, where the
     intermediate register is dead after the push.
+  - zero_init_collapse: replace 1+ adjacent `mov <size> [m], 0`
+    stores with `xor eax, eax` + per-store `mov [m], <eax/ax/al>`.
+    Saves 2 bytes per dword-zero store (7 bytes → 3 bytes per store
+    plus a single 2-byte xor) and 1 byte per byte-zero store. Common
+    in function prologues with multiple `int x = 0;` initializers.
   - jcc_jmp_inversion: collapse `jcc L1; jmp L2; L1:` into
     `j!cc L2; L1:` (with the cc inverted). Saves 5 bytes per match —
     drops the unconditional jmp. Common in `if-else` and ternary
@@ -361,6 +366,7 @@ class PeepholeOptimizer:
             lines = self._pass_redundant_test_collapse(lines)
             lines = self._pass_narrowing_load_test_collapse(lines)
             lines = self._pass_jcc_jmp_inversion(lines)
+            lines = self._pass_zero_init_collapse(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -3216,6 +3222,146 @@ class PeepholeOptimizer:
             out.append(line)
             i += 1
         return out
+
+    # Map NASM size keyword to the EAX-family sub-register that
+    # carries 0 when EAX = 0.
+    _ZERO_INIT_SIZE_TO_REG: dict[str, str] = {
+        "byte": "al",
+        "word": "ax",
+        "dword": "eax",
+    }
+
+    def _pass_zero_init_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Replace 1+ adjacent ``mov <size> [m], 0`` stores with
+        ``xor eax, eax`` followed by per-store ``mov [m], <reg>``.
+
+        Each ``mov dword [m], 0`` is 7 bytes; the rewrite produces
+        ``mov [m], eax`` at 3 bytes plus one upfront ``xor eax, eax``
+        at 2 bytes. Net savings:
+        - 1 store: 7 → 5 (xor + mov), save 2 bytes.
+        - N stores: 7N → 2 + 3N, save 4N - 2 bytes.
+
+        Byte stores: 4 → 3 (1 byte saved + 2 bytes xor amortized).
+        Word stores: 5 (66-prefixed) → 4, save 1 byte.
+
+        Conditions:
+        - 1+ adjacent ``mov <size> [m], 0`` instructions (size in
+          {byte, word, dword}; mixed sizes within a chain are OK).
+        - EAX is dead after the chain (we'll write 0 to it).
+        - Flags are safe after the chain (xor sets ZF/SF/PF/CF/OF;
+          subsequent flag-readers would see different state).
+
+        Common in function prologues with multiple zero-initialized
+        locals (e.g. ``int a = 0, b = 0, c = 0;``).
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if not (
+                line.kind == "instr"
+                and self._is_zero_imm_store(line)
+            ):
+                out.append(line)
+                i += 1
+                continue
+            # Found a zero-imm-store. Collect adjacent ones.
+            chain_idx = [i]
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j]
+                if nxt.kind in ("blank", "comment"):
+                    j += 1
+                    continue
+                if (
+                    nxt.kind == "instr"
+                    and self._is_zero_imm_store(nxt)
+                ):
+                    chain_idx.append(j)
+                    j += 1
+                    continue
+                break
+            # Validity: EAX dead after, flags safe after.
+            after_idx = j
+            if not self._reg_dead_after(lines, after_idx, "eax"):
+                # Conservative: skip the whole chain (don't fire).
+                for k in chain_idx:
+                    out.append(lines[k])
+                i = j
+                continue
+            if not self._flags_safe_after(lines, after_idx):
+                for k in chain_idx:
+                    out.append(lines[k])
+                i = j
+                continue
+            # Emit xor + per-store rewrites.
+            indent = self._extract_indent(line.raw)
+            out.append(Line(
+                raw=f"{indent}xor     eax, eax",
+                kind="instr",
+                op="xor",
+                operands="eax, eax",
+            ))
+            for k in chain_idx:
+                ld = lines[k]
+                parts = _operands_split(ld.operands)
+                if parts is None:
+                    # Shouldn't happen if _is_zero_imm_store
+                    # accepted it; bail conservatively.
+                    out.append(ld)
+                    continue
+                dest, _ = parts
+                # Strip the size keyword and pick the matching reg.
+                size_kw, mem = self._split_sized_mem(dest.strip())
+                reg = self._ZERO_INIT_SIZE_TO_REG.get(
+                    size_kw.lower(), "eax"
+                )
+                out.append(Line(
+                    raw=f"{indent}mov     {mem}, {reg}",
+                    kind="instr",
+                    op="mov",
+                    operands=f"{mem}, {reg}",
+                ))
+            self.stats["zero_init_collapse"] = (
+                self.stats.get("zero_init_collapse", 0)
+                + len(chain_idx)
+            )
+            i = j
+        return out
+
+    @staticmethod
+    def _is_zero_imm_store(line: Line) -> bool:
+        """Return True if this is ``mov <byte|word|dword> [m], 0``.
+        Only sized memory destinations are recognized (NASM requires
+        the size keyword for memory + immediate stores)."""
+        if line.kind != "instr" or line.op != "mov":
+            return False
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return False
+        dest, src = parts
+        if src.strip() != "0":
+            return False
+        m = re.match(
+            r"^(byte|word|dword)\s+\[.*\]\s*$",
+            dest.strip(),
+            re.IGNORECASE,
+        )
+        return m is not None
+
+    @staticmethod
+    def _split_sized_mem(text: str) -> tuple[str, str]:
+        """Split ``"<size> [m]"`` into ``("<size>", "[m]")``."""
+        m = re.match(
+            r"^(byte|word|dword|qword)\s+(\[.*\])\s*$",
+            text,
+            re.IGNORECASE,
+        )
+        if m is None:
+            return ("", text)
+        return (m.group(1), m.group(2))
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
         """P-jmp-to-next: `jmp X` immediately (modulo blanks/comments)

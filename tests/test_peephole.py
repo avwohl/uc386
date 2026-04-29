@@ -470,8 +470,17 @@ def test_leave_collapse_with_intervening_blank():
 
 
 def test_imm_store_collapse_zero():
-    """`mov eax, 0; mov [...], eax; mov eax, 1` collapses the first
-    two lines into a direct memory-immediate store."""
+    """`mov eax, 0; mov [...], eax; mov eax, 1` initially collapses
+    via imm_store_collapse to `mov dword [...], 0; mov eax, 1`. Then
+    zero_init_collapse rewrites the dword-zero store to a shorter
+    `xor eax, eax; mov [...], eax` form (saving 2 more bytes).
+
+    End-to-end output:
+        xor eax, eax
+        mov [ebp - 4], eax
+        mov eax, 1
+        mov [ebp - 8], eax
+    """
     asm = (
         "_f:\n"
         "        mov     eax, 0\n"
@@ -482,11 +491,10 @@ def test_imm_store_collapse_zero():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    # First store collapses (line C = `mov eax, 1` is the witness).
-    assert "        mov     dword [ebp - 4], 0" in out
-    # Second store doesn't collapse (no witness EAX overwrite after).
-    # That's fine — the witness requirement is the safety guarantee.
+    assert "xor     eax, eax" in out
+    assert "mov     [ebp - 4], eax" in out
     assert opt.stats.get("imm_store_collapse", 0) >= 1
+    assert opt.stats.get("zero_init_collapse", 0) >= 1
 
 
 def test_imm_store_collapse_label_source():
@@ -2830,6 +2838,117 @@ def test_narrowing_load_test_collapse_skips_full_dword_load():
     assert "cmp     dword [esi], 0" in out
     assert opt.stats.get("narrowing_load_test_collapse", 0) == 0
     assert opt.stats.get("cmp_load_collapse", 0) == 1
+
+
+# ── zero_init_collapse ───────────────────────────────────────────
+
+
+def test_zero_init_collapse_dword_chain():
+    """Adjacent `mov dword [m], 0` stores collapse to a single
+    `xor eax, eax` followed by `mov [m], eax` per store."""
+    asm = (
+        "_main:\n"
+        "        mov     dword [ebp - 4], 0\n"
+        "        mov     dword [ebp - 8], 0\n"
+        "        mov     dword [ebp - 12], 0\n"
+        "        mov     eax, [ebp - 4]\n"  # witness: overwrites EAX
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     eax, eax" in out
+    assert "mov     [ebp - 4], eax" in out
+    assert "mov     [ebp - 8], eax" in out
+    assert "mov     [ebp - 12], eax" in out
+    assert "mov     dword [ebp" not in out
+    assert opt.stats.get("zero_init_collapse") == 3
+
+
+def test_zero_init_collapse_single_store():
+    """Even a single `mov dword [m], 0` is rewritten — the upfront
+    `xor eax, eax` (2 bytes) plus `mov [m], eax` (3 bytes) totals
+    5 bytes, vs the original 7 bytes. Saves 2 bytes."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 4], 0\n"
+        "        mov     eax, 1\n"  # witness
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     eax, eax" in out
+    assert "mov     [ebp - 4], eax" in out
+    assert opt.stats.get("zero_init_collapse") == 1
+
+
+def test_zero_init_collapse_byte_form():
+    """Byte zero-stores use AL: `mov byte [m], 0` → `mov [m], al`
+    after `xor eax, eax`."""
+    asm = (
+        "_f:\n"
+        "        mov     byte [ebp - 1], 0\n"
+        "        mov     byte [ebp - 2], 0\n"
+        "        mov     eax, 1\n"  # witness
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     eax, eax" in out
+    assert "mov     [ebp - 1], al" in out
+    assert "mov     [ebp - 2], al" in out
+    assert opt.stats.get("zero_init_collapse") == 2
+
+
+def test_zero_init_collapse_skips_when_eax_live():
+    """If EAX is live after the chain, we can't clobber it via xor."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 4], 0\n"
+        "        ret\n"  # ret reads EAX (return value)
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("zero_init_collapse", 0) == 0
+
+
+def test_zero_init_collapse_skips_when_flag_reader_after():
+    """If the next instr reads flags (e.g. jc/jnc), the xor's flag
+    side effect would change the branch outcome."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 4], 0\n"
+        "        jc      .skip\n"  # flag-reader before any clobberer
+        "        mov     eax, 1\n"
+        "        ret\n"
+        ".skip:\n"
+        "        mov     eax, 2\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("zero_init_collapse", 0) == 0
+
+
+def test_zero_init_collapse_stops_at_non_zero_store():
+    """A non-zero store breaks the chain — only consecutive zero
+    stores collapse."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 4], 0\n"
+        "        mov     dword [ebp - 8], 5\n"  # not zero
+        "        mov     dword [ebp - 12], 0\n"
+        "        mov     eax, 1\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # First chain: just [ebp - 4], single store.
+    assert "xor     eax, eax" in out
+    assert "mov     [ebp - 4], eax" in out
+    # The non-zero store is preserved.
+    assert "mov     dword [ebp - 8], 5" in out
+    # Stats: 1 + 1 = 2 (one for first chain, one for last chain).
+    assert opt.stats.get("zero_init_collapse") == 2
 
 
 # ── jcc_jmp_inversion ────────────────────────────────────────────
