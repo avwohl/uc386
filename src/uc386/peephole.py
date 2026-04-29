@@ -412,6 +412,8 @@ class PeepholeOptimizer:
             lines = self._pass_value_forward_to_reg(lines)
             lines = self._pass_byte_stores_to_dword(lines)
             lines = self._pass_pop_index_push_collapse(lines)
+            lines = self._pass_pop_index_load_collapse(lines)
+            lines = self._pass_push_pop_to_mov(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -3492,20 +3494,21 @@ class PeepholeOptimizer:
         self, lines: list[Line]
     ) -> list[Line]:
         """Collapse ``shl IDX, N; add BASE, IDX; mov DST, [BASE]``
-        into ``mov DST, [BASE + IDX*SCALE]`` where SCALE = 2^N.
+        (or ``mov DST, [BASE + DISP]``) into a SIB-form load.
+        ``[BASE]`` → ``[BASE + IDX*SCALE]``;
+        ``[BASE + DISP]`` → ``[BASE + IDX*SCALE + DISP]``.
 
         x86 supports the SIB byte form ``[base + index*scale]``
-        directly in mov memory operands, eliminating the need for
-        explicit shl + add to compute the address. Saves 4 bytes
-        per match (shl is 3 bytes, add reg/reg is 2 bytes; the
-        SIB-form mov gains 1 byte over the plain `[reg]` form).
+        (with optional 8/32-bit displacement) directly in mov memory
+        operands, eliminating the need for explicit shl + add to
+        compute the address. Saves 4 bytes per match (shl + add).
 
         Conditions:
         - Three consecutive instr lines (no labels/comments between).
         - Line A: ``shl IDX, N`` where N ∈ {1, 2, 3} (scale 2/4/8;
           scale 1 = no-op shl, irrelevant).
         - Line B: ``add BASE, IDX`` (different reg).
-        - Line C: ``mov DST, [BASE]`` (plain memory deref of BASE).
+        - Line C: ``mov DST, [BASE]`` or ``mov DST, [BASE +/- DISP]``.
         - IDX must be dead after Line C (we drop the shl, so IDX
           retains its pre-shl value; subsequent code expecting the
           shifted value would be wrong).
@@ -3569,16 +3572,21 @@ class PeepholeOptimizer:
             if not self._is_general_register(dst_reg):
                 i += 1
                 continue
-            # Source must be `[BASE]` (no offset, no SIB already).
+            # Source must be `[BASE]` or `[BASE +/- DISP]`.
             c_src_stripped = c_src
+            size_prefix = ""
             for prefix in ("dword ", "word ", "byte ", "qword "):
                 if c_src_stripped.lower().startswith(prefix):
+                    size_prefix = c_src_stripped[:len(prefix)]
                     c_src_stripped = c_src_stripped[
                         len(prefix):
                     ].lstrip()
                     break
             mem_re = re.match(
-                r"^\[([a-zA-Z]+)\s*\]$", c_src_stripped
+                r"^\[\s*([a-zA-Z]+)"
+                r"(?:\s*([+-])\s*(\d+))?"
+                r"\s*\]$",
+                c_src_stripped,
             )
             if mem_re is None:
                 i += 1
@@ -3587,6 +3595,8 @@ class PeepholeOptimizer:
             if mem_reg != base_reg:
                 i += 1
                 continue
+            disp_sign = mem_re.group(2)
+            disp_val = mem_re.group(3)
             # Liveness: IDX dead after line C; BASE either ==
             # DST (overwritten) or dead after.
             if not self._reg_dead_after(out, i + 3, idx_reg):
@@ -3600,7 +3610,15 @@ class PeepholeOptimizer:
             # Rewrite: drop A and B; replace C with SIB-form mov.
             indent = self._extract_indent(c.raw)
             scale = SCALE[n]
-            new_src = f"[{base_reg} + {idx_reg}*{scale}]"
+            if disp_sign is None:
+                new_src = (
+                    f"{size_prefix}[{base_reg} + {idx_reg}*{scale}]"
+                )
+            else:
+                new_src = (
+                    f"{size_prefix}[{base_reg} + {idx_reg}*{scale} "
+                    f"{disp_sign} {disp_val}]"
+                )
             new_raw = f"{indent}mov     {dst_reg}, {new_src}"
             new_line = Line(
                 raw=new_raw,
@@ -3845,9 +3863,19 @@ class PeepholeOptimizer:
                 if store_dest is None:
                     i += 1
                     continue
+                # Try the 4-line tail first (canonical form for
+                # any OP). Then fall back to the 3-line short tail
+                # (commutative-OP-only fast path the codegen emits).
                 match = self._match_compound_assign_frame(
                     out, i, store_dest
                 )
+                tail_count = 4 if match is not None else None
+                if match is None:
+                    match = self._match_compound_assign_frame_short(
+                        out, i, store_dest
+                    )
+                    if match is not None:
+                        tail_count = 3
                 if match is None:
                     i += 1
                     continue
@@ -3856,8 +3884,20 @@ class PeepholeOptimizer:
                 if not self._reg_dead_after(out, i + 1, "ecx"):
                     i += 1
                     continue
-                # Rewrite: drop push, mov ecx eax, pop eax, OP eax
-                # ecx, mov [m] eax — replace with `OP [m], eax`.
+                # Verify EAX dead after the store. Otherwise, code
+                # downstream relied on EAX = [m]'s NEW value (the
+                # canonical 4-line tail leaves EAX = lhs OP rhs);
+                # after the in-place RMW, EAX holds rhs only, which
+                # differs. A common trap: ``store_load_collapse``
+                # already dropped a subsequent ``mov eax, [m]``
+                # because the original store made it redundant —
+                # if we now collapse, downstream EAX reads see
+                # rhs instead of the in-memory new value.
+                if not self._reg_dead_after(out, i + 1, "eax"):
+                    i += 1
+                    continue
+                # Rewrite: drop push, framing tail, mov [m] eax —
+                # replace with ``OP [m], eax`` in place of the tail.
                 indent = self._extract_indent(line.raw)
                 spacer = " " * max(8 - len(op_str), 1)
                 new_raw = (
@@ -3869,19 +3909,16 @@ class PeepholeOptimizer:
                     op=op_str,
                     operands=f"{store_dest}, eax",
                 )
-                # Drop lines push_idx, i-3, i-2, i-1, i; insert
-                # new_line at i-3's old position. The chain (between
-                # push_idx+1 and i-4) is preserved.
-                # Build the new list.
+                # Chain runs from push_idx+1 to (i - tail_count)
+                # inclusive — exclusive slice end = i - tail_count + 1.
+                # For tail_count=4 (canonical) this is i - 3; for
+                # tail_count=3 (commutative short form) it's i - 2.
                 new_out = []
-                # Keep everything before push_idx.
                 new_out.extend(out[:push_idx])
-                # Skip push_idx; keep chain (push_idx+1 .. i-4).
-                new_out.extend(out[push_idx + 1: i - 3])
-                # Insert the rewritten op.
+                new_out.extend(
+                    out[push_idx + 1: i - tail_count + 1]
+                )
                 new_out.append(new_line)
-                # Skip the framing tail (i-3, i-2, i-1, i); keep
-                # everything after i.
                 new_out.extend(out[i + 1:])
                 self.stats["compound_assign_collapse"] = (
                     self.stats.get(
@@ -3982,24 +4019,31 @@ class PeepholeOptimizer:
         ):
             return None
         # Walk back from store_idx - 4 to find the matching push.
-        # The chain must be stack-balanced (no other push/pop / esp
-        # adjustment) and must not modify store_dest's memory.
+        # Track stack depth — balanced inner push/pop pairs are
+        # OK (e.g. nested array-indexing pushes).
         push_target = f"dword {store_dest}"
+        depth = 0
         for j in range(store_idx - 4, -1, -1):
             ln = lines[j]
             if ln.kind != "instr":
                 if ln.kind == "label":
                     return None  # crossed a basic-block boundary
                 continue
-            # Found the push?
-            if (
-                ln.op == "push"
-                and ln.operands.strip().lower()
-                == push_target.lower()
-            ):
-                return (j, op_str)
-            # Stack manipulation — bail.
-            if ln.op in {"push", "pop"}:
+            if ln.op == "pop":
+                # Walking backward past a pop — stack was deeper.
+                depth += 1
+                continue
+            if ln.op == "push":
+                if depth > 0:
+                    # Matches a later (in source order) pop.
+                    depth -= 1
+                    continue
+                # Outer push at chain start.
+                if (
+                    ln.operands.strip().lower()
+                    == push_target.lower()
+                ):
+                    return (j, op_str)
                 return None
             if (
                 ln.op in ("add", "sub")
@@ -4009,6 +4053,103 @@ class PeepholeOptimizer:
             if ln.op == "call":
                 return None  # call clobbers ECX/EDX, also stack
             # Memory write to store_dest — bail.
+            mod_parts = _operands_split(ln.operands or "")
+            if mod_parts is not None:
+                m_dest, _ = mod_parts
+                if (
+                    "[" in m_dest
+                    and self._mem_overlaps(
+                        m_dest.strip(), store_dest
+                    )
+                ):
+                    return None
+        return None
+
+    # Commutative subset of compound-assign ops. The short-tail form
+    # `pop ecx; OP eax, ecx; mov [m], eax` is only correct when OP
+    # is commutative (so `rhs OP lhs == lhs OP rhs`). sub is
+    # excluded.
+    _COMPOUND_BINOPS_COMMUTATIVE: frozenset[str] = frozenset({
+        "add", "and", "or", "xor",
+    })
+
+    def _match_compound_assign_frame_short(
+        self,
+        lines: list[Line],
+        store_idx: int,
+        store_dest: str,
+    ) -> tuple[int, str] | None:
+        """Look back from `store_idx` for the 3-line short tail.
+        The codegen emits this directly for commutative compound
+        ops:
+            store_idx - 1: ``OP eax, ecx`` (commutative OP).
+            store_idx - 2: ``pop ecx``.
+            ...chain (no stack manipulation, no [m] modification)...
+            push_idx: ``push dword [m]`` matching store_dest.
+
+        For commutative OPs, ``rhs OP lhs == lhs OP rhs``, so the
+        codegen skips the canonical save-restore (``mov ecx, eax;
+        pop eax``) and uses the simpler ``pop ecx`` directly.
+
+        Returns (push_idx, op_str) on match, None otherwise.
+        """
+        ops_at = lambda j: (
+            lines[j] if 0 <= j < len(lines) else None
+        )
+        # store_idx - 1: OP eax, ecx (commutative).
+        op_line = ops_at(store_idx - 1)
+        if op_line is None or op_line.kind != "instr":
+            return None
+        if op_line.op not in self._COMPOUND_BINOPS_COMMUTATIVE:
+            return None
+        op_parts = _operands_split(op_line.operands)
+        if op_parts is None:
+            return None
+        if (
+            op_parts[0].strip().lower() != "eax"
+            or op_parts[1].strip().lower() != "ecx"
+        ):
+            return None
+        op_str = op_line.op
+        # store_idx - 2: pop ecx.
+        pop_line = ops_at(store_idx - 2)
+        if (
+            pop_line is None
+            or pop_line.kind != "instr"
+            or pop_line.op != "pop"
+            or pop_line.operands.strip().lower() != "ecx"
+        ):
+            return None
+        # Walk back from store_idx - 3 to find the matching push.
+        # Track stack depth — balanced inner push/pop pairs OK.
+        push_target = f"dword {store_dest}"
+        depth = 0
+        for j in range(store_idx - 3, -1, -1):
+            ln = lines[j]
+            if ln.kind != "instr":
+                if ln.kind == "label":
+                    return None
+                continue
+            if ln.op == "pop":
+                depth += 1
+                continue
+            if ln.op == "push":
+                if depth > 0:
+                    depth -= 1
+                    continue
+                if (
+                    ln.operands.strip().lower()
+                    == push_target.lower()
+                ):
+                    return (j, op_str)
+                return None
+            if (
+                ln.op in ("add", "sub")
+                and ln.operands.strip().lower().startswith("esp,")
+            ):
+                return None
+            if ln.op == "call":
+                return None
             mod_parts = _operands_split(ln.operands or "")
             if mod_parts is not None:
                 m_dest, _ = mod_parts
@@ -4504,6 +4645,253 @@ class PeepholeOptimizer:
                     "pop_index_push_collapse", 0
                 ) + 1
             )
+            continue
+        return out
+
+    def _pass_pop_index_load_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Sister of ``_pass_pop_index_push_collapse`` for the LOAD
+        end. Collapse the array-index-then-load pattern that uses a
+        prior ``pop`` for the base.
+
+        Pattern:
+            shl IDX, N           ; scale index
+            pop BASE             ; restore previously-pushed base
+            add IDX, BASE        ; compute address
+            mov DST, [IDX]       ; load arr[i]
+
+        Rewrite:
+            pop BASE
+            mov DST, [BASE + IDX*SCALE]
+
+        Saves 5 bytes per match (drops shl + add; the SIB-form mov
+        adds 1 byte over the plain ``mov DST, [reg]`` form).
+
+        Conditions:
+        - 4 consecutive instr lines.
+        - Line A: ``shl IDX, N`` for N ∈ {1, 2, 3}.
+        - Line B: ``pop BASE``.
+        - Line C: ``add IDX, BASE``.
+        - Line D: ``mov DST, [IDX]``.
+        - IDX dead after Line D unless IDX == DST (then DST kills
+          IDX's register naturally — it's the load target).
+        - DST may be IDX, BASE, or different — all valid SIB forms.
+
+        Common in compound-assign chains where the rhs is an array
+        load through a previously-saved base — e.g. ``s += arr[i]``
+        (after compound_assign_collapse fired) or the index-load
+        directly inside any expression.
+        """
+        SCALE = {1: 2, 2: 4, 3: 8}
+        out = list(lines)
+        i = 0
+        while i + 3 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            c = out[i + 2]
+            d = out[i + 3]
+            if not (
+                a.kind == "instr" and a.op == "shl"
+                and b.kind == "instr" and b.op == "pop"
+                and c.kind == "instr" and c.op == "add"
+                and d.kind == "instr" and d.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            cp = _operands_split(c.operands)
+            dp = _operands_split(d.operands)
+            if ap is None or cp is None or dp is None:
+                i += 1
+                continue
+            idx_reg = ap[0].strip().lower()
+            try:
+                n = int(ap[1].strip())
+            except ValueError:
+                i += 1
+                continue
+            if n not in SCALE:
+                i += 1
+                continue
+            base_reg = b.operands.strip().lower()
+            c_dst = cp[0].strip().lower()
+            c_src = cp[1].strip().lower()
+            if (
+                not self._is_general_register(idx_reg)
+                or not self._is_general_register(base_reg)
+                or c_dst != idx_reg
+                or c_src != base_reg
+                or idx_reg == base_reg
+            ):
+                i += 1
+                continue
+            # Line D: mov DST, [IDX]
+            d_dst = dp[0].strip().lower()
+            d_src = dp[1].strip()
+            if not self._is_general_register(d_dst):
+                i += 1
+                continue
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if d_src.lower().startswith(prefix):
+                    d_src = d_src[len(prefix):].lstrip()
+                    break
+            mem_re = re.match(
+                r"^\[\s*([a-zA-Z]+)\s*\]$", d_src
+            )
+            if mem_re is None or mem_re.group(1).lower() != idx_reg:
+                i += 1
+                continue
+            # IDX must be dead after the load — unless it's the
+            # load target (in which case the load itself is the
+            # final write).
+            if d_dst != idx_reg:
+                if not self._reg_dead_after(out, i + 4, idx_reg):
+                    i += 1
+                    continue
+            # Build rewrite.
+            scale = SCALE[n]
+            indent_d = self._extract_indent(d.raw)
+            new_pop = Line(
+                raw=b.raw,
+                kind="instr", op="pop", operands=base_reg,
+            )
+            new_load_src = (
+                f"[{base_reg} + {idx_reg}*{scale}]"
+            )
+            new_load = Line(
+                raw=f"{indent_d}mov     {d_dst}, {new_load_src}",
+                kind="instr",
+                op="mov",
+                operands=f"{d_dst}, {new_load_src}",
+            )
+            out = out[:i] + [new_pop, new_load] + out[i + 4:]
+            self.stats["pop_index_load_collapse"] = (
+                self.stats.get(
+                    "pop_index_load_collapse", 0
+                ) + 1
+            )
+            continue
+        return out
+
+    def _pass_push_pop_to_mov(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Replace ``push IMM_OR_LABEL; ... stack-balanced chain ... ;
+        pop REG`` with ``mov REG, IMM_OR_LABEL`` (placed where the
+        pop was), dropping the push entirely.
+
+        Saves 1 byte per match (push imm32 + pop reg = 5 + 1 = 6
+        bytes; mov reg, imm32 = 5 bytes). Plus eliminates a stack
+        round-trip.
+
+        Conditions:
+        - First instr: ``push X`` where X is a numeric immediate or
+          a label/label-arithmetic expression (no register, no
+          memory deref).
+        - Walk forward, tracking stack depth. Match the FIRST
+          ``pop REG`` at depth 0 (going forward, push +1, pop -1).
+          If we encounter a `pop` at depth 1 (matches our push),
+          that's our matching pop.
+        - Chain between push and pop must not access [esp + N]
+          (stack address depends on push), call (clobbers stack),
+          or ret/leave/enter (similar). Conditional/unconditional
+          jumps fence the rewrite (control flow may bypass the
+          push/pop pair).
+
+        Common after pop_index_*_collapse drops the indexing chain
+        but leaves the original `push BASE` and `pop BASE_REG` —
+        which now have no chain between them or a trivial chain.
+        """
+        out = list(lines)
+        i = 0
+        while i < len(out):
+            a = out[i]
+            if not (a.kind == "instr" and a.op == "push"):
+                i += 1
+                continue
+            push_op = a.operands.strip()
+            # Check: imm or label (not register or mem).
+            if "[" in push_op or self._is_general_register(
+                push_op.lower()
+            ):
+                i += 1
+                continue
+            # Optional size keyword strip — but a 32-bit push of
+            # imm doesn't normally have one.
+            stripped = push_op
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if stripped.lower().startswith(prefix):
+                    stripped = stripped[len(prefix):].lstrip()
+                    break
+            # Walk forward looking for matching pop.
+            depth = 1  # we're past the push
+            match_idx = None
+            failed = False
+            j = i + 1
+            while j < len(out):
+                ln = out[j]
+                if ln.kind == "label":
+                    # Label is an external entry point — control
+                    # flow may reach the pop without our push.
+                    failed = True
+                    break
+                if ln.kind != "instr":
+                    j += 1
+                    continue
+                if ln.op == "push":
+                    depth += 1
+                    j += 1
+                    continue
+                if ln.op == "pop":
+                    if depth == 1:
+                        # This matches our push.
+                        target_reg = ln.operands.strip().lower()
+                        if not self._is_general_register(target_reg):
+                            failed = True
+                        else:
+                            match_idx = j
+                        break
+                    depth -= 1
+                    j += 1
+                    continue
+                # Stack-affecting ops fence the search.
+                if ln.op in {
+                    "call", "ret", "iret", "iretd", "retf",
+                    "retn", "leave", "enter",
+                }:
+                    failed = True
+                    break
+                if ln.op.startswith("j"):
+                    # Any jump fences (control flow may not reach pop).
+                    failed = True
+                    break
+                # Operand-references-esp fence.
+                if "esp" in (ln.operands or "").lower():
+                    failed = True
+                    break
+                j += 1
+            if failed or match_idx is None:
+                i += 1
+                continue
+            # Build rewrite: drop push at i, replace pop at
+            # match_idx with `mov target_reg, push_op`.
+            indent = self._extract_indent(out[match_idx].raw)
+            new_mov = Line(
+                raw=f"{indent}mov     {target_reg}, {stripped}",
+                kind="instr",
+                op="mov",
+                operands=f"{target_reg}, {stripped}",
+            )
+            new_out = (
+                out[:i] + out[i + 1: match_idx]
+                + [new_mov] + out[match_idx + 1:]
+            )
+            out = new_out
+            self.stats["push_pop_to_mov"] = (
+                self.stats.get("push_pop_to_mov", 0) + 1
+            )
+            # Don't advance i (might match again from the same i).
             continue
         return out
 

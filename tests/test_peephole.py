@@ -2971,6 +2971,64 @@ def test_index_load_collapse_skips_invalid_scale():
     assert opt.stats.get("index_load_collapse", 0) == 0
 
 
+def test_index_load_collapse_with_positive_displacement():
+    """Struct member access via array index: ``arr[i].y`` lowers
+    as ``shl ecx, 3; add eax, ecx; mov eax, [eax + 4]`` and
+    collapses to ``mov eax, [eax + ecx*8 + 4]``.
+    """
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     ecx, 3\n"
+        "        add     eax, ecx\n"
+        "        mov     eax, [eax + 4]\n"  # struct member offset
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [eax + ecx*8 + 4]" in out
+    assert "shl     ecx, 3" not in out
+    assert "add     eax, ecx" not in out
+    assert opt.stats.get("index_load_collapse") == 1
+
+
+def test_index_load_collapse_with_negative_displacement():
+    """Less common but possible — ``[BASE - DISP]`` form."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, ecx\n"
+        "        mov     eax, [eax - 8]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [eax + ecx*4 - 8]" in out
+    assert opt.stats.get("index_load_collapse") == 1
+
+
+def test_index_load_collapse_with_size_prefix_and_disp():
+    """Sized memory operand with displacement preserves the size
+    prefix in the rewrite."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, ecx\n"
+        "        movsx   eax, byte [eax + 4]\n"  # sized + disp
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Note: this matcher only fires for the `mov` op, not movsx,
+    # so it should NOT collapse (movsx is not in our match set).
+    assert opt.stats.get("index_load_collapse", 0) == 0
+
+
 # ── compound_assign_collapse ─────────────────────────────────────
 
 
@@ -3100,6 +3158,125 @@ def test_compound_assign_collapse_global_destination():
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
     assert "add     [_glob], eax" in out
+    assert opt.stats.get("compound_assign_collapse") == 1
+
+
+def test_compound_assign_collapse_short_tail_commutative():
+    """The codegen's commutative-OP shortcut: ``pop ecx; OP eax,
+    ecx; mov [m], eax`` — only 3-line tail, no save-restore.
+
+    For commutative OPs (add/and/or/xor), ``rhs OP lhs == lhs OP
+    rhs``, so the codegen pops lhs into ECX and ops directly.
+    """
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp - 4]\n"
+        "        mov     eax, [ebp + 8]\n"  # chain: load rhs
+        "        pop     ecx\n"  # pop lhs into ecx (3-line tail)
+        "        add     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     eax, 0\n"  # ECX dead witness
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     [ebp - 4], eax" in out
+    assert "push    dword [ebp - 4]" not in out
+    assert "pop     ecx" not in out
+    assert opt.stats.get("compound_assign_collapse") == 1
+
+
+def test_compound_assign_collapse_short_tail_xor():
+    """``xor`` is commutative — short tail works."""
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp - 4]\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        pop     ecx\n"
+        "        xor     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     [ebp - 4], eax" in out
+    assert opt.stats.get("compound_assign_collapse") == 1
+
+
+def test_compound_assign_collapse_short_tail_rejects_sub():
+    """``sub`` is NOT commutative — short tail must NOT match.
+
+    With ``pop ecx; sub eax, ecx; mov [m], eax``, the result is
+    ``rhs - lhs``, but the C semantics is ``lhs - rhs``. The
+    codegen never emits this short form for sub, but defend
+    against false matches anyway.
+    """
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp - 4]\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        pop     ecx\n"
+        "        sub     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("compound_assign_collapse", 0) == 0
+
+
+def test_compound_assign_collapse_short_tail_balanced_inner_pushpop():
+    """Chain may contain balanced inner push/pop pairs (e.g.
+    nested array indexing). Walk-back tracks stack depth so they
+    don't trip the bail-on-stack-manipulation check.
+    """
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp - 4]\n"  # outer push (lhs)
+        "        push    _g\n"  # inner push (indexing base)
+        "        mov     eax, [ebp - 8]\n"
+        "        shl     eax, 2\n"
+        "        pop     ecx\n"  # inner pop (matches inner push)
+        "        add     eax, ecx\n"
+        "        mov     eax, [eax]\n"  # deref → eax = g[i]
+        "        pop     ecx\n"  # outer pop (matches outer push)
+        "        add     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The compound-assign frame collapses to in-place add.
+    assert "add     [ebp - 4], eax" in out
+    assert opt.stats.get("compound_assign_collapse") == 1
+
+
+def test_compound_assign_collapse_long_tail_balanced_inner_pushpop():
+    """Same balanced-inner-pushpop fix applies to the canonical
+    4-line tail too.
+    """
+    asm = (
+        "_f:\n"
+        "        push    dword [ebp - 4]\n"
+        "        push    _g\n"  # inner push
+        "        mov     eax, [ebp - 8]\n"
+        "        shl     eax, 2\n"
+        "        pop     ecx\n"  # inner pop
+        "        add     eax, ecx\n"
+        "        mov     eax, [eax]\n"
+        "        mov     ecx, eax\n"  # 4-line canonical tail begins
+        "        pop     eax\n"
+        "        sub     eax, ecx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "sub     [ebp - 4], eax" in out
     assert opt.stats.get("compound_assign_collapse") == 1
 
 
@@ -4683,6 +4860,226 @@ def test_pop_index_push_collapse_scale_8():
     out = opt.optimize(asm)
     assert "push    dword [ecx + eax*8]" in out
     assert opt.stats.get("pop_index_push_collapse") == 1
+
+
+# ── pop_index_load_collapse ──────────────────────────────────────
+
+
+def test_pop_index_load_collapse_basic():
+    """`shl idx, 2; pop base; add idx, base; mov dst, [idx]` →
+    `pop base; mov dst, [base + idx*4]`. The DST is also IDX (eax)
+    in the typical loop body — load target overwrites, so IDX-dead
+    check doesn't apply."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, 3\n"
+        "        shl     eax, 2\n"
+        "        pop     ecx\n"
+        "        add     eax, ecx\n"
+        "        mov     eax, [eax]\n"  # DST = IDX = eax
+        "        mov     eax, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [ecx + eax*4]" in out
+    assert "shl     eax, 2" not in out
+    assert "add     eax, ecx" not in out
+    assert opt.stats.get("pop_index_load_collapse") == 1
+
+
+def test_pop_index_load_collapse_dst_different_from_idx():
+    """DST != IDX — IDX-dead check applies and must succeed."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, 3\n"
+        "        shl     eax, 2\n"
+        "        pop     ecx\n"
+        "        add     eax, ecx\n"
+        "        mov     edx, [eax]\n"  # DST = edx
+        "        xor     eax, eax\n"  # eax dead witness
+        "        mov     eax, edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     edx, [ecx + eax*4]" in out
+    assert opt.stats.get("pop_index_load_collapse") == 1
+
+
+def test_pop_index_load_collapse_skips_invalid_scale():
+    """Only scales 2/4/8."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 3\n"
+        "        shl     eax, 4\n"  # scale 16
+        "        pop     ecx\n"
+        "        add     eax, ecx\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("pop_index_load_collapse", 0) == 0
+
+
+def test_pop_index_load_collapse_scale_8():
+    """Scale 8 (long-long arrays)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 3\n"
+        "        shl     eax, 3\n"  # scale 8
+        "        pop     ecx\n"
+        "        add     eax, ecx\n"
+        "        mov     eax, [eax]\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [ecx + eax*8]" in out
+    assert opt.stats.get("pop_index_load_collapse") == 1
+
+
+def test_pop_index_load_collapse_skips_when_idx_live_and_dst_diff():
+    """DST != IDX, and IDX is read after — can't drop."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, 3\n"
+        "        shl     eax, 2\n"
+        "        pop     ecx\n"
+        "        add     eax, ecx\n"
+        "        mov     edx, [eax]\n"
+        "        mov     [ebp - 4], eax\n"  # eax live (the address)
+        "        mov     eax, edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("pop_index_load_collapse", 0) == 0
+
+
+# ── push_pop_to_mov ──────────────────────────────────────────────
+
+
+def test_push_pop_to_mov_label():
+    """`push _label; chain; pop ecx` → `chain; mov ecx, _label`.
+    Drops the push, replaces pop with mov.
+
+    A subsequent imm_binop_collapse pass may further collapse
+    `mov ecx, _label; add eax, ecx` to `add eax, _label`. Test
+    asserts only the structural drop of push/pop."""
+    asm = (
+        "_f:\n"
+        "        push    _g\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        pop     ecx\n"
+        "        mov     [_glob], ecx\n"  # consume ecx so cascade doesn't apply
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    _g" not in out
+    assert "pop     ecx" not in out
+    assert "mov     ecx, _g" in out
+    assert opt.stats.get("push_pop_to_mov") == 1
+
+
+def test_push_pop_to_mov_immediate():
+    """Numeric immediate also folds."""
+    asm = (
+        "_f:\n"
+        "        push    42\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        pop     edx\n"
+        "        mov     [_glob], edx\n"  # consume edx
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     edx, 42" in out
+    assert opt.stats.get("push_pop_to_mov") == 1
+
+
+def test_push_pop_to_mov_skips_register():
+    """`push reg` (not imm/label) — don't rewrite (would lose
+    the original reg's value)."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, 5\n"
+        "        pop     ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_to_mov", 0) == 0
+
+
+def test_push_pop_to_mov_skips_with_call():
+    """Call inside the chain — fence (call could disturb stack)."""
+    asm = (
+        "_f:\n"
+        "        push    _g\n"
+        "        call    _helper\n"
+        "        pop     ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_to_mov", 0) == 0
+
+
+def test_push_pop_to_mov_skips_with_esp_access():
+    """Chain accesses [esp + N] — push offsets it; can't drop."""
+    asm = (
+        "_f:\n"
+        "        push    100\n"
+        "        mov     eax, [esp + 4]\n"  # reaches PAST our push
+        "        pop     ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_to_mov", 0) == 0
+
+
+def test_push_pop_to_mov_skips_with_jump():
+    """Chain has a jump — control flow may bypass the pop."""
+    asm = (
+        "_f:\n"
+        "        push    _g\n"
+        "        jmp     .L_target\n"
+        "        pop     ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_to_mov", 0) == 0
+
+
+def test_push_pop_to_mov_balanced_inner_pushpop():
+    """Chain has balanced inner push/pop — depth tracking matches
+    the OUTER pop, not the inner one."""
+    asm = (
+        "_f:\n"
+        "        push    _g\n"  # outer push
+        "        push    eax\n"  # inner push
+        "        mov     eax, 5\n"
+        "        pop     edx\n"  # inner pop (matches inner push)
+        "        pop     ecx\n"  # outer pop (matches outer push) — replaced
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # ecx should hold _g; the inner pair is preserved.
+    assert "mov     ecx, _g" in out
+    # The OUTER push must be dropped.
+    assert out.count("push    _g") == 0
+    assert opt.stats.get("push_pop_to_mov") == 1
 
 
 # ── label_push_collapse ──────────────────────────────────────────
