@@ -4909,6 +4909,45 @@ def test_bool_struct_member_init_from_float():
     assert "setne" in asm
 
 
+def test_bool_compound_assign_through_pointer_with_float():
+    # `*p += 0.7` for `_Bool *p` was truncating 0.7 to int 0
+    # via `_eval_expr_to_eax`, then 0 + 0 = 0, store 0. Per C,
+    # `b += 0.7` is `b = b + 0.7` evaluated in float, then cast
+    # to bool — should give 1. Same bug for arr[i] / s.m bool
+    # lvalues with float / LL / int128 / complex rhs. Fix:
+    # snapshot pattern that routes through _assign's bool path.
+    asm = _compile(
+        "int main(void) {\n"
+        "    _Bool b = 0;\n"
+        "    _Bool *p = &b;\n"
+        "    *p += 0.7;\n"
+        "    return b;\n"  # should be 1
+        "}\n"
+    )
+    # The fix introduces an addr_slot snapshot and routes the
+    # inner assign through _eval_to_bool_eax — telltale sequence
+    # is fldz/fucompp/setne (the bool-from-float path).
+    assert "fldz" in asm
+    assert "setne" in asm
+
+
+def test_bool_bitfield_compound_assign_with_float():
+    # Same shape for bool bit-fields. The general bit-field
+    # compound assign path uses `_eval_expr_to_eax` (truncates
+    # float). Fix: snapshot through a 1-byte bool slot and
+    # route the inner op through _assign's bool path.
+    asm = _compile(
+        "struct B { _Bool a : 1; _Bool b : 1; };\n"
+        "int main(void) {\n"
+        "    struct B s = {0, 0};\n"
+        "    s.a += 0.5;\n"
+        "    return s.a;\n"  # should be 1
+        "}\n"
+    )
+    assert "fldz" in asm
+    assert "setne" in asm
+
+
 def test_global_bool_init_from_float():
     # Global `_Bool g = 0.5` previously raised because the global
     # init path used `_const_eval` (integer-only). Now bool

@@ -6055,6 +6055,52 @@ class CodeGenerator:
             return out
         raise CodegenError(f"__int128 unary op `{op}` not supported")
 
+    def _compound_assign_bool_lvalue(
+        self,
+        expr: ast.BinaryOp,
+        op: str,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """`*p OP= rhs` / `arr[i] OP= rhs` / `s.m OP= rhs` for `_Bool`
+        lvalues with a wider-than-int rhs (float, long long, int128,
+        complex). The regular path truncates rhs via `_eval_expr_to_eax`,
+        losing fractional bits or the high half. Snapshot pattern:
+        compute &lvalue once, then synthesize
+        `*addr = (*addr) OP rhs` and route through `_assign`'s
+        bool-aware path (which uses `_eval_to_bool_eax`).
+        """
+        addr_slot_name = f"__compbool_addr_{id(expr)}"
+        bool_ty = ast.BasicType(name="bool", is_signed=False)
+        ptr_ty = ast.PointerType(base_type=bool_ty)
+        addr_disp = ctx.alloc_local(addr_slot_name, ptr_ty, size=4)
+        out: list[str] = []
+        # 1. Compute &lvalue once into addr_slot.
+        if isinstance(expr.left, ast.Index):
+            out += self._index_address(expr.left, ctx)
+        elif (
+            isinstance(expr.left, ast.UnaryOp)
+            and expr.left.op == "*"
+        ):
+            out += self._eval_expr_to_eax(expr.left.operand, ctx)
+        elif isinstance(expr.left, ast.Member):
+            out += self._member_address(expr.left, ctx)
+        else:
+            raise CodegenError(
+                f"_Bool compound assign target not supported: "
+                f"{type(expr.left).__name__}"
+            )
+        out.append(f"        mov     {_ebp_addr(addr_disp)}, eax")
+        # 2. Synthesize `*addr_slot = (*addr_slot) OP rhs` and route
+        # through `_assign` (its bool-target path uses
+        # `_eval_to_bool_eax` so float / LL / int128 / complex rhs
+        # convert correctly).
+        snap_id = ast.Identifier(name=addr_slot_name)
+        deref = ast.UnaryOp(op="*", operand=snap_id)
+        inner = ast.BinaryOp(op=op, left=deref, right=expr.right)
+        synth = ast.BinaryOp(op="=", left=ast.UnaryOp(op="*", operand=snap_id), right=inner)
+        out += self._assign(synth, ctx)
+        return out
+
     def _compound_assign_complex_lvalue(
         self,
         expr: ast.BinaryOp,
@@ -14651,6 +14697,59 @@ class CodeGenerator:
                 out.append(f"        sar     edx, {shift}")
         return out
 
+    def _compound_assign_bool_bitfield(
+        self,
+        expr: ast.BinaryOp,
+        bf: tuple,
+        ctx: _FuncCtx,
+    ) -> list[str]:
+        """`s.bool_bf op= rhs` for a `_Bool` bit-field with a wider-
+        than-int rhs. Snapshot the field value into a hidden 1-byte
+        bool slot, do `snap = snap OP rhs` through `_assign` (which
+        uses `_eval_to_bool_eax`), then store snap back into the field.
+        """
+        bit_offset, bit_width, member_ty = bf[:3]
+        unit_size = bf[3] if len(bf) == 4 else 4
+        snap_name = f"__compbool_bf_snap_{id(expr)}"
+        bool_ty = ast.BasicType(name="bool", is_signed=False)
+        addr_name = f"__compbool_bf_addr_{id(expr)}"
+        ptr_ty = ast.PointerType(base_type=bool_ty)
+        addr_disp = ctx.alloc_local(addr_name, ptr_ty, size=4)
+        snap_disp = ctx.alloc_local(snap_name, bool_ty, size=4)
+        op = self._COMPOUND_OPS[expr.op]
+        mask = (1 << bit_width) - 1
+        clear_mask = (~(mask << bit_offset)) & 0xFFFFFFFF
+        # 1. Compute &storage_unit, save in addr_slot.
+        out = self._member_address(expr.left, ctx)
+        out.append(f"        mov     {_ebp_addr(addr_disp)}, eax")
+        # 2. Load current bit-field value (0 or 1) into snap.
+        out.append("        mov     ecx, eax")
+        out.append("        mov     eax, [ecx]")
+        if bit_offset > 0:
+            out.append(f"        shr     eax, {bit_offset}")
+        out.append(f"        and     eax, {mask}")
+        out.append(f"        mov     {_ebp_addr(snap_disp)}, al")
+        # 3. Synthesize `snap = snap OP rhs` and route through `_assign`.
+        snap_id = ast.Identifier(name=snap_name)
+        inner = ast.BinaryOp(op=op, left=snap_id, right=expr.right)
+        synth = ast.BinaryOp(op="=", left=snap_id, right=inner)
+        # We need the snap variable's type known to ctx for _assign's
+        # bool-target dispatch — alloc_local already registered it.
+        out += self._assign(synth, ctx)
+        # 4. Read snap back, RMW the storage unit.
+        out.append(f"        movzx   eax, byte {_ebp_addr(snap_disp)}")
+        out.append(f"        and     eax, {mask}")
+        if bit_offset > 0:
+            out.append(f"        shl     eax, {bit_offset}")
+        out.append(f"        mov     ecx, {_ebp_addr(addr_disp)}")
+        out.append("        mov     edx, [ecx]")
+        out.append(f"        and     edx, {clear_mask}")
+        out.append("        or      edx, eax")
+        out.append("        mov     [ecx], edx")
+        # Result of the assignment expression is the new value (0/1).
+        out.append(f"        movzx   eax, byte {_ebp_addr(snap_disp)}")
+        return out
+
     def _compound_assign_bitfield(
         self,
         expr: ast.BinaryOp,
@@ -14667,6 +14766,23 @@ class CodeGenerator:
             return self._compound_assign_bitfield_ll(expr, bf, ctx)
         bit_offset, bit_width, member_ty = bf[:3]
         op = self._COMPOUND_OPS[expr.op]
+        # `_Bool` bit-field with a wider-than-int rhs (float / LL /
+        # int128 / complex): the regular path truncates rhs via
+        # `_eval_expr_to_eax`, losing fractional / high-bit signal.
+        # Snapshot through a hidden 1-byte bool slot so `_assign`'s
+        # bool path runs and uses `_eval_to_bool_eax` on the inner.
+        if (
+            isinstance(member_ty, ast.BasicType)
+            and member_ty.name == "bool"
+        ):
+            rhs_ty = self._type_of(expr.right, ctx)
+            if (
+                self._is_float_type(rhs_ty)
+                or self._is_long_long(rhs_ty)
+                or self._is_int128(rhs_ty)
+                or isinstance(rhs_ty, ast.ComplexType)
+            ):
+                return self._compound_assign_bool_bitfield(expr, bf, ctx)
         mask = (1 << bit_width) - 1
         clear_mask = (~(mask << bit_offset)) & 0xFFFFFFFF
         is_unsigned = self._is_unsigned(member_ty)
@@ -16067,6 +16183,28 @@ class CodeGenerator:
             return self._compound_assign_complex_lvalue(
                 expr, op, target_ty_check, ctx,
             )
+        # `_Bool` compound assign on a non-Identifier lvalue with a
+        # rhs that's wider than int (float / LL / int128 / complex):
+        # the regular path truncates rhs via `_eval_expr_to_eax`,
+        # losing fractional / high-bit signal. Route through a
+        # snapshot pattern so `_assign`'s bool-aware path runs and
+        # uses `_eval_to_bool_eax` on the inner BinaryOp result.
+        if (
+            isinstance(target_ty_check, ast.BasicType)
+            and target_ty_check.name == "bool"
+            and not isinstance(expr.left, ast.Identifier)
+        ):
+            rhs_ty = self._type_of(expr.right, ctx)
+            needs_wide_path = (
+                self._is_float_type(rhs_ty)
+                or self._is_long_long(rhs_ty)
+                or self._is_int128(rhs_ty)
+                or isinstance(rhs_ty, ast.ComplexType)
+            )
+            if needs_wide_path:
+                return self._compound_assign_bool_lvalue(
+                    expr, op, ctx,
+                )
 
         if isinstance(expr.left, ast.Identifier):
             ty = self._identifier_type(expr.left.name, ctx)
