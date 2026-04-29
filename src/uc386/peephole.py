@@ -403,6 +403,7 @@ class PeepholeOptimizer:
             lines = self._pass_transfer_pop_collapse(lines)
             lines = self._pass_label_load_collapse(lines)
             lines = self._pass_value_forward_to_reg(lines)
+            lines = self._pass_byte_stores_to_dword(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -4382,6 +4383,109 @@ class PeepholeOptimizer:
             )
             continue
         return out
+
+    def _pass_byte_stores_to_dword(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Pack 4 consecutive ``mov byte [ebp +- N + i], imm8`` stores
+        (i = 0, 1, 2, 3) into a single ``mov dword [ebp +- N], imm32``.
+
+        Each `mov byte [m], imm8` is 4 bytes (`C6 ... imm8`). The
+        equivalent `mov dword [m], imm32` is 7 bytes. Saves 9 bytes
+        per 4-store group (16 → 7).
+
+        Common in `char arr[N] = "string"` initialization where the
+        codegen emits per-byte stores for each character.
+
+        Conditions:
+        - 4 consecutive instr lines.
+        - All match ``mov byte [<base> ± N + j], imm8`` with the
+          same base and consecutive offsets j = 0, 1, 2, 3 (or
+          j = N, N+1, N+2, N+3 for any starting point).
+        - All imm8 values are integer literals.
+
+        Limited to ``[ebp ± N]`` addressing for safety. Other forms
+        (`[reg + N]` register-base, label addresses, etc.) skipped.
+        """
+        out = list(lines)
+        i = 0
+        while i + 3 < len(out):
+            chunk = out[i:i + 4]
+            packed = self._try_pack_byte_stores(chunk)
+            if packed is None:
+                i += 1
+                continue
+            # Replace 4 lines with 1.
+            out = out[:i] + [packed] + out[i + 4:]
+            self.stats["byte_stores_to_dword"] = (
+                self.stats.get("byte_stores_to_dword", 0) + 1
+            )
+            # Don't advance — try to pack the next 4 from i again
+            # (in case the next group is also packable).
+            continue
+        return out
+
+    @staticmethod
+    def _try_pack_byte_stores(
+        chunk: list[Line],
+    ) -> Line | None:
+        """If the 4 lines form a packable byte-store group, return
+        the replacement dword-store Line. Otherwise None."""
+        if len(chunk) != 4:
+            return None
+        offsets: list[int] = []
+        values: list[int] = []
+        sign = "+"
+        base_disp = 0
+        for idx, ln in enumerate(chunk):
+            if ln.kind != "instr" or ln.op != "mov":
+                return None
+            parts = _operands_split(ln.operands)
+            if parts is None:
+                return None
+            dest, src = parts
+            dest_norm = dest.strip()
+            # Must be `byte [ebp + N]` or `byte [ebp - N]`.
+            m = re.fullmatch(
+                r"byte\s+\[\s*ebp\s*([+-])\s*(\d+)\s*\]",
+                dest_norm,
+                re.IGNORECASE,
+            )
+            if not m:
+                return None
+            disp = int(m.group(2)) if m.group(1) == "+" else -int(m.group(2))
+            offsets.append(disp)
+            try:
+                values.append(int(src.strip()) & 0xFF)
+            except ValueError:
+                return None
+            if idx == 0:
+                sign = m.group(1)
+                base_disp = disp
+        # Offsets must be consecutive: base, base+1, base+2, base+3.
+        if offsets != [base_disp + j for j in range(4)]:
+            return None
+        # Pack into little-endian dword.
+        packed = (
+            values[0]
+            | (values[1] << 8)
+            | (values[2] << 16)
+            | (values[3] << 24)
+        )
+        # Build the rewrite. Use a positive offset+sign that matches
+        # the base. The base is at offsets[0], which is base_disp.
+        indent = re.match(r"^[ \t]*", chunk[0].raw).group(0)
+        if base_disp >= 0:
+            addr = f"[ebp + {base_disp}]"
+        else:
+            addr = f"[ebp - {-base_disp}]"
+        new_raw = f"{indent}mov     dword {addr}, {packed}"
+        return Line(
+            raw=new_raw,
+            kind="instr",
+            op="mov",
+            operands=f"dword {addr}, {packed}",
+        )
 
     def _pass_value_forward_to_reg(
         self, lines: list[Line]

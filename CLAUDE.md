@@ -1126,3 +1126,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - Updated `test_char_array_string_init_with_padding` to expect the new `mov word [m], 0` shape.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: byte_stores_to_dword**: pack 4 consecutive `mov byte [ebp ± N + i], imm8` stores (i = 0, 1, 2, 3) into a single `mov dword [ebp ± N], imm32`. Saves 9 bytes per match (4 byte-stores at 4 bytes each = 16 bytes → 1 dword-store at 7 bytes). Common in `char arr[N] = "string"` initialization.
+  - **probe_strops**: the first 4 chars of "hello" (`h`, `e`, `l`, `l` = 0x68, 0x65, 0x6c, 0x6c) collapse into `mov dword [ebp - 32], 0x6c6c6568`. The trailing `o` and null terminator stay as byte stores (only 4-byte chunks pack).
+  - **Limited to `[ebp ± N]` addressing**. Other forms (register-base, label addresses) skipped for safety.
+  - **Restart-from-i**: after a successful pack, the loop doesn't advance — the next 4 lines starting at i (which is now the dword store) might form another packable group with the next byte stores. This handles 8+ consecutive byte stores correctly (2 fires for 8 stores).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests (258 total). Pipeline 1734/1734 (100%).

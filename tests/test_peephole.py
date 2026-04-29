@@ -4519,3 +4519,90 @@ def test_value_forward_to_reg_skips_self_mov():
     assert opt.stats.get("value_forward_to_reg", 0) == 0
     # And the self-mov is gone.
     assert "mov     eax, eax" not in out
+
+
+# ── byte_stores_to_dword ─────────────────────────────────────────
+
+
+def test_byte_stores_to_dword_basic():
+    """4 consecutive byte-imm stores at consecutive offsets pack
+    into a single dword-imm store."""
+    asm = (
+        "_f:\n"
+        "        mov     byte [ebp - 32], 104\n"
+        "        mov     byte [ebp - 31], 101\n"
+        "        mov     byte [ebp - 30], 108\n"
+        "        mov     byte [ebp - 29], 108\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # 0x6c6c6568 = 'l'<<24 | 'l'<<16 | 'e'<<8 | 'h' = 1819043176
+    assert "mov     dword [ebp - 32], 1819043176" in out
+    assert "mov     byte [ebp - 32], 104" not in out
+    assert opt.stats.get("byte_stores_to_dword") == 1
+
+
+def test_byte_stores_to_dword_eight_consecutive():
+    """8 consecutive byte stores → 2 dword stores (2 fires)."""
+    asm = (
+        "_f:\n"
+        "        mov     byte [ebp - 8], 1\n"
+        "        mov     byte [ebp - 7], 2\n"
+        "        mov     byte [ebp - 6], 3\n"
+        "        mov     byte [ebp - 5], 4\n"
+        "        mov     byte [ebp - 4], 5\n"
+        "        mov     byte [ebp - 3], 6\n"
+        "        mov     byte [ebp - 2], 7\n"
+        "        mov     byte [ebp - 1], 8\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("byte_stores_to_dword") == 2
+
+
+def test_byte_stores_to_dword_skips_non_consecutive():
+    """If offsets aren't consecutive, can't pack."""
+    asm = (
+        "_f:\n"
+        "        mov     byte [ebp - 32], 104\n"
+        "        mov     byte [ebp - 31], 101\n"
+        "        mov     byte [ebp - 29], 108\n"  # gap
+        "        mov     byte [ebp - 28], 108\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("byte_stores_to_dword", 0) == 0
+
+
+def test_byte_stores_to_dword_skips_three_stores():
+    """3 stores aren't enough to pack."""
+    asm = (
+        "_f:\n"
+        "        mov     byte [ebp - 32], 104\n"
+        "        mov     byte [ebp - 31], 101\n"
+        "        mov     byte [ebp - 30], 108\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("byte_stores_to_dword", 0) == 0
+
+
+def test_byte_stores_to_dword_positive_offset():
+    """Positive offsets (params) also work."""
+    asm = (
+        "_f:\n"
+        "        mov     byte [ebp + 8], 1\n"
+        "        mov     byte [ebp + 9], 2\n"
+        "        mov     byte [ebp + 10], 3\n"
+        "        mov     byte [ebp + 11], 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # 0x04030201 = 67305985
+    assert "mov     dword [ebp + 8], 67305985" in out
+    assert opt.stats.get("byte_stores_to_dword") == 1
