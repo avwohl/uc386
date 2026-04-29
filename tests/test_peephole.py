@@ -4268,6 +4268,78 @@ def test_zero_init_collapse_single_store():
     assert opt.stats.get("zero_init_collapse") == 1
 
 
+def test_narrow_store_reload_collapse_word():
+    """`mov word [m], ax; movsx eax, word [m]` collapses to
+    `mov word [m], ax; movsx eax, ax`. Saves 1 byte."""
+    asm = (
+        "_f:\n"
+        "        mov     word [ebp - 4], ax\n"
+        "        movsx   eax, word [ebp - 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     word [ebp - 4], ax" in out
+    assert "movsx   eax, ax" in out
+    assert opt.stats.get("narrow_store_reload_collapse") == 1
+
+
+def test_narrow_store_reload_collapse_byte():
+    """Byte form: `mov byte [m], al; movzx eax, byte [m]` →
+    `mov byte [m], al; movzx eax, al`."""
+    asm = (
+        "_f:\n"
+        "        mov     byte [ebp - 1], al\n"
+        "        movzx   eax, byte [ebp - 1]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     byte [ebp - 1], al" in out
+    assert "movzx   eax, al" in out
+    assert opt.stats.get("narrow_store_reload_collapse") == 1
+
+
+def test_narrow_store_reload_collapse_movzx():
+    """movzx (zero-extend) version also collapses."""
+    asm = (
+        "_f:\n"
+        "        mov     word [ebp - 4], cx\n"
+        "        movzx   ebx, word [ebp - 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "movzx   ebx, cx" in out
+    assert opt.stats.get("narrow_store_reload_collapse") == 1
+
+
+def test_narrow_store_reload_collapse_skips_size_mismatch():
+    """If the load and store sizes don't match, don't collapse."""
+    asm = (
+        "_f:\n"
+        "        mov     byte [ebp - 4], al\n"
+        "        movsx   eax, word [ebp - 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("narrow_store_reload_collapse", 0) == 0
+
+
+def test_narrow_store_reload_collapse_skips_different_addr():
+    """Different memory addresses don't collapse."""
+    asm = (
+        "_f:\n"
+        "        mov     word [ebp - 4], ax\n"
+        "        movsx   eax, word [ebp - 8]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("narrow_store_reload_collapse", 0) == 0
+
+
 def test_dual_zero_init_consolidate_basic():
     """Pattern `xor eax, eax; xor edx, edx; mov [m1], eax; mov [m2], edx`
     consolidates to `xor eax, eax; mov [m1], eax; mov [m2], eax`. The

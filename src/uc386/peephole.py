@@ -420,6 +420,7 @@ class PeepholeOptimizer:
             lines = self._pass_zero_init_collapse(lines)
             lines = self._pass_redundant_xor_zero(lines)
             lines = self._pass_dual_zero_init_consolidate(lines)
+            lines = self._pass_narrow_store_reload_collapse(lines)
             lines = self._pass_compound_assign_collapse(lines)
             lines = self._pass_index_load_collapse(lines)
             lines = self._pass_index_load_collapse_label(lines)
@@ -6165,6 +6166,111 @@ class PeepholeOptimizer:
             return False  # sub-word stores excluded (different reg)
         src_low = src.strip().lower()
         return src_low in {r.lower() for r in regs}
+
+    # Map low byte/word sub-registers to their containing 32-bit reg.
+    # Note: AH/BH/CH/DH (high-byte) NOT included — they're not the
+    # natural source for byte stores from ASM lowering's perspective,
+    # and movsx/movzx from a high byte requires a different opcode.
+    _LOW_BYTE_REGS: dict[str, str] = {
+        "al": "eax", "bl": "ebx", "cl": "ecx", "dl": "edx",
+    }
+    _LOW_WORD_REGS: dict[str, str] = {
+        "ax": "eax", "bx": "ebx", "cx": "ecx", "dx": "edx",
+        "si": "esi", "di": "edi", "bp": "ebp",
+    }
+
+    def _pass_narrow_store_reload_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse `mov <size> [m], REG_LOW; movsx/movzx DST, <size>
+        [m]` into `mov <size> [m], REG_LOW; movsx/movzx DST, REG_LOW`.
+        Saves 1 byte per match (the memory operand on the extension
+        becomes a register operand, dropping the disp/sib).
+
+        Common when the codegen narrows a value to a sub-word slot via
+        a store, then reads it back with sign/zero extension to a
+        32-bit register. The reload is redundant — REG_LOW still holds
+        the value that was stored.
+
+        Conditions:
+        - Line A: `mov <byte|word> [m], REG_LOW` where REG_LOW is a
+          recognized low byte (al/bl/cl/dl) or low word (ax/bx/cx/dx/
+          si/di/bp) register.
+        - Line B: `movsx <DST>, <byte|word> [m]` or
+          `movzx <DST>, <byte|word> [m]` — same size, same memory.
+        - Rewrite: line B becomes
+          `movsx <DST>, REG_LOW` / `movzx <DST>, REG_LOW`.
+        """
+        out = list(lines)
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op == "mov"
+                and b.kind == "instr" and b.op in ("movsx", "movzx")
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            if ap is None or bp is None:
+                i += 1
+                continue
+            a_dest, a_src = ap
+            b_dest, b_src = bp
+            a_dest_text = a_dest.strip()
+            a_src_low = a_src.strip().lower()
+            b_dest_low = b_dest.strip().lower()
+            b_src_text = b_src.strip()
+            # Line A: extract size keyword and memory operand.
+            a_size, a_mem = self._split_sized_mem(a_dest_text)
+            if a_size.lower() not in ("byte", "word"):
+                i += 1
+                continue
+            # Line A's source must be a recognized low sub-register
+            # matching the size.
+            if a_size.lower() == "byte":
+                if a_src_low not in self._LOW_BYTE_REGS:
+                    i += 1
+                    continue
+            else:  # word
+                if a_src_low not in self._LOW_WORD_REGS:
+                    i += 1
+                    continue
+            # Line B: source must be `<size> [m]` where <size> matches
+            # and [m] equals A's memory operand.
+            b_size, b_mem = self._split_sized_mem(b_src_text)
+            if b_size.lower() != a_size.lower():
+                i += 1
+                continue
+            if self._normalize_mem(b_mem) != self._normalize_mem(a_mem):
+                i += 1
+                continue
+            # Dest of line B must be a 32-bit GP register.
+            if not self._is_general_register(b_dest_low):
+                i += 1
+                continue
+            # Rewrite line B: replace memory operand with the register.
+            indent = self._extract_indent(b.raw)
+            new_raw = f"{indent}{b.op:7s} {b_dest_low}, {a_src_low}"
+            out[i + 1] = Line(
+                raw=new_raw, kind="instr", op=b.op,
+                operands=f"{b_dest_low}, {a_src_low}",
+            )
+            self.stats["narrow_store_reload_collapse"] = (
+                self.stats.get(
+                    "narrow_store_reload_collapse", 0
+                ) + 1
+            )
+            i += 2
+        return out
+
+    @staticmethod
+    def _normalize_mem(mem_text: str) -> str:
+        """Normalize whitespace inside a memory operand for textual
+        comparison. `[ebp - 4]` and `[ebp-4]` both compare equal."""
+        return re.sub(r"\s+", "", mem_text.strip())
 
     # Commutative two-operand binops where `OP eax, ecx` and
     # `OP ecx, eax` produce identical EAX results. imul (two-operand

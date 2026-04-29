@@ -1390,3 +1390,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Test value**: even the modest fire count is real savings; the implementation is small and correctness-clean (the rewrite preserves observable semantics — REG_A and REG_B both hold 0, so substituting REG_A for REG_B in stores changes nothing, and the EDX-dead check ensures dropping the xor is safe).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests (482 total). 924 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: narrow_store_reload_collapse**: collapse `mov <byte|word> [m], REG_LOW; movsx/movzx DST, <byte|word> [m]` into `mov <byte|word> [m], REG_LOW; movsx/movzx DST, REG_LOW`. The reload from memory is replaced with a register-to-register sign/zero-extend — the value just stored is still in the source register. Saves 1 byte per fire (memory operand → register operand encoding).
+  - **Common shape**: `short` / `char` lvalue assignment followed by use as a 32-bit value. Codegen narrows via `mov word [m], ax` for the store, then needs the 32-bit value back: `movsx eax, word [m]`. The reload from memory is unnecessary because AX still holds the stored value.
+  - **Conditions**: store source must be a recognized low byte (al/bl/cl/dl) or low word (ax/bx/cx/dx/si/di/bp) sub-register; store size matches the load's size; same memory operand (textually, after whitespace normalization); DST is a 32-bit GP register.
+  - **Real-world impact**: 66 fires across 41 files in the full torture corpus. Each fire saves 1 byte; aggregate ~66 bytes across torture.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests (487 total). 924 unit tests total. Pipeline 1734/1734 (100%).
