@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 import struct
 
 import unicorn
@@ -841,7 +842,45 @@ def _strip_libc_function(libc_text: str, name: str) -> str:
     return "\n".join(out)
 
 
-def bundle_user_asm(asm_path: Path) -> Path:
+def _user_referenced_symbols(asm_text: str) -> set[str]:
+    """All identifiers starting with `_` that appear in non-comment
+    user asm lines, excluding labels defined by the user.
+
+    Catches calls (`call _foo`), function-pointer loads (`mov eax,
+    _foo`, `push _foo`), data references (`mov eax, [_foo]`), and
+    initialized data (`dd _foo`). Conservative — over-includes is
+    fine; under-includes would break linkage.
+
+    `extern _foo` declarations alone do NOT count: the AST optimizer
+    can leave behind unused externs (e.g., a `<math.h>` include that
+    declared all 162 math functions but the user only calls `sin`).
+    Embedding those would defeat the point.
+    """
+    pattern = re.compile(r"\b(_[_A-Za-z][A-Za-z0-9_]*)\b")
+    out: set[str] = set()
+    for line in asm_text.splitlines():
+        s = line.strip()
+        if s.startswith(";") or not s:
+            continue
+        # Skip extern declarations — they're declarations, not refs.
+        if s.startswith("extern "):
+            continue
+        # Skip global declarations.
+        if s.startswith("global "):
+            continue
+        # Skip section directives.
+        if s.startswith("section "):
+            continue
+        # Strip inline comments.
+        idx = line.find(";")
+        if idx >= 0:
+            line = line[:idx]
+        for tok in pattern.findall(line):
+            out.add(tok)
+    return out
+
+
+def bundle_user_asm(asm_path: Path, *, selective_libc: bool = True) -> Path:
     """Strip `extern _name` lines for libc-provided symbols and append
     `lib/i386_dos_libc.asm`. Writes the merged asm next to `asm_path`
     with a `.bundled.asm` suffix and returns its path.
@@ -850,14 +889,39 @@ def bundle_user_asm(asm_path: Path) -> Path:
     test that ships its own `sin`). When that happens, we strip the
     matching definition from libc.asm so nasm doesn't see a
     duplicate.
+
+    With `selective_libc=True` (default), only the libc functions
+    transitively reachable from the user's externs and call targets
+    are embedded. The data and bss sections are always included
+    (always-needed scratch buffers, file-descriptor table, etc.).
     """
     libc_syms = _libc_provided_symbols()
     user_text = asm_path.read_text()
     user_syms = _user_defined_symbols(user_text)
-    libc_text = LIBC_ASM_PATH.read_text()
-    # Drop libc definitions that the user provides.
-    for name in libc_syms & user_syms:
-        libc_text = _strip_libc_function(libc_text, name)
+
+    if selective_libc:
+        from .libc_split import parse_libc
+        libc_text = LIBC_ASM_PATH.read_text()
+        parsed = parse_libc(libc_text)
+        # User-defined symbols shadow libc (e.g., test ships its own
+        # `sin`). Drop those from `functions` before computing closure
+        # so we don't try to embed both definitions.
+        for name in list(parsed.functions):
+            if name.lstrip("_") in user_syms:
+                del parsed.functions[name]
+        # Initial set of needed names: any `_*` reference in non-
+        # comment lines. `extern` declarations alone don't count —
+        # `<math.h>` declares 162 math functions but a typical program
+        # calls 0–2.
+        seeds = _user_referenced_symbols(user_text)
+        needed = parsed.transitive_closure(seeds)
+        libc_text = parsed.emit(needed)
+    else:
+        libc_text = LIBC_ASM_PATH.read_text()
+        # Drop libc definitions that the user provides.
+        for name in libc_syms & user_syms:
+            libc_text = _strip_libc_function(libc_text, name)
+
     user_lines = user_text.splitlines()
     out_lines: list[str] = []
     for line in user_lines:

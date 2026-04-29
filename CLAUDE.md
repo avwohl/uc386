@@ -898,3 +898,14 @@ See `README.md` for the public roadmap (Phase 0–6).
 - **2026-04-29 — Phase A peephole: setcc_jcc_collapse**: collapses every `if (...)` / `while (...)` / `for (cond; ...)` / `?:` in the codebase. The boolean-materialize-then-branch chain `setCC al; movzx eax, al; test eax, eax; jz/jnz LBL` becomes a single `j<cc> LBL` with the right inversion (jz after setCC inverts the condition; jnz keeps it). 18-entry CC inverse table covers e/ne, l/le/g/ge, b/be/a/ae, s/ns, o/no, p/np plus aliases (z/nz, c/nc, pe/po). 6 hits on probe_size.c — every comparison fires (`if`, `for`-cond, etc.). Saves 3 instructions per match. **probe_size.c down from 226 to 167 lines = 26.1% total reduction across all 7 patterns.**
 
   **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +5 peephole tests (46 total). Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase D slice 1: selective libc inclusion**: huge binary-size win. Every uc386-compiled binary previously embedded the full 3547-line monolithic libc (~6 KB of code) regardless of what the user actually called. New `src/uc386/libc_split.py` parses libc into per-function units (187 functions + 9 data labels), tracks each function's deps via regex scan over its body, and computes the transitive closure from the user's actual call sites. Modified `dos_emu.bundle_user_asm()` to embed only the reached functions (default on; `selective_libc=False` falls back to monolithic for safety).
+  - **Hello-world: 5891 → 123 bytes** (47x reduction)
+  - **probe_size.c (printf, fact, sum, classify): 6248 → 480 bytes** (13x reduction)
+  - Avg 76% reduction across c-testsuite test binaries; biggest wins on programs that don't touch float/string libc.
+  - Two key bug fixes during integration:
+    1. The label regex `_[A-Za-z][A-Za-z0-9_]*` rejected `___builtin_*` names (second char is `_`, not `[A-Za-z]`). Fixed to `_[_A-Za-z][A-Za-z0-9_]*`. Found via initial torture run with 310 regressions on tests using `___builtin_printf` / `___builtin_memcpy` etc.
+    2. Initial seed strategy used `extern _name` declarations as roots — but `<math.h>` declares 162 math functions, all of which would then be pulled in. Switched to scanning for any `_*` reference in non-comment lines (call targets, address loads, push immediates, data refs). Extern declarations alone are now ignored.
+  - Data section (`.data` + `.bss`) is always emitted in full — small (16 lines), and tracking data deps would add complexity for no measurable win.
+  - +19 libc_split tests covering parsing, dep extraction, transitive closure (with cycles), emit, and integration with the real libc file.
+
+  **Result: 1514/1514 gcc-c-torture, 220/220 c-testsuite still 100%**. +19 libc_split tests (461 total smoke + peephole + libc_split). Pipeline 1734/1734 (100%).
