@@ -2456,6 +2456,150 @@ def test_add_one_to_inc_all_registers():
         assert opt.stats.get("add_one_to_inc") == 1
 
 
+# ── redundant_test_collapse ──────────────────────────────────────
+
+
+def test_redundant_test_collapse_after_and():
+    asm = (
+        "_f:\n"
+        "        and     eax, 1\n"
+        "        test    eax, eax\n"
+        "        jz      .L1\n"
+        ".L1:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "        test    eax, eax" not in out
+    assert "        and     eax, 1" in out
+    assert opt.stats.get("redundant_test_collapse") == 1
+
+
+def test_redundant_test_collapse_after_logical():
+    """and/or/xor clear OF and CF (same as test reg, reg) and set
+    ZF/SF/PF based on result — the test eax, eax after them is
+    fully redundant for any subsequent Jcc."""
+    for op_setup in (
+        "        and     eax, 0xF\n",
+        "        or      eax, 0xFF\n",
+        "        xor     eax, ebx\n",
+    ):
+        asm = (
+            "_f:\n"
+            f"{op_setup}"
+            "        test    eax, eax\n"
+            "        jz      .L1\n"
+            ".L1:\n"
+            "        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        out = opt.optimize(asm)
+        assert "test    eax, eax" not in out, f"{op_setup}: {out}"
+        assert opt.stats.get("redundant_test_collapse") == 1
+
+
+def test_redundant_test_collapse_skips_unsafe_arithmetic():
+    """add/sub/inc/dec/neg/shl/shr/sar set OF and CF based on
+    overflow or shifted-out bits, which differs from test's
+    'always clear OF/CF'. Dropping `test reg, reg` after these
+    would change behavior for jg/jl/ja/jb/jo/etc.
+
+    Specifically caught by torture's signed-comparison-after-sub
+    tests (20000403-1, bf-sign-2): `sub eax, ecx; test eax, eax;
+    jg L` with overflow has SF != OF after sub (so jg not-taken)
+    but SF == OF after sub+test (so jg may be taken). Different.
+    """
+    for op_setup in (
+        "        add     eax, 5\n",
+        "        sub     eax, 3\n",
+        "        inc     eax\n",
+        "        dec     eax\n",
+        "        neg     eax\n",
+        "        shl     eax, 2\n",
+        "        shr     eax, 1\n",
+        "        sar     eax, 4\n",
+    ):
+        asm = (
+            "_f:\n"
+            f"{op_setup}"
+            "        test    eax, eax\n"
+            "        jg      .L1\n"
+            ".L1:\n"
+            "        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        opt.optimize(asm)
+        assert opt.stats.get("redundant_test_collapse", 0) == 0, (
+            f"{op_setup}: must not collapse"
+        )
+
+
+def test_redundant_test_collapse_skips_intervening_op():
+    """Don't drop test if there's an instruction between the
+    flag-setter and the test."""
+    asm = (
+        "_f:\n"
+        "        and     eax, 1\n"
+        "        push    eax\n"
+        "        test    eax, eax\n"
+        "        jz      .L1\n"
+        ".L1:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_test_collapse", 0) == 0
+
+
+def test_redundant_test_collapse_skips_mismatched_register():
+    """`add eax, X; test ebx, ebx` — different reg, not redundant."""
+    asm = (
+        "_f:\n"
+        "        add     eax, 5\n"
+        "        test    ebx, ebx\n"
+        "        jz      .L1\n"
+        ".L1:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_test_collapse", 0) == 0
+
+
+def test_redundant_test_collapse_skips_non_arithmetic():
+    """`mov eax, X; test eax, eax` — mov DOES NOT set flags. Test
+    is needed."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        test    eax, eax\n"
+        "        jz      .L1\n"
+        ".L1:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_test_collapse", 0) == 0
+
+
+def test_redundant_test_collapse_block_boundary():
+    """A label between flag-setter and test is a basic block
+    boundary — control could enter from elsewhere with different
+    flag state."""
+    asm = (
+        "_f:\n"
+        "        and     eax, 1\n"
+        ".L_target:\n"
+        "        test    eax, eax\n"
+        "        jz      .L1\n"
+        ".L1:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_test_collapse", 0) == 0
+
+
 # ── Convergence ──────────────────────────────────────────────────
 
 

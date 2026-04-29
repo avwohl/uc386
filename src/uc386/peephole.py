@@ -97,6 +97,10 @@ Currently implements:
     `dec reg`). Saves 2 bytes per match. inc/dec leave CF unchanged
     while add/sub set CF; the rewrite is safe only when CF is dead
     after (no `jc/jnc/ja/jb/...` reads it before being overwritten).
+  - redundant_test_collapse: drop `test reg, reg` immediately after
+    a flag-setting arithmetic op on the same reg. Common after
+    `and eax, MASK; test eax, eax; jcc` — the AND already set ZF/SF
+    based on its result, so the test is redundant. Saves 2 bytes.
 
 Patterns to add (see PEEPHOLE_PLAN.md for details): tail calls,
 jump threading, multi-instruction right-operand retargeting.
@@ -321,6 +325,7 @@ class PeepholeOptimizer:
             lines = self._pass_fst_fstp_collapse(lines)
             lines = self._pass_fpu_op_collapse(lines)
             lines = self._pass_add_one_to_inc(lines)
+            lines = self._pass_redundant_test_collapse(lines)
             after = len(lines)
             if after == before:
                 # All passes only delete or replace-with-fewer; if the
@@ -2674,6 +2679,96 @@ class PeepholeOptimizer:
                         continue
             out.append(line)
         return out
+
+    # Instructions whose ZF/SF are set based on the result AND which
+    # ALSO clear OF and CF — the same flag state as `test reg, reg`.
+    # After any of these, a subsequent `test reg, reg` (with the same
+    # reg as the dest) is fully redundant: ALL flag bits match what
+    # the prior op set, so any subsequent Jcc reads the same state.
+    #
+    # Restricted to logical ops only. add/sub/inc/dec/neg/shl/shr/sar
+    # set OF and CF based on overflow / shifted-out bits — those
+    # diverge from test's "always 0" — so dropping the test changes
+    # the flag state seen by jg/jl/ja/jb/jo/etc. A specific failure:
+    # `sub eax, ecx; test eax, eax; jg L` with overflow gives SF != OF,
+    # so jg is not-taken; dropping the test gives SF maybe == OF
+    # depending on overflow direction. Caught by torture's signed-
+    # comparison-after-subtraction tests (20000403-1, bf-sign-2).
+    _ZF_SF_SETTING_RMW_OPS: frozenset[str] = frozenset({
+        "and", "or", "xor",
+    })
+
+    def _pass_redundant_test_collapse(self, lines: list[Line]) -> list[Line]:
+        """Drop ``test reg, reg`` when the immediately-preceding
+        instruction was a flag-setting arithmetic on the same reg.
+        The prior op already set ZF/SF based on its result, so a
+        ``test reg, reg`` is redundant — same flag state.
+
+        Saves 2 bytes per match. Common in:
+
+            and  eax, MASK   ; sets flags
+            test eax, eax    ; redundant
+            jz   target
+
+        becomes:
+
+            and  eax, MASK
+            jz   target
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (
+                line.kind == "instr"
+                and line.op == "test"
+            ):
+                parts = _operands_split(line.operands)
+                if parts is not None:
+                    a, b = parts
+                    al = a.strip().lower()
+                    bl = b.strip().lower()
+                    # Self-test: `test reg, reg` (same reg both sides).
+                    if al == bl and self._is_general_register(al):
+                        # Look back for the preceding instruction that
+                        # set this reg as its destination.
+                        prev_idx = self._find_prev_instr(out)
+                        if prev_idx is not None:
+                            prev = out[prev_idx]
+                            if prev.op in self._ZF_SF_SETTING_RMW_OPS:
+                                # All current ops in the safe set are
+                                # 2-operand (and/or/xor). The
+                                # destination is the first operand.
+                                pp = _operands_split(prev.operands)
+                                if (
+                                    pp is not None
+                                    and pp[0].strip().lower() == al
+                                ):
+                                    self.stats[
+                                        "redundant_test_collapse"
+                                    ] = (
+                                        self.stats.get(
+                                            "redundant_test_collapse", 0
+                                        ) + 1
+                                    )
+                                    i += 1
+                                    continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _find_prev_instr(out: list[Line]) -> int | None:
+        """Return the index of the last `instr` line in `out`, or
+        None if there isn't one (or there's a label/directive in
+        between, which is a basic-block boundary)."""
+        for i in range(len(out) - 1, -1, -1):
+            ln = out[i]
+            if ln.kind == "instr":
+                return i
+            if ln.kind in ("label", "directive", "data"):
+                return None  # block boundary
+        return None
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:
         """P-jmp-to-next: `jmp X` immediately (modulo blanks/comments)
