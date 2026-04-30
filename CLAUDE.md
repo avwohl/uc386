@@ -1994,3 +1994,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete impact on pr70602**: chain `and eax, 1; shl eax, 31; sar eax, 31` (separated from `mov eax, 18` by `mov [m], eax; cmp [_b], 0; jnz`) now folds to 0. Combined with mov_zero_to_xor + jcc_jmp_inversion cascades, the boolean-OR-materialize-then-test pattern collapses dramatically. pr70602: 64 → 58 lines.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests (1259 total). Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: const_fold_chain extended with not/neg**: extend the chain ops set to include single-operand RMW `not reg` (bitwise complement) and `neg reg` (two's complement negation). Saves bytes per fold. Common in expression evaluation that produces a small bit pattern via a known constant.
+  - **`not reg`**: chain_acc = (~chain_acc) & 0xFFFFFFFF. e.g. `mov eax, 5; not eax` → `mov eax, 0xFFFFFFFA` (4294967290).
+  - **`neg reg`**: chain_acc = (-chain_acc) & 0xFFFFFFFF. e.g. `mov eax, 5; neg eax` → `mov eax, 0xFFFFFFFB` (4294967291).
+  - **Both can also serve as chain start**: when no `mov reg, IMM_INIT` precedes but the first op is `not reg` or `neg reg`, recognize as start.
+  - **Tried imul (3-op `imul reg, reg, IMM` and 2-op `imul reg, IMM`)** — caused regressions on torture tests 20050119-1 / -2 (struct array with byte-mode enums, where the cascade through other passes produced incorrect address arithmetic). Reverted imul; slice 40 includes only not/neg.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +3 peephole tests (1262 total). Pipeline 1734/1734 (100%).

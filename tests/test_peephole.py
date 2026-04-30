@@ -15304,3 +15304,62 @@ def test_const_fold_chain_skips_when_call_clobbers_eax():
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
     assert "and     eax, 1" in out
+
+
+# ── const_fold_chain — not/neg/imul extensions ───────────────────
+
+
+def test_const_fold_chain_not():
+    """`mov eax, 5; not eax` folds to `mov eax, 0xFFFFFFFA`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 5\n"
+        "        not     eax\n"
+        "        push    eax\n"
+        "        call    _g\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # ~5 = 0xFFFFFFFA = 4294967290
+    assert "not     eax" not in out
+    assert opt.stats.get("const_fold_chain", 0) >= 1
+
+
+def test_const_fold_chain_neg():
+    """`mov eax, 5; neg eax` folds to `mov eax, -5` (0xFFFFFFFB)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 5\n"
+        "        neg     eax\n"
+        "        push    eax\n"
+        "        call    _g\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "neg     eax" not in out
+    assert opt.stats.get("const_fold_chain", 0) >= 1
+
+
+def test_const_fold_chain_combined_not_neg():
+    """Multi-op chain: mov + and + not + neg."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 7\n"
+        "        and     eax, 5\n"   # 7 & 5 = 5
+        "        not     eax\n"      # ~5 = 0xFFFFFFFA
+        "        neg     eax\n"      # -0xFFFFFFFA = 6
+        "        push    eax\n"
+        "        call    _g\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "and     eax" not in out
+    assert "not     eax" not in out
+    assert "neg     eax" not in out
+    assert opt.stats.get("const_fold_chain", 0) >= 3

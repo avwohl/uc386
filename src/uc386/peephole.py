@@ -11097,6 +11097,11 @@ class PeepholeOptimizer:
                             break
                         except ValueError:
                             break
+                # Single-operand RMW on reg (not/neg) = chain start.
+                if op in ("not", "neg"):
+                    op_dst = ln.operands.strip()
+                    if op_dst.lower() == a_dst_low:
+                        break
                 # Otherwise: check the instruction doesn't write reg.
                 if self._instr_writes_reg(ln, a_dst_low):
                     break
@@ -11116,8 +11121,22 @@ class PeepholeOptimizer:
                 if op not in (
                     "and", "or", "xor", "add", "sub",
                     "shl", "shr", "sar", "sal",
+                    "not", "neg",
                 ):
                     break
+                # Single-operand (not, neg) vs 2-operand (rest) vs
+                # 3-operand (imul reg, reg, IMM).
+                if op in ("not", "neg"):
+                    op_dst = ln.operands.strip()
+                    if op_dst.lower() != a_dst_low:
+                        break
+                    if op == "not":
+                        chain_acc = (~chain_acc) & 0xFFFFFFFF
+                    else:  # neg
+                        chain_acc = (-chain_acc) & 0xFFFFFFFF
+                    chain_count += 1
+                    chain_end += 1
+                    continue
                 op_parts = _operands_split(ln.operands)
                 if op_parts is None:
                     break
