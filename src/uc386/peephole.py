@@ -459,6 +459,7 @@ class PeepholeOptimizer:
             lines = self._pass_dup_push_pop_self_op(lines)
             lines = self._pass_push_pop_op_to_memop(lines)
             lines = self._pass_push_pop_register_op(lines)
+            lines = self._pass_zero_load_after_zero_store(lines)
             lines = self._pass_label_load_collapse(lines)
             lines = self._pass_label_push_collapse(lines)
             lines = self._pass_label_store_collapse(lines)
@@ -10511,6 +10512,176 @@ class PeepholeOptimizer:
                 self.stats.get("push_pop_register_op", 0) + 1
             )
             continue
+        return out
+
+    def _pass_zero_load_after_zero_store(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Replace ``mov REG, [m]`` with ``xor REG, REG`` when the
+        slot was just zero-stored and no intervening write/control
+        flow has happened.
+
+        Pattern:
+            xor   REG_A, REG_A
+            mov   [m], REG_A          ; slot = 0
+            ... chain (no labels, no calls, no jumps,
+                       no write to [m], no lea of &m) ...
+            mov   REG_B, [m]          ; load — slot is still 0
+
+        Rewrite the final ``mov REG_B, [m]`` to ``xor REG_B, REG_B``.
+        Saves 1 byte per match (3-byte ebp-rel mov → 2-byte xor reg).
+
+        Common in bit-field init idioms where the codegen first
+        zeroes the slot and then re-reads it during the field-write
+        RMW. The reload is redundant — we know the value is 0.
+
+        Conditions:
+        - Memory operand is `[ebp ± N]` literal-offset.
+        - Slot's offset is NOT address-taken anywhere in the function
+          (else indirect writes via captured pointers could mutate).
+        - Chain has no labels, no calls, no jumps, no writes to [m].
+        - Flags must be safe at the new xor's position (xor sets
+          ZF/SF/PF/CF/OF; original mov didn't touch them — so any
+          flag-reader before the next flag-clobber would see
+          different flags).
+        - REG_B is a 32-bit GP register.
+        """
+        out = list(lines)
+        addr_taken_per_line = self._compute_addr_taken_per_line(out)
+        i = 0
+        while i + 3 < len(out):
+            a = out[i]
+            if (
+                a.kind != "instr"
+                or a.op != "xor"
+            ):
+                i += 1
+                continue
+            a_parts = _operands_split(a.operands)
+            if a_parts is None:
+                i += 1
+                continue
+            a_dst, a_src = a_parts
+            a_dst_low = a_dst.strip().lower()
+            a_src_low = a_src.strip().lower()
+            if (
+                a_dst_low not in PeepholeOptimizer._GP32
+                or a_dst_low != a_src_low
+            ):
+                i += 1
+                continue
+            # B: mov [m], REG_A
+            b = out[i + 1]
+            if b.kind != "instr" or b.op != "mov":
+                i += 1
+                continue
+            b_parts = _operands_split(b.operands)
+            if b_parts is None:
+                i += 1
+                continue
+            b_dst, b_src = b_parts
+            if b_src.strip().lower() != a_dst_low:
+                i += 1
+                continue
+            b_dst_clean = self._strip_size_prefix(b_dst.strip())
+            slot_off = self._ebp_offset(b_dst_clean)
+            if slot_off is None:
+                i += 1
+                continue
+            # Slot must not be address-taken.
+            if slot_off in addr_taken_per_line[i]:
+                i += 1
+                continue
+            # Walk forward to find a load from same slot.
+            load_idx = None
+            chain_safe = True
+            for j in range(i + 2, min(len(out), i + 12)):
+                ln = out[j]
+                if ln.kind == "label":
+                    chain_safe = False
+                    break
+                if ln.kind != "instr":
+                    continue
+                if ln.op in ("call", "ret", "leave", "iret",
+                             "iretd", "retf", "retn", "jmp",
+                             "enter"):
+                    chain_safe = False
+                    break
+                if ln.op.startswith("j") and ln.op != "jmp":
+                    chain_safe = False
+                    break
+                # Check for write to [m].
+                op_parts = _operands_split(ln.operands or "")
+                if op_parts is not None:
+                    dest = op_parts[0].strip()
+                    if "[" in dest:
+                        dest_off = self._ebp_offset(
+                            self._strip_size_prefix(dest)
+                        )
+                        if dest_off is not None and dest_off == slot_off:
+                            chain_safe = False
+                            break
+                else:
+                    # Single-operand RMW like inc/dec on memory.
+                    operand = (ln.operands or "").strip()
+                    if "[" in operand:
+                        op_off = self._ebp_offset(
+                            self._strip_size_prefix(operand)
+                        )
+                        if (
+                            op_off is not None
+                            and op_off == slot_off
+                            and ln.op in (
+                                "inc", "dec", "neg", "not",
+                            )
+                        ):
+                            chain_safe = False
+                            break
+                # LEA capturing &m.
+                if ln.op == "lea" and op_parts is not None:
+                    _, lea_src = op_parts
+                    lea_off = self._ebp_offset(lea_src.strip())
+                    if lea_off is not None and lea_off == slot_off:
+                        chain_safe = False
+                        break
+                # Found a matching load?
+                if ln.op == "mov" and op_parts is not None:
+                    ld_dst, ld_src = op_parts
+                    ld_dst_low = ld_dst.strip().lower()
+                    ld_src_clean = self._strip_size_prefix(
+                        ld_src.strip()
+                    )
+                    ld_off = self._ebp_offset(ld_src_clean)
+                    if (
+                        ld_dst_low in PeepholeOptimizer._GP32
+                        and ld_off is not None
+                        and ld_off == slot_off
+                    ):
+                        load_idx = j
+                        load_dst = ld_dst_low
+                        break
+            if not chain_safe or load_idx is None:
+                i += 1
+                continue
+            # Flags safety: from load_idx + 1 walk forward; until
+            # first flag-clobber or fence, no flag-reader allowed.
+            if not self._flags_safe_after(out, load_idx + 1):
+                i += 1
+                continue
+            # Rewrite. Replace load with xor.
+            indent = self._extract_indent(out[load_idx].raw)
+            new_raw = f"{indent}xor     {load_dst}, {load_dst}"
+            out[load_idx] = Line(
+                raw=new_raw, kind="instr",
+                op="xor", operands=f"{load_dst}, {load_dst}",
+            )
+            self.stats["zero_load_after_zero_store"] = (
+                self.stats.get("zero_load_after_zero_store", 0) + 1
+            )
+            # Don't advance i; let the loop revisit. Since we replaced
+            # the load with a register operation, no cascade is
+            # immediately enabled at i, but a later optimization could.
+            i += 1
         return out
 
     def _function_takes_ebp_addr(

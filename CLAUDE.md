@@ -1880,3 +1880,19 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Real-world impact**: pr70602 alone went from 471 → 318 lines (32% reduction) on top of all prior peephole passes. The bit-field-write idiom appears in any C code that writes to packed struct fields.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (1198 total). Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: zero_load_after_zero_store**: replace `mov REG, [m]` with `xor REG, REG` when the slot was just zero-stored and no intervening write/control flow has happened. Direct savings 1 byte per match (3-byte ebp-rel mov → 2-byte xor); much larger via cascade through `dead_stack_store` and similar passes.
+  - **Pattern**:
+    ```
+    xor   REG_A, REG_A
+    mov   [m], REG_A           ; slot = 0
+    ... chain (no labels, no calls, no jumps,
+               no write to [m], no lea of &m) ...
+    mov   REG_B, [m]           ; load — slot is still 0
+    ```
+    Rewrite the load to `xor REG_B, REG_B` directly.
+  - **Cascade**: with the load gone, `dead_stack_store` may now drop the zero-store itself (if no other reads reach it), and follow-on passes may fold the chain further.
+  - **Conditions**: `[m]` is `[ebp ± N]`; the slot's offset is NOT address-taken anywhere in the function (else indirect writes via captured pointers could mutate); chain has no labels, no calls, no jumps, no writes to `[m]`; flags safe at the new xor's position (xor sets flags; original mov didn't — any flag-reader before the next flag-clobber would observe different flags); REG_B is a 32-bit GP register.
+  - **Common shape**: bit-field init idioms where the codegen first zeroes the slot via `xor reg, reg; mov [m], reg`, then re-reads it during the field-write RMW. The reload is redundant — we know the value is 0.
+  - **Concrete impact on pr70602** (bit-field-init torture): 21 fires of the load-replacement, plus dramatic cascade. 471 → 277 lines (41% reduction) on top of all prior peephole work, including slice 29's `push_pop_register_op`. With the loads turned into xors, `dead_stack_store` and similar passes drop the now-unreferenced zero-stores. The bit-field init idiom is heavily simplified.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (1204 total). Pipeline 1734/1734 (100%).

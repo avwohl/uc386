@@ -14164,3 +14164,111 @@ def test_push_pop_register_op_skips_label_in_chain():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("push_pop_register_op", 0) == 0
+
+
+# ── zero_load_after_zero_store ───────────────────────────────────
+
+
+def test_zero_load_after_zero_store_basic():
+    """`xor eax, eax; mov [m], eax; ...; mov ecx, [m]` →
+    `xor eax, eax; mov [m], eax; ...; xor ecx, ecx`.
+    Saves 1 byte (3-byte ebp-rel mov → 2-byte xor)."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        mov     [ebp - 4], eax\n"
+        "        and     eax, 1\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        and     ecx, 4294967294\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The load was rewritten to xor.
+    assert "xor     ecx, ecx" in out
+    # The original load is gone.
+    assert "mov     ecx, [ebp - 4]" not in out
+    assert opt.stats.get("zero_load_after_zero_store", 0) == 1
+
+
+def test_zero_load_after_zero_store_skips_label_in_chain():
+    """A label between zero-store and load means control flow could
+    enter at the label with [m] holding a different value. Skip."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        mov     [ebp - 4], eax\n"
+        ".L_top:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("zero_load_after_zero_store", 0) == 0
+
+
+def test_zero_load_after_zero_store_skips_call_in_chain():
+    """A call could mutate [m] via globals/aliasing. Skip."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        mov     [ebp - 4], eax\n"
+        "        call    _g\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("zero_load_after_zero_store", 0) == 0
+
+
+def test_zero_load_after_zero_store_skips_intervening_write():
+    """If the chain writes to [m] (different value), slot no longer
+    0. Skip."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     dword [ebp - 4], 42\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("zero_load_after_zero_store", 0) == 0
+
+
+def test_zero_load_after_zero_store_skips_lea_capture():
+    """If &[m] is captured via lea, indirect writes through that
+    pointer could mutate the slot. Skip."""
+    asm = (
+        "_f:\n"
+        "        lea     edx, [ebp - 4]\n"
+        "        xor     eax, eax\n"
+        "        mov     [ebp - 4], eax\n"
+        "        and     eax, 1\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("zero_load_after_zero_store", 0) == 0
+
+
+def test_zero_load_after_zero_store_skips_when_flags_read():
+    """xor sets flags; original mov didn't. If flag-reader follows
+    load before next flag-clobber, skip."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        mov     [ebp - 4], eax\n"
+        "        and     eax, 1\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        je      .L\n"
+        "        ret\n"
+        ".L:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("zero_load_after_zero_store", 0) == 0
