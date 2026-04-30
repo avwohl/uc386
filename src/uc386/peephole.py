@@ -458,6 +458,7 @@ class PeepholeOptimizer:
             lines = self._pass_transfer_pop_cmp_collapse(lines)
             lines = self._pass_dup_push_pop_self_op(lines)
             lines = self._pass_push_pop_op_to_memop(lines)
+            lines = self._pass_push_pop_register_op(lines)
             lines = self._pass_label_load_collapse(lines)
             lines = self._pass_label_push_collapse(lines)
             lines = self._pass_label_store_collapse(lines)
@@ -10252,6 +10253,263 @@ class PeepholeOptimizer:
                 self.stats.get("push_pop_op_to_memop", 0) + 1
             )
             # Don't advance i; new line may fire another pass.
+            continue
+        return out
+
+    def _pass_push_pop_register_op(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Drop save/restore around register-via-different-reg op.
+
+        Pattern:
+            push    REG_PUSHED         ; save REG_PUSHED's value
+            ... chain (no write to REG_PUSHED) ...
+            pop     REG_POPPED         ; recover into different reg
+            OP      TARGET, REG_POPPED ; commutative binop
+
+        Rewrite (drop push and pop, source from REG_PUSHED directly):
+            ... chain ...
+            OP      TARGET, REG_PUSHED
+
+        Saves 2 instructions (1 push + 1 pop = 2 bytes).
+        REG_PUSHED still holds its original value at the OP site
+        because the chain doesn't write it; using REG_PUSHED instead
+        of REG_POPPED yields the same operand value.
+
+        Common in bit-field write idioms where the codegen pushes the
+        value to write across a sequence that builds the masked
+        storage word, then ORs the popped value in. The push is
+        unnecessary because the value's source register isn't
+        clobbered by the masking computation.
+
+        Conditions:
+        - Line 1: ``push REG_PUSHED`` (32-bit GP register).
+        - Lines 2..N (chain): stack-balanced, no labels, no
+          control flow (calls allowed), no write to REG_PUSHED.
+        - Line N+1: ``pop REG_POPPED`` (32-bit GP register).
+        - Line N+2: ``OP TARGET, REG_POPPED`` for OP in commutative
+          binops (add/and/or/xor/imul).
+        - REG_PUSHED, REG_POPPED, TARGET all distinct.
+        - REG_POPPED dead after line N+2 (else its post-state
+          differs).
+        - Chain length ≥ 1 (the 0-length case is handled by
+          `transfer_pop_collapse` and similar).
+        """
+        out = list(lines)
+        i = 0
+        while i < len(out):
+            push_line = out[i]
+            if (
+                push_line.kind != "instr"
+                or push_line.op != "push"
+            ):
+                i += 1
+                continue
+            push_reg = push_line.operands.strip().lower()
+            if push_reg not in PeepholeOptimizer._GP32:
+                i += 1
+                continue
+            # Walk forward to find matching pop. Track stack depth.
+            depth = 1
+            pop_idx = None
+            chain_safe = True
+            chain_writes_push_reg = False
+            j = i + 1
+            while j < len(out):
+                ln = out[j]
+                if ln.kind == "label":
+                    chain_safe = False
+                    break
+                if ln.kind != "instr":
+                    j += 1
+                    continue
+                op = ln.op
+                if op == "push":
+                    depth += 1
+                    j += 1
+                    continue
+                if op == "pop":
+                    depth -= 1
+                    if depth == 0:
+                        pop_idx = j
+                        break
+                    # Inner pop into something that might be push_reg
+                    # — those are part of the chain. We still need to
+                    # check if push_reg becomes the dest.
+                    pop_dest = ln.operands.strip().lower()
+                    if pop_dest == push_reg:
+                        chain_writes_push_reg = True
+                    j += 1
+                    continue
+                if op in ("ret", "iret", "iretd", "retf", "retn",
+                          "leave", "jmp", "enter"):
+                    chain_safe = False
+                    break
+                # Conditional jumps (control flow leaves the chain
+                # unchecked). Bail.
+                if op.startswith("j") and op != "jmp":
+                    chain_safe = False
+                    break
+                # `add esp, K` / `sub esp, K` — depth tracking.
+                if (
+                    op in ("add", "sub")
+                    and ln.operands.lower().startswith("esp,")
+                ):
+                    parts_esp = _operands_split(ln.operands)
+                    if parts_esp is None:
+                        chain_safe = False
+                        break
+                    _, esp_amt = parts_esp
+                    try:
+                        amt = int(esp_amt.strip(), 0)
+                    except ValueError:
+                        chain_safe = False
+                        break
+                    if amt % 4 != 0:
+                        chain_safe = False
+                        break
+                    delta = amt // 4
+                    if op == "add":
+                        depth -= delta
+                    else:
+                        depth += delta
+                    if depth <= 0:
+                        chain_safe = False
+                        break
+                    j += 1
+                    continue
+                # Calls clobber EAX/ECX/EDX per cdecl. If push_reg
+                # is one of those, the chain "writes" it.
+                if op == "call":
+                    if push_reg in ("eax", "ecx", "edx"):
+                        chain_writes_push_reg = True
+                    j += 1
+                    continue
+                # Generic: check if instr writes push_reg as dest.
+                op_parts = _operands_split(ln.operands or "")
+                if op_parts is not None:
+                    dest = op_parts[0].strip().lower()
+                    # Sub-register write to push_reg's family.
+                    dest_canon = (
+                        PeepholeOptimizer._SUBREG_TO_GP32.get(
+                            dest, dest
+                        )
+                    )
+                    if dest_canon == push_reg:
+                        chain_writes_push_reg = True
+                else:
+                    # Single-operand op (inc/dec/neg/not/pop/etc.)
+                    single = (ln.operands or "").strip().lower()
+                    single_canon = (
+                        PeepholeOptimizer._SUBREG_TO_GP32.get(
+                            single, single
+                        )
+                    )
+                    if (
+                        single_canon == push_reg
+                        and op in (
+                            "inc", "dec", "neg", "not", "mul",
+                            "div", "idiv", "imul",
+                        )
+                    ):
+                        chain_writes_push_reg = True
+                # Implicit reg writers (cdq writes EDX, mul/div
+                # write EAX/EDX).
+                if op == "cdq" and push_reg == "edx":
+                    chain_writes_push_reg = True
+                if op in ("mul", "div", "idiv"):
+                    if push_reg in ("eax", "edx"):
+                        chain_writes_push_reg = True
+                if (
+                    op in ("imul",)
+                    and ln.operands
+                    and "," not in ln.operands
+                ):
+                    # 1-operand imul: writes EDX:EAX
+                    if push_reg in ("eax", "edx"):
+                        chain_writes_push_reg = True
+                j += 1
+            if (
+                not chain_safe
+                or pop_idx is None
+                or chain_writes_push_reg
+            ):
+                i += 1
+                continue
+            # Pop reg.
+            pop_reg = out[pop_idx].operands.strip().lower()
+            if pop_reg not in PeepholeOptimizer._GP32:
+                i += 1
+                continue
+            if pop_reg == push_reg:
+                # Same-reg restore: standard save/restore. Other
+                # passes handle this case (e.g. push_pop_op_to_memop
+                # with mem-target, or right_operand_retarget).
+                i += 1
+                continue
+            # Find the OP line right after pop.
+            op_idx = None
+            for k in range(pop_idx + 1, len(out)):
+                if out[k].kind == "label":
+                    break
+                if out[k].kind == "instr":
+                    op_idx = k
+                    break
+            if op_idx is None:
+                i += 1
+                continue
+            op_line = out[op_idx]
+            if op_line.op not in PeepholeOptimizer._COMMUTATIVE_BINOPS:
+                i += 1
+                continue
+            opp = _operands_split(op_line.operands)
+            if opp is None:
+                i += 1
+                continue
+            target = opp[0].strip().lower()
+            op_src = opp[1].strip().lower()
+            if target not in PeepholeOptimizer._GP32:
+                i += 1
+                continue
+            # All three regs distinct.
+            if target in (pop_reg, push_reg) or push_reg == pop_reg:
+                i += 1
+                continue
+            if op_src != pop_reg:
+                i += 1
+                continue
+            # pop_reg dead after op. Use treat_as_scratch=True
+            # because the codegen never relies on EDX being the LL
+            # high-half return value at this point — it would set
+            # EDX explicitly before function exit, not via this
+            # bit-field-write idiom's pop.
+            if not self._reg_dead_after(
+                out, op_idx + 1, pop_reg, treat_as_scratch=True
+            ):
+                i += 1
+                continue
+            # Rewrite. New OP uses push_reg as source.
+            indent = self._extract_indent(op_line.raw)
+            spacer = " " * max(8 - len(op_line.op), 1)
+            new_op_raw = (
+                f"{indent}{op_line.op}{spacer}{target}, {push_reg}"
+            )
+            new_op_line = Line(
+                raw=new_op_raw,
+                kind="instr",
+                op=op_line.op,
+                operands=f"{target}, {push_reg}",
+            )
+            new_out = []
+            new_out.extend(out[:i])
+            new_out.extend(out[i + 1:pop_idx])
+            new_out.extend(out[pop_idx + 1:op_idx])
+            new_out.append(new_op_line)
+            new_out.extend(out[op_idx + 1:])
+            out = new_out
+            self.stats["push_pop_register_op"] = (
+                self.stats.get("push_pop_register_op", 0) + 1
+            )
             continue
         return out
 

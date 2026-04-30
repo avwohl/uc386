@@ -1860,3 +1860,23 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Real-world impact** (30 random torture sample): 11 instances of the residual `shl + add reg` chain that don't match the load/push collapsers. Saves 2 bytes per fire = ~22 bytes per 30 tests. Modest but real.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +8 peephole tests (1191 total). Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: push_pop_register_op**: drop the save/restore around register-via-different-reg op pattern. Common in bit-field write idioms.
+  - **Pattern**:
+    ```
+    push    REG_PUSHED              ; save value
+    ... chain (no write to REG_PUSHED) ...
+    pop     REG_POPPED              ; recover into different reg
+    OP      TARGET, REG_POPPED      ; commutative binop
+    ```
+  - **Rewrite** (drop push and pop, source from REG_PUSHED directly):
+    ```
+    ... chain ...
+    OP      TARGET, REG_PUSHED
+    ```
+    Saves 2 instructions (1 push + 1 pop = 2 bytes) per match.
+  - **Why this works**: REG_PUSHED still holds its original value at the OP site (chain doesn't write it). REG_POPPED in the original equals REG_PUSHED's pushed value. So substituting REG_PUSHED for REG_POPPED in the OP yields the same operand value.
+  - **Common shape**: bit-field write where the codegen pushes the value to write across a sequence that builds the masked storage word, then ORs the popped value in. The push/pop pair is unnecessary because the value's source register isn't clobbered by the masking computation. pr70602 (bit-field-init torture test) had 41 fires of this pattern.
+  - **Conditions**: Line 1 push REG_PUSHED (32-bit GP); chain stack-balanced, no labels, no control flow (calls allowed); line N+1 pop REG_POPPED (different from REG_PUSHED); line N+2 OP TARGET, REG_POPPED for OP in commutative binops (add/and/or/xor/imul); REG_POPPED dead after the OP (with `treat_as_scratch=True` so EDX-as-scratch is correctly dead at function exit when the function isn't LL-returning); chain doesn't write to REG_PUSHED (calls clobbering EAX/ECX/EDX per cdecl count as writes when REG_PUSHED is one of those).
+  - **Real-world impact**: pr70602 alone went from 471 → 318 lines (32% reduction) on top of all prior peephole passes. The bit-field-write idiom appears in any C code that writes to packed struct fields.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (1198 total). Pipeline 1734/1734 (100%).

@@ -14032,3 +14032,135 @@ def test_shl_add_reg_to_lea_followed_by_dec():
     out = opt.optimize(asm)
     assert "lea     eax, [eax + ecx*4]" in out
     assert opt.stats.get("shl_add_reg_to_lea", 0) == 1
+
+
+# ── push_pop_register_op ─────────────────────────────────────────
+
+
+def test_push_pop_register_op_basic():
+    """Bit-field write idiom:
+        push    eax              ; save value
+        mov     ecx, [m]         ; load storage
+        and     ecx, MASK        ; clear field bits
+        pop     edx              ; restore value into different reg
+        or      ecx, edx         ; combine
+
+    Rewrite: drop push and pop, use eax directly:
+        mov     ecx, [m]
+        and     ecx, MASK
+        or      ecx, eax
+    """
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        and     ecx, 4294967294\n"
+        "        pop     edx\n"
+        "        or      ecx, edx\n"
+        "        mov     [ebp - 8], ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    eax" not in out
+    assert "pop     edx" not in out
+    assert "or      ecx, eax" in out
+    assert opt.stats.get("push_pop_register_op", 0) == 1
+
+
+def test_push_pop_register_op_skips_chain_writes_pushed():
+    """If the chain writes to the pushed register, the push is real
+    (we'd lose the value). Skip."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, 42\n"   # writes eax!
+        "        pop     edx\n"
+        "        or      ecx, edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_register_op", 0) == 0
+
+
+def test_push_pop_register_op_skips_call_clobbering_pushed():
+    """Calls clobber EAX/ECX/EDX (cdecl). If pushed reg is one of
+    those, the chain effectively writes it. Skip."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        call    _g\n"
+        "        pop     edx\n"
+        "        or      ecx, edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_register_op", 0) == 0
+
+
+def test_push_pop_register_op_skips_same_reg():
+    """push reg; ...; pop reg (same): standard save/restore. Other
+    passes handle this — skip."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        pop     eax\n"   # same as pushed
+        "        or      ecx, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_register_op", 0) == 0
+
+
+def test_push_pop_register_op_skips_pop_reg_live_after():
+    """If pop_reg is live after the OP, the rewrite changes its
+    value — skip."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        pop     edx\n"
+        "        or      ecx, edx\n"
+        "        mov     [ebp - 4], edx\n"   # uses edx (= popped val)
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_register_op", 0) == 0
+
+
+def test_push_pop_register_op_skips_non_commutative_op():
+    """Restricted to commutative binops (add/and/or/xor/imul). cmp,
+    sub, etc. excluded for now."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        pop     edx\n"
+        "        sub     ecx, edx\n"   # sub: not commutative
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_register_op", 0) == 0
+
+
+def test_push_pop_register_op_skips_label_in_chain():
+    """Labels in chain mean control flow — skip (chain might not
+    execute monotonically)."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     ecx, [ebp - 8]\n"
+        ".L_mid:\n"
+        "        pop     edx\n"
+        "        or      ecx, edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_register_op", 0) == 0
