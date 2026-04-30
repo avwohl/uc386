@@ -524,6 +524,7 @@ class PeepholeOptimizer:
             lines = self._pass_sib_const_index_fold(lines)
             lines = self._pass_push_const_index_fold(lines)
             lines = self._pass_trampoline_elimination(lines)
+            lines = self._pass_pure_leaf_drop_frame(lines)
             # Drop labels that aren't referenced anywhere. Other
             # passes may have replaced jcc/jmp targets, leaving some
             # labels orphaned. After dropping, dead_after_terminator
@@ -18586,6 +18587,231 @@ class PeepholeOptimizer:
             out.append(line)
             i += 1
         return out
+
+    def _pass_pure_leaf_drop_frame(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Phase F: drop the EBP frame for pure-leaf functions with
+        params.
+
+        Pattern (per function):
+            _fn:
+                    push    ebp
+                    mov     ebp, esp
+                    <body — only [ebp + N] reads, no push/pop/call,
+                    no [ebp - N] (locals), no SIB-form ebp, no ebp
+                    write outside the prologue>
+            (.epilogue:)?
+                    leave
+                    ret
+
+        Rewrite:
+            _fn:
+                    <body with [ebp + N] → [esp + (N - 4)]>
+            (.epilogue:)?
+                    ret
+
+        Saves 4 bytes per fire (drops `push ebp` + `mov ebp, esp` +
+        `leave`; the `ret` stays). Common on arithmetic helper
+        functions (`int sq(int x) { return x * x; }`) where the
+        peephole has already collapsed the stack-machine slack to a
+        register-only body.
+        """
+        out = list(lines)
+        ranges = self._function_ranges(out)
+        # Build a flat list of replacements; apply at the end so we
+        # don't disturb subsequent function-range indices mid-walk.
+        replacements: list[tuple[int, int, list[Line]]] = []
+        for start, end in ranges:
+            # Need a global label at `start`; if the prelude range
+            # has no global label, skip.
+            if (
+                out[start].kind != "label"
+                or out[start].label.startswith(".")
+            ):
+                continue
+            # The prologue must be exactly `push ebp` + `mov ebp, esp`
+            # at start+1, +2 (after possible blank lines).
+            i = start + 1
+            while i < end and out[i].kind in ("blank", "comment"):
+                i += 1
+            if not (
+                i < end
+                and out[i].kind == "instr"
+                and out[i].op == "push"
+                and out[i].operands.strip().lower() == "ebp"
+            ):
+                continue
+            push_idx = i
+            i += 1
+            while i < end and out[i].kind in ("blank", "comment"):
+                i += 1
+            if not (
+                i < end
+                and out[i].kind == "instr"
+                and out[i].op == "mov"
+                and out[i].operands.strip().lower() == "ebp, esp"
+            ):
+                continue
+            mov_idx = i
+            body_start = mov_idx + 1
+            # The function must end with `leave` then `ret` (with
+            # optional blanks in between). Find them.
+            j = end - 1
+            while j >= body_start and out[j].kind in ("blank", "comment"):
+                j -= 1
+            if not (
+                j >= body_start
+                and out[j].kind == "instr"
+                and out[j].op == "ret"
+            ):
+                continue
+            ret_idx = j
+            j -= 1
+            while j >= body_start and out[j].kind in ("blank", "comment"):
+                j -= 1
+            if not (
+                j >= body_start
+                and out[j].kind == "instr"
+                and out[j].op == "leave"
+            ):
+                continue
+            leave_idx = j
+            # Body: [body_start, leave_idx). Must be pure-leaf.
+            if not self._body_is_pure_leaf_lines(
+                out[body_start:leave_idx]
+            ):
+                continue
+            # Body must reference [ebp + N] for at least one N (else
+            # this is a no-param function and `skip_frame` already
+            # caught it — re-running here would just re-emit). Bail
+            # if no [ebp + N] references — saves no bytes.
+            if not any(
+                self._has_ebp_pos_offset(line)
+                for line in out[body_start:leave_idx]
+            ):
+                continue
+            # Build the rewrite: drop push_idx, mov_idx, leave_idx.
+            # Rewrite all body lines' [ebp + N] → [esp + (N - 4)].
+            new_body = [
+                self._rewrite_ebp_to_esp_in_line(line)
+                for line in out[body_start:leave_idx]
+            ]
+            # The new function range:
+            # [out[start]] + (any blanks/comments before push) +
+            # new_body + (any blanks between leave and ret + the ret).
+            head = [out[start]] + out[start + 1:push_idx]
+            tail = out[leave_idx + 1:end]
+            new_lines = head + new_body + tail
+            replacements.append((start, end, new_lines))
+            self.stats["pure_leaf_drop_frame"] = (
+                self.stats.get("pure_leaf_drop_frame", 0) + 1
+            )
+        # Apply replacements in reverse so earlier indices remain valid.
+        for start, end, new_lines in reversed(replacements):
+            out = out[:start] + new_lines + out[end:]
+        return out
+
+    @staticmethod
+    def _body_is_pure_leaf_lines(body: list[Line]) -> bool:
+        """Check whether `body` (a list of Line objects) is a
+        pure-leaf body — no ESP-modifying instructions, no calls,
+        no [ebp - N] (locals) accesses, no SIB-form ebp accesses,
+        no ebp writes / register-form refs."""
+        DISALLOWED_OPS = {
+            "push", "pop", "call", "enter", "leave",
+            "pushf", "pushfd", "popf", "popfd",
+            "pusha", "pushad", "popa", "popad",
+            "ret", "retn", "retf", "iret", "iretd",
+            "rep", "repe", "repz", "repne", "repnz",
+            "loop", "loope", "loopne", "loopz", "loopnz",
+            "int", "into",
+        }
+        for line in body:
+            if line.kind != "instr":
+                continue
+            op = line.op
+            if op in DISALLOWED_OPS:
+                return False
+            operands = line.operands or ""
+            ops_lower = operands.lower()
+            # `add esp, ...` / `sub esp, ...` / `mov esp, ...`
+            if op in ("add", "sub") and re.match(
+                r"^\s*esp\s*,", ops_lower,
+            ):
+                return False
+            if op == "mov" and re.match(
+                r"^\s*esp\s*,", ops_lower,
+            ):
+                return False
+            if op == "xchg" and "esp" in ops_lower:
+                return False
+            # ebp written as a register (not via memory operand).
+            if op == "mov" and re.match(
+                r"^\s*ebp\s*,", ops_lower,
+            ):
+                return False
+            if op in ("xor", "and", "or", "add", "sub", "imul") and re.match(
+                r"^\s*ebp\s*,", ops_lower,
+            ):
+                return False
+            # [ebp - N] (local access). Bail.
+            if re.search(
+                r"\[\s*ebp\s*-\s*\d+\s*\]", operands, re.IGNORECASE,
+            ):
+                return False
+            # SIB-form ebp accesses.
+            if re.search(
+                r"\[\s*ebp\s*\+\s*\w+\s*\*",
+                operands,
+                re.IGNORECASE,
+            ):
+                return False
+            # `ebp` as register operand (not in a memory operand).
+            no_mem = re.sub(r"\[[^\]]*\]", "", operands)
+            if re.search(r"\bebp\b", no_mem, re.IGNORECASE):
+                return False
+        return True
+
+    @staticmethod
+    def _has_ebp_pos_offset(line: Line) -> bool:
+        if line.kind != "instr":
+            return False
+        return bool(re.search(
+            r"\[\s*ebp\s*\+\s*\d+\s*\]",
+            line.operands or "",
+            re.IGNORECASE,
+        ))
+
+    @staticmethod
+    def _rewrite_ebp_to_esp_in_line(line: Line) -> Line:
+        """Rewrite `[ebp + N]` to `[esp + (N - 4)]` in a single
+        instruction's operands (and raw text). Other lines pass
+        through unchanged."""
+        if line.kind != "instr":
+            return line
+        def sub_one(m: re.Match) -> str:
+            n = int(m.group(1))
+            new_n = n - 4
+            if new_n == 0:
+                return "[esp]"
+            return f"[esp + {new_n}]"
+        new_operands = re.sub(
+            r"\[\s*ebp\s*\+\s*(\d+)\s*\]",
+            sub_one,
+            line.operands or "",
+            flags=re.IGNORECASE,
+        )
+        new_raw = re.sub(
+            r"\[\s*ebp\s*\+\s*(\d+)\s*\]",
+            sub_one,
+            line.raw,
+            flags=re.IGNORECASE,
+        )
+        return Line(
+            raw=new_raw, kind="instr",
+            op=line.op, operands=new_operands,
+        )
 
 
 def optimize(asm_text: str) -> str:

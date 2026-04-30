@@ -2068,3 +2068,13 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Net assessment**: Phases B-F evaluation complete. B done. C already worked. D pt2 implicit. E rejected for our environment. F deferred. The plan's "Phase B should knock typical binary down 20-30%" is conservatively achieved given Phase A's 89% reduction on pr70602 had already taken most of the headroom.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. Same test count (1305 total). Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase F slice 1: pure_leaf_drop_frame**: drop the EBP frame for non-recursive functions whose post-peephole body is a pure expression tree.
+  - **Pattern (per function, post-peephole)**: `_fn:; push ebp; mov ebp, esp; <body>; .epilogue:?; leave; ret` where `<body>` only does `[ebp + N]` reads and register operations — no `push`/`pop`/`call`/`leave`/`add esp`/`sub esp`/`mov esp,*`/`mov ebp,*`/`[ebp - N]`/SIB-form ebp.
+  - **Rewrite**: drop `push ebp` + `mov ebp, esp` + `leave`. Rewrite all `[ebp + N]` to `[esp + (N - 4)]` (since the saved-EBP slot is gone, the first param moves from `[ebp + 8]` to `[esp + 4]`). Saves 4 bytes per fire.
+  - **Why peephole layer**: at codegen time, even simple binops emit push/pop via the stack-machine pattern. Only AFTER `right_operand_retarget`, `imm_binop_collapse`, etc. has collapsed those to register-only does the body become "pure leaf". Detecting at codegen would miss most real candidates.
+  - **Conservative bail**: any disallowed instruction in the body bails the entire function. Keeps the rewrite safe — ESP must be exactly the same throughout the body for `[esp + N]` accesses to remain valid.
+  - **Sample fire rate**: 8 fires per 50 random torture tests. Common in arithmetic helper functions (`int sq(int x) { return x * x; }`, `int neg(int x) { return -x; }`, `int triple(int x) { return x * 3; }`). Across the full torture suite ~250 fires = 1KB saved.
+  - **Companion to existing `skip_frame` codegen optimization** (slice 2026-04-29) which handles functions with NO params and no locals. This slice extends to leaf-with-params.
+  - **9 unit tests** covering basic single/two-param, the bail conditions (call, sub esp, locals, sib ebp, ebp register use), the no-params case, and the .epilogue label.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +9 peephole tests (1314 total). Pipeline 1734/1734 (100%).

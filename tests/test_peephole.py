@@ -13600,6 +13600,172 @@ def test_trampoline_elimination_global_label_safe():
     assert opt.stats.get("trampoline_elimination", 0) == 0
 
 
+# ── pure_leaf_drop_frame ─────────────────────────────────────────
+
+
+def test_pure_leaf_drop_frame_basic():
+    """`int sq(int x) { return x * x; }`-shape leaf: drop frame,
+    rewrite [ebp + 8] → [esp + 4]."""
+    asm = (
+        "_sq:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        imul    eax, eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    ebp" not in out
+    assert "leave" not in out
+    assert "[esp + 4]" in out
+    assert "ret" in out
+    assert opt.stats.get("pure_leaf_drop_frame", 0) == 1
+
+
+def test_pure_leaf_drop_frame_two_params():
+    """Two-param leaf: [ebp + 8] → [esp + 4], [ebp + 12] → [esp + 8]."""
+    asm = (
+        "_add:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        add     eax, [ebp + 12]\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "[esp + 4]" in out
+    assert "[esp + 8]" in out
+    assert opt.stats.get("pure_leaf_drop_frame", 0) == 1
+
+
+def test_pure_leaf_drop_frame_skips_when_call_in_body():
+    """Body with a `call` is not pure-leaf — bail."""
+    asm = (
+        "_helper:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        call    _other\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    ebp" in out
+    assert opt.stats.get("pure_leaf_drop_frame", 0) == 0
+
+
+def test_pure_leaf_drop_frame_skips_when_sub_esp_in_body():
+    """Body with `sub esp, ...` (e.g., FPU scratch) is not pure-leaf
+    — ESP shifts after the prologue."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        sub     esp, 4\n"  # FPU scratch alloc
+        "        mov     eax, [ebp + 8]\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("pure_leaf_drop_frame", 0) == 0
+
+
+def test_pure_leaf_drop_frame_skips_when_locals_present():
+    """If the body accesses [ebp - N] (a local), the function has a
+    real frame — bail."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        sub     esp, 4\n"  # has locals — but this contradicts no-frame too
+        "        mov     [ebp - 4], eax\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("pure_leaf_drop_frame", 0) == 0
+
+
+def test_pure_leaf_drop_frame_skips_when_no_params():
+    """A function with no `[ebp + N]` references doesn't benefit;
+    skip_frame at codegen would have caught it (or no params at
+    all). Bail to avoid double-emit."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        mov     eax, 42\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # No [ebp + N] references — pass declines to fire (skip_frame
+    # at codegen would handle this; if it didn't, this is some
+    # unusual case we don't need to optimize).
+    assert opt.stats.get("pure_leaf_drop_frame", 0) == 0
+
+
+def test_pure_leaf_drop_frame_with_epilogue_label():
+    """`.epilogue:` label between body and `leave; ret` is preserved."""
+    asm = (
+        "_sq:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        imul    eax, eax\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "[esp + 4]" in out
+    assert "leave" not in out
+    # The .epilogue label may be dropped by unreferenced-label removal
+    # since nothing references it; or may stay.
+    assert opt.stats.get("pure_leaf_drop_frame", 0) == 1
+
+
+def test_pure_leaf_drop_frame_skips_sib_ebp():
+    """SIB-form ebp accesses (e.g. `[ebp + ecx*4]`) shouldn't appear
+    on the param side, but defensively bail."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        mov     eax, [ebp + ecx*4]\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("pure_leaf_drop_frame", 0) == 0
+
+
+def test_pure_leaf_drop_frame_skips_ebp_register_use():
+    """`mov reg, ebp` exposes ebp's value — bail."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        mov     eax, ebp\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("pure_leaf_drop_frame", 0) == 0
+
+
 def test_chain_binop_collapse_add():
     """`mov ecx, X; add ecx, Y; add eax, ecx` → `add eax, X; add eax, Y`."""
     asm = (
