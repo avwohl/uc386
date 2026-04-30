@@ -477,6 +477,7 @@ class PeepholeOptimizer:
             lines = self._pass_lea_store_collapse(lines)
             lines = self._pass_dead_stack_store(lines)
             lines = self._pass_dead_unused_slot_stores(lines)
+            lines = self._pass_slot_constant_propagation(lines)
             lines = self._pass_reg_copy_addr_forward(lines)
             lines = self._pass_value_forward_to_reg(lines)
             lines = self._pass_xfer_store_collapse(lines)
@@ -14005,6 +14006,205 @@ class PeepholeOptimizer:
                 continue
             new_out.append(ln)
         return new_out
+
+    def _pass_slot_constant_propagation(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Replace `mov reg, [ebp ± N]` with `mov reg, IMM` when the
+        slot is a "singleton-write IMM" — i.e., written exactly once
+        in the function with `mov dword [ebp ± N], IMM_LITERAL` and
+        never modified elsewhere (no RMW, no `lea` for address-taken
+        access, no SIB-form ebp access).
+
+        Per-function analysis. After this pass, downstream chain
+        folding (slices 35/39/40) can fold subsequent imm-op chains
+        on the loaded register.
+
+        Conditions for marking a slot as constant:
+        - Exactly one writer: `mov dword [ebp ± N], IMM_LITERAL`.
+        - No `lea reg, [ebp ± N]` (would expose address for indirect
+          writes).
+        - No RMW operations on the slot (`inc/dec/and/or/xor/add/sub
+          dword [ebp ± N], ...`).
+        - No SIB-form `[ebp + reg*K (+ disp)]` accessing variable
+          offsets.
+        - Function must have a proper prologue (so we know it's a
+          real function, not a synthetic snippet).
+
+        Rewrite: for each `mov reg, [ebp ± N]` (no displacement)
+        where the slot is constant, replace with `mov reg, IMM`.
+        """
+        out = list(lines)
+        ranges = PeepholeOptimizer._function_ranges(out)
+        for start, end in ranges:
+            # Skip ranges without a real prologue.
+            has_prologue = False
+            for k in range(start, end):
+                ln = out[k]
+                if ln.kind == "instr" and (
+                    ln.op == "enter"
+                    or (ln.op == "push" and "ebp" in (ln.operands or "").lower())
+                ):
+                    has_prologue = True
+                    break
+            if not has_prologue:
+                continue
+            # Bail on SIB-form ebp access or lea of ebp-rel.
+            sib_or_lea = False
+            for k in range(start, end):
+                ln = out[k]
+                if ln.kind != "instr":
+                    continue
+                ops = ln.operands or ""
+                if "[" in ops and "ebp" in ops.lower():
+                    # Check for SIB-form (contains '*' inside brackets).
+                    bracket_text = ops[
+                        ops.index("[") + 1: ops.index("]")
+                        if "]" in ops else len(ops)
+                    ]
+                    if "*" in bracket_text:
+                        sib_or_lea = True
+                        break
+                if (ln.op == "lea"
+                        and "ebp" in ops.lower()):
+                    # Could be `lea reg, [ebp ± N]` or
+                    # `lea reg, [ebp + reg*K]` etc. Bail.
+                    sib_or_lea = True
+                    break
+            if sib_or_lea:
+                continue
+            # Find entry-block end: prologue + linear code until first
+            # control flow boundary (any jcc/jmp/call/ret/leave) or any
+            # non-start label. Writers outside the entry block can be
+            # conditional and don't dominate downstream reads — unsafe
+            # to propagate.
+            entry_block_end = end
+            seen_start_label = False
+            for k in range(start, end):
+                ln = out[k]
+                if ln.kind == "label":
+                    if not seen_start_label:
+                        seen_start_label = True
+                        continue
+                    entry_block_end = k
+                    break
+                if ln.kind == "instr":
+                    if (ln.op.startswith("j")
+                            or ln.op == "call"
+                            or ln.op in ("ret", "leave", "iret",
+                                         "retn", "retf")):
+                        entry_block_end = k
+                        break
+            # Collect per-slot writers (with entry-block flag) and RMW.
+            slot_writers: dict[int, list[tuple[int, int, bool]]] = {}
+            slot_rmw: set[int] = set()
+            for k in range(start, end):
+                ln = out[k]
+                if ln.kind != "instr":
+                    continue
+                op = ln.op
+                # Check stores to [ebp ± N]: `mov <size?> [ebp ± N], src`.
+                if op == "mov":
+                    parts = _operands_split(ln.operands)
+                    if parts is not None:
+                        dst, src = parts
+                        dst_t = dst.strip()
+                        # Strip optional size prefix.
+                        for prefix in ("dword ", "word ", "byte ",
+                                       "qword "):
+                            if dst_t.lower().startswith(prefix):
+                                dst_t = dst_t[len(prefix):].lstrip()
+                                break
+                        offset = self._ebp_offset(dst_t)
+                        if offset is not None:
+                            # Skip parameters: positive offsets are
+                            # caller-pushed values; pre-write reads see
+                            # the caller's value, not our IMM.
+                            if offset > 0:
+                                slot_rmw.add(offset)
+                                continue
+                            # Only IMM-literal source is a "constant
+                            # store"; reg/mem source = non-constant.
+                            imm_val = self._parse_imm_value(src.strip())
+                            if imm_val is None:
+                                slot_rmw.add(offset)
+                            else:
+                                in_entry = k < entry_block_end
+                                slot_writers.setdefault(
+                                    offset, []
+                                ).append((k, imm_val, in_entry))
+                # RMW ops with [ebp ± N] dest.
+                elif op in ("add", "sub", "and", "or", "xor",
+                            "inc", "dec", "shl", "shr", "sar",
+                            "rol", "ror", "rcl", "rcr",
+                            "not", "neg"):
+                    parts = _operands_split(ln.operands)
+                    dst_t = None
+                    if parts is not None:
+                        dst_t = parts[0].strip()
+                    elif ln.operands:
+                        dst_t = ln.operands.strip()
+                    if dst_t is not None:
+                        for prefix in ("dword ", "word ", "byte ",
+                                       "qword "):
+                            if dst_t.lower().startswith(prefix):
+                                dst_t = dst_t[len(prefix):].lstrip()
+                                break
+                        offset = self._ebp_offset(dst_t)
+                        if offset is not None:
+                            slot_rmw.add(offset)
+            # Determine constant slots.
+            #   - All writers (entry + conditional) write same IMM.
+            #   - At least one writer is in the entry block (it
+            #     dominates all reads).
+            constant_slots: dict[int, int] = {}
+            for offset, writes in slot_writers.items():
+                if offset in slot_rmw:
+                    continue
+                imms = {w[1] for w in writes}
+                if len(imms) != 1:
+                    continue
+                if not any(w[2] for w in writes):
+                    # No entry-block writer: pre-write value undefined.
+                    continue
+                constant_slots[offset] = writes[0][1]
+            if not constant_slots:
+                continue
+            # Replace `mov reg, [ebp ± N]` (no disp, no SIB) with
+            # `mov reg, IMM` for constant slots.
+            for k in range(start, end):
+                ln = out[k]
+                if ln.kind != "instr" or ln.op != "mov":
+                    continue
+                parts = _operands_split(ln.operands)
+                if parts is None:
+                    continue
+                dst, src = parts
+                dst_low = dst.strip().lower()
+                if dst_low not in PeepholeOptimizer._GP32:
+                    continue
+                src_t = src.strip()
+                # Source must be a plain `[ebp ± N]` (no size prefix
+                # since reg-load infers from dest).
+                offset = self._ebp_offset(src_t)
+                if offset is None:
+                    continue
+                if offset not in constant_slots:
+                    continue
+                imm = constant_slots[offset]
+                indent = self._extract_indent(ln.raw)
+                new_raw = f"{indent}mov     {dst_low}, {imm}"
+                new_line = Line(
+                    raw=new_raw, kind="instr",
+                    op="mov", operands=f"{dst_low}, {imm}",
+                )
+                out[k] = new_line
+                self.stats["slot_constant_propagation"] = (
+                    self.stats.get(
+                        "slot_constant_propagation", 0
+                    ) + 1
+                )
+        return out
 
     @staticmethod
     def _stack_store_offset(line: Line) -> int | None:

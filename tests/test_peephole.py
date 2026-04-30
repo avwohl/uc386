@@ -15363,3 +15363,136 @@ def test_const_fold_chain_combined_not_neg():
     assert "not     eax" not in out
     assert "neg     eax" not in out
     assert opt.stats.get("const_fold_chain", 0) >= 3
+
+
+# ── slot_constant_propagation ────────────────────────────────────
+
+
+def test_slot_constant_propagation_basic():
+    """`mov dword [ebp - 4], 18; ...; mov eax, [ebp - 4]` —
+    the slot is written exactly once with IMM 18 and never modified,
+    so the load can be replaced with `mov eax, 18`."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        mov     dword [ebp - 4], 18\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        shr     eax, 1\n"
+        "        push    eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Slice 41 replaces `mov eax, [ebp - 4]` with `mov eax, 18`.
+    # Then chain folder folds `mov eax, 18; shr eax, 1` to `mov eax, 9`.
+    assert opt.stats.get(
+        "slot_constant_propagation", 0
+    ) >= 1
+
+
+def test_slot_constant_propagation_multi_writers_same_imm():
+    """Multiple writers all storing the SAME IMM is OK."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        mov     dword [ebp - 4], 18\n"
+        "        cmp     dword [_b], 0\n"
+        "        je      .L_skip\n"
+        "        mov     dword [ebp - 4], 18\n"   # same IMM
+        ".L_skip:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        push    eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get(
+        "slot_constant_propagation", 0
+    ) >= 1
+
+
+def test_slot_constant_propagation_skips_multi_writers_diff_imm():
+    """Multiple writers with DIFFERENT IMMs — can't propagate."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        mov     dword [ebp - 4], 18\n"
+        "        cmp     dword [_b], 0\n"
+        "        je      .L_skip\n"
+        "        mov     dword [ebp - 4], 19\n"   # different IMM
+        ".L_skip:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        push    eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get(
+        "slot_constant_propagation", 0
+    ) == 0
+
+
+def test_slot_constant_propagation_skips_when_lea_addr_taken():
+    """If `lea reg, [ebp ± N]` exposes the slot's address, indirect
+    writes might modify it. Bail."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        mov     dword [ebp - 4], 18\n"
+        "        lea     ecx, [ebp - 4]\n"   # address-taken
+        "        push    ecx\n"
+        "        call    _g\n"
+        "        add     esp, 4\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        push    eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # lea exposes address - my pass should bail (sib_or_lea bail).
+    assert opt.stats.get(
+        "slot_constant_propagation", 0
+    ) == 0
+
+
+def test_slot_constant_propagation_skips_when_rmw():
+    """If the slot is RMW'd (`add [m], 1`, `inc [m]`), can't
+    propagate — value changes."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        mov     dword [ebp - 4], 18\n"
+        "        add     dword [ebp - 4], 1\n"   # RMW
+        "        mov     eax, [ebp - 4]\n"
+        "        push    eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get(
+        "slot_constant_propagation", 0
+    ) == 0
+
+
+def test_slot_constant_propagation_skips_when_reg_source():
+    """If the writer's source is a register (not immediate), can't
+    determine the value statically."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        mov     [ebp - 4], eax\n"   # source is reg, not imm
+        "        mov     ecx, [ebp - 4]\n"
+        "        push    ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get(
+        "slot_constant_propagation", 0
+    ) == 0

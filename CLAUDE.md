@@ -2001,3 +2001,15 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Tried imul (3-op `imul reg, reg, IMM` and 2-op `imul reg, IMM`)** — caused regressions on torture tests 20050119-1 / -2 (struct array with byte-mode enums, where the cascade through other passes produced incorrect address arithmetic). Reverted imul; slice 40 includes only not/neg.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +3 peephole tests (1262 total). Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: slot_constant_propagation**: per-function analysis identifying `[ebp - N]` local slots that are provably constant — written with a `mov <size> [ebp - N], IMM_LITERAL` whose execution dominates all reads — and replacing every `mov reg, [ebp - N]` load with `mov reg, IMM` directly. Saves the load-from-memory; downstream chain folding (slices 35/39/40) then folds any imm-op chain on the loaded register down to a single mov.
+  - **Conditions for marking a slot as constant**:
+    - **Local only**: offset must be negative (`[ebp - N]`). Positive offsets are parameters whose pre-write value is the caller-pushed value, NOT the IMM we'd substitute. Found via 20030120-1 torture failure: test2's parameter `w` was being incorrectly substituted with the conditional `w = 2` value, breaking `test2(1)` which expected return value 1.
+    - **Entry-block dominator**: at least one writer must be in the function's entry block (linear code from prologue to first jcc/jmp/call/ret/leave/label). Without this, conditionally-written slots could be mis-propagated for reads where the condition didn't hold.
+    - **Single IMM value**: all writers (entry-block AND conditional) must agree on the same IMM literal. If any write has a non-IMM source (register, memory) or differs in value, the slot is excluded.
+    - **No address-take**: bail entire function if any `lea reg, [ebp ± N]` appears (address could be exposed for indirect writes).
+    - **No SIB-form ebp access**: bail if any `[ebp + reg*K (+ N)]` exists (variable index could touch any slot).
+    - **No RMW**: any `inc/dec/and/or/xor/add/sub/...` to `[ebp - N]` excludes the slot.
+    - **Real prologue**: function must start with `enter` or `push ebp; mov ebp, esp` (skip synthetic test asm fragments).
+  - **Concrete impact on pr70602** (bit-field-init torture): 1 fire of slot_constant_propagation, plus massive cascade. pr70602 went from 58 lines to 52 lines (10% reduction on top of all prior peephole work; 89% total reduction from 471 lines pre-Phase A). Pattern: bit-field encoding stores constant 9 to slot, then derives the second extract chain from the slot — propagation collapses the chain to `mov dword [_c], 9` directly.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (1268 total). Pipeline 1734/1734 (100%).
