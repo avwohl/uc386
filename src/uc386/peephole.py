@@ -4716,7 +4716,7 @@ class PeepholeOptimizer:
         into ``OP dword [mem], SRC`` when reg is dead after the store.
 
         OP ∈ {add, sub, and, or, xor}. SRC is a numeric immediate or
-        a non-EAX general-purpose register. x86 supports both
+        a non-`reg` general-purpose register. x86 supports both
         ``OP r/m32, imm`` and ``OP r/m32, r32`` forms.
 
         Saves 5 bytes per match (3-byte load + 3-byte op + 3-byte
@@ -4727,12 +4727,14 @@ class PeepholeOptimizer:
         form, where y has been hoisted into a register).
 
         Conditions:
-        - Line A: ``mov eax, [mem]`` (plain mov; mem must be a memory
-          deref).
-        - Line B: ``OP eax, SRC`` where OP is add/sub/and/or/xor and
-          SRC is a numeric literal OR a non-EAX 32-bit register.
-        - Line C: ``mov [mem], eax`` (same mem as line A).
-        - EAX is dead after line C (CFG-aware scan).
+        - Line A: ``mov reg, [mem]`` (any 32-bit GP reg; plain mov;
+          mem must be a memory deref).
+        - Line B: ``OP reg, SRC`` where OP is add/sub/and/or/xor and
+          SRC is a numeric literal OR a non-`reg` 32-bit register.
+        - Line C: ``mov [mem], reg`` (same mem as line A).
+        - reg is dead after line C (CFG-aware scan; uses
+          treat_as_scratch=True since reg's value is being used purely
+          for the RMW).
         """
         out: list[Line] = []
         i = 0
@@ -4749,7 +4751,9 @@ class PeepholeOptimizer:
                     adest_low = adest.strip().lower()
                     asrc_norm = asrc.strip()
                     if (
-                        adest_low == "eax"
+                        adest_low in {
+                            "eax", "ebx", "ecx", "edx", "esi", "edi",
+                        }
                         and asrc_norm.startswith("[")
                         and asrc_norm.endswith("]")
                     ):
@@ -4762,12 +4766,17 @@ class PeepholeOptimizer:
                             if bp is not None:
                                 bdest, bsrc = bp
                                 bsrc_norm = bsrc.strip()
-                                src_for_rewrite = self._rmw_source_text(
-                                    bsrc_norm
+                                src_for_rewrite = (
+                                    self._rmw_source_text_for_reg(
+                                        bsrc_norm, adest_low,
+                                    )
                                 )
                                 if (
-                                    bdest.strip().lower() == "eax"
+                                    bdest.strip().lower() == adest_low
                                     and src_for_rewrite is not None
+                                    and not self._operand_references_reg(
+                                        asrc_norm, adest_low
+                                    )
                                 ):
                                     c = lines[i + 2]
                                     if (
@@ -4781,9 +4790,14 @@ class PeepholeOptimizer:
                                                 cdest.strip()
                                                 == asrc_norm
                                                 and csrc.strip().lower()
-                                                == "eax"
+                                                == adest_low
                                                 and self._reg_dead_after(
-                                                    lines, i + 3, "eax"
+                                                    lines, i + 3,
+                                                    adest_low,
+                                                    treat_as_scratch=(
+                                                        adest_low
+                                                        != "eax"
+                                                    ),
                                                 )
                                             ):
                                                 indent = (
@@ -4846,6 +4860,45 @@ class PeepholeOptimizer:
         if sl in {"ebx", "ecx", "edx", "esi", "edi"}:
             return sl
         return None
+
+    @staticmethod
+    def _rmw_source_text_for_reg(
+        src: str, working_reg: str,
+    ) -> str | None:
+        """For `OP <working_reg>, src` where the rewrite goes to
+        `OP [mem], src`, decide if `src` is acceptable.
+
+        Like `_rmw_source_text` but parameterized over the working
+        register: `src` may not be `working_reg` (its value is stale
+        after we drop the load) but any other GP32 is fine.
+        """
+        s = src.strip()
+        imm = PeepholeOptimizer._parse_numeric_immediate(s)
+        if imm is not None:
+            return str(imm)
+        sl = s.lower()
+        if sl in PeepholeOptimizer._GP32 and sl != working_reg.lower():
+            return sl
+        return None
+
+    @staticmethod
+    def _operand_references_reg(operand: str, reg32: str) -> bool:
+        """Does `operand` mention `reg32` or any of its sub-register
+        aliases? Word-boundary match."""
+        sub_aliases = {
+            "eax": ("eax", "ax", "al", "ah"),
+            "ebx": ("ebx", "bx", "bl", "bh"),
+            "ecx": ("ecx", "cx", "cl", "ch"),
+            "edx": ("edx", "dx", "dl", "dh"),
+            "esi": ("esi", "si"),
+            "edi": ("edi", "di"),
+            "ebp": ("ebp", "bp"),
+            "esp": ("esp", "sp"),
+        }
+        for alias in sub_aliases.get(reg32.lower(), (reg32.lower(),)):
+            if _references_register(operand, alias):
+                return True
+        return False
 
     def _pass_rmw_mem_src_collapse(
         self, lines: list[Line]

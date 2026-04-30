@@ -13458,3 +13458,85 @@ def test_pop_cmp_chain_retarget_skips_non_fresh_chain_first():
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
     assert opt.stats.get("pop_cmp_chain_retarget", 0) == 0
+
+
+def test_rmw_collapse_edx():
+    """rmw_collapse fires for non-EAX working registers (EDX, ECX, ...).
+    The 3-line load+op+store on any GP scratch reg collapses to
+    `OP [m], src`."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, [ebp - 4]\n"
+        "        and     edx, 4294967239\n"
+        "        mov     [ebp - 4], edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("rmw_collapse", 0) == 1
+    assert "and     dword [ebp - 4], 4294967239" in out
+
+
+def test_rmw_collapse_ecx():
+    """ECX as working reg also fires."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        or      ecx, 16\n"
+        "        mov     [ebp - 8], ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("rmw_collapse", 0) == 1
+    assert "or      dword [ebp - 8], 16" in out
+
+
+def test_rmw_collapse_edx_with_reg_src_eax():
+    """EDX as working reg, EAX as source — EAX-source is allowed since
+    working reg is EDX (not the same)."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, [ebp - 4]\n"
+        "        or      edx, eax\n"
+        "        mov     [ebp - 4], edx\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("rmw_collapse", 0) == 1
+    assert "or      dword [ebp - 4], eax" in out
+
+
+def test_rmw_collapse_skips_self_referential_mem():
+    """If memory operand references the working register (e.g.,
+    `[edx + 4]`), the rewrite is unsafe — after dropping the load,
+    EDX would have a different value."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, [edx + 4]\n"
+        "        add     edx, 5\n"
+        "        mov     [edx + 4], edx\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("rmw_collapse", 0) == 0
+
+
+def test_rmw_collapse_skips_when_src_is_working_reg():
+    """`mov edx, [m]; add edx, edx; mov [m], edx` — src can't be edx
+    itself (its value is the load result, which we drop)."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, [ebp - 4]\n"
+        "        add     edx, edx\n"  # src is working reg — bail
+        "        mov     [ebp - 4], edx\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("rmw_collapse", 0) == 0

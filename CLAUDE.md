@@ -1796,3 +1796,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Common shape**: equality comparisons in `if`/`while` conditions where the rhs is a multi-instruction expression (constant load + shift, label-arithmetic, etc.) that survives `binop_collapse` and `right_operand_retarget` because the trailing pattern lacks the `mov ecx, eax` that those passes require.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests. 1165 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: rmw_collapse generalized to any GP scratch register**: extends `rmw_collapse` to recognize the load+op+store pattern with EBX/ECX/EDX/ESI/EDI as the working register (not just EAX). Saves 5 bytes per match.
+  - **Pattern**: `mov reg, [m]; OP reg, SRC; mov [m], reg` → `OP dword [m], SRC`. SRC is a numeric immediate or any non-`reg` GP32. Reg ∈ {eax, ebx, ecx, edx, esi, edi}.
+  - **Common shape**: bit-manipulation patterns where the codegen uses EDX as the working register (e.g. `*p &= mask | val` lowers as `mov edx, [m]; and edx, mask; mov [m], edx`). Was missed by the EAX-only pass.
+  - **`treat_as_scratch=True` for non-EAX regs**: EAX is the cdecl return register, so it may be live at ret. EBX/EDI/ESI are callee-saved (preserved by convention). ECX/EDX are caller-saved scratch. For ALL non-EAX regs, the codegen NEVER expects them live at function exit (callee-saved get restored via leave; scratch is dead by definition). For EAX, keep `treat_as_scratch=False` to preserve the existing behavior of not folding when EAX is the return value.
+  - **New helpers**: `_rmw_source_text_for_reg(src, working_reg)` (parameterized over the working register, allowing any non-`working_reg` GP32) and `_operand_references_reg(operand, reg32)` (sub-alias-aware reference check).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests. 1170 unit tests total. Pipeline 1734/1734 (100%).
