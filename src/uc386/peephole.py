@@ -496,6 +496,12 @@ class PeepholeOptimizer:
             lines = self._pass_byte_stores_to_dword(lines)
             lines = self._pass_pop_index_push_collapse(lines)
             lines = self._pass_pop_index_load_collapse(lines)
+            # Runs AFTER all index/push/load consumers above so they
+            # get first crack on the full shl+add+consumer chain.
+            # When the chain has no load/push consumer (just produces
+            # an address, e.g. for dec/push later), this pass folds
+            # the shl+add pair into a single LEA.
+            lines = self._pass_shl_add_reg_to_lea(lines)
             # Runs AFTER pop_index_*_collapse so those passes can
             # consume the SIB-form patterns first.
             lines = self._pass_pop_op_chain_retarget(lines)
@@ -4262,6 +4268,102 @@ class PeepholeOptimizer:
                                     self.stats["shl_add_label_to_lea"] = (
                                         self.stats.get(
                                             "shl_add_label_to_lea", 0
+                                        ) + 1
+                                    )
+                                    i += 2
+                                    continue
+            out.append(line)
+            i += 1
+        return out
+
+    def _pass_shl_add_reg_to_lea(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``shl IDX, N; add DST, IDX`` (DST != IDX, N ∈
+        {1, 2, 3}) into ``lea DST, [DST + IDX*scale]`` (scale = 2^N).
+
+        Sister pass to ``shl_add_label_to_lea``. Handles the case where
+        the second operand of `add` is a register (not a label).
+        Common when both base and index live in registers — typically
+        `mov BASE, [m]; mov IDX, [n]; shl IDX, N; add BASE, IDX` where
+        the result is the address of `BASE + IDX*scale` for a non-load
+        consumer (push, dec, etc.).
+
+        Encoding: original `shl IDX, N` (3 bytes) + `add DST, IDX` (2
+        bytes) = 5 bytes. Rewrite: `lea DST, [DST + IDX*scale]` = 3
+        bytes (8D ModRM SIB). Saves 2 bytes per match.
+
+        Conditions:
+        - Line 1: ``shl IDX, N`` where N ∈ {1, 2, 3}.
+        - Line 2: ``add DST, IDX`` (DST is a 32-bit GP register).
+        - DST != IDX (else the rewrite would produce a different
+          arithmetic result — `shl IDX, N; add IDX, IDX` = IDX*(2^N+1),
+          while `lea IDX, [IDX + IDX*scale]` = IDX*(scale+1)).
+        - Flags after the add are dead (lea doesn't set flags).
+        - IDX dead after the rewrite OR IDX is preserved (the lea
+          doesn't modify IDX, so this always holds — no liveness
+          constraint on IDX needed).
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (
+                i + 1 < len(lines)
+                and line.kind == "instr"
+                and line.op == "shl"
+            ):
+                parts = _operands_split(line.operands)
+                if parts is not None:
+                    idx_reg, count = parts
+                    idx_low = idx_reg.strip().lower()
+                    count_str = count.strip()
+                    if (
+                        self._is_general_register(idx_low)
+                        and count_str in ("1", "2", "3")
+                    ):
+                        scale = 2 ** int(count_str)
+                        nxt = lines[i + 1]
+                        if (
+                            nxt.kind == "instr"
+                            and nxt.op == "add"
+                        ):
+                            nxt_parts = _operands_split(nxt.operands)
+                            if nxt_parts is not None:
+                                ndest, nsrc = nxt_parts
+                                ndest_low = ndest.strip().lower()
+                                nsrc_low = nsrc.strip().lower()
+                                if (
+                                    self._is_general_register(ndest_low)
+                                    and nsrc_low == idx_low
+                                    and ndest_low != idx_low
+                                    and self._flags_safe_after(
+                                        lines, i + 2
+                                    )
+                                ):
+                                    indent = self._extract_indent(
+                                        line.raw
+                                    )
+                                    new_src = (
+                                        f"[{ndest_low} + "
+                                        f"{idx_low}*{scale}]"
+                                    )
+                                    new_raw = (
+                                        f"{indent}lea     "
+                                        f"{ndest_low}, {new_src}"
+                                    )
+                                    new_line = Line(
+                                        raw=new_raw,
+                                        kind="instr",
+                                        op="lea",
+                                        operands=(
+                                            f"{ndest_low}, {new_src}"
+                                        ),
+                                    )
+                                    out.append(new_line)
+                                    self.stats["shl_add_reg_to_lea"] = (
+                                        self.stats.get(
+                                            "shl_add_reg_to_lea", 0
                                         ) + 1
                                     )
                                     i += 2

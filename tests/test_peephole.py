@@ -13891,3 +13891,144 @@ def test_bool_materialize_collapse_form_b_skips_eax_live():
     out = opt.optimize(asm)
     # Should NOT fire — EAX is live (return value).
     assert opt.stats.get("bool_materialize_collapse", 0) == 0
+
+
+# ── shl_add_reg_to_lea ───────────────────────────────────────────
+
+
+def test_shl_add_reg_to_lea_basic():
+    """`shl ecx, 2; add eax, ecx` → `lea eax, [eax + ecx*4]`.
+
+    Saves 1 instruction (~2 bytes). Sister of shl_add_label_to_lea
+    for the case where the second add operand is a register (not a
+    label).
+    """
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, ecx\n"
+        "        push    eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     eax, [eax + ecx*4]" in out
+    assert "shl     ecx, 2" not in out
+    assert "add     eax, ecx" not in out
+    assert opt.stats.get("shl_add_reg_to_lea") == 1
+
+
+def test_shl_add_reg_to_lea_scale_2():
+    """N=1 produces SCALE=2."""
+    asm = (
+        "_f:\n"
+        "        shl     ecx, 1\n"
+        "        add     eax, ecx\n"
+        "        push    eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     eax, [eax + ecx*2]" in out
+
+
+def test_shl_add_reg_to_lea_scale_8():
+    """N=3 produces SCALE=8."""
+    asm = (
+        "_f:\n"
+        "        shl     edx, 3\n"
+        "        add     eax, edx\n"
+        "        push    eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     eax, [eax + edx*8]" in out
+
+
+def test_shl_add_reg_to_lea_skips_same_reg():
+    """`shl eax, N; add eax, eax` → DST == IDX. Result would be
+    different (eax * (2^N + 1) vs eax * (scale + 1) where scale = 2^N).
+
+    Specifically: `shl eax, 2; add eax, eax` = eax*5 (after shl,
+    eax = eax*4; then eax = eax*4 + eax*4 = eax*8). Hmm wait that's
+    eax*8 not eax*5... wait `add eax, eax` sums TWO copies of the
+    SAME current eax = 2*eax. So `shl eax, 2; add eax, eax` =
+    eax*4 then eax = (eax*4)*2 = eax*8. The lea form would be
+    `lea eax, [eax + eax*4]` = 5*eax. So they differ — SKIP.
+    """
+    asm = (
+        "_f:\n"
+        "        shl     eax, 2\n"
+        "        add     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("shl_add_reg_to_lea", 0) == 0
+
+
+def test_shl_add_reg_to_lea_skips_non_matching_idx():
+    """The shl IDX register must match the add's source register."""
+    asm = (
+        "_f:\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, edx\n"   # source is edx, not ecx
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("shl_add_reg_to_lea", 0) == 0
+
+
+def test_shl_add_reg_to_lea_skips_when_flags_read():
+    """If flags after the add are read (e.g., by jz), skip — lea
+    doesn't set flags but add does.
+    """
+    asm = (
+        "_f:\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, ecx\n"
+        "        jz      .L\n"
+        "        ret\n"
+        ".L:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("shl_add_reg_to_lea", 0) == 0
+
+
+def test_shl_add_reg_to_lea_skips_invalid_count():
+    """N must be 1, 2, or 3 (lea SCALE bits support only 1/2/4/8)."""
+    asm = (
+        "_f:\n"
+        "        shl     ecx, 4\n"   # SCALE 16 — not encodable
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("shl_add_reg_to_lea", 0) == 0
+
+
+def test_shl_add_reg_to_lea_followed_by_dec():
+    """Real-world shape from torture: `shl ecx, 2; add eax, ecx;
+    dec dword [eax]`. dec sets flags but doesn't read prior flags
+    (the lea didn't run yet). After the rewrite, dec sees the same
+    flag state it would after lea (= no change), then sets its own
+    flags. Safe.
+    """
+    asm = (
+        "_f:\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, ecx\n"
+        "        dec     dword [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     eax, [eax + ecx*4]" in out
+    assert opt.stats.get("shl_add_reg_to_lea", 0) == 1
