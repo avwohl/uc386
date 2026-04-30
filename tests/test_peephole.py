@@ -12375,6 +12375,168 @@ def test_lea_sib_load_collapse_dest_overwrites_lea_reg():
     assert opt.stats.get("lea_sib_load_collapse", 0) == 1
 
 
+# ── lea_self_sib_into_load ────────────────────────────────────────
+
+
+def test_lea_self_sib_into_load_basic():
+    """`lea reg, [reg + idx*scale]; mov reg, [reg + disp]` →
+    `mov reg, [reg + idx*scale + disp]`. Common in struct-array
+    `.member` access. Saves 3 bytes."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        lea     eax, [eax + ecx*8]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     eax, [eax + ecx*8]" not in out
+    assert "[eax + ecx*8 + 4]" in out
+    assert opt.stats.get("lea_self_sib_into_load", 0) == 1
+
+
+def test_lea_self_sib_into_load_no_disp():
+    """`lea reg, [reg + idx*scale]; mov reg, [reg]` →
+    `mov reg, [reg + idx*scale]`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        lea     eax, [eax + ecx*4]\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     eax" not in out
+    assert "[eax + ecx*4]" in out
+    assert opt.stats.get("lea_self_sib_into_load", 0) == 1
+
+
+def test_lea_self_sib_into_load_movsx():
+    """movsx target works when target == lea reg (load overwrites)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        lea     eax, [eax + ecx*2]\n"
+        "        movsx   eax, word [eax]\n"  # dst=eax overwrites lea reg
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     eax" not in out
+    assert "movsx" in out and "[eax + ecx*2]" in out
+    assert opt.stats.get("lea_self_sib_into_load", 0) == 1
+
+
+def test_lea_self_sib_into_load_lea_with_disp1():
+    """LEA's source can include a +/- disp; folded into combined
+    disp. `lea eax, [eax + ecx*4 + 8]; mov eax, [eax + 4]` →
+    `mov eax, [eax + ecx*4 + 12]`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        lea     eax, [eax + ecx*4 + 8]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "[eax + ecx*4 + 12]" in out
+    assert opt.stats.get("lea_self_sib_into_load", 0) == 1
+
+
+def test_lea_self_sib_into_load_combined_disp_zero():
+    """Disp1 + Disp2 = 0 → drops the disp entirely."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        lea     eax, [eax + ecx*4 + 8]\n"
+        "        mov     eax, [eax - 8]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "[eax + ecx*4]" in out
+    assert "+ 0" not in out and " - 0" not in out
+
+
+def test_lea_self_sib_into_load_skips_when_b_has_sib():
+    """If B's address has its own SIB, the result would need two
+    scaled indices — bail."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        lea     eax, [eax + ecx*4]\n"
+        "        mov     eax, [eax + edx*2]\n"  # B has its own SIB
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("lea_self_sib_into_load", 0) == 0
+
+
+def test_lea_self_sib_into_load_skips_when_lea_not_self():
+    """LEA must be self-modifying (dst == base). `lea eax, [_g + ...]`
+    isn't this pattern."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [_g + ecx*4]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("lea_self_sib_into_load", 0) == 0
+
+
+def test_lea_self_sib_into_load_skips_when_idx_writeen():
+    """If idx is written between A and B, the LEA's result
+    differs from the substitution. Bail."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        lea     eax, [eax + ecx*4]\n"
+        "        mov     ecx, 99\n"  # writes idx
+        "        mov     eax, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("lea_self_sib_into_load", 0) == 0
+
+
+def test_lea_self_sib_into_load_idx_read_ok():
+    """Idx may be read between A and B (as long as not written)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        lea     eax, [eax + ecx*4]\n"
+        "        cmp     ecx, 0\n"  # reads idx but doesn't write
+        "        mov     eax, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # cmp is allowed; pass should fire.
+    assert opt.stats.get("lea_self_sib_into_load", 0) == 1
+
+
+def test_lea_self_sib_into_load_skips_when_dst_differs_and_reg_live():
+    """If DST != REG and REG is live after, can't drop the LEA."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        lea     eax, [eax + ecx*4]\n"
+        "        mov     edx, [eax + 4]\n"  # dst=edx, reg=eax
+        "        mov     [_addr], eax\n"  # eax read after — live
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("lea_self_sib_into_load", 0) == 0
+
+
 # ── dup_addr_compute_collapse ─────────────────────────────────────
 
 

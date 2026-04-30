@@ -475,6 +475,7 @@ class PeepholeOptimizer:
             lines = self._pass_lea_load_collapse(lines)
             lines = self._pass_lea_sib_load_collapse(lines)
             lines = self._pass_lea_sib_label_load_collapse(lines)
+            lines = self._pass_lea_self_sib_into_load(lines)
             lines = self._pass_lea_offset_fold(lines)
             lines = self._pass_lea_forward_to_reg(lines)
             lines = self._pass_lea_store_collapse(lines)
@@ -13624,6 +13625,183 @@ class PeepholeOptimizer:
                 self.stats.get(
                     "lea_sib_label_load_collapse", 0
                 ) + 1
+            )
+            continue
+        return out
+
+    def _pass_lea_self_sib_into_load(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse the codegen's struct-array element-access pattern.
+
+        Pattern (2 instrs, possibly with intermediates between):
+            lea     REG, [REG + IDX*SCALE]            ; A
+            ... independent intermediate ops ...      ; (don't touch REG/IDX)
+            mov/movsx/movzx DST, [REG (+ DISP2)?]      ; B
+
+        (LEA's source can also include a +/- DISP1.) Rewrite to:
+            ... intermediate ...
+            mov/movsx/movzx DST, [REG + IDX*SCALE + (DISP1+DISP2)]
+
+        Drops A. Saves 3 bytes per match. Common in
+        ``arr[i].member`` for struct arrays whose sizeof doesn't fit
+        x86 SIB scale (sizeof not in {1, 2, 4, 8} — codegen emits
+        ``mul``-then-add) AND for sizeof-fitting struct arrays where
+        ``arr[i]`` is followed by a non-zero member offset.
+
+        Conditions:
+        - A: ``lea REG, [REG + IDX*SCALE (+ DISP1)?]`` — LEA's
+          destination is also referenced inside its source (the
+          self-modifying form). IDX must be a different reg from
+          REG. Scale ∈ {1, 2, 4, 8}.
+        - Up to 8 intermediate instructions, none of which write or
+          read REG, and none of which write IDX. (IDX may be read.)
+        - B: ``mov/movsx/movzx DST, [REG (+ DISP2)?]`` — REG used
+          as plain base, no SIB on B's address. (B with its own
+          SIB would need two scaled indices in the result, which
+          x86 modrm doesn't support — bail.)
+        - DST == REG OR REG dead after B (treat_as_scratch=False —
+          REG might be EAX as the return value, which we mustn't
+          drop the address-of-something-just-loaded).
+        """
+        out = list(lines)
+        i = 0
+        max_intermediate = 8
+        # Match `[REG + IDX*SCALE]` or `[REG + IDX*SCALE + DISP]` /
+        # `[REG + IDX*SCALE - DISP]`.
+        lea_sib_re = re.compile(
+            r"^\s*\[\s*(\w+)\s*\+\s*(\w+)\s*\*\s*(\d+)"
+            r"(?:\s*([+-])\s*(\d+))?\s*\]\s*$",
+            re.IGNORECASE,
+        )
+        # B's address: `[REG]` or `[REG + DISP]` / `[REG - DISP]`,
+        # with optional size prefix.
+        load_re = re.compile(
+            r"^\s*(?:(dword|word|byte|qword)\s+)?"
+            r"\[\s*(\w+)(?:\s*([+-])\s*(\d+))?\s*\]\s*$",
+            re.IGNORECASE,
+        )
+        while i < len(out):
+            a = out[i]
+            if not (a.kind == "instr" and a.op == "lea"):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            if ap is None:
+                i += 1
+                continue
+            r1 = ap[0].strip().lower()
+            if not self._is_general_register(r1):
+                i += 1
+                continue
+            m_lea = lea_sib_re.match(ap[1])
+            if m_lea is None:
+                i += 1
+                continue
+            base = m_lea.group(1).lower()
+            idx = m_lea.group(2).lower()
+            scale = int(m_lea.group(3))
+            disp1 = 0
+            if m_lea.group(4) is not None:
+                disp1 = int(m_lea.group(5))
+                if m_lea.group(4) == "-":
+                    disp1 = -disp1
+            # LEA must be self-modifying: dst == base.
+            if base != r1:
+                i += 1
+                continue
+            # IDX must be a different reg, and scale must fit.
+            if idx == r1 or scale not in (1, 2, 4, 8):
+                i += 1
+                continue
+            if not self._is_general_register(idx):
+                i += 1
+                continue
+            # Walk forward looking for a load using r1 as base.
+            j = i + 1
+            steps = 0
+            while j < len(out) and steps < max_intermediate:
+                ln = out[j]
+                if ln.kind in ("blank", "comment"):
+                    j += 1
+                    continue
+                if ln.kind != "instr":
+                    break
+                # Intermediate must not touch r1.
+                if self._references_reg_family(ln.operands, r1):
+                    if (
+                        ln.op in ("mov", "movsx", "movzx")
+                        and self._uses_reg_as_base(ln, r1)
+                    ):
+                        break
+                    break
+                # Intermediate must not WRITE idx (reads OK).
+                if self._instr_writes_reg(ln, idx):
+                    break
+                steps += 1
+                j += 1
+            else:
+                i += 1
+                continue
+            if j >= len(out):
+                i += 1
+                continue
+            b = out[j]
+            if not (
+                b.kind == "instr"
+                and b.op in ("mov", "movsx", "movzx")
+            ):
+                i += 1
+                continue
+            bp = _operands_split(b.operands)
+            if bp is None:
+                i += 1
+                continue
+            r2 = bp[0].strip().lower()
+            if not self._is_general_register(r2):
+                i += 1
+                continue
+            m_b = load_re.match(bp[1])
+            if m_b is None:
+                # Maybe B has SIB; bail (would need 2 scaled idx).
+                i += 1
+                continue
+            size_kw = m_b.group(1) or ""
+            b_base = m_b.group(2).lower()
+            if b_base != r1:
+                # B's base is some other register; not our pattern.
+                i += 1
+                continue
+            disp2 = 0
+            if m_b.group(3) is not None:
+                disp2 = int(m_b.group(4))
+                if m_b.group(3) == "-":
+                    disp2 = -disp2
+            # Liveness: r1 dead after B, OR r1 == r2 (overwritten).
+            if r1 != r2 and not self._reg_dead_after(out, j + 1, r1):
+                i += 1
+                continue
+            # Build collapsed B: `[r1 + idx*scale + (disp1+disp2)]`.
+            combined_disp = disp1 + disp2
+            disp_text = ""
+            if combined_disp > 0:
+                disp_text = f" + {combined_disp}"
+            elif combined_disp < 0:
+                disp_text = f" - {-combined_disp}"
+            new_addr = f"[{r1} + {idx}*{scale}{disp_text}]"
+            if size_kw:
+                new_addr = f"{size_kw} {new_addr}"
+            indent = self._extract_indent(b.raw)
+            new_raw = (
+                f"{indent}{b.op:<7s} {r2}, {new_addr}"
+            )
+            new_b = Line(
+                raw=new_raw, kind="instr",
+                op=b.op, operands=f"{r2}, {new_addr}",
+            )
+            out = out[:i] + out[i + 1:j] + [new_b] + out[j + 1:]
+            self.stats["lea_self_sib_into_load"] = (
+                self.stats.get("lea_self_sib_into_load", 0) + 1
             )
             continue
         return out
