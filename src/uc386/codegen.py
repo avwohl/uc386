@@ -13977,8 +13977,8 @@ class CodeGenerator:
                 location=expr.location,
             )
 
-        # NOTE: The PEEPHOLE_PLAN.md proposes a printf("...\n") → puts("...")
-        # rewrite as part of Phase E. For uc386 specifically this is a NET
+        # NOTE: a printf("...\n") → puts("...") rewrite was evaluated and
+        # rejected for uc386. Rationale: NET
         # LOSS: `_printf` delegates to dos_emu's INT 21h AH=0x5F host-side
         # printf (the format parser lives in dos_emu.py, not in libc), so
         # the libc body is just ~13 instructions of "load fd, fmt, va; INT

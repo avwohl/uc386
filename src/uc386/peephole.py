@@ -152,7 +152,7 @@ Currently implements:
     bytes per match. Common in string/byte loops:
     `while (*p) p++;` → `... cmp byte [eax], 0; jz end ...`.
 
-Patterns to add (see PEEPHOLE_PLAN.md for details): tail calls,
+Long-tail patterns not yet implemented: tail calls, additional
 jump threading, multi-instruction right-operand retargeting.
 """
 
