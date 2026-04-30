@@ -525,6 +525,7 @@ class PeepholeOptimizer:
             lines = self._pass_push_const_index_fold(lines)
             lines = self._pass_trampoline_elimination(lines)
             lines = self._pass_pure_leaf_drop_frame(lines)
+            lines = self._pass_drop_dead_frame_alloc(lines)
             # Drop labels that aren't referenced anywhere. Other
             # passes may have replaced jcc/jmp targets, leaving some
             # labels orphaned. After dropping, dead_after_terminator
@@ -18826,6 +18827,199 @@ class PeepholeOptimizer:
             line.operands or "",
             re.IGNORECASE,
         ))
+
+    def _pass_drop_dead_frame_alloc(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Slice Y v2: drop the stack-frame allocation when the
+        function's body has zero `[ebp - N]` (local) accesses but
+        does have calls. Keeps the `push ebp / mov ebp, esp` pair
+        (so [ebp + N] param accesses survive across calls) but
+        drops the `sub esp, K` (or rewrites `enter K, 0` to
+        `push ebp; mov ebp, esp`).
+
+        Pattern (per function):
+            _fn:
+                    push    ebp
+                    mov     ebp, esp
+                    sub     esp, K           ; ← drop this
+                    <body — references [ebp + N] for params; may
+                    have calls; NO [ebp - N] (locals dead)>
+                    leave
+                    ret
+        Or:
+            _fn:
+                    enter   K, 0             ; ← rewrite to push/mov
+                    <body>
+                    leave
+                    ret
+
+        Saves 3 bytes per fire (sub esp K → 0) or 1 byte per fire
+        (enter K, 0 = 4 bytes → push ebp; mov ebp, esp = 3 bytes).
+
+        Sister of `pure_leaf_drop_frame`: that pass requires NO
+        calls in body (so it can replace [ebp + N] with [esp + N-4]
+        and drop the EBP frame entirely). This pass keeps EBP for
+        param access so it works on non-leaf functions where
+        peephole has eliminated all the local accesses.
+        """
+        out = list(lines)
+        ranges = self._function_ranges(out)
+        replacements: list[tuple[int, int, list[Line]]] = []
+        for start, end in ranges:
+            if (
+                out[start].kind != "label"
+                or out[start].label.startswith(".")
+            ):
+                continue
+            i = start + 1
+            while i < end and out[i].kind in ("blank", "comment"):
+                i += 1
+            # Three prologue forms:
+            # 1. push ebp; mov ebp, esp; sub esp, K  → drop sub
+            # 2. enter K, 0                          → rewrite to push/mov
+            # Fast bail when neither matches.
+            push_idx = -1
+            mov_idx = -1
+            sub_idx = -1
+            enter_idx = -1
+            if (
+                i < end
+                and out[i].kind == "instr"
+                and out[i].op == "push"
+                and out[i].operands.strip().lower() == "ebp"
+            ):
+                push_idx = i
+                i += 1
+                while i < end and out[i].kind in ("blank", "comment"):
+                    i += 1
+                if not (
+                    i < end
+                    and out[i].kind == "instr"
+                    and out[i].op == "mov"
+                    and out[i].operands.strip().lower() == "ebp, esp"
+                ):
+                    continue
+                mov_idx = i
+                i += 1
+                while i < end and out[i].kind in ("blank", "comment"):
+                    i += 1
+                if not (
+                    i < end
+                    and out[i].kind == "instr"
+                    and out[i].op == "sub"
+                    and re.match(
+                        r"^\s*esp\s*,\s*\d+\s*$",
+                        out[i].operands or "", re.IGNORECASE,
+                    )
+                ):
+                    continue
+                sub_idx = i
+                body_start = sub_idx + 1
+            elif (
+                i < end
+                and out[i].kind == "instr"
+                and out[i].op == "enter"
+                and re.match(
+                    r"^\s*\d+\s*,\s*0\s*$",
+                    out[i].operands or "", re.IGNORECASE,
+                )
+            ):
+                enter_idx = i
+                body_start = enter_idx + 1
+            else:
+                continue
+            # Function ends with `leave; ret`.
+            j = end - 1
+            while j >= body_start and out[j].kind in (
+                "blank", "comment",
+            ):
+                j -= 1
+            if not (
+                j >= body_start
+                and out[j].kind == "instr"
+                and out[j].op == "ret"
+            ):
+                continue
+            j -= 1
+            while j >= body_start and out[j].kind in (
+                "blank", "comment",
+            ):
+                j -= 1
+            if not (
+                j >= body_start
+                and out[j].kind == "instr"
+                and out[j].op == "leave"
+            ):
+                continue
+            leave_idx = j
+            # Body must have NO [ebp - N] accesses (locals dead).
+            # Also no SIB-form ebp accesses (variable-offset, can't
+            # reason about), and no [esp + N] accesses (would mean
+            # the body uses ESP-relative scratch that depends on
+            # the prologue's `sub esp` allocation — dropping the
+            # alloc would shift those accesses to invalid memory).
+            body_clean = True
+            for k in range(body_start, leave_idx):
+                ln = out[k]
+                if ln.kind != "instr":
+                    continue
+                ops = ln.operands or ""
+                if re.search(
+                    r"\[\s*ebp\s*-\s*\d+\s*\]", ops, re.IGNORECASE,
+                ):
+                    body_clean = False
+                    break
+                if re.search(
+                    r"\[\s*ebp\s*\+\s*\w+\s*\*", ops, re.IGNORECASE,
+                ):
+                    body_clean = False
+                    break
+                # `[esp + N]` (any positive offset) — body relies
+                # on ESP relative to the prologue's allocated
+                # scratch. Bail.
+                if re.search(
+                    r"\[\s*esp\s*\+\s*\w+", ops, re.IGNORECASE,
+                ):
+                    body_clean = False
+                    break
+                if re.search(
+                    r"\[\s*esp\s*\]", ops, re.IGNORECASE,
+                ):
+                    body_clean = False
+                    break
+            if not body_clean:
+                continue
+            # Build the rewrite.
+            if enter_idx >= 0:
+                # Rewrite `enter K, 0` to `push ebp; mov ebp, esp`.
+                indent = self._extract_indent(out[enter_idx].raw)
+                push_line = Line(
+                    raw=f"{indent}push    ebp",
+                    kind="instr", op="push", operands="ebp",
+                )
+                mov_line = Line(
+                    raw=f"{indent}mov     ebp, esp",
+                    kind="instr", op="mov", operands="ebp, esp",
+                )
+                new_lines = (
+                    out[start:enter_idx]
+                    + [push_line, mov_line]
+                    + out[enter_idx + 1:end]
+                )
+            else:
+                # Drop the `sub esp, K` line.
+                new_lines = (
+                    out[start:sub_idx]
+                    + out[sub_idx + 1:end]
+                )
+            replacements.append((start, end, new_lines))
+            self.stats["drop_dead_frame_alloc"] = (
+                self.stats.get("drop_dead_frame_alloc", 0) + 1
+            )
+        for start, end, new_lines in reversed(replacements):
+            out = out[:start] + new_lines + out[end:]
+        return out
 
     @staticmethod
     def _rewrite_ebp_to_esp_in_line(line: Line) -> Line:

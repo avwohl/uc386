@@ -13717,6 +13717,91 @@ def test_pure_leaf_drop_frame_with_sub_esp_in_prologue():
     assert opt.stats.get("pure_leaf_drop_frame", 0) == 1
 
 
+# ── drop_dead_frame_alloc (Slice Y v2) ────────────────────────────
+
+
+def test_drop_dead_frame_alloc_sub_esp():
+    """Non-leaf function with `sub esp K` but no `[ebp - N]` body
+    accesses. Drop just the `sub esp K` (keep EBP for params)."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        sub     esp, 8\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        push    eax\n"
+        "        call    _helper\n"
+        "        pop     ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "sub     esp" not in out
+    assert "push    ebp" in out
+    assert "leave" in out
+    assert opt.stats.get("drop_dead_frame_alloc", 0) == 1
+
+
+def test_drop_dead_frame_alloc_enter_form():
+    """`enter K, 0` form rewrites to `push ebp; mov ebp, esp` when
+    body has no [ebp - N] accesses but does have calls."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        push    eax\n"
+        "        call    _helper\n"
+        "        pop     ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "enter" not in out
+    assert "push    ebp" in out
+    assert "mov     ebp, esp" in out
+    assert "leave" in out
+    assert opt.stats.get("drop_dead_frame_alloc", 0) == 1
+
+
+def test_drop_dead_frame_alloc_skips_when_locals_used():
+    """Body uses [ebp - N] in a way that survives other peephole
+    passes — we can't drop the frame allocation."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        sub     esp, 8\n"
+        "        call    _seed\n"  # writes EAX
+        "        mov     [ebp - 4], eax\n"  # save call result
+        "        call    _other\n"  # clobbers EAX
+        "        add     eax, [ebp - 4]\n"  # use saved local
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("drop_dead_frame_alloc", 0) == 0
+
+
+def test_drop_dead_frame_alloc_skips_when_sib_ebp():
+    """SIB-form ebp accesses (e.g. `[ebp + ecx*4]`) are
+    variable-offset; can't reason about — bail."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        sub     esp, 16\n"
+        "        mov     eax, [ebp + ecx*4]\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("drop_dead_frame_alloc", 0) == 0
+
+
 def test_pure_leaf_drop_frame_skips_when_locals_present():
     """If the body accesses [ebp - N] (a local), the function has a
     real frame — bail."""
