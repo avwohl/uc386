@@ -10581,21 +10581,41 @@ class PeepholeOptimizer:
                 offset_d = int(d_match.group(2))
                 if d_match.group(1) == "-":
                     offset_d = -offset_d
-            if offset_b != offset_d:
-                i += 1
-                continue
-            # All checks pass. Replace lines C and D with
-            # `mov R2, R1`.
             indent = self._extract_indent(c.raw)
-            new_raw = f"{indent}mov     {r2}, {r1}"
-            new_line = Line(
-                raw=new_raw, kind="instr", op="mov",
-                operands=f"{r2}, {r1}",
-            )
-            out = out[:i + 2] + [new_line] + out[i + 4:]
-            self.stats["dup_load_chain_to_copy"] = (
-                self.stats.get("dup_load_chain_to_copy", 0) + 1
-            )
+            if offset_b == offset_d:
+                # Same offset: drop C and D, replace with mov R2, R1.
+                # End state: R1 == R2 == *(base + N).
+                new_raw = f"{indent}mov     {r2}, {r1}"
+                new_line = Line(
+                    raw=new_raw, kind="instr", op="mov",
+                    operands=f"{r2}, {r1}",
+                )
+                out = out[:i + 2] + [new_line] + out[i + 4:]
+                self.stats["dup_load_chain_to_copy"] = (
+                    self.stats.get("dup_load_chain_to_copy", 0) + 1
+                )
+            else:
+                # Different offsets: drop C only; insert `mov R2, R1`
+                # BEFORE B (so R2 has base before R1 is clobbered by
+                # B's deref). After this, B clobbers R1 to *(base+N1)
+                # and D reads R2 (still = base) for *(base+N2).
+                # Saves 1 byte: 3-byte ebp-rel `mov R2, [m]` →
+                # 2-byte `mov R2, R1`.
+                new_raw = f"{indent}mov     {r2}, {r1}"
+                new_line = Line(
+                    raw=new_raw, kind="instr", op="mov",
+                    operands=f"{r2}, {r1}",
+                )
+                out = (
+                    out[:i + 1]
+                    + [new_line, b, d]
+                    + out[i + 4:]
+                )
+                self.stats["dup_load_chain_to_copy_diff_off"] = (
+                    self.stats.get(
+                        "dup_load_chain_to_copy_diff_off", 0
+                    ) + 1
+                )
             # Don't advance — re-check from current pos.
         return out
 

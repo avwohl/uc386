@@ -5710,8 +5710,18 @@ def test_dup_load_chain_to_copy_with_offset():
     assert opt.stats.get("dup_load_chain_to_copy") == 1
 
 
-def test_dup_load_chain_to_copy_different_offset_skips():
-    """Mismatched offsets — different members of the same struct."""
+def test_dup_load_chain_to_copy_different_offset_fires():
+    """Mismatched offsets — different members of the same struct.
+    Drops the redundant `mov R2, [m]` and inserts a `mov R2, R1`
+    BEFORE B (so R2 has base before R1 is clobbered by the deref).
+    Saves 1 byte (3-byte ebp-rel mem load → 2-byte reg-reg copy).
+
+    Original:                       Rewrite:
+        mov eax, [ebp + 8]              mov eax, [ebp + 8]
+        mov eax, [eax + 4]              mov ecx, eax        ; new
+        mov ecx, [ebp + 8]              mov eax, [eax + 4]
+        mov ecx, [ecx + 8]              mov ecx, [ecx + 8]
+    """
     asm = (
         "_f:\n"
         "        mov     eax, [ebp + 8]\n"
@@ -5722,8 +5732,12 @@ def test_dup_load_chain_to_copy_different_offset_skips():
         "        ret\n"
     )
     opt = PeepholeOptimizer()
-    opt.optimize(asm)
+    out = opt.optimize(asm)
+    assert "mov     ecx, [ebp + 8]" not in out
+    assert "mov     ecx, eax" in out
+    # The original same-offset stat doesn't fire here.
     assert opt.stats.get("dup_load_chain_to_copy", 0) == 0
+    assert opt.stats.get("dup_load_chain_to_copy_diff_off") == 1
 
 
 def test_dup_load_chain_to_copy_skips_intermediate_instr():

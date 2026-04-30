@@ -1492,3 +1492,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`_fill` (loop array fill)**: 7-line loop body shrinks to 4 lines — `mov eax, [arr]; mov ecx, [i]; mov edx, [val]; mov [eax + ecx*4], edx`. Saves 3 instructions per loop iteration.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +1 peephole test (5 total in this slice). 979 unit tests. Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: dup_load_chain_to_copy extended for differing offsets**: extends the existing pass to handle the case where the two derefs use DIFFERENT offsets. Saves 1 byte per match by replacing the redundant `mov R2, [m]` with a `mov R2, R1` (reg-reg copy is 1 byte shorter than ebp-rel mem load).
+  - **Original pattern**: `mov R1, [m]; mov R1, [R1 + N1]; mov R2, [m]; mov R2, [R2 + N2]` — each register loads m and dereferences at a different offset.
+  - **Same-offset case (N1 == N2, existing)**: drop C and D, replace with `mov R2, R1`. R1 == R2 at end. Saves 4 bytes.
+  - **Different-offset case (N1 != N2, NEW)**: drop C only; insert `mov R2, R1` BEFORE B. Order becomes A, NEW, B, D. After NEW, R2 = base. After B, R1 = *(base + N1) (R2 still = base). After D, R2 = *(base + N2). Saves 1 byte.
+  - **Common shape**: `s->x + s->y` (different members of same struct). The codegen evaluates each operand independently, loading the struct pointer each time. The new sub-case allows the second pointer load to be a register copy.
+  - **Stat keys**: `dup_load_chain_to_copy` (same-offset), `dup_load_chain_to_copy_diff_off` (different-offset).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. Updated 1 existing test (now expects fire instead of skip). 979 unit tests. Pipeline 1734/1734 (100%).
