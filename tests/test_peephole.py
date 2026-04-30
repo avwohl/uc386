@@ -5920,6 +5920,165 @@ def test_copy_save_deref_collapse_skips_when_r1_eq_r2():
     assert opt.stats.get("copy_save_deref_collapse", 0) == 0
 
 
+# ── dup_load_with_intermediate ────────────────────────────────────
+
+
+def test_dup_load_with_intermediate_basic():
+    """Linked-list traversal: load ptr, deref, accumulate, RELOAD
+    ptr, deref, advance. The reload is redundant when we route the
+    first load to a different register that survives the deref.
+
+    Original:                       After:
+        mov ecx, [ebp + 8]              mov eax, [ebp + 8]
+        mov ecx, [ecx]                  mov ecx, [eax]
+        add [ebp - 4], ecx              add [ebp - 4], ecx
+        mov eax, [ebp + 8]              mov eax, [eax + 4]
+        mov eax, [eax + 4]              mov [ebp + 8], eax
+        mov [ebp + 8], eax
+    """
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        mov     ecx, [ecx]\n"
+        "        add     dword [ebp - 4], ecx\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        mov     [ebp + 8], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("dup_load_with_intermediate") == 1
+    # Only ONE `mov reg, [ebp + 8]` should remain (the load).
+    # The redundant second load is gone.
+    out_lines = [
+        ln.strip() for ln in out.split("\n")
+        if ln.strip().startswith("mov     eax, [ebp + 8]")
+        or ln.strip().startswith("mov     ecx, [ebp + 8]")
+    ]
+    assert len(out_lines) == 1
+
+
+def test_dup_load_with_intermediate_skips_when_m_modified():
+    """If intermediate code stores to [m], the rewrite is unsafe."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        mov     ecx, [ecx]\n"
+        "        mov     [ebp + 8], 42\n"  # modifies [m]!
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dup_load_with_intermediate", 0) == 0
+
+
+def test_dup_load_with_intermediate_skips_when_r2_read():
+    """If intermediate code reads R2, the rewrite breaks because in
+    the rewrite R2 holds [m]'s value, not its pre-A value."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        mov     ecx, [ecx]\n"
+        "        mov     [ebp - 4], eax\n"  # reads R2 (eax)
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dup_load_with_intermediate", 0) == 0
+
+
+def test_dup_load_with_intermediate_skips_when_r2_written():
+    """If intermediate code writes R2, the rewrite breaks because
+    by E, R2 doesn't hold [m] anymore."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        mov     ecx, [ecx]\n"
+        "        xor     eax, eax\n"  # writes R2 (eax)
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dup_load_with_intermediate", 0) == 0
+
+
+def test_dup_load_with_intermediate_skips_when_call_in_between():
+    """Function calls invalidate the cross-block assumption (callee
+    might modify [m])."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        mov     ecx, [ecx]\n"
+        "        call    _helper\n"  # could modify anything
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dup_load_with_intermediate", 0) == 0
+
+
+def test_dup_load_with_intermediate_skips_when_label_in_between():
+    """Labels create CFG entry points; the rewrite would change
+    semantics for any predecessor that jumps to the label."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        mov     ecx, [ecx]\n"
+        ".L_mid:\n"  # external entry point
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dup_load_with_intermediate", 0) == 0
+
+
+def test_dup_load_with_intermediate_with_offset_in_b():
+    """B can have any offset (not just zero)."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        mov     ecx, [ecx + 12]\n"
+        "        add     dword [ebp - 4], ecx\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + 16]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("dup_load_with_intermediate") == 1
+    # First deref now uses EAX as base.
+    assert "mov     ecx, [eax + 12]" in out
+
+
+def test_dup_load_with_intermediate_skips_when_addr_taken():
+    """If [m]'s address is taken via lea, then a register-base
+    write in intermediate could alias [m]."""
+    asm = (
+        "_f:\n"
+        "        lea     edx, [ebp + 8]\n"  # address-take
+        "        mov     ecx, [ebp + 8]\n"
+        "        mov     ecx, [ecx]\n"
+        "        mov     [edx], 99\n"  # could alias [ebp + 8]!
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dup_load_with_intermediate", 0) == 0
+
+
 # ── xfer_store_collapse ───────────────────────────────────────────
 
 

@@ -456,6 +456,7 @@ class PeepholeOptimizer:
             lines = self._pass_dead_store_before_push(lines)
             lines = self._pass_dup_load_chain_to_copy(lines)
             lines = self._pass_copy_save_deref_collapse(lines)
+            lines = self._pass_dup_load_with_intermediate(lines)
             lines = self._pass_redundant_mem_load_via_xfer(lines)
             lines = self._pass_load_add_xfer_forward(lines)
             lines = self._pass_byte_stores_to_dword(lines)
@@ -10729,6 +10730,239 @@ class PeepholeOptimizer:
             out = out[:i] + [new_a, new_c, d] + out[i + 4:]
             self.stats["copy_save_deref_collapse"] = (
                 self.stats.get("copy_save_deref_collapse", 0) + 1
+            )
+        return out
+
+    def _pass_dup_load_with_intermediate(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Eliminate the second of two same-source loads when
+        separated by intermediate code that doesn't disturb [m] or
+        the second register. Pattern:
+
+            mov R1, [m]              ; A
+            mov R1, [R1] or [R1+N1]  ; B
+            ... K >= 1 instructions, no labels/jumps/calls ...
+              (must not modify [m] or read/write R2)
+            mov R2, [m]              ; D (drop)
+            mov R2, [R2] or [R2+N2]  ; E
+        →
+            mov R2, [m]              ; load directly to R2
+            mov R1, [R2] or [R2+N1]  ; deref via R2 to R1
+            ... intermediate ...     ; (R2 still holds m)
+            mov R2, [R2] or [R2+N2]  ; deref via R2
+
+        Saves 3 bytes per match (drops the second `mov R2, [m]`)
+        for ebp-relative m. Common in linked-list traversal where
+        the loop body uses ptr twice — once for `head->val`, once
+        for `head = head->next`.
+
+        Conditions:
+        - m is a literal `[ebp ± N]` slot (else aliasing analysis
+          isn't sound).
+        - R1 != R2, both 32-bit GP regs.
+        - Intermediate doesn't modify [m]: stores to other slots
+          are OK; register-base writes are OK iff [m]'s offset
+          isn't address-taken anywhere in the function.
+        - Intermediate doesn't read or write R2 (in original R2
+          holds its pre-A value; in rewrite R2 holds `m`'s value).
+        - No control flow in intermediate (calls, jumps, labels)
+          — those would invalidate the cross-block assumption.
+        """
+        out = list(lines)
+        addr_taken_per_line = self._compute_addr_taken_per_line(out)
+        MAX_INTERMEDIATE = 16
+        i = 0
+        while i + 4 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op == "mov"
+                and b.kind == "instr" and b.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            if ap is None or bp is None:
+                i += 1
+                continue
+            r1 = ap[0].strip().lower()
+            m_text = ap[1].strip()
+            if not self._is_general_register(r1):
+                i += 1
+                continue
+            if not (m_text.startswith("[") and m_text.endswith("]")):
+                i += 1
+                continue
+            if self._ebp_offset(m_text) is None:
+                i += 1
+                continue
+            if bp[0].strip().lower() != r1:
+                i += 1
+                continue
+            b_match = re.match(
+                r"^\[\s*" + re.escape(r1)
+                + r"(?:\s*([+-])\s*(\d+))?\s*\]$",
+                bp[1].strip(), re.IGNORECASE,
+            )
+            if b_match is None:
+                i += 1
+                continue
+            # Forward scan for D = `mov R2, [m]` then E = deref R2.
+            j = i + 2
+            d_idx = None
+            r2 = None
+            e_match = None
+            failed = False
+            intermediate_count = 0
+            while j < len(out) and intermediate_count <= MAX_INTERMEDIATE:
+                line = out[j]
+                if line.kind == "label" or line.kind == "directive":
+                    failed = True
+                    break
+                if line.kind != "instr":
+                    j += 1
+                    continue
+                # Test if this is D.
+                if line.op == "mov":
+                    lp = _operands_split(line.operands)
+                    if lp is not None:
+                        cand_dst = lp[0].strip().lower()
+                        cand_src = lp[1].strip()
+                        if (
+                            self._is_general_register(cand_dst)
+                            and cand_dst != r1
+                            and cand_src == m_text
+                        ):
+                            # Check D+1 is E.
+                            if j + 1 < len(out):
+                                e = out[j + 1]
+                                if (
+                                    e.kind == "instr"
+                                    and e.op == "mov"
+                                ):
+                                    ep = _operands_split(e.operands)
+                                    if ep is not None:
+                                        if (
+                                            ep[0].strip().lower()
+                                            == cand_dst
+                                        ):
+                                            e_m = re.match(
+                                                r"^\[\s*"
+                                                + re.escape(cand_dst)
+                                                + r"(?:\s*([+-])"
+                                                + r"\s*(\d+))?\s*\]$",
+                                                ep[1].strip(),
+                                                re.IGNORECASE,
+                                            )
+                                            if e_m is not None:
+                                                r2 = cand_dst
+                                                d_idx = j
+                                                e_match = e_m
+                                                break
+                # Not D. Check intermediate constraints.
+                if line.op in {"call", "ret", "iret", "iretd",
+                               "retn", "retf", "leave", "enter"}:
+                    failed = True
+                    break
+                if line.op.startswith("j"):
+                    failed = True
+                    break
+                ops_text = line.operands or ""
+                # Check whether this line modifies [m].
+                # Two-operand stores: dest is a memory operand.
+                # One-operand RMW (inc/dec/neg/not/shl/shr/sar/etc.):
+                # operand is the modified location.
+                two_op = _operands_split(ops_text)
+                if two_op is not None:
+                    dest_op = two_op[0].strip()
+                    if "[" in dest_op:
+                        if not self._mem_disjoint_with_taken(
+                            m_text, dest_op,
+                            addr_taken_per_line[j],
+                        ):
+                            failed = True
+                            break
+                else:
+                    if line.op in {
+                        "inc", "dec", "neg", "not", "shl", "shr",
+                        "sar", "sal", "rol", "ror", "rcl", "rcr",
+                        "pop",
+                    }:
+                        op_only = (line.operands or "").strip()
+                        if "[" in op_only:
+                            if not self._mem_disjoint_with_taken(
+                                m_text, op_only,
+                                addr_taken_per_line[j],
+                            ):
+                                failed = True
+                                break
+                intermediate_count += 1
+                j += 1
+            if failed or d_idx is None or r2 is None:
+                i += 1
+                continue
+            # Need at least 1 intermediate instr. K=0 is handled by
+            # the existing dup_load_chain_to_copy passes.
+            if d_idx == i + 2:
+                i += 1
+                continue
+            # Second constraint: R2 not read/written in intermediate.
+            r2_safe = True
+            for k in range(i + 2, d_idx):
+                line = out[k]
+                if line.kind != "instr":
+                    continue
+                ops_text = line.operands or ""
+                if self._references_reg_family(ops_text, r2):
+                    r2_safe = False
+                    break
+                # Implicit-reg writers (cdq writes EDX, mul/idiv
+                # writes EDX:EAX, etc.) — bail on R2 in {eax, ecx,
+                # edx} if any implicit-reg user appears.
+                if (
+                    line.op in PeepholeOptimizer._IMPLICIT_REG_USERS
+                    and r2 in {"eax", "ecx", "edx", "esi", "edi"}
+                ):
+                    r2_safe = False
+                    break
+            if not r2_safe:
+                i += 1
+                continue
+            # All checks passed. Rewrite.
+            indent_a = self._extract_indent(a.raw)
+            indent_b = self._extract_indent(b.raw)
+            new_a_raw = f"{indent_a}mov     {r2}, {m_text}"
+            new_a = Line(
+                raw=new_a_raw, kind="instr", op="mov",
+                operands=f"{r2}, {m_text}",
+            )
+            if b_match.group(1) is None:
+                new_b_addr = f"[{r2}]"
+            else:
+                new_b_addr = (
+                    f"[{r2} {b_match.group(1)} "
+                    f"{b_match.group(2)}]"
+                )
+            new_b_raw = f"{indent_b}mov     {r1}, {new_b_addr}"
+            new_b = Line(
+                raw=new_b_raw, kind="instr", op="mov",
+                operands=f"{r1}, {new_b_addr}",
+            )
+            # Replace A and B with new_a and new_b; drop D; keep
+            # everything else.
+            out = (
+                out[:i]
+                + [new_a, new_b]
+                + out[i + 2:d_idx]
+                + out[d_idx + 1:]
+            )
+            addr_taken_per_line = self._compute_addr_taken_per_line(
+                out
+            )
+            self.stats["dup_load_with_intermediate"] = (
+                self.stats.get("dup_load_with_intermediate", 0) + 1
             )
         return out
 
