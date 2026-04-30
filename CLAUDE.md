@@ -1610,3 +1610,8 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete win on `_sum_first_n` (probe_next.c)**: loop body shrinks from 9 instructions to 6 — `mov edx, _g; shl eax, 2; add eax, edx; mov eax, [eax]` becomes `mov eax, [_g + eax*4]`. Saves ~10 bytes per qualifying iteration.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +8 peephole tests. 1042 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: mov_label_shl_add_load_to_sib with displacement**: extends the prior pass to handle `mov DST, [IDX + DISP]` and `mov DST, [IDX - DISP]` deref forms (in addition to the plain `[IDX]` form). The displacement folds into the SIB form: `mov BASE, LABEL; shl IDX, N; add IDX, BASE; mov DST, [IDX + 4]` collapses to `mov DST, [LABEL + IDX*scale + 4]`.
+  - **Common shape**: struct array indexing `pts[i].member` for a global struct array. The codegen materializes the struct base into a scratch register, then derefs `[reg + member_offset]` after the shl/add. Without this extension, `pts[i].x` (member offset 0) collapsed but `pts[i].y` (offset 4) didn't.
+  - **Concrete win**: `_sum_y` (sum of `pts[i].y` over a global `struct{int x,y;} pts[5]`) loop body shrinks from 9 instructions to 6 — `mov edx, _pts; shl eax, 3; add eax, edx; mov eax, [eax + 4]` becomes `mov eax, [_pts + eax*8 + 4]`.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +3 peephole tests. 1045 unit tests total. Pipeline 1734/1734 (100%).

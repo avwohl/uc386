@@ -10153,6 +10153,59 @@ def test_mov_label_shl_add_load_to_sib_skips_same_reg():
     assert opt.stats.get("mov_label_shl_add_load_to_sib", 0) == 0
 
 
+def test_mov_label_shl_add_load_to_sib_with_disp_8():
+    """`pts[i].member` for a struct array. The deref has a positive
+    member-offset displacement: `mov eax, [eax + 4]`. Pass folds the
+    displacement into the SIB form: `mov eax, [_pts + eax*8 + 4]`."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, _pts\n"
+        "        shl     eax, 3\n"
+        "        add     eax, edx\n"
+        "        mov     eax, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     edx, _pts" not in out
+    assert "shl     eax, 3" not in out
+    assert "add     eax, edx" not in out
+    assert "mov     eax, [_pts + eax*8 + 4]" in out
+    assert opt.stats.get("mov_label_shl_add_load_to_sib") == 1
+
+
+def test_mov_label_shl_add_load_to_sib_with_disp_negative():
+    """Negative displacement on the deref folds into the SIB form."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, _arr\n"
+        "        shl     eax, 2\n"
+        "        add     eax, edx\n"
+        "        mov     eax, [eax - 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [_arr + eax*4 - 4]" in out
+    assert opt.stats.get("mov_label_shl_add_load_to_sib") == 1
+
+
+def test_mov_label_shl_add_load_to_sib_with_disp_hex():
+    """Hex displacement also folds."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, _arr\n"
+        "        shl     eax, 2\n"
+        "        add     eax, edx\n"
+        "        mov     eax, [eax + 0x10]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [_arr + eax*4 + 0x10]" in out
+    assert opt.stats.get("mov_label_shl_add_load_to_sib") == 1
+
+
 def test_mov_label_shl_add_load_to_sib_loop_body():
     """Realistic loop body: cmp at top with EAX = i, body derefs
     `g[i]`. EDX is dead at function exit; .L1_for_top is a back-edge

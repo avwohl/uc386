@@ -6045,23 +6045,26 @@ class PeepholeOptimizer:
             A: mov BASE, LABEL
             B: shl IDX, N            ; N in {1, 2, 3}
             C: add IDX, BASE
-            D: mov/movsx/movzx DST, [IDX]
+            D: mov/movsx/movzx DST, [IDX (+/- DISP)?]
 
         Rewrite:
-            D': mov/movsx/movzx DST, [LABEL + IDX*scale]
+            D': mov/movsx/movzx DST, [LABEL + IDX*scale (+/- DISP)?]
 
         Drops A, B, C entirely. Saves 3 instructions / ~10 bytes.
 
         Common shape: a for-loop's body where the loop counter sits
         in EAX (loaded for the cmp at the loop top), then the body
-        derefs `g[i]`. Codegen picks a fresh register (EDX) to hold
-        the global base because EAX is busy with the index.
+        derefs `g[i]` (zero disp) or `s_arr[i].member` (non-zero
+        disp for member access). Codegen picks a fresh register
+        (EDX) to hold the global base because EAX is busy with the
+        index.
 
         Conditions:
         - BASE, IDX, DST are 32-bit GP registers; BASE != IDX.
         - LABEL is non-numeric, non-memory, non-register.
         - N in {1, 2, 3} (scale 2/4/8).
-        - D's mem operand is plain `[IDX]` (no displacement).
+        - D's mem operand is `[IDX]` or `[IDX + DISP]` /
+          `[IDX - DISP]` with literal DISP.
         - BASE dead after D (the original sequence ended with
           BASE = LABEL; after rewrite BASE keeps its pre-A value).
         - IDX dead after D OR DST == IDX (original ended with
@@ -6160,8 +6163,10 @@ class PeepholeOptimizer:
                     size_prefix = d_src[:len(prefix)]
                     d_src = d_src[len(prefix):].lstrip()
                     break
+            # Match `[IDX]` or `[IDX +/- DISP]`.
             mem_re = re.match(
-                r"^\[\s*([a-zA-Z]+)\s*\]$",
+                r"^\[\s*([a-zA-Z]+)\s*"
+                r"(?:([+-])\s*(\d+|0x[0-9a-fA-F]+))?\s*\]$",
                 d_src,
             )
             if mem_re is None:
@@ -6171,6 +6176,8 @@ class PeepholeOptimizer:
             if mem_reg != idx_reg:
                 i += 1
                 continue
+            disp_sign = mem_re.group(2)
+            disp_val = mem_re.group(3)
             # BASE must be dead after D (the rewrite leaves BASE at
             # its pre-A value; original ended with BASE = LABEL).
             # treat_as_scratch=True since BASE is a scratch holding a
@@ -6191,8 +6198,12 @@ class PeepholeOptimizer:
             # Rewrite.
             indent = self._extract_indent(d.raw)
             scale = SCALE[n]
+            disp_text = ""
+            if disp_sign and disp_val:
+                disp_text = f" {disp_sign} {disp_val}"
             new_src = (
-                f"{size_prefix}[{label} + {idx_reg}*{scale}]"
+                f"{size_prefix}"
+                f"[{label} + {idx_reg}*{scale}{disp_text}]"
             )
             opname = d.op
             spacer = " " * max(8 - len(opname), 1)
