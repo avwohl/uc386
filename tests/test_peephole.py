@@ -14782,3 +14782,136 @@ def test_const_fold_chain_sar_signed():
     assert ("mov     eax, 4294967295" in out
             or "or      eax, -1" in out)
     assert opt.stats.get("const_fold_chain", 0) == 1
+
+
+# ── dead_xor_or_chain_drop ───────────────────────────────────────
+
+
+def test_dead_xor_or_chain_drop_basic():
+    """`xor ecx, ecx; mov eax, 18; or ecx, eax` triplet where ECX is
+    dead after — drop both xor and or. Saves 4 bytes per match."""
+    asm = (
+        "_f:\n"
+        "        xor     ecx, ecx\n"
+        "        mov     eax, 18\n"
+        "        or      ecx, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     ecx, ecx" not in out
+    assert "or      ecx, eax" not in out
+    # The mov eax, 18 in the chain may or may not survive (other
+    # passes may drop it as dead). We only verify the xor + or drop.
+    assert opt.stats.get("dead_xor_or_chain_drop", 0) == 1
+
+
+def test_dead_xor_or_chain_drop_skips_when_t_live_after():
+    """If REG_T (ecx) is live after the OR (used by something), can't
+    drop — REG_T's end value matters."""
+    asm = (
+        "_f:\n"
+        "        xor     ecx, ecx\n"
+        "        mov     eax, 18\n"
+        "        or      ecx, eax\n"
+        "        push    ecx\n"   # uses ecx after the OR
+        "        call    _g\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_xor_or_chain_drop", 0) == 0
+
+
+def test_dead_xor_or_chain_drop_skips_when_chain_writes_t():
+    """If chain writes REG_T, the OR sees a non-zero REG_T and the
+    semantics aren't `OR(0, REG_X)`. Skip."""
+    asm = (
+        "_f:\n"
+        "        xor     ecx, ecx\n"
+        "        mov     ecx, 5\n"   # writes REG_T
+        "        or      ecx, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_xor_or_chain_drop", 0) == 0
+
+
+def test_dead_xor_or_chain_drop_skips_label_in_chain():
+    """A label between xor and or means control flow could enter
+    with REG_T non-zero — skip."""
+    asm = (
+        "_f:\n"
+        "        xor     ecx, ecx\n"
+        ".L_top:\n"
+        "        mov     eax, 18\n"
+        "        or      ecx, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_xor_or_chain_drop", 0) == 0
+
+
+def test_dead_xor_or_chain_drop_skips_call_in_chain():
+    """A call could clobber the surrounding state — skip."""
+    asm = (
+        "_f:\n"
+        "        xor     ecx, ecx\n"
+        "        call    _g\n"
+        "        or      ecx, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_xor_or_chain_drop", 0) == 0
+
+
+def test_dead_xor_or_chain_drop_skips_when_flags_read_after():
+    """xor + or both clobber flags. If a flag-reader follows the OR
+    before the next clobber, skip."""
+    asm = (
+        "_f:\n"
+        "        xor     ecx, ecx\n"
+        "        mov     eax, 18\n"
+        "        or      ecx, eax\n"
+        "        je      .L\n"   # reads ZF
+        "        ret\n"
+        ".L:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_xor_or_chain_drop", 0) == 0
+
+
+def test_dead_xor_or_chain_drop_pr70602_pattern():
+    """Real pattern from pr70602: 5 dead xor+or triplets in a row
+    where the slot stores were dropped by dead_unused_slot_stores.
+    All five fire."""
+    asm = (
+        "_f:\n"
+        "        xor     ecx, ecx\n"
+        "        mov     eax, 18\n"
+        "        or      ecx, eax\n"
+        "        xor     ecx, ecx\n"
+        "        mov     eax, 18\n"
+        "        or      ecx, eax\n"
+        "        xor     ecx, ecx\n"
+        "        mov     eax, 18\n"
+        "        or      ecx, eax\n"
+        "        xor     ecx, ecx\n"
+        "        mov     eax, 18\n"
+        "        or      ecx, eax\n"
+        "        xor     ecx, ecx\n"
+        "        mov     eax, 18\n"
+        "        or      ecx, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     ecx, ecx" not in out
+    assert "or      ecx, eax" not in out
+    assert opt.stats.get("dead_xor_or_chain_drop", 0) == 5

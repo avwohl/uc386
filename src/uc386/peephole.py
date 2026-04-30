@@ -462,6 +462,7 @@ class PeepholeOptimizer:
             lines = self._pass_zero_load_after_zero_store(lines)
             lines = self._pass_xor_then_and_collapse(lines)
             lines = self._pass_xor_or_store_collapse(lines)
+            lines = self._pass_dead_xor_or_chain_drop(lines)
             lines = self._pass_const_fold_chain(lines)
             lines = self._pass_or_with_zero_reg_drop(lines)
             lines = self._pass_label_load_collapse(lines)
@@ -10705,6 +10706,124 @@ class PeepholeOptimizer:
                 zero_regs.discard("eax")
                 zero_regs.discard("edx")
             i += 1
+        return out
+
+    def _pass_dead_xor_or_chain_drop(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Drop a dead `xor REG_T, REG_T; <chain>; or REG_T, REG_X`
+        triplet when REG_T is dead after the OR.
+
+        Pattern (with no store requirement, unlike slice 34):
+            xor   REG_T, REG_T
+            ... chain (no labels, calls, jumps,
+                       no read/write of REG_T) ...
+            or    REG_T, REG_X
+
+        If REG_T is dead after the OR, both the xor and the or can
+        be dropped. Saves 4 bytes per match.
+
+        Common in bit-field assemble idioms where the codegen emits
+        the assemble triplet but the slot is never stored (the slot
+        is unread elsewhere — `dead_unused_slot_stores` already
+        dropped the store).
+
+        Conditions:
+        - REG_T and REG_X are distinct GP32 regs.
+        - Chain doesn't read/write REG_T (REG_T stays 0).
+        - Chain has no labels, calls, jumps.
+        - REG_T is dead after the OR.
+        - Flags safe after (xor + or set flags; we drop both).
+        """
+        out = list(lines)
+        i = 0
+        while i + 2 < len(out):
+            a = out[i]
+            if a.kind != "instr" or a.op != "xor":
+                i += 1
+                continue
+            a_parts = _operands_split(a.operands)
+            if a_parts is None:
+                i += 1
+                continue
+            a_dst, a_src = a_parts
+            a_dst_low = a_dst.strip().lower()
+            a_src_low = a_src.strip().lower()
+            if (
+                a_dst_low not in PeepholeOptimizer._GP32
+                or a_dst_low != a_src_low
+            ):
+                i += 1
+                continue
+            t_reg = a_dst_low
+            # Walk forward looking for `or REG_T, REG_X`.
+            or_idx = None
+            chain_safe = True
+            j = i + 1
+            while j < len(out) and j < i + 12:
+                ln = out[j]
+                if ln.kind == "label":
+                    chain_safe = False
+                    break
+                if ln.kind != "instr":
+                    j += 1
+                    continue
+                op = ln.op
+                if op in (
+                    "call", "ret", "iret", "iretd", "retf", "retn",
+                    "leave", "jmp", "enter",
+                ) or (op.startswith("j") and op != "jmp"):
+                    chain_safe = False
+                    break
+                if op == "or":
+                    o_parts = _operands_split(ln.operands)
+                    if o_parts is not None:
+                        o_dst, o_src = o_parts
+                        if (
+                            o_dst.strip().lower() == t_reg
+                            and o_src.strip().lower()
+                                in PeepholeOptimizer._GP32
+                            and o_src.strip().lower() != t_reg
+                        ):
+                            or_idx = j
+                            break
+                if self._references_reg_family(ln.operands, t_reg):
+                    chain_safe = False
+                    break
+                if op in ("cdq", "mul", "div", "idiv"):
+                    if t_reg in ("eax", "edx"):
+                        chain_safe = False
+                        break
+                if (
+                    op == "imul" and ln.operands
+                    and "," not in ln.operands
+                ):
+                    if t_reg in ("eax", "edx"):
+                        chain_safe = False
+                        break
+                j += 1
+            if not chain_safe or or_idx is None:
+                i += 1
+                continue
+            # REG_T dead after the OR.
+            if not self._reg_dead_after(
+                out, or_idx + 1, t_reg, treat_as_scratch=True
+            ):
+                i += 1
+                continue
+            # Flags safe after.
+            if not self._flags_safe_after(out, or_idx + 1):
+                i += 1
+                continue
+            # Drop xor and or.
+            new_out = list(out[:i])
+            new_out.extend(out[i + 1:or_idx])  # chain (drop xor)
+            new_out.extend(out[or_idx + 1:])  # drop or
+            out = new_out
+            self.stats["dead_xor_or_chain_drop"] = (
+                self.stats.get("dead_xor_or_chain_drop", 0) + 1
+            )
+            continue
         return out
 
     def _pass_const_fold_chain(

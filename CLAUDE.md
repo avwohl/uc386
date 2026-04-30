@@ -1958,3 +1958,9 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete impact on pr70602**: 32 fires combined with all prior peephole work. 471 → 80 lines (83% total reduction). The bit-field encoding chains fold to single mov-immediate instructions.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (1232 total). Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: dead_xor_or_chain_drop**: drop the dead `xor REG_T, REG_T; <chain>; or REG_T, REG_X` triplet when REG_T is dead after the OR. Generalization of slice 34 with no store requirement. Saves 4 bytes per match.
+  - **Common shape**: bit-field assemble idioms where the codegen emits the assemble triplet but the slot is never stored — `dead_unused_slot_stores` already dropped the surrounding store, leaving `xor ecx, ecx; mov eax, 18; or ecx, eax` as a dead chain. Slice 34 (`xor_or_store_collapse`) only catches it when the trailing `mov [m], REG_T` is still present; my pass picks up the residual case where the store is gone.
+  - **Conditions**: A is `xor REG_T, REG_T` (REG_T ∈ GP32); chain is up to 12 instructions, no labels/jumps/calls/leave/enter, no read or write of REG_T; some line in the chain is `or REG_T, REG_X` (REG_X ∈ GP32, distinct from REG_T); REG_T dead after the OR (`treat_as_scratch=True`); flags safe after the OR.
+  - **Concrete impact on pr70602**: 5 fires (one per dead bit-field assemble triplet). 471 → 67 lines (86% total reduction across all peephole work).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (1239 total). Pipeline 1734/1734 (100%).
