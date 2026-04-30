@@ -13624,3 +13624,121 @@ def test_mov_neg_one_to_or_fires_with_arithmetic_after():
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
     assert opt.stats.get("mov_neg_one_to_or", 0) == 1
+
+
+def test_bool_materialize_collapse_basic():
+    """`xor eax, eax; jmp L_end; .L_true: mov eax, 1; .L_end: test
+    eax, eax; jnz .L_target` collapses to direct jcc redirects."""
+    asm = (
+        "_main:\n"
+        "        cmp     eax, 1\n"
+        "        jne     .L3_or_true\n"
+        "        xor     eax, eax\n"
+        "        jmp     .L4_or_end\n"
+        ".L3_or_true:\n"
+        "        mov     eax, 1\n"
+        ".L4_or_end:\n"
+        "        test    eax, eax\n"
+        "        jnz     .L_target\n"
+        "        push    42\n"           # EAX clobbered after
+        "        call    _foo\n"
+        "        pop     ecx\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+        ".L_target:\n"
+        "        call    _abort\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("bool_materialize_collapse", 0) == 1
+    # The xor/jmp/L_or_true/mov/L_or_end/test/jnz should all be gone
+    assert ".L3_or_true:" not in out
+    assert ".L4_or_end:" not in out
+    assert "test    eax, eax" not in out
+    # The original `jne .L3_or_true` should now go to .L_target
+    assert "jne     .L_target" in out
+
+
+def test_bool_materialize_collapse_skips_eax_live_after():
+    """If EAX is alive after the consumer's not-taken path,
+    don't collapse (we'd change EAX's value)."""
+    asm = (
+        "_main:\n"
+        "        cmp     eax, 1\n"
+        "        jne     .L3_or_true\n"
+        "        xor     eax, eax\n"
+        "        jmp     .L4_or_end\n"
+        ".L3_or_true:\n"
+        "        mov     eax, 1\n"
+        ".L4_or_end:\n"
+        "        test    eax, eax\n"
+        "        jnz     .L_target\n"
+        "        ret\n"  # EAX is the return value — alive
+        ".L_target:\n"
+        "        call    _abort\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("bool_materialize_collapse", 0) == 0
+
+
+def test_bool_materialize_collapse_skips_jz_consumer():
+    """jz consumer requires more complex rewrite (need extra jmp);
+    we restrict to jnz for safety."""
+    asm = (
+        "_main:\n"
+        "        cmp     eax, 1\n"
+        "        jne     .L3_or_true\n"
+        "        xor     eax, eax\n"
+        "        jmp     .L4_or_end\n"
+        ".L3_or_true:\n"
+        "        mov     eax, 1\n"
+        ".L4_or_end:\n"
+        "        test    eax, eax\n"
+        "        jz      .L_target\n"  # jz, not jnz
+        "        push    42\n"
+        "        call    _foo\n"
+        "        pop     ecx\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+        ".L_target:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("bool_materialize_collapse", 0) == 0
+
+
+def test_bool_materialize_collapse_multiple_jccs_to_true():
+    """Multiple jcc references to .L_or_true (typical short-circuit
+    || pattern with multiple operands) all redirect to .L_target."""
+    asm = (
+        "_main:\n"
+        "        cmp     eax, 1\n"
+        "        jne     .L3_or_true\n"   # first short-circuit
+        "        cmp     eax, 5\n"
+        "        jne     .L3_or_true\n"   # second short-circuit
+        "        xor     eax, eax\n"
+        "        jmp     .L4_or_end\n"
+        ".L3_or_true:\n"
+        "        mov     eax, 1\n"
+        ".L4_or_end:\n"
+        "        test    eax, eax\n"
+        "        jnz     .L_target\n"
+        "        push    42\n"
+        "        call    _foo\n"
+        "        pop     ecx\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+        ".L_target:\n"
+        "        call    _abort\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("bool_materialize_collapse", 0) == 1
+    # Both jne's should now point to .L_target
+    assert out.count("jne     .L_target") == 2
+    assert ".L3_or_true:" not in out

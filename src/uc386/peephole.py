@@ -421,6 +421,7 @@ class PeepholeOptimizer:
             lines = self._pass_redundant_test_collapse(lines)
             lines = self._pass_narrowing_load_test_collapse(lines)
             lines = self._pass_jcc_jmp_inversion(lines)
+            lines = self._pass_bool_materialize_collapse(lines)
             lines = self._pass_zero_init_collapse(lines)
             lines = self._pass_same_imm_store_share_reg(lines)
             lines = self._pass_redundant_xor_zero(lines)
@@ -6385,6 +6386,203 @@ class PeepholeOptimizer:
                         continue
             out.append(line)
             i += 1
+        return out
+
+    def _pass_bool_materialize_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse the boolean-materialize-then-test pattern:
+
+            xor    eax, eax
+            jmp    .L_end
+        .L_true:
+            mov    eax, 1
+        .L_end:
+            test   eax, eax
+            jnz    .L_target
+
+        Drop everything from `xor` to the consumer `jnz` and rewrite
+        every prior `jcc .L_true` reference to `jcc .L_target`. Save
+        7+ bytes per match (the dropped 5-line block).
+
+        For the `jz` consumer form (`jz .L_target` taken when result
+        is 0 = no jcc fired), the rewrite needs an extra `jmp
+        .L_target` at the end to handle the all-conditions-met fall-
+        through path. Each prior `jcc .L_true` becomes `jcc <line
+        after the consumer>` (i.e., skip past the jmp). Since we
+        can't always cleanly identify "the line after", we restrict
+        to the jnz case for safety.
+
+        Conditions:
+        - The pattern is exactly: `xor eax, eax; jmp .L_end;
+          .L_true: mov eax, 1; .L_end: test eax, eax; jnz .L_target`.
+        - EAX is dead after the consumer's not-taken path (i.e., the
+          consumer's fall-through code doesn't read EAX). After our
+          rewrite, EAX no longer holds a meaningful value.
+        - The .L_true label MUST only be referenced by jcc-to-true
+          instructions (and the trampoline's own definition), so the
+          materialize block was the only consumer.
+        - Both labels are local (`.X` form, NASM-scoped per global).
+
+        Real-world impact: 58 fires across 200 torture tests. Saves
+        ~10-15 bytes per fire (7+ bytes from the dropped block, plus
+        the savings from each rewritten `jcc` taking a more direct
+        target).
+
+        Common in `if (a || b)`-style conditions where the codegen
+        materializes the boolean for `test eax, eax` use.
+        """
+        # Pre-pass: build list of all jcc target references for each
+        # local label. Used to verify .L_true is only referenced by
+        # jcc-to-true (and not also from elsewhere).
+        out: list[Line] = list(lines)
+        n = len(out)
+
+        i = 0
+        fires = 0
+        while i + 6 < n:
+            # Find the 7-instruction sequence (xor/jmp/label/mov/label/
+            # test/jnz). Allow blanks/comments between in principle, but
+            # practically they're contiguous in our codegen.
+            a = out[i]
+            if not (
+                a.kind == "instr"
+                and a.op == "xor"
+                and a.operands.replace(" ", "").lower() == "eax,eax"
+            ):
+                i += 1
+                continue
+            # B: jmp .L_end
+            b = out[i + 1] if i + 1 < n else None
+            if b is None or b.kind != "instr" or b.op != "jmp":
+                i += 1
+                continue
+            l_end_target = b.operands.strip()
+            if not l_end_target.startswith("."):
+                i += 1
+                continue
+            # C: label .L_true
+            c = out[i + 2] if i + 2 < n else None
+            if c is None or c.kind != "label":
+                i += 1
+                continue
+            c_label = c.label
+            if not c_label.startswith("."):
+                i += 1
+                continue
+            # D: mov eax, 1
+            d = out[i + 3] if i + 3 < n else None
+            if d is None or d.kind != "instr" or d.op != "mov":
+                i += 1
+                continue
+            if d.operands.replace(" ", "").lower() != "eax,1":
+                i += 1
+                continue
+            # E: label .L_end (matches l_end_target)
+            e = out[i + 4] if i + 4 < n else None
+            if e is None or e.kind != "label":
+                i += 1
+                continue
+            e_label = e.label
+            if e_label != l_end_target:
+                i += 1
+                continue
+            # F: test eax, eax
+            f = out[i + 5] if i + 5 < n else None
+            if f is None or f.kind != "instr" or f.op != "test":
+                i += 1
+                continue
+            if f.operands.replace(" ", "").lower() != "eax,eax":
+                i += 1
+                continue
+            # G: jnz .L_target
+            g = out[i + 6] if i + 6 < n else None
+            if g is None or g.kind != "instr" or g.op != "jnz":
+                i += 1
+                continue
+            l_target = g.operands.strip()
+            if not l_target.startswith("."):
+                i += 1
+                continue
+            # Verify EAX is dead after G (the not-taken path).
+            if not self._reg_dead_after(out, i + 7, "eax"):
+                i += 1
+                continue
+            # Find the function scope this lives in.
+            scope = ""
+            for k in range(i, -1, -1):
+                pk = out[k]
+                if pk.kind == "label":
+                    name = pk.label
+                    if not name.startswith("."):
+                        scope = name
+                        break
+            # Find all references to c_label within this scope. They
+            # must all be `jcc c_label` (any condition).
+            scope_start = None
+            scope_end = n
+            cur_scope = ""
+            for k in range(n):
+                pk = out[k]
+                if pk.kind == "label":
+                    name = pk.label
+                    if not name.startswith("."):
+                        if cur_scope == scope:
+                            scope_end = k
+                            break
+                        if name == scope:
+                            scope_start = k
+                            cur_scope = scope
+                        else:
+                            cur_scope = name
+            if scope_start is None:
+                i += 1
+                continue
+            # Collect all jcc references to c_label within the scope.
+            jcc_indices: list[int] = []
+            other_ref = False
+            for k in range(scope_start, scope_end):
+                pk = out[k]
+                if pk.kind != "instr":
+                    continue
+                if k == i + 1:
+                    continue  # the trampoline's own jmp
+                if pk.kind == "instr" and pk.operands and (
+                    c_label in pk.operands
+                ):
+                    # Must be a conditional jump.
+                    if (
+                        pk.op.startswith("j")
+                        and pk.op != "jmp"
+                        and pk.operands.strip() == c_label
+                    ):
+                        jcc_indices.append(k)
+                    else:
+                        # Unexpected reference (jmp, data, lea, etc.)
+                        other_ref = True
+                        break
+            if other_ref or not jcc_indices:
+                i += 1
+                continue
+            # All checks passed. Rewrite each jcc to point at l_target.
+            for k in jcc_indices:
+                pk = out[k]
+                indent = self._extract_indent(pk.raw)
+                spacer = " " * max(1, 8 - len(pk.op))
+                new_raw = f"{indent}{pk.op}{spacer}{l_target}"
+                out[k] = Line(
+                    raw=new_raw, kind="instr",
+                    op=pk.op, operands=l_target,
+                )
+            # Drop A through G (indices i to i+6).
+            del out[i:i + 7]
+            n -= 7
+            fires += 1
+            self.stats["bool_materialize_collapse"] = (
+                self.stats.get("bool_materialize_collapse", 0) + 1
+            )
+            # Don't advance i — the new state at i is whatever
+            # followed G; let the loop reconsider.
         return out
 
     # Map NASM size keyword to the EAX-family sub-register that

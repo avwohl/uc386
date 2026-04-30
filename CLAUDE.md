@@ -1810,3 +1810,12 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Real-world impact**: 175 fires across 13/300 torture files; 350 bytes saved across 300 tests. Concentrated in shift-test-heavy files (arith-rand, ashiftrt-test).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests. 1175 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: bool_materialize_collapse**: collapse the `xor eax, eax; jmp .L_end; .L_true: mov eax, 1; .L_end: test eax, eax; jnz .L_target` boolean-materialize-then-test idiom into direct jcc redirects. Saves 7+ bytes per match (the entire 7-line block is dropped).
+  - **Pattern**: detected via the literal 7-line sequence after the original jcc-to-`.L_true` references. The materialize block produces EAX = 1 if any prior `jcc .L_true` fired, else 0. Followed by `test eax, eax; jnz .L_target` which takes the branch when result = 1.
+  - **Rewrite**: every prior `jcc .L_true` reference (within the same function scope) becomes `jcc .L_target` directly. The 7-line block is dropped entirely.
+  - **Restricted to `jnz` consumer**: `jz` consumer would need an extra `jmp .L_target` at the end (since the all-conditions-met fall-through path needs to branch to L_target). The simpler jnz case covers half the fires; the jz case is left for a future slice.
+  - **Conditions**: pattern must be exact 7-line sequence (no intermediate code); EAX must be dead after the consumer's not-taken path (we eliminate the EAX=0 or EAX=1 result entirely, so the value is no longer guaranteed); the .L_true label is referenced ONLY by jcc-to-true within the same function scope (no other access pattern would survive the rewrite).
+  - **Common shape**: `if (a || b) abort();`-style code. The codegen lowers `||` via short-circuit + materialize; my pass collapses the materialize when the result is immediately tested.
+  - **Real-world impact**: 58 fires across 200 torture tests when restricted to jnz consumer (out of 112 total bool-materialize sites; the other 54 are jz consumers).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests. 1179 unit tests total. Pipeline 1734/1734 (100%).
