@@ -462,6 +462,7 @@ class PeepholeOptimizer:
             lines = self._pass_zero_load_after_zero_store(lines)
             lines = self._pass_xor_then_and_collapse(lines)
             lines = self._pass_xor_or_store_collapse(lines)
+            lines = self._pass_const_fold_chain(lines)
             lines = self._pass_or_with_zero_reg_drop(lines)
             lines = self._pass_label_load_collapse(lines)
             lines = self._pass_label_push_collapse(lines)
@@ -10704,6 +10705,137 @@ class PeepholeOptimizer:
                 zero_regs.discard("eax")
                 zero_regs.discard("edx")
             i += 1
+        return out
+
+    def _pass_const_fold_chain(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Constant-fold ``mov reg, IMM_INIT; <imm-op chain on reg>``
+        to a single ``mov reg, RESULT``.
+
+        Pattern:
+            mov   reg, IMM_INIT
+            op1   reg, IMM1
+            op2   reg, IMM2
+            ... (chain of imm-source ops on reg)
+
+        For ops in {and, or, xor, add, sub, shl, shr, sar} where each
+        op's source is an immediate, simulate the chain at peephole
+        time and emit a single ``mov reg, RESULT``. Saves bytes per
+        chain instruction folded.
+
+        Common in bit-field encoding idioms where the codegen emits
+        ``mov eax, IMM; and eax, MASK; shl eax, BITPOS`` to position
+        a value into bit-field bits — these are entirely constant
+        and should fold.
+
+        Conditions:
+        - reg is a 32-bit GP register.
+        - Initial `mov reg, IMM_INIT` with IMM_INIT a numeric literal.
+        - Subsequent chain ops are immediate-source arithmetic on the
+          same reg, with numeric literal source.
+        - Chain length ≥ 1 (a single fold gains at least 2 bytes).
+        - Flags safe after the chain (chain's last op sets flags;
+          the folded mov doesn't).
+        """
+        out = list(lines)
+        i = 0
+        while i < len(out):
+            a = out[i]
+            if a.kind != "instr" or a.op != "mov":
+                i += 1
+                continue
+            a_parts = _operands_split(a.operands)
+            if a_parts is None:
+                i += 1
+                continue
+            a_dst, a_src = a_parts
+            a_dst_low = a_dst.strip().lower()
+            if a_dst_low not in PeepholeOptimizer._GP32:
+                i += 1
+                continue
+            try:
+                acc = int(a_src.strip(), 0)
+            except ValueError:
+                i += 1
+                continue
+            # Mask to 32 bits.
+            acc = acc & 0xFFFFFFFF
+            # Walk forward consuming chain ops on reg.
+            chain_end = i + 1
+            chain_count = 0
+            chain_acc = acc
+            while chain_end < len(out):
+                ln = out[chain_end]
+                if ln.kind in ("blank", "comment"):
+                    chain_end += 1
+                    continue
+                if ln.kind != "instr":
+                    break
+                op = ln.op
+                if op not in (
+                    "and", "or", "xor", "add", "sub",
+                    "shl", "shr", "sar", "sal",
+                ):
+                    break
+                op_parts = _operands_split(ln.operands)
+                if op_parts is None:
+                    break
+                op_dst, op_src = op_parts
+                if op_dst.strip().lower() != a_dst_low:
+                    break
+                try:
+                    imm = int(op_src.strip(), 0)
+                except ValueError:
+                    break
+                # Apply op to chain_acc.
+                if op == "and":
+                    chain_acc = chain_acc & (imm & 0xFFFFFFFF)
+                elif op == "or":
+                    chain_acc = (chain_acc | imm) & 0xFFFFFFFF
+                elif op == "xor":
+                    chain_acc = (chain_acc ^ imm) & 0xFFFFFFFF
+                elif op == "add":
+                    chain_acc = (chain_acc + imm) & 0xFFFFFFFF
+                elif op == "sub":
+                    chain_acc = (chain_acc - imm) & 0xFFFFFFFF
+                elif op in ("shl", "sal"):
+                    chain_acc = (chain_acc << (imm & 0x1F)) & 0xFFFFFFFF
+                elif op == "shr":
+                    chain_acc = (chain_acc >> (imm & 0x1F)) & 0xFFFFFFFF
+                elif op == "sar":
+                    # Arithmetic shift right (sign-extend high bit).
+                    if chain_acc & 0x80000000:
+                        # Sign-extend
+                        signed = chain_acc - 0x100000000
+                        chain_acc = (signed >> (imm & 0x1F)) & 0xFFFFFFFF
+                    else:
+                        chain_acc = (chain_acc >> (imm & 0x1F)) & 0xFFFFFFFF
+                chain_count += 1
+                chain_end += 1
+            if chain_count == 0:
+                i += 1
+                continue
+            # Flags safe after the last chain op.
+            if not self._flags_safe_after(out, chain_end):
+                i += 1
+                continue
+            # Rewrite. Replace the original mov with the folded value.
+            indent = self._extract_indent(a.raw)
+            new_raw = f"{indent}mov     {a_dst_low}, {chain_acc}"
+            new_mov = Line(
+                raw=new_raw, kind="instr",
+                op="mov", operands=f"{a_dst_low}, {chain_acc}",
+            )
+            new_out = list(out[:i])
+            new_out.append(new_mov)
+            new_out.extend(out[chain_end:])
+            out = new_out
+            self.stats["const_fold_chain"] = (
+                self.stats.get("const_fold_chain", 0) + chain_count
+            )
+            # Don't advance i; the new mov could be folded with more.
+            continue
         return out
 
     def _pass_xor_or_store_collapse(

@@ -8457,11 +8457,15 @@ def test_byte_stores_to_dword_positive_offset():
 
 def test_pop_index_push_collapse_basic():
     """`shl idx, 2; pop base; add idx, base; push dword [idx]` →
-    `pop base; push dword [base + idx*4]`."""
+    `pop base; push dword [base + idx*4]`.
+
+    Use a memory-loaded index so const_fold_chain doesn't preempt
+    by folding the const + shl pair.
+    """
     asm = (
         "_f:\n"
         "        push    eax\n"  # save base
-        "        mov     eax, 3\n"  # load index
+        "        mov     eax, [ebp - 4]\n"  # runtime index
         "        shl     eax, 2\n"
         "        pop     ecx\n"
         "        add     eax, ecx\n"
@@ -8515,7 +8519,7 @@ def test_pop_index_push_collapse_scale_8():
     """Scale 8 (long-long arrays)."""
     asm = (
         "_f:\n"
-        "        mov     eax, 3\n"
+        "        mov     eax, [ebp - 4]\n"   # runtime index
         "        shl     eax, 3\n"  # scale 8
         "        pop     ecx\n"
         "        add     eax, ecx\n"
@@ -8536,11 +8540,14 @@ def test_pop_index_load_collapse_basic():
     """`shl idx, 2; pop base; add idx, base; mov dst, [idx]` →
     `pop base; mov dst, [base + idx*4]`. The DST is also IDX (eax)
     in the typical loop body — load target overwrites, so IDX-dead
-    check doesn't apply."""
+    check doesn't apply.
+
+    Use a memory-loaded index so const_fold_chain doesn't preempt.
+    """
     asm = (
         "_f:\n"
         "        push    eax\n"
-        "        mov     eax, 3\n"
+        "        mov     eax, [ebp - 4]\n"
         "        shl     eax, 2\n"
         "        pop     ecx\n"
         "        add     eax, ecx\n"
@@ -8561,7 +8568,7 @@ def test_pop_index_load_collapse_dst_different_from_idx():
     asm = (
         "_f:\n"
         "        push    eax\n"
-        "        mov     eax, 3\n"
+        "        mov     eax, [ebp - 4]\n"
         "        shl     eax, 2\n"
         "        pop     ecx\n"
         "        add     eax, ecx\n"
@@ -8596,7 +8603,7 @@ def test_pop_index_load_collapse_scale_8():
     """Scale 8 (long-long arrays)."""
     asm = (
         "_f:\n"
-        "        mov     eax, 3\n"
+        "        mov     eax, [ebp - 4]\n"
         "        shl     eax, 3\n"  # scale 8
         "        pop     ecx\n"
         "        add     eax, ecx\n"
@@ -13369,13 +13376,17 @@ def test_chain_binop_collapse_imul():
 
 
 def test_pop_cmp_chain_retarget_basic():
-    """`push eax; mov eax, N; shl eax, K; pop ecx; cmp eax, ecx;
+    """`push eax; mov eax, [m]; shl eax, K; pop ecx; cmp eax, ecx;
     je L` — drop push/pop, retarget chain to ECX. ZF symmetric so
-    subsequent je is safe."""
+    subsequent je is safe.
+
+    Use a memory-loaded value so const_fold_chain doesn't preempt
+    by folding the const+shl pair.
+    """
     asm = (
         "_f:\n"
         "        push    eax\n"
-        "        mov     eax, 5\n"
+        "        mov     eax, [ebp - 4]\n"
         "        shl     eax, 3\n"
         "        pop     ecx\n"
         "        cmp     eax, ecx\n"
@@ -13388,7 +13399,7 @@ def test_pop_cmp_chain_retarget_basic():
     out = opt.optimize(asm)
     assert opt.stats.get("pop_cmp_chain_retarget", 0) == 1
     # Chain retargeted to ECX
-    assert "mov     ecx, 5" in out
+    assert "mov     ecx, [ebp - 4]" in out
     assert "shl     ecx, 3" in out
     # push and pop dropped
     assert "push    eax" not in out
@@ -14668,3 +14679,106 @@ def test_xor_or_store_collapse_skips_call_in_chain():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("xor_or_store_collapse", 0) == 0
+
+
+# ── const_fold_chain ─────────────────────────────────────────────
+
+
+def test_const_fold_chain_basic():
+    """`mov eax, 9; and eax, 1048575; shl eax, 1` →
+    `mov eax, 18`. Saves 6+ bytes per fold."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 9\n"
+        "        and     eax, 1048575\n"
+        "        shl     eax, 1\n"
+        "        mov     [ebp - 4], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, 18" in out
+    assert "and     eax, 1048575" not in out
+    assert "shl     eax, 1" not in out
+    assert opt.stats.get("const_fold_chain", 0) == 2  # and + shl folded
+
+
+def test_const_fold_chain_arithmetic():
+    """`mov eax, 5; add eax, 3; sub eax, 2` → `mov eax, 6`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 5\n"
+        "        add     eax, 3\n"
+        "        sub     eax, 2\n"
+        "        mov     [ebp - 4], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, 6" in out
+    assert opt.stats.get("const_fold_chain", 0) == 2
+
+
+def test_const_fold_chain_xor():
+    """xor with imm: `mov eax, 0xFF; xor eax, 0x0F` → `mov eax, 0xF0`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 255\n"   # 0xFF
+        "        xor     eax, 15\n"    # 0x0F
+        "        mov     [ebp - 4], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, 240" in out  # 0xFF ^ 0x0F = 0xF0 = 240
+    assert opt.stats.get("const_fold_chain", 0) == 1
+
+
+def test_const_fold_chain_skips_non_imm():
+    """If chain op's source is non-immediate, can't fold."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 9\n"
+        "        and     eax, ecx\n"   # source is reg
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("const_fold_chain", 0) == 0
+
+
+def test_const_fold_chain_skips_when_flags_read():
+    """Chain's last op sets flags; folded mov doesn't. If flag-reader
+    follows, skip."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 9\n"
+        "        and     eax, 1\n"
+        "        je      .L\n"   # reads ZF
+        "        ret\n"
+        ".L:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("const_fold_chain", 0) == 0
+
+
+def test_const_fold_chain_sar_signed():
+    """sar handles sign extension correctly. Cascade with
+    mov_neg_one_to_or may convert the resulting mov to
+    `or reg, -1`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 4294967280\n"   # 0xFFFFFFF0 (-16 signed)
+        "        sar     eax, 4\n"             # sign-shift right by 4
+        "        mov     [ebp - 4], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # 0xFFFFFFF0 sar 4 (signed) = 0xFFFFFFFF = 4294967295.
+    # Slice 24 may convert the folded mov to `or eax, -1`.
+    assert ("mov     eax, 4294967295" in out
+            or "or      eax, -1" in out)
+    assert opt.stats.get("const_fold_chain", 0) == 1

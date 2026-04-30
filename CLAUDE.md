@@ -1942,3 +1942,19 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete impact on pr70602**: 11 fires combined with all prior peephole work. 471 → 125 lines (73% total reduction). The bit-field assemble idiom is now optimal — just the value computations and the final stores.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests (1226 total). Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: const_fold_chain**: constant-fold `mov reg, IMM_INIT; <imm-op chain on reg>` to a single `mov reg, RESULT`. Saves bytes per chain instruction folded.
+  - **Pattern**:
+    ```
+    mov   reg, IMM_INIT
+    op1   reg, IMM1
+    op2   reg, IMM2
+    ... (chain of imm-source ops on reg)
+    ```
+    For ops in {and, or, xor, add, sub, shl, shr, sar, sal} where each op's source is a numeric literal, simulate the chain at peephole time and emit a single `mov reg, RESULT`.
+  - **Common shape**: bit-field encoding idioms like `mov eax, 9; and eax, 1048575; shl eax, 1` (mask + position bits) — entirely constant; folds to `mov eax, 18`.
+  - **Sign extension** for `sar` is handled correctly: a 32-bit value with high bit set is sign-extended via Python's signed shift before re-masking.
+  - **Test updates**: 4 existing tests (`test_pop_index_push_collapse_basic`, `test_pop_index_push_collapse_scale_8`, `test_pop_index_load_collapse_basic`, `test_pop_index_load_collapse_dst_different_from_idx`, `test_pop_index_load_collapse_scale_8`, `test_pop_cmp_chain_retarget_basic`) used const-loaded indices like `mov eax, 3; shl eax, 2` which now fold via slice 35 — preempting the SIB-form pop+index collapsers. Updated to use memory-loaded indices (`mov eax, [ebp - 4]`).
+  - **Test for sar**: cascade with slice 24 (mov_neg_one_to_or) may convert the resulting `mov eax, 4294967295` to `or eax, -1`; both forms are correct.
+  - **Concrete impact on pr70602**: 32 fires combined with all prior peephole work. 471 → 80 lines (83% total reduction). The bit-field encoding chains fold to single mov-immediate instructions.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (1232 total). Pipeline 1734/1734 (100%).
