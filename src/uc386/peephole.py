@@ -393,6 +393,7 @@ class PeepholeOptimizer:
             # remaining mov+push pairs (outer save-pushes that don't
             # have a matching mov-ecx-eax pop pattern).
             lines = self._pass_push_memory(lines)
+            lines = self._pass_push_memory_to_push_reg(lines)
             lines = self._pass_cmp_zero_to_test(lines)
             lines = self._pass_dead_mov_to_reg(lines)
             lines = self._pass_prologue_to_enter(lines)
@@ -1262,6 +1263,232 @@ class PeepholeOptimizer:
                             continue
             out.append(line)
             i += 1
+        return out
+
+    def _pass_push_memory_to_push_reg(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Replace ``push <size?> [m]`` with ``push REG`` when REG is
+        known to already hold ``[m]``'s value from a recent
+        ``mov REG, [m]`` that hasn't been invalidated.
+
+        Saves 2 bytes per match for ebp-relative ``[m]`` (3-byte
+        push-mem → 1-byte push-reg), or 4-5 bytes for label or SIB
+        memory (push-mem with disp32 / SIB → 1-byte push-reg).
+
+        Common shape: a for-loop body that loads ``i`` for the
+        condition cmp into EAX, then later pushes ``i`` as a call
+        argument. The push currently re-reads memory; my pass reuses
+        the value already in EAX.
+
+        Differs from ``push_memory`` (collapses adjacent
+        ``mov reg, [m]; push reg`` into ``push dword [m]`` — saving
+        bytes when the reg is dead, since the dropped mov is bigger
+        than the gained `dword` prefix). My pass goes the OTHER
+        direction: when the load and push are NON-adjacent (separated
+        by a chain that uses REG's value), keeping REG and using
+        ``push REG`` is shorter than the explicit memory push.
+
+        Tracking model: per-register ``reg_mem`` map updated as the
+        pass walks lines. Set on ``mov REG, [m]``, invalidated by
+        any write to REG or to overlapping memory, by labels (control-
+        flow boundaries — REG might enter from elsewhere), by jumps
+        / calls (caller-saved-reg clobber, control flow), by
+        directives / data sections (function boundary).
+
+        Conditions:
+        - REG is a 32-bit GP register.
+        - [m] is ebp-relative literal `[ebp ± N]` or label literal
+          `[_name]` (we can compare textually). Other forms (SIB,
+          register-base) bail on safety grounds.
+        - When push appears, find a REG whose tracked mem equals
+          push's memory operand (after stripping size prefix and
+          normalizing whitespace).
+        """
+        out: list[Line] = []
+        # reg_mem maps reg32 → memory operand (string).
+        reg_mem: dict[str, str] = {}
+        # Track whether previous instruction was an unconditional
+        # terminator (ret/jmp/leave): if so, the next label has no
+        # text fallthrough predecessor.
+        prev_unconditional = False
+
+        def normalize_mem(text: str) -> str | None:
+            """Strip size prefix and normalize. Return None if not
+            a recognized ebp-relative or label form."""
+            t = text.strip()
+            for prefix in (
+                "dword ", "word ", "byte ", "qword ",
+            ):
+                if t.lower().startswith(prefix):
+                    t = t[len(prefix):].lstrip()
+                    break
+            if not (t.startswith("[") and t.endswith("]")):
+                return None
+            inner = t[1:-1].strip()
+            # Reject if contains *, [, ] — SIB form.
+            if "*" in inner:
+                return None
+            # Normalize whitespace.
+            return "[" + " ".join(inner.split()) + "]"
+
+        for i, ln in enumerate(lines):
+            if ln.kind == "blank" or ln.kind == "comment":
+                out.append(ln)
+                continue
+            if ln.kind == "label":
+                # Control-flow boundary — invalidate.
+                reg_mem = {}
+                out.append(ln)
+                prev_unconditional = False
+                continue
+            if ln.kind in ("directive", "data"):
+                reg_mem = {}
+                out.append(ln)
+                prev_unconditional = False
+                continue
+            if ln.kind != "instr":
+                out.append(ln)
+                continue
+            # Process the instruction.
+            op = ln.op
+            ops = ln.operands
+
+            # Case: push <size?> [m] — try to substitute.
+            if op == "push" and reg_mem:
+                src = ops.strip()
+                m = normalize_mem(src)
+                if m is not None:
+                    # Find a reg whose tracked mem matches.
+                    matched_reg: str | None = None
+                    for r, rm in reg_mem.items():
+                        if rm == m:
+                            matched_reg = r
+                            break
+                    if matched_reg is not None:
+                        indent = self._extract_indent(ln.raw)
+                        new_raw = (
+                            f"{indent}push    {matched_reg}"
+                        )
+                        new_line = Line(
+                            raw=new_raw,
+                            kind="instr",
+                            op="push",
+                            operands=matched_reg,
+                        )
+                        out.append(new_line)
+                        self.stats[
+                            "push_memory_to_push_reg"
+                        ] = self.stats.get(
+                            "push_memory_to_push_reg", 0
+                        ) + 1
+                        prev_unconditional = False
+                        # push doesn't write any reg; tracking
+                        # state unchanged.
+                        continue
+
+            # Update tracking for `mov REG, [m]`.
+            if op == "mov":
+                parts = _operands_split(ops)
+                if parts is not None:
+                    dst = parts[0].strip().lower()
+                    src = parts[1].strip()
+                    if (
+                        self._is_general_register(dst)
+                        and src.startswith("[")
+                        and src.endswith("]")
+                    ):
+                        m = normalize_mem(src)
+                        if m is not None:
+                            # Invalidate any other reg holding the
+                            # same memory (since dst now owns it).
+                            reg_mem = {
+                                r: rm for r, rm in reg_mem.items()
+                                if rm != m
+                            }
+                            reg_mem[dst] = m
+                            out.append(ln)
+                            prev_unconditional = False
+                            continue
+                    # mov dst, X (any other shape): invalidate dst.
+                    if self._is_general_register(dst):
+                        reg_mem.pop(dst, None)
+                    # If dst is a memory operand, invalidate any
+                    # reg whose tracked mem matches it (or
+                    # conservatively, invalidate all).
+                    if dst.startswith("[") or dst.startswith(
+                        "dword "
+                    ) or dst.startswith("word "
+                    ) or dst.startswith("byte "):
+                        # Conservative: clear all tracking on any
+                        # memory write (don't try alias analysis).
+                        reg_mem = {}
+                    out.append(ln)
+                    prev_unconditional = False
+                    continue
+
+            # Calls clobber caller-saved regs and the called
+            # function may modify memory.
+            if op == "call":
+                reg_mem = {}
+                out.append(ln)
+                prev_unconditional = False
+                continue
+
+            # Jumps end the basic block.
+            if op == "jmp":
+                reg_mem = {}
+                out.append(ln)
+                prev_unconditional = True
+                continue
+            if op.startswith("j"):
+                # Conditional — fall through with same tracking
+                # but the taken path resets it (we don't track
+                # across taken paths).
+                out.append(ln)
+                prev_unconditional = False
+                continue
+            if op in {
+                "ret", "iret", "iretd", "retf", "retn",
+                "leave",
+            }:
+                reg_mem = {}
+                out.append(ln)
+                prev_unconditional = True
+                continue
+
+            # Other instructions: invalidate the destination
+            # register if it's a write.
+            parts = _operands_split(ops)
+            if parts is not None:
+                dst = parts[0].strip().lower()
+                if self._is_general_register(dst):
+                    # 2-operand op writes dst (cmp/test are reads;
+                    # all others write dst).
+                    if op not in {"cmp", "test"}:
+                        reg_mem.pop(dst, None)
+                # Memory write — invalidate all tracking.
+                if dst.startswith("["):
+                    reg_mem = {}
+                # Implicit-reg-using ops (cdq writes EDX from EAX,
+                # etc.): conservative, clear all.
+                if not PeepholeOptimizer._has_explicit_operands_only(
+                    ln
+                ):
+                    reg_mem = {}
+            else:
+                # 1-operand or zero-operand op. inc/dec/neg/not on
+                # a reg modifies it; pop writes its operand.
+                # Conservative: invalidate.
+                if op in {
+                    "inc", "dec", "neg", "not", "pop", "mul",
+                    "imul", "div", "idiv", "cdq", "stosb",
+                    "stosw", "stosd", "lodsb", "lodsw", "lodsd",
+                }:
+                    # These touch eax/edx/ecx/etc. implicitly.
+                    reg_mem = {}
+            out.append(ln)
+            prev_unconditional = False
         return out
 
     def _pass_imm_store_collapse(self, lines: list[Line]) -> list[Line]:

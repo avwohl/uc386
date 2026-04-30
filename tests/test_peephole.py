@@ -10235,6 +10235,120 @@ def test_mov_label_shl_add_load_to_sib_loop_body():
     assert opt.stats.get("mov_label_shl_add_load_to_sib") == 1
 
 
+def test_push_memory_to_push_reg_basic():
+    """`mov eax, [m]; cmp eax, X; jge L; push dword [m]` collapses
+    push's memory operand to `push eax`. Saves 2 bytes per match.
+
+    Common shape: for-loop body where the cmp at the top loaded
+    the loop counter into EAX, then a function-call arg push
+    re-reads the same memory."""
+    asm = (
+        "_f:\n"
+        ".L1_top:\n"
+        "        mov     eax, [ebp - 8]\n"
+        "        cmp     eax, [ebp + 8]\n"
+        "        jge     .L_end\n"
+        "        push    dword [ebp - 8]\n"
+        "        call    _helper\n"
+        "        pop     ecx\n"
+        "        jmp     .L1_top\n"
+        ".L_end:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    dword [ebp - 8]" not in out
+    assert "push    eax" in out
+    assert opt.stats.get("push_memory_to_push_reg", 0) >= 1
+
+
+def test_push_memory_to_push_reg_skips_when_reg_modified():
+    """If REG is overwritten between the load and the push, my
+    pass should NOT fire."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 8]\n"
+        "        mov     eax, 42\n"  # eax overwritten
+        "        push    dword [ebp - 8]\n"
+        "        call    _helper\n"
+        "        pop     ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_memory_to_push_reg", 0) == 0
+
+
+def test_push_memory_to_push_reg_skips_after_label():
+    """Labels are control-flow boundaries; cross-label tracking is
+    invalidated."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 8]\n"
+        ".L_mid:\n"  # label invalidates tracking
+        "        push    dword [ebp - 8]\n"
+        "        call    _helper\n"
+        "        pop     ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_memory_to_push_reg", 0) == 0
+
+
+def test_push_memory_to_push_reg_skips_after_call():
+    """Calls clobber caller-saved regs."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 8]\n"
+        "        call    _helper\n"  # clobbers eax
+        "        push    dword [ebp - 8]\n"
+        "        call    _other\n"
+        "        pop     ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_memory_to_push_reg", 0) == 0
+
+
+def test_push_memory_to_push_reg_skips_when_memory_written():
+    """If the source memory is written between the mov and the push,
+    the cached register's value is stale."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 8]\n"
+        "        mov     [ebp - 8], 42\n"  # memory write
+        "        push    dword [ebp - 8]\n"
+        "        call    _helper\n"
+        "        pop     ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_memory_to_push_reg", 0) == 0
+
+
+def test_push_memory_to_push_reg_label_memory():
+    """Pass also fires for global-label memory `[_glob]`. Saves
+    more bytes (5+ → 1 byte per push)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [_glob]\n"
+        "        cmp     eax, 0\n"
+        "        push    dword [_glob]\n"
+        "        call    _helper\n"
+        "        pop     ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    dword [_glob]" not in out
+    assert "push    eax" in out
+    assert opt.stats.get("push_memory_to_push_reg", 0) == 1
+
+
 def test_xfer_load_store_collapse_basic():
     """`mov ecx, eax; mov eax, [m]; mov [ecx], eax` collapses to
     `mov ecx, [m]; mov [eax], ecx`. Drops the xfer; saves 1 instr.
