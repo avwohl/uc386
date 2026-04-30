@@ -437,6 +437,7 @@ class PeepholeOptimizer:
             lines = self._pass_index_store_xfer_collapse(lines)
             lines = self._pass_push_index_collapse(lines)
             lines = self._pass_self_mov_elimination(lines)
+            lines = self._pass_indirect_call_collapse(lines)
             lines = self._pass_transfer_pop_collapse(lines)
             lines = self._pass_transfer_pop_cmp_collapse(lines)
             lines = self._pass_dup_push_pop_self_op(lines)
@@ -12055,6 +12056,90 @@ class PeepholeOptimizer:
                         )
                         continue
             out.append(line)
+        return out
+
+    def _pass_indirect_call_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``mov REG, MEM; call REG`` into
+        ``call dword MEM``.
+
+        x86's ``call r/m32`` form supports a memory operand directly,
+        eliminating the intermediate register load. Saves 2 bytes
+        per match for ebp-relative or SIB-form memory (3-byte mov
+        dropped, mem-form call gains 1 byte vs reg-form), 1 byte for
+        absolute-label memory (5-byte mov dropped, mem-form call
+        gains 4 bytes).
+
+        Common shape: function-pointer calls. Codegen evaluates the
+        callee expression into EAX, then emits ``call eax``. After
+        my pass, the load and call fuse into a single instruction.
+        Particularly impactful for vtable-style dispatches where the
+        function pointer is at a struct member offset —
+        ``mov eax, [ebp + 8]; mov eax, [eax + 4]; call eax`` becomes
+        ``mov eax, [ebp + 8]; call dword [eax + 4]``.
+
+        Conditions:
+        - Line A: ``mov REG, MEM`` where REG is a 32-bit GP register
+          and MEM is a memory operand (``[...]`` form).
+        - Line B: ``call REG`` (same REG, single operand).
+        - Lines A and B are adjacent.
+
+        Safety: even when MEM references REG (e.g.,
+        ``mov eax, [eax + 4]; call eax``), the rewrite is correct.
+        The original sequence loads ``[old_eax + 4]`` into eax then
+        calls eax. The rewrite reads from ``[old_eax + 4]`` (eax
+        still has its pre-mov value at the call site) and calls that
+        target. End state matches: same callee invoked, same return
+        value in eax post-call.
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            if i + 1 >= len(lines):
+                out.append(lines[i])
+                i += 1
+                continue
+            a = lines[i]
+            b = lines[i + 1]
+            if not (
+                a.kind == "instr" and a.op == "mov"
+                and b.kind == "instr" and b.op == "call"
+            ):
+                out.append(lines[i])
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            if ap is None:
+                out.append(lines[i])
+                i += 1
+                continue
+            dest = ap[0].strip().lower()
+            src = ap[1].strip()
+            call_target = b.operands.strip().lower()
+            if not self._is_general_register(dest) or call_target != dest:
+                out.append(lines[i])
+                i += 1
+                continue
+            # Source must be a memory operand `[...]`.
+            if not (src.startswith("[") and src.endswith("]")):
+                out.append(lines[i])
+                i += 1
+                continue
+            # Build the rewritten call.
+            indent = self._extract_indent(b.raw)
+            new_raw = f"{indent}call    dword {src}"
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op="call",
+                operands=f"dword {src}",
+            )
+            out.append(new_line)
+            self.stats["indirect_call_collapse"] = (
+                self.stats.get("indirect_call_collapse", 0) + 1
+            )
+            i += 2
         return out
 
     def _pass_jmp_to_next_label(self, lines: list[Line]) -> list[Line]:

@@ -7286,6 +7286,135 @@ def test_self_mov_elimination_keeps_mov_with_memory():
     assert opt.stats.get("self_mov_elimination", 0) == 0
 
 
+# ── indirect_call_collapse ───────────────────────────────────────
+
+
+def test_indirect_call_collapse_ebp_rel():
+    """`mov eax, [ebp + 8]; call eax` → `call dword [ebp + 8]`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        call    eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [ebp + 8]" not in out
+    assert "call    dword [ebp + 8]" in out
+    assert opt.stats.get("indirect_call_collapse") == 1
+
+
+def test_indirect_call_collapse_sib_form():
+    """`mov eax, [eax + 4]; call eax` → `call dword [eax + 4]`.
+    Even when MEM references the target reg, the rewrite is correct
+    because the call reads the same address."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        call    eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "call    dword [eax + 4]" in out
+    assert opt.stats.get("indirect_call_collapse") == 1
+
+
+def test_indirect_call_collapse_label():
+    """`mov eax, [_glob]; call eax` → `call dword [_glob]`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [_fnptr]\n"
+        "        call    eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [_fnptr]" not in out
+    assert "call    dword [_fnptr]" in out
+    assert opt.stats.get("indirect_call_collapse") == 1
+
+
+def test_indirect_call_collapse_other_reg():
+    """The pass works for any 32-bit GP register, not just eax."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, [ebp - 4]\n"
+        "        call    edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     edx, [ebp - 4]" not in out
+    assert "call    dword [ebp - 4]" in out
+    assert opt.stats.get("indirect_call_collapse") == 1
+
+
+def test_indirect_call_collapse_skips_immediate_source():
+    """`mov eax, _foo; call eax` is NOT this pattern (codegen would
+    emit `call _foo` directly anyway). Source must be a memory
+    operand."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _foo\n"
+        "        call    eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("indirect_call_collapse", 0) == 0
+
+
+def test_indirect_call_collapse_skips_register_mismatch():
+    """`mov eax, [m]; call edx` is NOT a match — different regs."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        call    edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("indirect_call_collapse", 0) == 0
+
+
+def test_indirect_call_collapse_skips_direct_call():
+    """A direct `call _foo` (no preceding mov) is unaffected."""
+    asm = (
+        "_f:\n"
+        "        call    _foo\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "call    _foo" in out
+    assert opt.stats.get("indirect_call_collapse", 0) == 0
+
+
+def test_indirect_call_collapse_codegen_integration():
+    """End-to-end: function pointer call lowers to a single
+    `call dword [ebp + N]` after peephole."""
+    from uc386.codegen import CodeGenerator
+    from uc_core.lexer import Lexer
+    from uc_core.parser import Parser
+
+    src = (
+        "int dispatch(int (*fp)(int, int), int x, int y) {\n"
+        "    return fp(x, y);\n"
+        "}\n"
+        "int main(void) { return 0; }\n"
+    )
+    tokens = list(Lexer(src, "test.c").tokenize())
+    tu = Parser(tokens).parse()
+    cg = CodeGenerator(peephole=True)
+    asm = cg.generate(tu)
+    # The function pointer load + call should fuse to a single
+    # mem-form call.
+    assert "call    dword [ebp + 8]" in asm
+    assert "mov     eax, [ebp + 8]\n        call    eax" not in asm
+
+
 # ── transfer_pop_collapse ────────────────────────────────────────
 
 
