@@ -541,40 +541,144 @@ class PeepholeOptimizer:
     def _pass_unreferenced_label_removal(
         self, lines: list[Line]
     ) -> list[Line]:
-        """Drop NASM-local label definitions (`.LX:`) that meet ALL
-        these conditions:
-        1. No operand in the file references them (textual match).
-        2. They are PRECEDED by an unconditional terminator (jmp/ret/
-           call-noreturn). This means there's no fallthrough into the
-           label — only jumps could reach it, but condition 1 says
-           there are no jumps. So the label is truly unreachable.
-        3. They are NOT immediately followed by `leave`/`ret`. This
-           preserves function epilogues even when no early returns
-           exist (the codegen emits `.epilogue:` consistently).
+        """Drop NASM-local label definitions (`.LX:`) that have zero
+        references within their function scope (and aren't referenced
+        cross-scope as `<global>.LX`) AND are preceded by an
+        unconditional terminator (jmp/ret/call-to-noreturn).
 
-        After dropping, `dead_after_terminator` may extend the dead
-        zone past the dropped label, dropping more code.
+        Reference counting is **scope-aware** with **cross-scope
+        qualified references**: NASM scopes local labels per the most
+        recent global label, so a `.epilogue:` in `_main` and a
+        `.epilogue:` in `_xb` are distinct. We count references only
+        within the function's scope (the range from one global label
+        to the next), PLUS any `_<global>.LX` qualified references
+        from anywhere in the file (e.g. `dd _bar.L1` in `.data`).
 
-        Counts use textual matching:
-        - A label `.LX:` contributes 1 textual match (its definition).
-        - References from operands (`jmp .LX`, `je .LX`, `_outer.LX`,
-          `dd .LX`) contribute additional matches.
-        - If only the definition exists (count == 1) AND conditions
-          2-3 hold, drop.
+        A "reference" is any textual occurrence of:
+        - `.<name>` in an instruction operand or data directive
+          within the same scope.
+        - `<global_label>.<name>` (qualified) anywhere in the file.
+
+        The label's own definition (`.<name>:`) does NOT count as a
+        reference.
+
+        After dropping, `dead_after_terminator` (next iteration) may
+        extend its dead zone past the (now-dropped) label and drop
+        any trailing dead code (e.g. a `leave; ret` epilogue that was
+        unreachable after a noreturn `call _exit` / `call _abort`).
 
         Limitations:
-        - NASM-local labels with the same name in different functions
-          are conflated (textual matching).
         - Global labels (those without a leading `.`) are not
           considered for removal — they may be exported.
         """
         label_pattern = re.compile(r"\.[A-Za-z_]\w*")
-        # Count textual occurrences across the entire file.
-        counts: dict[str, int] = {}
+        # `_global.local` qualified reference pattern.
+        qualified_pattern = re.compile(
+            r"\b([A-Za-z_]\w*)(\.[A-Za-z_]\w*)"
+        )
+
+        # Build per-scope ranges. Each scope is [start, end) of lines,
+        # bounded by global labels or file boundaries.
+        boundaries: list[int] = [0]
+        scope_globals: list[str] = []
+        # Walk to identify global labels and boundary positions.
+        first_global_idx: int | None = None
+        for k, line in enumerate(lines):
+            if line.kind == "label":
+                stripped = line.raw.strip()
+                if stripped.endswith(":"):
+                    n = stripped[:-1].strip()
+                    if not n.startswith("."):
+                        boundaries.append(k)
+                        if first_global_idx is None:
+                            first_global_idx = k
+        boundaries.append(len(lines))
+        # Dedup.
+        boundaries = sorted(set(boundaries))
+        # Determine the global label owning each scope.
+        # The scope before the first global label has no owner (treat
+        # as None).
+        for s in range(len(boundaries) - 1):
+            scope_start = boundaries[s]
+            owner: str | None = None
+            for k in range(scope_start, boundaries[s + 1]):
+                line = lines[k]
+                if line.kind == "label":
+                    stripped = line.raw.strip()
+                    if stripped.endswith(":"):
+                        n = stripped[:-1].strip()
+                        if not n.startswith("."):
+                            owner = n
+                            break
+                # Stop at first instruction (no global label in this
+                # scope past it).
+                if line.kind == "instr":
+                    break
+            scope_globals.append(owner if owner else "")
+
+        # Count cross-scope qualified references anywhere in the file.
+        # cross_refs maps (global_owner, ".local") -> count.
+        cross_refs: dict[tuple[str, str], int] = {}
         for line in lines:
-            for match in label_pattern.finditer(line.raw):
-                name = match.group()
-                counts[name] = counts.get(name, 0) + 1
+            for m in qualified_pattern.finditer(line.raw):
+                global_part, local_part = m.group(1), m.group(2)
+                key = (global_part, local_part)
+                cross_refs[key] = cross_refs.get(key, 0) + 1
+
+        # For each scope, count IN-SCOPE references (= textual
+        # occurrences of `.<name>` minus the definition's own match).
+        # We exclude qualified references `<global>.<local>` from this
+        # in-scope count to avoid double-counting (they're tracked
+        # separately in cross_refs).
+        scope_ref_counts: list[dict[str, int]] = []
+        for s in range(len(boundaries) - 1):
+            scope_start = boundaries[s]
+            scope_end = boundaries[s + 1]
+            ref_counts: dict[str, int] = {}
+            for k in range(scope_start, scope_end):
+                line = lines[k]
+                # Identify this line's own label-definition name (so
+                # we don't count it as a reference).
+                own_name: str | None = None
+                if line.kind == "label":
+                    stripped = line.raw.strip()
+                    if stripped.endswith(":"):
+                        n = stripped[:-1].strip()
+                        if n.startswith("."):
+                            own_name = n
+                # Build a set of "covered" character spans for
+                # qualified `_g.local` matches — those are tracked
+                # separately, so don't double-count their `.local`
+                # parts in the in-scope counting.
+                qualified_spans: list[tuple[int, int]] = []
+                for qm in qualified_pattern.finditer(line.raw):
+                    qualified_spans.append(qm.span())
+                # Count `.<name>` matches that are NOT inside a
+                # qualified match.
+                for match in label_pattern.finditer(line.raw):
+                    name = match.group()
+                    span_start = match.start()
+                    inside_qualified = any(
+                        qs[0] <= span_start < qs[1]
+                        for qs in qualified_spans
+                    )
+                    if inside_qualified:
+                        continue
+                    if name == own_name:
+                        # Own definition match — don't count.
+                        own_name = None  # only skip first match
+                        continue
+                    ref_counts[name] = ref_counts.get(name, 0) + 1
+            scope_ref_counts.append(ref_counts)
+
+        # Map each line idx to its scope idx.
+        def scope_idx_for(idx: int) -> int:
+            # Find largest j where boundaries[j] <= idx.
+            for j in range(len(boundaries) - 2, -1, -1):
+                if boundaries[j] <= idx:
+                    return j
+            return 0
+
         # Walk and drop unreferenced label definitions.
         out: list[Line] = []
         i = 0
@@ -584,21 +688,27 @@ class PeepholeOptimizer:
                 stripped = line.raw.strip()
                 if stripped.endswith(":"):
                     name = stripped[:-1].strip()
-                    if (
-                        name.startswith(".")
-                        and counts.get(name, 0) <= 1
-                        and self._preceded_by_terminator(lines, i)
-                        and not self._followed_by_function_epilogue(
-                            lines, i + 1
+                    if name.startswith("."):
+                        s_idx = scope_idx_for(i)
+                        in_scope = scope_ref_counts[s_idx].get(
+                            name, 0
                         )
-                    ):
-                        self.stats["unreferenced_label_removal"] = (
-                            self.stats.get(
-                                "unreferenced_label_removal", 0
-                            ) + 1
-                        )
-                        i += 1
-                        continue
+                        owner = scope_globals[s_idx]
+                        cross = cross_refs.get((owner, name), 0)
+                        if (
+                            in_scope == 0
+                            and cross == 0
+                            and self._preceded_by_terminator(
+                                lines, i
+                            )
+                        ):
+                            self.stats["unreferenced_label_removal"] = (
+                                self.stats.get(
+                                    "unreferenced_label_removal", 0
+                                ) + 1
+                            )
+                            i += 1
+                            continue
             out.append(line)
             i += 1
         return out

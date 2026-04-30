@@ -58,9 +58,9 @@ def test_drops_dead_after_ret():
     out = optimize(asm)
     # The mov between `ret` and `.unused:` is dead.
     assert "mov     eax, 99" not in out
-    # The `.unused:` label still survives (we don't remove unreachable
-    # labels — that's asm DCE's job).
-    assert ".unused:" in out
+    # `.unused:` is now also dropped — it has 0 references and is
+    # preceded by a terminator, so it's unreachable.
+    assert ".unused:" not in out
 
 
 def test_does_not_drop_after_conditional_jump():
@@ -131,10 +131,16 @@ def test_keeps_jmp_to_distant_label():
         "        ret\n"
         ".far:\n"
         "        ret\n"
+        "        nop\n"  # extra non-droppable line so .far survives the cascade
     )
     out = optimize(asm)
-    # The jmp goes to .far, but the next label is .near. Don't drop.
-    assert "jmp     .far" in out
+    # `.far:` survives because it's referenced by the jmp. `.near:`
+    # is unreferenced and preceded by jmp, so it's dropped (and its
+    # following `ret` becomes dead, extending the dead zone). The
+    # `jmp .far` itself doesn't get redirected — `.far:` is still
+    # present after `.near:` is removed.
+    assert ".far:" in out
+    assert ".near:" not in out
 
 
 def test_keeps_indirect_jmp():
@@ -191,12 +197,14 @@ def test_dead_after_call_abort():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    # The xor and mov after call _abort should be dropped.
+    # The xor and mov after call _abort are dropped.
     assert "xor     eax, eax" not in out
     assert "mov     ebx, 1" not in out
-    # The label and following instructions are preserved.
-    assert ".epilogue:" in out
-    assert "leave" in out
+    # The unreferenced `.epilogue:` is also dropped (preceded by
+    # noreturn terminator, no refs), and its trailing leave/ret
+    # become dead and get dropped by the cascade.
+    assert ".epilogue:" not in out
+    assert "leave" not in out
     assert opt.stats.get("dead_after_terminator", 0) >= 2
 
 
@@ -216,7 +224,9 @@ def test_dead_after_call_exit():
     out = opt.optimize(asm)
     assert "add     esp, 4" not in out
     assert "xor     eax, eax" not in out
-    assert ".epilogue:" in out
+    # `.epilogue:` is unreferenced and preceded by a noreturn call —
+    # dropped, and the cascade drops trailing leave/ret.
+    assert ".epilogue:" not in out
 
 
 def test_dead_after_call_builtin_unreachable():
@@ -297,9 +307,10 @@ def test_unreferenced_label_removal_skips_with_fallthrough():
     assert opt.stats.get("unreferenced_label_removal", 0) == 0
 
 
-def test_unreferenced_label_removal_preserves_epilogue():
-    """Don't drop a label directly followed by leave/ret — that's
-    a function epilogue."""
+def test_unreferenced_label_removal_drops_dead_epilogue():
+    """Drop unreferenced `.epilogue:` even when followed by `leave;
+    ret` — when preceded by a noreturn call, the entire epilogue is
+    unreachable. The cascade then drops leave/ret too."""
     asm = (
         "_f:\n"
         "        call    _abort\n"
@@ -309,10 +320,60 @@ def test_unreferenced_label_removal_preserves_epilogue():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    # .epilogue is preceded by `call _abort` (now a terminator) and
-    # unreferenced. But it's followed by leave/ret — preserve as
-    # function-epilogue convention.
-    assert ".epilogue:" in out
+    # `.epilogue:` is dropped, and dead_after_terminator extends past
+    # to drop the trailing leave; ret.
+    assert ".epilogue:" not in out
+    assert "leave" not in out
+    assert "ret" not in out
+
+
+def test_unreferenced_label_scoped_per_function():
+    """Local labels with the same name in different functions are
+    scoped per-function. `.epilogue:` referenced in `_f` (via early
+    return) but not in `_g` (which uses noreturn call) — only `_g`'s
+    `.epilogue:` is dropped."""
+    asm = (
+        "_f:\n"
+        "        test    eax, eax\n"
+        "        jz      .epilogue\n"
+        "        mov     eax, 1\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+        "_g:\n"
+        "        call    _abort\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # `_f`'s `.epilogue:` is REFERENCED via `jz .epilogue` — preserve.
+    # `_g`'s `.epilogue:` has 0 refs in _g's scope and is preceded by
+    # noreturn — drop, and cascade drops trailing leave/ret.
+    # Verify there's exactly one `.epilogue:` left (the one in _f).
+    assert out.count(".epilogue:") == 1
+    # The leave; ret in `_f` survives (still referenced via jz).
+    assert "leave" in out
+
+
+def test_unreferenced_label_removal_drops_chained_after_jmp():
+    """Unreferenced label after `jmp .other` is dropped. The
+    cascade then drops dead instructions following."""
+    asm = (
+        "_f:\n"
+        "        jmp     .other\n"
+        ".dead:\n"
+        "        ret\n"
+        ".other:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # `.dead:` is unreferenced and preceded by jmp — dropped.
+    assert ".dead:" not in out
+    # `.other:` is referenced — preserved.
+    assert ".other:" in out
 
 
 def test_unreferenced_label_removal_global_label_preserved():
