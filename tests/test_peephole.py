@@ -13752,3 +13752,142 @@ def test_bool_materialize_collapse_multiple_jccs_to_true():
     # Both jne's should now point to .L_target
     assert out.count("jne     .L_target") == 2
     assert ".L3_or_true:" not in out
+
+
+def test_bool_materialize_collapse_form_b_jz_consumer():
+    """Form B: LL-cmp variant where mov-1 comes BEFORE xor.
+
+    Pattern (with `xor edx, edx` LL-cmp tail):
+        cmp ...; jne .L_false
+        cmp ...; jne .L_false
+        .L_true: mov eax, 1; jmp .L_end
+        .L_false: xor eax, eax
+        .L_end: xor edx, edx; test eax, eax; jz .L_target
+
+    For jz: result==0 means a jcc fired (some condition failed).
+    Each `jne .L_false` retargets to `jz`'s target directly.
+    """
+    asm = (
+        "_main:\n"
+        "        cmp     edx, ebx\n"
+        "        jne     .L8_ll_cmp_false\n"
+        "        cmp     eax, ecx\n"
+        "        jne     .L8_ll_cmp_false\n"
+        ".L7_ll_cmp_true:\n"
+        "        mov     eax, 1\n"
+        "        jmp     .L9_ll_cmp_end\n"
+        ".L8_ll_cmp_false:\n"
+        "        xor     eax, eax\n"
+        ".L9_ll_cmp_end:\n"
+        "        xor     edx, edx\n"
+        "        test    eax, eax\n"
+        "        jz      .L6_endif\n"
+        "        call    _abort\n"
+        ".L6_endif:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("bool_materialize_collapse", 0) == 1
+    # Both jne's should now point at .L6_endif (jz's target).
+    assert out.count("jne     .L6_endif") == 2
+    # Materialize block gone.
+    assert "mov     eax, 1" not in out
+    assert ".L8_ll_cmp_false:" not in out
+    assert ".L9_ll_cmp_end:" not in out
+    # Optional .L_true label (unreferenced) also dropped.
+    assert ".L7_ll_cmp_true:" not in out
+
+
+def test_bool_materialize_collapse_form_b_jnz_consumer():
+    """Form B with jnz consumer: result==1 means all conditions met.
+
+    Insert `jmp .L_target` + skip label; retarget jccs to skip.
+    """
+    asm = (
+        "_main:\n"
+        "        cmp     eax, 1\n"
+        "        jne     .L_false\n"
+        "        cmp     eax, 2\n"
+        "        jne     .L_false\n"
+        "        mov     eax, 1\n"
+        "        jmp     .L_end\n"
+        ".L_false:\n"
+        "        xor     eax, eax\n"
+        ".L_end:\n"
+        "        test    eax, eax\n"
+        "        jnz     .L_target\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+        ".L_target:\n"
+        "        call    _abort\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("bool_materialize_collapse", 0) == 1
+    # Original materialize block labels gone.
+    assert ".L_false:" not in out
+    assert ".L_end:" not in out
+    # After cascade with jcc_jmp_inversion, the second jne+jmp pair
+    # collapses to `je .L_target` (taking branch when condition met).
+    assert "je      .L_target" in out
+    # The first jne goes to the skip label (still present since it's
+    # the target of the first short-circuit jcc).
+    assert ".bm_skip_" in out
+
+
+def test_bool_materialize_collapse_form_b_no_edx_clear():
+    """Form B without the `xor edx, edx` LL-cmp tail.
+
+    Pattern is otherwise identical to the LL form. Used when the
+    short-circuit chain produces a regular int-typed boolean.
+    """
+    asm = (
+        "_main:\n"
+        "        cmp     eax, 0\n"
+        "        je      .L_false\n"
+        "        mov     eax, 1\n"
+        "        jmp     .L_end\n"
+        ".L_false:\n"
+        "        xor     eax, eax\n"
+        ".L_end:\n"
+        "        test    eax, eax\n"
+        "        jz      .L_target\n"
+        "        call    _foo\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+        ".L_target:\n"
+        "        call    _abort\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("bool_materialize_collapse", 0) == 1
+    assert "je      .L_target" in out
+    assert ".L_false:" not in out
+
+
+def test_bool_materialize_collapse_form_b_skips_eax_live():
+    """Form B should NOT fire if EAX is live after the consumer."""
+    asm = (
+        "_main:\n"
+        "        cmp     eax, 1\n"
+        "        jne     .L_false\n"
+        "        mov     eax, 1\n"
+        "        jmp     .L_end\n"
+        ".L_false:\n"
+        "        xor     eax, eax\n"
+        ".L_end:\n"
+        "        test    eax, eax\n"
+        "        jz      .L_target\n"
+        "        ret\n"   # EAX is the return value!
+        ".L_target:\n"
+        "        call    _abort\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Should NOT fire — EAX is live (return value).
+    assert opt.stats.get("bool_materialize_collapse", 0) == 0

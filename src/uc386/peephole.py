@@ -422,6 +422,7 @@ class PeepholeOptimizer:
             lines = self._pass_narrowing_load_test_collapse(lines)
             lines = self._pass_jcc_jmp_inversion(lines)
             lines = self._pass_bool_materialize_collapse(lines)
+            lines = self._pass_bool_materialize_collapse_form_b(lines)
             lines = self._pass_zero_init_collapse(lines)
             lines = self._pass_same_imm_store_share_reg(lines)
             lines = self._pass_redundant_xor_zero(lines)
@@ -6388,6 +6389,266 @@ class PeepholeOptimizer:
             i += 1
         return out
 
+    def _pass_bool_materialize_collapse_form_b(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Form B: the LL-cmp variant where labels are reversed.
+
+        Pattern (with optional `xor edx, edx` for LL-cmp):
+
+            prior_jccs:  jcc .L_false  (taken when condition fails)
+            (.L_true:)             [optional]
+            mov   eax, 1     ; (no jcc fired → all conditions met)
+            jmp   .L_end
+            .L_false:        (some jcc fired → result 0)
+            xor   eax, eax
+            .L_end:
+            [xor edx, edx]    ; optional
+            test  eax, eax
+            jcc   .L_target
+
+        Result: EAX = 1 if no jcc fired, 0 if any did. Inverse of
+        Form A's "EAX = 0 default; 1 on hit".
+
+        Consumer semantics:
+        - `jnz .L_target`: target taken when result=1 = all conditions
+          met. Use synthetic skip + jmp insertion (same as Form A jz).
+        - `jz .L_target`: target taken when result=0 = some jcc fired.
+          Rewrite each prior `jcc .L_false` → `jcc .L_target`.
+
+        We anchor detection on `mov eax, 1` followed by `jmp .L_end;
+        .L_false: xor eax, eax; .L_end:` instead of starting from xor.
+        """
+        out: list[Line] = list(lines)
+        n = len(out)
+
+        i = 0
+        while i + 6 < n:
+            # A: mov eax, 1
+            a = out[i]
+            if not (
+                a.kind == "instr"
+                and a.op == "mov"
+                and a.operands.replace(" ", "").lower() == "eax,1"
+            ):
+                i += 1
+                continue
+            # B: jmp .L_end
+            b = out[i + 1] if i + 1 < n else None
+            if b is None or b.kind != "instr" or b.op != "jmp":
+                i += 1
+                continue
+            l_end_target = b.operands.strip()
+            if not l_end_target.startswith("."):
+                i += 1
+                continue
+            # C: label .L_false
+            c = out[i + 2] if i + 2 < n else None
+            if c is None or c.kind != "label":
+                i += 1
+                continue
+            c_label = c.label
+            if not c_label.startswith("."):
+                i += 1
+                continue
+            # D: xor eax, eax
+            d = out[i + 3] if i + 3 < n else None
+            if d is None or d.kind != "instr" or d.op != "xor":
+                i += 1
+                continue
+            if d.operands.replace(" ", "").lower() != "eax,eax":
+                i += 1
+                continue
+            # E: label .L_end (matches l_end_target)
+            e = out[i + 4] if i + 4 < n else None
+            if e is None or e.kind != "label":
+                i += 1
+                continue
+            if e.label != l_end_target:
+                i += 1
+                continue
+            # F: optional `xor edx, edx`, then `test eax, eax`.
+            f_idx = i + 5
+            edx_clear = False
+            f = out[f_idx] if f_idx < n else None
+            if (
+                f is not None
+                and f.kind == "instr"
+                and f.op == "xor"
+                and f.operands.replace(" ", "").lower() == "edx,edx"
+            ):
+                edx_clear = True
+                f_idx += 1
+                f = out[f_idx] if f_idx < n else None
+            if f is None or f.kind != "instr" or f.op != "test":
+                i += 1
+                continue
+            if f.operands.replace(" ", "").lower() != "eax,eax":
+                i += 1
+                continue
+            # G: jnz/jz .L_target
+            g_idx = f_idx + 1
+            g = out[g_idx] if g_idx < n else None
+            if g is None or g.kind != "instr" or g.op not in ("jnz", "jz"):
+                i += 1
+                continue
+            consumer_op = g.op
+            l_target = g.operands.strip()
+            if not l_target.startswith("."):
+                i += 1
+                continue
+            # EAX dead after consumer (we eliminate the EAX=0/1 result).
+            if not self._reg_dead_after(out, g_idx + 1, "eax"):
+                i += 1
+                continue
+            if edx_clear and not self._reg_dead_after(
+                out, g_idx + 1, "edx"
+            ):
+                i += 1
+                continue
+            block_size = 7 + (1 if edx_clear else 0)
+            # Find the function scope.
+            scope = ""
+            for k in range(i, -1, -1):
+                pk = out[k]
+                if pk.kind == "label":
+                    name = pk.label
+                    if not name.startswith("."):
+                        scope = name
+                        break
+            scope_start = None
+            scope_end = n
+            cur_scope = ""
+            for k in range(n):
+                pk = out[k]
+                if pk.kind == "label":
+                    name = pk.label
+                    if not name.startswith("."):
+                        if cur_scope == scope:
+                            scope_end = k
+                            break
+                        if name == scope:
+                            scope_start = k
+                            cur_scope = scope
+                        else:
+                            cur_scope = name
+            if scope_start is None:
+                i += 1
+                continue
+            # Collect all jcc references to c_label (=L_false) in scope.
+            # ALSO: there may be a `.L_true:` label JUST before A
+            # (mov eax, 1) — the codegen sometimes emits that. If
+            # present, ensure it's only referenced from within our
+            # block (or unreferenced).
+            jcc_indices: list[int] = []
+            other_ref = False
+            for k in range(scope_start, scope_end):
+                pk = out[k]
+                if pk.kind != "instr":
+                    continue
+                if pk.kind == "instr" and pk.operands and (
+                    c_label in pk.operands
+                ):
+                    if (
+                        pk.op.startswith("j")
+                        and pk.op != "jmp"
+                        and pk.operands.strip() == c_label
+                    ):
+                        jcc_indices.append(k)
+                    else:
+                        other_ref = True
+                        break
+            if other_ref or not jcc_indices:
+                i += 1
+                continue
+            # Check for an optional `.L_true:` label just before A.
+            # If present, drop it as well (only if unreferenced).
+            true_label_idx = None
+            k = i - 1
+            while k >= 0 and out[k].kind in ("blank", "comment"):
+                k -= 1
+            if k >= 0 and out[k].kind == "label":
+                tlabel = out[k].label
+                if tlabel.startswith("."):
+                    # Check if anything within scope references tlabel.
+                    referenced = False
+                    for m in range(scope_start, scope_end):
+                        pm = out[m]
+                        if pm.kind != "instr":
+                            continue
+                        if pm.operands and tlabel in pm.operands:
+                            if pm.operands.strip() == tlabel:
+                                referenced = True
+                                break
+                    if not referenced:
+                        true_label_idx = k
+            if consumer_op == "jz":
+                # Rewrite each jcc to point at l_target directly.
+                for k in jcc_indices:
+                    pk = out[k]
+                    indent = self._extract_indent(pk.raw)
+                    spacer = " " * max(1, 8 - len(pk.op))
+                    new_raw = f"{indent}{pk.op}{spacer}{l_target}"
+                    out[k] = Line(
+                        raw=new_raw, kind="instr",
+                        op=pk.op, operands=l_target,
+                    )
+                # Drop block. Also drop the optional .L_true label.
+                if true_label_idx is not None:
+                    del out[true_label_idx]
+                    i_block_start = i - 1
+                    n -= 1
+                else:
+                    i_block_start = i
+                del out[i_block_start:i_block_start + block_size]
+                n -= block_size
+                self.stats["bool_materialize_collapse"] = (
+                    self.stats.get(
+                        "bool_materialize_collapse", 0
+                    ) + 1
+                )
+            else:
+                # consumer_op == "jnz": all-conditions-met goes to
+                # target. Insert `jmp .L_target` + skip label;
+                # retarget jccs to .L_skip.
+                skip_label = self._unique_local_label(
+                    out, base="bm_skip"
+                )
+                for k in jcc_indices:
+                    pk = out[k]
+                    indent = self._extract_indent(pk.raw)
+                    spacer = " " * max(1, 8 - len(pk.op))
+                    new_raw = f"{indent}{pk.op}{spacer}{skip_label}"
+                    out[k] = Line(
+                        raw=new_raw, kind="instr",
+                        op=pk.op, operands=skip_label,
+                    )
+                indent_a = self._extract_indent(out[i].raw)
+                jmp_raw = f"{indent_a}jmp     {l_target}"
+                jmp_line = Line(
+                    raw=jmp_raw, kind="instr",
+                    op="jmp", operands=l_target,
+                )
+                lbl_raw = f"{skip_label}:"
+                lbl_line = Line(
+                    raw=lbl_raw, kind="label",
+                    label=skip_label,
+                )
+                if true_label_idx is not None:
+                    out[true_label_idx:i + block_size] = [
+                        jmp_line, lbl_line,
+                    ]
+                    n -= (block_size + 1) - 2
+                else:
+                    out[i:i + block_size] = [jmp_line, lbl_line]
+                    n -= (block_size - 2)
+                self.stats["bool_materialize_collapse"] = (
+                    self.stats.get(
+                        "bool_materialize_collapse", 0
+                    ) + 1
+                )
+        return out
+
     def _pass_bool_materialize_collapse(
         self, lines: list[Line]
     ) -> list[Line]:
@@ -6488,8 +6749,22 @@ class PeepholeOptimizer:
             if e_label != l_end_target:
                 i += 1
                 continue
-            # F: test eax, eax
-            f = out[i + 5] if i + 5 < n else None
+            # F: test eax, eax. Allow an optional `xor edx, edx`
+            # before the test (LL-cmp emits one to clear the high
+            # half of the LL result; safe to retain since the
+            # rewritten code has no LL semantics anymore).
+            f_idx = i + 5
+            edx_clear = False
+            f = out[f_idx] if f_idx < n else None
+            if (
+                f is not None
+                and f.kind == "instr"
+                and f.op == "xor"
+                and f.operands.replace(" ", "").lower() == "edx,edx"
+            ):
+                edx_clear = True
+                f_idx += 1
+                f = out[f_idx] if f_idx < n else None
             if f is None or f.kind != "instr" or f.op != "test":
                 i += 1
                 continue
@@ -6497,7 +6772,8 @@ class PeepholeOptimizer:
                 i += 1
                 continue
             # G: jnz .L_target  OR  jz .L_target
-            g = out[i + 6] if i + 6 < n else None
+            g_idx = f_idx + 1
+            g = out[g_idx] if g_idx < n else None
             if g is None or g.kind != "instr" or g.op not in ("jnz", "jz"):
                 i += 1
                 continue
@@ -6507,9 +6783,19 @@ class PeepholeOptimizer:
                 i += 1
                 continue
             # Verify EAX is dead after G (the not-taken path).
-            if not self._reg_dead_after(out, i + 7, "eax"):
+            if not self._reg_dead_after(out, g_idx + 1, "eax"):
                 i += 1
                 continue
+            # If edx_clear is True, also verify EDX is dead — we'll
+            # drop the xor edx, edx along with the rest.
+            if edx_clear and not self._reg_dead_after(
+                out, g_idx + 1, "edx"
+            ):
+                i += 1
+                continue
+            # Compute the size of the block to drop: 7 instrs base +
+            # 1 if edx_clear.
+            block_size = 7 + (1 if edx_clear else 0)
             # Find the function scope this lives in.
             scope = ""
             for k in range(i, -1, -1):
@@ -6578,15 +6864,15 @@ class PeepholeOptimizer:
                         raw=new_raw, kind="instr",
                         op=pk.op, operands=l_target,
                     )
-                # Drop A through G (indices i to i+6).
-                del out[i:i + 7]
-                n -= 7
+                # Drop the entire block.
+                del out[i:i + block_size]
+                n -= block_size
                 fires += 1
                 self.stats["bool_materialize_collapse"] = (
                     self.stats.get("bool_materialize_collapse", 0) + 1
                 )
             else:
-                # consumer_op == "jz": replace the 7-line block with
+                # consumer_op == "jz": replace the block with
                 # `jmp .L_target` + new synthetic skip label. Each
                 # prior jcc retargets .L_or_true → .L_skip.
                 # Generate a unique skip label name.
@@ -6603,7 +6889,7 @@ class PeepholeOptimizer:
                         raw=new_raw, kind="instr",
                         op=pk.op, operands=skip_label,
                     )
-                # Replace 7-line block with `jmp .L_target` + label.
+                # Replace block with `jmp .L_target` + label.
                 indent_a = self._extract_indent(out[i].raw)
                 jmp_raw = f"{indent_a}jmp     {l_target}"
                 jmp_line = Line(
@@ -6615,8 +6901,8 @@ class PeepholeOptimizer:
                     raw=lbl_raw, kind="label",
                     label=skip_label,
                 )
-                out[i:i + 7] = [jmp_line, lbl_line]
-                n -= 5  # 7 dropped, 2 added
+                out[i:i + block_size] = [jmp_line, lbl_line]
+                n -= (block_size - 2)
                 fires += 1
                 self.stats["bool_materialize_collapse"] = (
                     self.stats.get("bool_materialize_collapse", 0) + 1

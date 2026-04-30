@@ -1829,3 +1829,26 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Real-world impact**: with both jnz and jz cases now handled, this pass catches all 112+ boolean-materialize sites in 200 torture tests. Combined with the cascade through `jcc_jmp_inversion`, real savings approach ~12-15 bytes per fire.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. Test suite unchanged (1179 unit tests; the existing test for jz was rewritten to assert the new behavior). Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: bool_materialize_collapse Form B (LL-cmp variant)**: extends slice 26 to also detect the inverse label ordering used by the LL_CMP codegen path, where `mov eax, 1` appears BEFORE `xor eax, eax` in source order.
+  - **Pattern (with optional `xor edx, edx` LL-cmp tail)**:
+    ```
+    prior_jccs:  jcc .L_false  (taken when condition fails)
+    (.L_true:)             [optional, dropped if unreferenced]
+    mov   eax, 1     ; (no jcc fired → all conditions met → result=1)
+    jmp   .L_end
+    .L_false:        (some jcc fired → result=0)
+    xor   eax, eax
+    .L_end:
+    [xor edx, edx]    ; optional, for LL-cmp
+    test  eax, eax
+    jcc   .L_target
+    ```
+    Inverse of Form A's "EAX = 0 default; 1 on hit". Anchored on `mov eax, 1` followed by `jmp .L_end; .L_false: xor eax, eax; .L_end:` instead of starting from xor.
+  - **jz consumer (target taken when result=0 = some jcc fired)**: rewrite each prior `jcc .L_false` → `jcc .L_target` directly. Block dropped entirely.
+  - **jnz consumer (target taken when result=1 = all met)**: synthetic skip label + `jmp .L_target` insertion. Each prior `jcc .L_false` retargets to skip label (since "false" path = condition failed = should skip-past the jmp).
+  - **Optional `.L_true:` label handling**: codegen sometimes emits a label before `mov eax, 1` (the conceptual "true" landing point). Pass scans within scope to verify the label is unreferenced; if so, drops it as part of the rewrite.
+  - **Common shape**: `if (a == b)`-style code where a/b are long longs. The LL_CMP codegen lowers to `cmp_high; jne false; cmp_low; jne false; mov eax, 1; jmp end; .L_false: xor eax, eax; .L_end: xor edx, edx; test eax, eax; jcc target`. Form B catches this; Form A's matcher (which anchors on `xor eax, eax; jmp .L_end`) doesn't.
+  - **Cascade with `jcc_jmp_inversion`**: for jnz consumer producing `jne .bm_skip_N; jmp .L_target` followed by `.bm_skip_N:`, the cascade collapses to `je .L_target` directly (saving the entire skip+jmp infrastructure).
+  - **Pre-survey on first 200 torture tests**: 54 fires of Form B pattern (in addition to Form A's coverage). Combined with Form A, the materialize-then-test idiom is now caught wherever it appears.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests (1183 total). Pipeline 1734/1734 (100%).
