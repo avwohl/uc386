@@ -1789,3 +1789,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Differs from `right_operand_retarget`** (which handles push/pop save/restore framing) and `pop_op_chain_retarget` (handles short-form commutative tail). My pass handles the linear no-push case where ECX is just used as a scratch.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests. 1160 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: pop_cmp_chain_retarget**: sister of `pop_op_chain_retarget` for the `cmp eax, ecx; <ZF Jcc>` consumer. Drops the push/pop save-restore frame and retargets the chain to write ECX directly. Saves 2 bytes per match.
+  - **Pattern**: `push eax; <chain (1+ instrs writing only EAX, fresh-write at start, no ECX/ESP refs)>; pop ecx; cmp eax, ecx; <ZF Jcc>`. Replace with: `<retargeted chain (eax→ecx)>; cmp eax, ecx; <ZF Jcc>`.
+  - **Why this works**: original computes `cmp computed, orig_eax` (= `computed == orig_eax`); rewrite computes `cmp orig_eax, computed`. ZF (= operands equal) is symmetric under operand swap, so `je`/`jne`/`jz`/`jnz`/`sete`/etc. produce the same behavior. SF/CF/OF are NOT symmetric — restricted to `_ZF_ONLY_FLAG_READERS`.
+  - **`_flags_safe_zf_only_after`**: scan forward from the jcc; until the first flag-clobber/fence (call/ret/jmp), every flag-reader must be ZF-only. Catches the case where two consecutive ZF-only readers consume the cmp's flags before the next clobber.
+  - **Common shape**: equality comparisons in `if`/`while` conditions where the rhs is a multi-instruction expression (constant load + shift, label-arithmetic, etc.) that survives `binop_collapse` and `right_operand_retarget` because the trailing pattern lacks the `mov ecx, eax` that those passes require.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests. 1165 unit tests total. Pipeline 1734/1734 (100%).

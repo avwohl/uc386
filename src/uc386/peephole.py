@@ -496,6 +496,7 @@ class PeepholeOptimizer:
             # Runs AFTER pop_index_*_collapse so those passes can
             # consume the SIB-form patterns first.
             lines = self._pass_pop_op_chain_retarget(lines)
+            lines = self._pass_pop_cmp_chain_retarget(lines)
             lines = self._pass_push_pop_to_mov(lines)
             lines = self._pass_sib_const_index_fold(lines)
             lines = self._pass_push_const_index_fold(lines)
@@ -2348,6 +2349,160 @@ class PeepholeOptimizer:
             i = push_idx
             continue
         return out
+
+    def _pass_pop_cmp_chain_retarget(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Sister of `pop_op_chain_retarget` for cmp followed by a
+        ZF-only Jcc. Match (looking back from
+        `pop ecx; cmp eax, ecx; <ZF jcc>`):
+
+            push    eax                   ← LHS save
+            <fresh EAX write>             ← chain instr 1
+            <EAX read-or-RMW>*            ← chain instrs 2..N
+            pop     ecx                   ← restore LHS to ECX
+            cmp     eax, ecx              ← compare RHS vs LHS
+            <ZF Jcc>                      ← je/jne/jz/jnz/...
+
+        Replace with:
+
+            <retargeted chain instr 1>    ← dest ECX
+            <retargeted chain instrs 2..N>
+            cmp     eax, ecx              ← unchanged; LHS still in EAX
+                                            (we didn't push), RHS in ECX
+            <ZF Jcc>                      ← unchanged
+
+        Drops push + pop = 2 bytes per match.
+
+        Why this works: the original computes `cmp computed,
+        orig_eax`; the rewrite computes `cmp orig_eax, computed`.
+        ZF (= operands equal) is symmetric, so subsequent
+        je/jne/sete/setne/etc. produce the same branch. SF/CF/OF
+        flip — the ZF-only Jcc constraint excludes any consumer
+        that reads them.
+
+        Common shape: equality comparisons in if/while conditions
+        where the rhs is a multi-instruction expression (constant
+        load + shift, label-arithmetic, etc.) that survives
+        binop_collapse / right_operand_retarget unchanged because
+        the trailing pattern is `pop ecx; cmp eax, ecx; je`
+        (no `mov ecx, eax` and no commutative OP).
+        """
+        out = list(lines)
+        i = 0
+        while i < len(out):
+            line = out[i]
+            # Match `pop ecx`.
+            if not (
+                line.kind == "instr"
+                and line.op == "pop"
+                and line.operands.strip().lower() == "ecx"
+            ):
+                i += 1
+                continue
+            # Next instr must be `cmp eax, ecx`.
+            instrs_after = self._next_n_instrs(out, i + 1, 2)
+            if instrs_after is None:
+                i += 1
+                continue
+            cmp_idx, cmp_line = instrs_after[0]
+            if cmp_line.op != "cmp":
+                i += 1
+                continue
+            cmpp = _operands_split(cmp_line.operands)
+            if cmpp is None:
+                i += 1
+                continue
+            if (
+                cmpp[0].strip().lower() != "eax"
+                or cmpp[1].strip().lower() != "ecx"
+            ):
+                i += 1
+                continue
+            # Following instr (the consumer) must be a ZF-only Jcc
+            # (or other ZF-only flag reader) — and there must be no
+            # other flag reader before flags get re-set. We check
+            # the immediate next instruction conservatively.
+            jcc_idx, jcc_line = instrs_after[1]
+            if jcc_line.op not in (
+                PeepholeOptimizer._ZF_ONLY_FLAG_READERS
+            ):
+                i += 1
+                continue
+            # Also require flags safe past the jcc — i.e., no other
+            # flag-reader (non-ZF) sees the cmp's flags. In our
+            # codegen the next flag-setter usually follows quickly,
+            # but be defensive: walk forward from jcc_idx + 1 until
+            # the first flag-clobber or flag-reader; if any reader
+            # is non-ZF-only, bail.
+            if not self._flags_safe_zf_only_after(
+                out, jcc_idx + 1
+            ):
+                i += 1
+                continue
+            # Backward scan to find the chain.
+            chain_info = self._find_rhs_chain(out, i)
+            if chain_info is None:
+                i += 1
+                continue
+            push_idx, chain_indices = chain_info
+            # Retarget every chain instruction.
+            for k in chain_indices:
+                out[k] = self._retarget_instr_eax_to_ecx(out[k])
+            # Drop pop_idx (= i) and push_idx (back to front).
+            out.pop(i)
+            out.pop(push_idx)
+            self.stats["pop_cmp_chain_retarget"] = (
+                self.stats.get("pop_cmp_chain_retarget", 0) + 1
+            )
+            i = push_idx
+            continue
+        return out
+
+    def _flags_safe_zf_only_after(
+        self, lines: list[Line], start: int,
+    ) -> bool:
+        """Scan forward from `start`. Until the first flag-clobbering
+        instruction (or fence — label/jmp/ret/call), every flag-reading
+        instruction we encounter must be in `_ZF_ONLY_FLAG_READERS`.
+        Returns True if so (or if no flag readers seen before a
+        clobber/fence).
+
+        Used to verify it's safe to swap operand order in a `cmp` —
+        only ZF is invariant under operand swap; other flags differ.
+        """
+        bound = min(len(lines), start + 20)
+        for j in range(start, bound):
+            ln = lines[j]
+            if ln.kind != "instr":
+                # Label/directive/data — control-flow merge or section
+                # boundary; assume safe (caller's code didn't make
+                # assumptions across the boundary).
+                return True
+            op = ln.op
+            # Fences: ret/leave/call (callee may set/use flags;
+            # cdecl says caller-saved flags are clobbered) — boundary.
+            if op in ("ret", "retn", "retf", "leave", "iret", "iretd"):
+                return True
+            if op == "call":
+                # Call clobbers flags by ABI assumption.
+                return True
+            # Unconditional jmp — boundary.
+            if op == "jmp":
+                return True
+            # Flag-readers: jcc, setcc, cmovcc, adc, sbb, rcl, rcr.
+            if op in PeepholeOptimizer._FLAG_READING_OPS:
+                if op not in PeepholeOptimizer._ZF_ONLY_FLAG_READERS:
+                    return False
+                # ZF-only reader: OK, keep scanning (we may have a
+                # chain je/jne/...). Continue.
+                continue
+            # Flag-clobbers: any arithmetic / logical / cmp / test /
+            # shift would re-set flags. If we hit one before a non-
+            # ZF reader, we're safe.
+            if op in PeepholeOptimizer._FLAG_CLOBBERING_OPS:
+                return True
+        return True
 
     def _pass_right_operand_retarget(self, lines: list[Line]) -> list[Line]:
         """Retarget the binop RHS chain from EAX to ECX, then drop

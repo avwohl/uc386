@@ -13353,3 +13353,108 @@ def test_chain_binop_collapse_imul():
     assert opt.stats.get("chain_binop_collapse", 0) == 1
     assert "imul    eax, [ebp - 4]" in out
     assert "imul    eax, [ebp - 8]" in out
+
+
+def test_pop_cmp_chain_retarget_basic():
+    """`push eax; mov eax, N; shl eax, K; pop ecx; cmp eax, ecx;
+    je L` — drop push/pop, retarget chain to ECX. ZF symmetric so
+    subsequent je is safe."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, 5\n"
+        "        shl     eax, 3\n"
+        "        pop     ecx\n"
+        "        cmp     eax, ecx\n"
+        "        je      .L_eq\n"
+        "        ret\n"
+        ".L_eq:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("pop_cmp_chain_retarget", 0) == 1
+    # Chain retargeted to ECX
+    assert "mov     ecx, 5" in out
+    assert "shl     ecx, 3" in out
+    # push and pop dropped
+    assert "push    eax" not in out
+    assert "pop     ecx" not in out
+
+
+def test_pop_cmp_chain_retarget_skips_non_zf_jcc():
+    """`jl/jg/jb/...` consume SF/CF/OF which aren't symmetric under
+    cmp operand swap. Don't fire."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, 5\n"
+        "        shl     eax, 3\n"
+        "        pop     ecx\n"
+        "        cmp     eax, ecx\n"
+        "        jl      .L_lt\n"
+        "        ret\n"
+        ".L_lt:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("pop_cmp_chain_retarget", 0) == 0
+
+
+def test_pop_cmp_chain_retarget_jne():
+    """jne is also ZF-only — fires."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, 100\n"
+        "        sar     eax, 2\n"
+        "        pop     ecx\n"
+        "        cmp     eax, ecx\n"
+        "        jne     .L_ne\n"
+        "        ret\n"
+        ".L_ne:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("pop_cmp_chain_retarget", 0) == 1
+
+
+def test_pop_cmp_chain_retarget_skips_chain_with_ecx_read():
+    """Chain mustn't read ECX (else retarget would self-reference)."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        mov     eax, [ecx]\n"  # reads ECX
+        "        shl     eax, 1\n"
+        "        pop     ecx\n"
+        "        cmp     eax, ecx\n"
+        "        je      .L_eq\n"
+        "        ret\n"
+        ".L_eq:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("pop_cmp_chain_retarget", 0) == 0
+
+
+def test_pop_cmp_chain_retarget_skips_non_fresh_chain_first():
+    """Chain's first instr must be a fresh EAX write (not RMW).
+    `add eax, X` reads EAX's prior value (the saved LHS), so post-
+    retarget the chain would compute differently."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        add     eax, 5\n"  # RMW — reads prior eax
+        "        pop     ecx\n"
+        "        cmp     eax, ecx\n"
+        "        je      .L_eq\n"
+        "        ret\n"
+        ".L_eq:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("pop_cmp_chain_retarget", 0) == 0
