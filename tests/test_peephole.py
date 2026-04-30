@@ -10235,6 +10235,94 @@ def test_mov_label_shl_add_load_to_sib_loop_body():
     assert opt.stats.get("mov_label_shl_add_load_to_sib") == 1
 
 
+def test_dup_load_to_copy_basic():
+    """`mov esi, [m]; mov eax, [m]` → `mov esi, [m]; mov eax, esi`.
+    Saves 5 bytes for SIB-form memory (7-byte load → 2-byte copy)."""
+    asm = (
+        "_f:\n"
+        "        mov     esi, [_g + eax*4]\n"
+        "        mov     eax, [_g + eax*4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     esi, [_g + eax*4]" in out
+    assert "mov     eax, esi" in out
+    # Only one SIB-form load remains.
+    assert out.count("[_g + eax*4]") == 1
+    assert opt.stats.get("dup_load_to_copy") == 1
+
+
+def test_dup_load_to_copy_ebp_relative():
+    """ebp-relative source: saves 1-2 bytes."""
+    asm = (
+        "_f:\n"
+        "        mov     ebx, [ebp - 4]\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ebx, [ebp - 4]" in out
+    assert "mov     ecx, ebx" in out
+    assert opt.stats.get("dup_load_to_copy") == 1
+
+
+def test_dup_load_to_copy_skips_when_addr_refs_r1():
+    """If the memory address references R1, A modifies the meaning
+    of the address for B."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [eax + 4]\n"  # writes EAX
+        "        mov     ecx, [eax + 4]\n"  # different address!
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dup_load_to_copy", 0) == 0
+
+
+def test_dup_load_to_copy_skips_when_memory_differs():
+    """Different memory operands are not a dup."""
+    asm = (
+        "_f:\n"
+        "        mov     ebx, [ebp - 4]\n"
+        "        mov     ecx, [ebp - 8]\n"  # different memory
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dup_load_to_copy", 0) == 0
+
+
+def test_dup_load_to_copy_skips_when_same_reg():
+    """R1 == R2 would be a self-mov; pass skips."""
+    asm = (
+        "_f:\n"
+        "        mov     ebx, [ebp - 4]\n"
+        "        mov     ebx, [ebp - 4]\n"  # same reg
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dup_load_to_copy", 0) == 0
+
+
+def test_dup_load_to_copy_with_size_prefix():
+    """Size-prefixed memory operands (different sizes) are different."""
+    asm = (
+        "_f:\n"
+        "        mov     ebx, dword [ebp - 4]\n"
+        "        mov     ecx, dword [ebp - 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Both have size prefix; same memory after stripping.
+    assert "mov     ecx, ebx" in out
+    assert opt.stats.get("dup_load_to_copy") == 1
+
+
 def test_lea_sib_label_load_collapse_cmp():
     """`lea eax, [_g + eax*4]; cmp dword [eax], edx` collapses to
     `cmp dword [_g + eax*4], edx`. Drops the 6-byte+ LEA. Common in

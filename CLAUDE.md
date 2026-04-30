@@ -1644,3 +1644,12 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Cascades** with `jcc_jmp_inversion` and `redundant_eax_load` to drop the redundant `mov eax, [ebp - 4]; jmp .epilogue` (since EAX already holds [ebp - 4]'s value at the je point).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests. 1072 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: dup_load_to_copy**: collapse adjacent same-memory loads. Pattern `mov R1, [m]; mov R2, [m]` → `mov R1, [m]; mov R2, R1`. Saves bytes for any non-trivial memory operand:
+  - ebp-rel `[ebp ± N]` (3-4 bytes): saves 1-2 bytes
+  - label `[_glob]` (5+ bytes): saves 3+ bytes
+  - SIB form `[_g + reg*4]` (7+ bytes): saves 5+ bytes
+  - **Common after `lea_sib_label_load_collapse`** produces two adjacent same-memory loads, e.g. for expressions like `g[i] + g[i]` or `pts[i].x; pts[i].y` patterns where the codegen evaluates each operand independently without memoization.
+  - **Safety**: pass requires the memory operand to NOT reference R1 (else after A modifies R1, B's address would be different). Memory operands are compared textually after stripping size prefixes and normalizing whitespace.
+  - **Sister of `dup_load_chain_to_copy`** which handles the 4-line `mov R1, [m]; mov R1, [R1+N1]; mov R2, [m]; mov R2, [R2+N2]` chained-deref pattern. My pass handles the simpler 2-line case where the loads aren't followed by a chain.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests. 1078 unit tests total. Pipeline 1734/1734 (100%).

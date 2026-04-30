@@ -467,6 +467,7 @@ class PeepholeOptimizer:
             lines = self._pass_value_forward_to_reg(lines)
             lines = self._pass_xfer_store_collapse(lines)
             lines = self._pass_dead_store_before_push(lines)
+            lines = self._pass_dup_load_to_copy(lines)
             lines = self._pass_dup_load_chain_to_copy(lines)
             lines = self._pass_copy_save_deref_collapse(lines)
             lines = self._pass_dup_load_with_intermediate(lines)
@@ -11718,6 +11719,109 @@ class PeepholeOptimizer:
             self.stats["copy_save_deref_collapse"] = (
                 self.stats.get("copy_save_deref_collapse", 0) + 1
             )
+        return out
+
+    def _pass_dup_load_to_copy(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse adjacent same-memory loads. Pattern (2 lines):
+            mov R1, [m]
+            mov R2, [m]    ; same memory textually
+        →
+            mov R1, [m]
+            mov R2, R1
+
+        Saves bytes for any non-trivial memory operand:
+        - ebp-rel `[ebp ± N]` (3-4 bytes): saves 1-2 bytes
+        - label `[_glob]` (5+ bytes): saves 3+ bytes
+        - SIB form `[_g + reg*4]` (7+ bytes): saves 5+ bytes
+
+        Common after `lea_sib_label_load_collapse` or other passes
+        produce two adjacent same-memory loads, e.g., `g[i] + g[i]`
+        or `pts[i].x; ...; pts[i].x` patterns.
+
+        Conditions:
+        - A: `mov R1, [m]` where R1 is a 32-bit GP reg.
+        - B: `mov R2, [m]` where R2 is a 32-bit GP reg, R2 != R1.
+        - The memory operands match textually after whitespace
+          normalization (and after stripping any size prefixes).
+        - The memory operand does NOT reference R1 (else after A
+          modifies R1, B's address would be different).
+        - This is the simpler 2-line case. Handled here BEFORE
+          `dup_load_chain_to_copy` runs (which expects a 4-line
+          chained-deref pattern).
+        """
+        out = list(lines)
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op == "mov"
+                and b.kind == "instr" and b.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            if ap is None or bp is None:
+                i += 1
+                continue
+            r1 = ap[0].strip().lower()
+            a_src = ap[1].strip()
+            r2 = bp[0].strip().lower()
+            b_src = bp[1].strip()
+            if (
+                not self._is_general_register(r1)
+                or not self._is_general_register(r2)
+                or r1 == r2
+            ):
+                i += 1
+                continue
+            # Strip optional size prefix.
+            def strip_size(s: str) -> str:
+                for p in ("dword ", "word ", "byte ", "qword "):
+                    if s.lower().startswith(p):
+                        return s[len(p):].lstrip()
+                return s
+            a_src_norm = strip_size(a_src)
+            b_src_norm = strip_size(b_src)
+            if not (
+                a_src_norm.startswith("[")
+                and a_src_norm.endswith("]")
+                and b_src_norm.startswith("[")
+                and b_src_norm.endswith("]")
+            ):
+                i += 1
+                continue
+            # Compare textually after whitespace-normalizing.
+            a_inner = " ".join(a_src_norm[1:-1].split())
+            b_inner = " ".join(b_src_norm[1:-1].split())
+            if a_inner != b_inner:
+                i += 1
+                continue
+            # Memory operand must not reference R1 (else after A
+            # writes R1, the address that B reads is different).
+            if self._references_reg_family(a_src, r1):
+                i += 1
+                continue
+            # Rewrite B as `mov R2, R1`.
+            indent = self._extract_indent(b.raw)
+            new_raw = f"{indent}mov     {r2}, {r1}"
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op="mov",
+                operands=f"{r2}, {r1}",
+            )
+            out = out[:i + 1] + [new_line] + out[i + 2:]
+            self.stats["dup_load_to_copy"] = (
+                self.stats.get("dup_load_to_copy", 0) + 1
+            )
+            # Don't advance i; the new line might combine with
+            # subsequent passes' targets.
+            i += 1
+            continue
         return out
 
     def _pass_dup_load_with_intermediate(
