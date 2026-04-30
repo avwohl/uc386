@@ -382,6 +382,7 @@ class PeepholeOptimizer:
             lines = self._pass_push_immediate(lines)
             lines = self._pass_imm_binop_collapse(lines)
             lines = self._pass_mov_zero_to_xor(lines)
+            lines = self._pass_mov_neg_one_to_or(lines)
             lines = self._pass_store_load_collapse(lines)
             lines = self._pass_right_operand_retarget(lines)
             lines = self._pass_store_chain_retarget(lines)
@@ -2110,6 +2111,77 @@ class PeepholeOptimizer:
             out.append(line)
             i += 1
         return out
+
+    def _pass_mov_neg_one_to_or(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Replace `mov reg, -1` (or its NASM-equivalent `mov reg,
+        4294967295`) with `or reg, -1` for any 32-bit GP register.
+        Saves 2 bytes per match (5-byte `mov reg, imm32` → 3-byte
+        `or reg, imm8` since -1 fits in a sign-extended imm8).
+
+        `or reg, -1` produces `reg | 0xFFFFFFFF = 0xFFFFFFFF` for ALL
+        prior reg values, including undefined / poisoned. So the
+        rewrite is value-equivalent regardless of reg's prior state.
+
+        Flag effects DIFFER: `mov` preserves flags; `or` clears OF
+        and CF, sets SF=1 (since result is negative), ZF=0, PF
+        based on low byte. So we require flags to be dead after
+        the instruction (same as mov_zero_to_xor's check).
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            reg = self._mov_reg_neg_one(line)
+            if (
+                reg is not None
+                and self._flags_safe_after(lines, i + 1)
+            ):
+                leading_ws = re.match(r"^\s*", line.raw).group(0)
+                new_raw = f"{leading_ws}or      {reg}, -1"
+                new_line = Line(
+                    raw=new_raw, kind="instr", op="or",
+                    operands=f"{reg}, -1",
+                )
+                out.append(new_line)
+                self.stats["mov_neg_one_to_or"] = (
+                    self.stats.get("mov_neg_one_to_or", 0) + 1
+                )
+                i += 1
+                continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _mov_reg_neg_one(line: Line) -> str | None:
+        """Return the register name if this is `mov <gp32-reg>, -1`
+        (or `mov reg, 4294967295`), else None.
+
+        NASM accepts both forms; the codegen emits both depending on
+        whether the literal was explicitly negative or unsigned-cast.
+        """
+        if line.kind != "instr" or line.op != "mov":
+            return None
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return None
+        dest, src = parts
+        src_text = src.strip()
+        # Accept literal -1 or 4294967295 (= 0xFFFFFFFF).
+        if src_text not in ("-1", "4294967295", "0xFFFFFFFF",
+                            "0xffffffff", "0xFFFFffff"):
+            # Also handle hex forms with full 32-bit width.
+            if not (
+                src_text.lower() == "0xffffffff"
+            ):
+                return None
+        dest_lower = dest.lower()
+        if dest_lower in {"eax", "ebx", "ecx", "edx",
+                          "esi", "edi", "ebp"}:
+            return dest_lower
+        return None
 
     @staticmethod
     def _mov_reg_zero(line: Line) -> str | None:

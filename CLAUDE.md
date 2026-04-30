@@ -1803,3 +1803,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **New helpers**: `_rmw_source_text_for_reg(src, working_reg)` (parameterized over the working register, allowing any non-`working_reg` GP32) and `_operand_references_reg(operand, reg32)` (sub-alias-aware reference check).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests. 1170 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: mov_neg_one_to_or**: replace `mov reg, -1` (or NASM-equivalent `mov reg, 4294967295`) with `or reg, -1`. Saves 2 bytes per match (5-byte mov-imm32 → 3-byte or-imm8-sign-ext).
+  - **Why this works**: `or reg, 0xFFFFFFFF = 0xFFFFFFFF` for ANY prior reg value (the OR with all-ones produces all-ones regardless). So the rewrite is value-equivalent.
+  - **Flag effects DIFFER**: `mov` preserves flags; `or` clears OF/CF, sets SF=1 (result is negative), ZF=0, PF based on low byte. Same flag-deadness check as `mov_zero_to_xor` ensures no flag-reader observes the change.
+  - **Common shape**: shift-test sequences. The codegen emits `mov reg, -1` to push -1 as a comparison value or shift result. With push_immediate handling the immediate-push case directly, my pass picks up the residual sites where the value is held in a register for cmp/test/etc.
+  - **Real-world impact**: 175 fires across 13/300 torture files; 350 bytes saved across 300 tests. Concentrated in shift-test-heavy files (arith-rand, ashiftrt-test).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests. 1175 unit tests total. Pipeline 1734/1734 (100%).

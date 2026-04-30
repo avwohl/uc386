@@ -13540,3 +13540,87 @@ def test_rmw_collapse_skips_when_src_is_working_reg():
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
     assert opt.stats.get("rmw_collapse", 0) == 0
+
+
+def test_mov_neg_one_to_or_basic():
+    """`mov reg, -1` → `or reg, -1`. Saves 2 bytes (5-byte
+    mov-imm32 → 3-byte or imm8 sign-extended). Flags must be
+    dead after."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, -1\n"
+        "        ret\n"  # ret is a flag fence
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("mov_neg_one_to_or", 0) == 1
+    assert "or      eax, -1" in out
+
+
+def test_mov_neg_one_to_or_unsigned_form():
+    """The codegen emits `mov reg, 4294967295` for unsigned-cast
+    -1. Same rewrite applies."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, 4294967295\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("mov_neg_one_to_or", 0) == 1
+    assert "or      edx, -1" in out
+
+
+def test_mov_neg_one_to_or_skips_if_flags_read():
+    """If flags are read after the mov before being clobbered,
+    the rewrite is unsafe — `or` clears OF/CF and sets SF/ZF.
+    `mov` preserves flags."""
+    asm = (
+        "_f:\n"
+        "        cmp     eax, ecx\n"  # flags set
+        "        mov     edx, -1\n"   # mov preserves flags
+        "        je      .L_eq\n"     # reads flags
+        "        ret\n"
+        ".L_eq:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("mov_neg_one_to_or", 0) == 0
+
+
+def test_mov_neg_one_to_or_skips_non_neg_one_value():
+    """Only -1 (or 4294967295) — not 0 or other constants."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 5\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("mov_neg_one_to_or", 0) == 0
+    asm2 = (
+        "_f:\n"
+        "        mov     eax, -2\n"
+        "        ret\n"
+    )
+    opt2 = PeepholeOptimizer()
+    out2 = opt2.optimize(asm2)
+    assert opt2.stats.get("mov_neg_one_to_or", 0) == 0
+
+
+def test_mov_neg_one_to_or_fires_with_arithmetic_after():
+    """Flag-clobbering arithmetic after the mov is a fence.
+    The new `or`'s flags are clobbered before being read."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, -1\n"
+        "        add     eax, 5\n"  # clobbers flags
+        "        je      .L_eq\n"   # reads flags from add, not mov
+        "        ret\n"
+        ".L_eq:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("mov_neg_one_to_or", 0) == 1
