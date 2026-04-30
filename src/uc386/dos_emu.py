@@ -25,13 +25,28 @@ from pathlib import Path
 import re
 import struct
 
-import unicorn
-from unicorn import Uc, UC_ARCH_X86, UC_MODE_32, UC_HOOK_INTR, UcError
-from unicorn.x86_const import (
-    UC_X86_REG_EAX, UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDX,
-    UC_X86_REG_ESI, UC_X86_REG_EDI, UC_X86_REG_EBP, UC_X86_REG_ESP,
-    UC_X86_REG_EIP, UC_X86_REG_EFLAGS,
-)
+# unicorn-engine is optional: required to actually run() / assemble_and_run()
+# (the emulator), but NOT required for bundle_text / bundle_user_asm /
+# _is_already_bundled (the compile-time libc embedding path that main.py
+# pulls in). CI installs minimal pytest deps and skips unicorn — so we
+# tolerate ImportError here and let run() raise a clean error instead.
+try:
+    import unicorn
+    from unicorn import Uc, UC_ARCH_X86, UC_MODE_32, UC_HOOK_INTR, UcError
+    from unicorn.x86_const import (
+        UC_X86_REG_EAX, UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDX,
+        UC_X86_REG_ESI, UC_X86_REG_EDI, UC_X86_REG_EBP, UC_X86_REG_ESP,
+        UC_X86_REG_EIP, UC_X86_REG_EFLAGS,
+    )
+    _UNICORN_AVAILABLE = True
+except ImportError:
+    _UNICORN_AVAILABLE = False
+    unicorn = None
+    Uc = UcError = None
+    UC_ARCH_X86 = UC_MODE_32 = UC_HOOK_INTR = None
+    UC_X86_REG_EAX = UC_X86_REG_EBX = UC_X86_REG_ECX = UC_X86_REG_EDX = None
+    UC_X86_REG_ESI = UC_X86_REG_EDI = UC_X86_REG_EBP = UC_X86_REG_ESP = None
+    UC_X86_REG_EIP = UC_X86_REG_EFLAGS = None
 
 
 # Memory layout
@@ -79,6 +94,11 @@ def run(
     argv: list[str] | None = None,
 ) -> Result:
     """Emulate a flat-binary i386 program; return its stdout + exit code."""
+    if not _UNICORN_AVAILABLE:
+        raise RuntimeError(
+            "dos_emu.run() requires the `unicorn` package. "
+            "Install with: pip install unicorn"
+        )
     if isinstance(binary, Path):
         binary = binary.read_bytes()
 
