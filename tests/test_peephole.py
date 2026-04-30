@@ -14383,13 +14383,20 @@ def test_xor_then_and_collapse_skips_xor_diff_regs():
 
 def test_or_with_zero_reg_drop_basic():
     """`xor eax, eax; xor ecx, ecx; or ecx, eax` → drop the OR.
-    eax is known 0 from the prior xor; OR with 0 is a no-op."""
+    eax is known 0 from the prior xor; OR with 0 is a no-op.
+
+    Use a non-store consumer so slice 34 (xor_or_store_collapse)
+    doesn't preempt this test by consuming the entire xor+or+store
+    quartet.
+    """
     asm = (
         "_f:\n"
         "        xor     eax, eax\n"
         "        xor     ecx, ecx\n"
         "        or      ecx, eax\n"
-        "        mov     [ebp - 4], ecx\n"
+        "        push    ecx\n"   # non-store consumer of ecx
+        "        call    _g\n"
+        "        add     esp, 4\n"
         "        ret\n"
     )
     opt = PeepholeOptimizer()
@@ -14564,3 +14571,100 @@ def test_shift_on_zero_reg_drop_skips_when_flags_read():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("shift_on_zero_reg_drop", 0) == 0
+
+
+# ── xor_or_store_collapse ────────────────────────────────────────
+
+
+def test_xor_or_store_collapse_basic():
+    """Bit-field assemble idiom:
+        xor   ecx, ecx
+        mov   eax, 9
+        and   eax, MASK
+        shl   eax, 1
+        or    ecx, eax
+        mov   [m], ecx
+
+    Rewrite drops xor + or; final mov sources from eax directly."""
+    asm = (
+        "_f:\n"
+        "        xor     ecx, ecx\n"
+        "        mov     eax, 9\n"
+        "        and     eax, 1048575\n"
+        "        shl     eax, 1\n"
+        "        or      ecx, eax\n"
+        "        mov     [ebp - 4], ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     ecx, ecx" not in out
+    assert "or      ecx, eax" not in out
+    assert "mov     [ebp - 4], eax" in out
+    assert opt.stats.get("xor_or_store_collapse", 0) == 1
+
+
+def test_xor_or_store_collapse_skips_when_chain_writes_t():
+    """If chain writes REG_T, the OR sees a non-zero REG_T — skip."""
+    asm = (
+        "_f:\n"
+        "        xor     ecx, ecx\n"
+        "        mov     ecx, 5\n"   # writes REG_T (ecx)
+        "        or      ecx, eax\n"
+        "        mov     [ebp - 4], ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("xor_or_store_collapse", 0) == 0
+
+
+def test_xor_or_store_collapse_skips_when_t_live_after():
+    """If REG_T (ecx) is live after the mov, can't drop the OR
+    (REG_T's end value would differ)."""
+    asm = (
+        "_f:\n"
+        "        xor     ecx, ecx\n"
+        "        mov     eax, 9\n"
+        "        or      ecx, eax\n"
+        "        mov     [ebp - 4], ecx\n"
+        "        push    ecx\n"   # uses ecx after the mov
+        "        call    _g\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("xor_or_store_collapse", 0) == 0
+
+
+def test_xor_or_store_collapse_skips_label_in_chain():
+    """A label between xor and or means control flow could enter
+    with REG_T non-zero — skip."""
+    asm = (
+        "_f:\n"
+        "        xor     ecx, ecx\n"
+        ".L_top:\n"
+        "        mov     eax, 9\n"
+        "        or      ecx, eax\n"
+        "        mov     [ebp - 4], ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("xor_or_store_collapse", 0) == 0
+
+
+def test_xor_or_store_collapse_skips_call_in_chain():
+    """A call could mutate state in unpredictable ways — skip."""
+    asm = (
+        "_f:\n"
+        "        xor     ecx, ecx\n"
+        "        call    _g\n"
+        "        or      ecx, eax\n"
+        "        mov     [ebp - 4], ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("xor_or_store_collapse", 0) == 0

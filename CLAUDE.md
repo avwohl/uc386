@@ -1921,3 +1921,24 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete impact on pr70602**: 26 `dead_xor_zero_drop` + 5 `shift_on_zero_reg_drop` fires combined with the OR/AND/load drops. 471 → 147 lines (69% total reduction) on top of all prior peephole work. The bit-field init code is now near-minimal — just the value computations and the final stores.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (1221 total). Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: xor_or_store_collapse**: collapse the bit-field assemble idiom to a single store. Saves 4 bytes per match.
+  - **Pattern**:
+    ```
+    xor   REG_T, REG_T
+    ... chain (no labels, calls, jumps, no read/write of REG_T) ...
+    or    REG_T, REG_X      ; REG_T = 0|REG_X = REG_X
+    mov   [m], REG_T        ; store REG_T = REG_X
+    ```
+  - **Rewrite**:
+    ```
+    ... chain ...
+    mov   [m], REG_X
+    ```
+    Drops xor + or; final mov sources from REG_X directly.
+  - **Saves 4 bytes per match** (xor 2 bytes + or 2 bytes = 4 bytes; mov stays the same length).
+  - **Conditions**: REG_T and REG_X are distinct GP32 regs; chain doesn't read/write REG_T (REG_T stays 0); REG_T is dead after the mov (since we drop the OR which would have left REG_T = REG_X); flags safe after (xor + or set flags; we drop both — flag state diverges in CF/OF after a chain ending in shl/shr).
+  - **Common shape**: bit-field write where the codegen first zeros REG_T (the storage word being assembled), then ORs in the value to be stored. The roundtrip through REG_T is unnecessary when REG_T is dead immediately after the store.
+  - **Slice 32 test update**: `test_or_with_zero_reg_drop_basic` was using `xor + or + store` which is now caught by slice 34's broader pattern. Updated to use a non-store consumer (`push ecx` followed by `call`) so slice 34 doesn't preempt the test.
+  - **Concrete impact on pr70602**: 11 fires combined with all prior peephole work. 471 → 125 lines (73% total reduction). The bit-field assemble idiom is now optimal — just the value computations and the final stores.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests (1226 total). Pipeline 1734/1734 (100%).

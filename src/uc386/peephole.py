@@ -461,6 +461,7 @@ class PeepholeOptimizer:
             lines = self._pass_push_pop_register_op(lines)
             lines = self._pass_zero_load_after_zero_store(lines)
             lines = self._pass_xor_then_and_collapse(lines)
+            lines = self._pass_xor_or_store_collapse(lines)
             lines = self._pass_or_with_zero_reg_drop(lines)
             lines = self._pass_label_load_collapse(lines)
             lines = self._pass_label_push_collapse(lines)
@@ -10703,6 +10704,176 @@ class PeepholeOptimizer:
                 zero_regs.discard("eax")
                 zero_regs.discard("edx")
             i += 1
+        return out
+
+    def _pass_xor_or_store_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse the bit-field assemble idiom:
+
+            xor   REG_T, REG_T
+            ... chain (no labels, calls, jumps,
+                       no read/write of REG_T) ...
+            or    REG_T, REG_X      ; REG_T = 0|REG_X = REG_X
+            mov   [m], REG_T        ; store REG_T = REG_X
+
+        Rewrite:
+            ... chain ...
+            mov   [m], REG_X
+
+        Saves 4 bytes per match (xor 2 bytes + or 2 bytes = 4 bytes;
+        mov stays the same length).
+
+        Common in bit-field write idioms where the codegen first
+        zeros REG_T then ORs in the value to be stored.
+
+        Conditions:
+        - REG_T and REG_X are both 32-bit GP registers, distinct.
+        - Chain has no labels, no calls, no jumps, no read/write
+          of REG_T (REG_T is dead through the chain).
+        - REG_T is dead after the mov (since we drop the OR which
+          would have left REG_T = REG_X; downstream reads of REG_T
+          would see different values).
+        - Flags safe after the mov (xor + or set flags; we drop
+          both — the rewrite preserves only the chain's last flag
+          state, which differs in CF/OF from or's behavior).
+        - The mov stores REG_T to memory `[m]`.
+        """
+        out = list(lines)
+        i = 0
+        while i + 3 < len(out):
+            a = out[i]
+            if a.kind != "instr" or a.op != "xor":
+                i += 1
+                continue
+            a_parts = _operands_split(a.operands)
+            if a_parts is None:
+                i += 1
+                continue
+            a_dst, a_src = a_parts
+            a_dst_low = a_dst.strip().lower()
+            a_src_low = a_src.strip().lower()
+            if (
+                a_dst_low not in PeepholeOptimizer._GP32
+                or a_dst_low != a_src_low
+            ):
+                i += 1
+                continue
+            t_reg = a_dst_low
+            # Walk forward looking for `or REG_T, REG_X` followed by
+            # `mov [m], REG_T`. Chain must not read/write REG_T.
+            or_idx = None
+            chain_safe = True
+            j = i + 1
+            while j < len(out) and j < i + 12:
+                ln = out[j]
+                if ln.kind == "label":
+                    chain_safe = False
+                    break
+                if ln.kind != "instr":
+                    j += 1
+                    continue
+                op = ln.op
+                # Control flow.
+                if op in (
+                    "call", "ret", "iret", "iretd", "retf", "retn",
+                    "leave", "jmp", "enter",
+                ) or (op.startswith("j") and op != "jmp"):
+                    chain_safe = False
+                    break
+                # Match the OR target.
+                if op == "or":
+                    o_parts = _operands_split(ln.operands)
+                    if o_parts is not None:
+                        o_dst, o_src = o_parts
+                        if (
+                            o_dst.strip().lower() == t_reg
+                            and o_src.strip().lower()
+                                in PeepholeOptimizer._GP32
+                            and o_src.strip().lower() != t_reg
+                        ):
+                            or_idx = j
+                            x_reg = o_src.strip().lower()
+                            break
+                # Check the chain doesn't read or write REG_T.
+                if self._references_reg_family(ln.operands, t_reg):
+                    chain_safe = False
+                    break
+                # Implicit reg writers/readers.
+                if op in ("cdq", "mul", "div", "idiv"):
+                    if t_reg in ("eax", "edx"):
+                        chain_safe = False
+                        break
+                if (
+                    op == "imul" and ln.operands
+                    and "," not in ln.operands
+                ):
+                    if t_reg in ("eax", "edx"):
+                        chain_safe = False
+                        break
+                j += 1
+            if not chain_safe or or_idx is None:
+                i += 1
+                continue
+            # Find the mov [m], REG_T immediately after the OR.
+            mov_idx = None
+            for k in range(or_idx + 1, len(out)):
+                if out[k].kind == "label":
+                    break
+                if out[k].kind != "instr":
+                    continue
+                mov_idx = k
+                break
+            if mov_idx is None:
+                i += 1
+                continue
+            mov_ln = out[mov_idx]
+            if mov_ln.op != "mov":
+                i += 1
+                continue
+            m_parts = _operands_split(mov_ln.operands)
+            if m_parts is None:
+                i += 1
+                continue
+            m_dst, m_src = m_parts
+            if (
+                m_src.strip().lower() != t_reg
+                or "[" not in m_dst
+            ):
+                i += 1
+                continue
+            # REG_T dead after the mov.
+            if not self._reg_dead_after(out, mov_idx + 1, t_reg):
+                i += 1
+                continue
+            # Flags safe after.
+            if not self._flags_safe_after(out, mov_idx + 1):
+                i += 1
+                continue
+            # Rewrite. Replace mov's source REG_T with REG_X. Drop
+            # xor (at i) and or (at or_idx).
+            indent = self._extract_indent(mov_ln.raw)
+            new_mov_raw = (
+                f"{indent}mov     {m_dst.strip()}, {x_reg}"
+            )
+            new_mov_line = Line(
+                raw=new_mov_raw,
+                kind="instr",
+                op="mov",
+                operands=f"{m_dst.strip()}, {x_reg}",
+            )
+            new_out = []
+            new_out.extend(out[:i])  # before xor
+            new_out.extend(out[i + 1:or_idx])  # chain (drop xor)
+            new_out.extend(out[or_idx + 1:mov_idx])  # between or & mov (drop or)
+            new_out.append(new_mov_line)
+            new_out.extend(out[mov_idx + 1:])
+            out = new_out
+            self.stats["xor_or_store_collapse"] = (
+                self.stats.get("xor_or_store_collapse", 0) + 1
+            )
+            # Don't advance i; new content at i.
+            continue
         return out
 
     def _pass_xor_then_and_collapse(
