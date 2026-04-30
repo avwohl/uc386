@@ -880,6 +880,105 @@ def _user_referenced_symbols(asm_text: str) -> set[str]:
     return out
 
 
+_LIBC_BUNDLE_MARKER = "; ==== bundled libc ===="
+
+
+def _is_already_bundled(text: str) -> bool:
+    """Detect whether asm text already has the libc embedded.
+
+    Reliable signals (from least to most stringent):
+    1. The bundle marker comment (`; ==== bundled libc ====`).
+    2. Libc-internal data labels — `__heap`, `__heap_ptr`,
+       `__sret_buf`, `__stdout`, `__stderr`, etc. — that user code
+       never defines. Presence of any of these means libc is
+       embedded.
+
+    NOT reliable: presence of any libc-named function body, because
+    user code can legitimately shadow a libc symbol (e.g.,
+    20020720-1 defines its own `link_error`). We avoid false
+    positives that would skip bundling when needed.
+    """
+    if _LIBC_BUNDLE_MARKER in text:
+        return True
+    # libc-internal data/bss labels that no user code should define.
+    # If any of these appear at column 0 with a `:` suffix, libc is
+    # embedded.
+    LIBC_INTERNAL_LABELS = (
+        "\n__heap:",
+        "\n__heap_ptr:",
+        "\n__heap_end:",
+        "\n__sret_buf:",
+        "\n__tmp_qword:",
+        "\n__signal_handlers:",
+        "\n__stdin:",
+        "\n__stdout:",
+        "\n__stderr:",
+    )
+    for marker in LIBC_INTERNAL_LABELS:
+        if marker in text:
+            return True
+    return False
+
+
+def bundle_text(user_text: str, *, selective_libc: bool = True) -> str:
+    """Pure-text version of bundle_user_asm: take user asm and return
+    user+libc combined text. Used by both the runtime path
+    (`bundle_user_asm` writes a temp file) and the compile-time path
+    (main.py embeds before peephole/asm DCE so they see libc too).
+
+    Idempotent: if the asm is already bundled (marker comment OR
+    any canonical libc function body is present), returns unchanged.
+    """
+    if _is_already_bundled(user_text):
+        return user_text
+    libc_syms = _libc_provided_symbols()
+    user_syms = _user_defined_symbols(user_text)
+
+    if selective_libc:
+        from .libc_split import parse_libc
+        libc_text = LIBC_ASM_PATH.read_text()
+        parsed = parse_libc(libc_text)
+        for name in list(parsed.functions):
+            if name.lstrip("_") in user_syms:
+                del parsed.functions[name]
+        seeds = _user_referenced_symbols(user_text)
+        needed = parsed.transitive_closure(seeds)
+        libc_text = parsed.emit(needed)
+    else:
+        libc_text = LIBC_ASM_PATH.read_text()
+        for name in libc_syms & user_syms:
+            libc_text = _strip_libc_function(libc_text, name)
+
+    user_lines = user_text.splitlines()
+    out_lines: list[str] = []
+    marker_inserted = False
+    for line in user_lines:
+        s = line.strip()
+        if s.startswith("extern "):
+            name = s[7:].strip().rstrip(",")
+            if name.startswith("_") and name[1:] in libc_syms:
+                continue
+        out_lines.append(line)
+        # Inject the marker into the file header so it survives
+        # asm DCE (which collects header lines until the first
+        # top-level label inside `.text`). We insert right after the
+        # `bits 32` directive — early enough to be in the header,
+        # late enough to be readable as a structured marker.
+        if not marker_inserted and s == "bits 32":
+            out_lines.append(_LIBC_BUNDLE_MARKER)
+            marker_inserted = True
+    # If we didn't find `bits 32` (unusual codegen output), fall
+    # back to inserting at the very start so the marker is still
+    # in the header.
+    if not marker_inserted:
+        out_lines.insert(0, _LIBC_BUNDLE_MARKER)
+    return (
+        "\n".join(out_lines)
+        + "\n\n"
+        + libc_text
+    )
+
+
 def bundle_user_asm(asm_path: Path, *, selective_libc: bool = True) -> Path:
     """Strip `extern _name` lines for libc-provided symbols and append
     `lib/i386_dos_libc.asm`. Writes the merged asm next to `asm_path`
@@ -892,51 +991,19 @@ def bundle_user_asm(asm_path: Path, *, selective_libc: bool = True) -> Path:
 
     With `selective_libc=True` (default), only the libc functions
     transitively reachable from the user's externs and call targets
-    are embedded. The data and bss sections are always included
-    (always-needed scratch buffers, file-descriptor table, etc.).
+    are embedded.
+
+    If the input asm is already bundled (compile-time embedding via
+    `bundle_text` puts a marker line in the file), this function
+    short-circuits and returns the path unchanged — no second bundle.
     """
-    libc_syms = _libc_provided_symbols()
     user_text = asm_path.read_text()
-    user_syms = _user_defined_symbols(user_text)
-
-    if selective_libc:
-        from .libc_split import parse_libc
-        libc_text = LIBC_ASM_PATH.read_text()
-        parsed = parse_libc(libc_text)
-        # User-defined symbols shadow libc (e.g., test ships its own
-        # `sin`). Drop those from `functions` before computing closure
-        # so we don't try to embed both definitions.
-        for name in list(parsed.functions):
-            if name.lstrip("_") in user_syms:
-                del parsed.functions[name]
-        # Initial set of needed names: any `_*` reference in non-
-        # comment lines. `extern` declarations alone don't count —
-        # `<math.h>` declares 162 math functions but a typical program
-        # calls 0–2.
-        seeds = _user_referenced_symbols(user_text)
-        needed = parsed.transitive_closure(seeds)
-        libc_text = parsed.emit(needed)
-    else:
-        libc_text = LIBC_ASM_PATH.read_text()
-        # Drop libc definitions that the user provides.
-        for name in libc_syms & user_syms:
-            libc_text = _strip_libc_function(libc_text, name)
-
-    user_lines = user_text.splitlines()
-    out_lines: list[str] = []
-    for line in user_lines:
-        s = line.strip()
-        # Strip lines like `extern _printf` for any libc-provided name.
-        if s.startswith("extern "):
-            name = s[7:].strip().rstrip(",")
-            if name.startswith("_") and name[1:] in libc_syms:
-                continue
-        out_lines.append(line)
+    if _is_already_bundled(user_text):
+        # Already bundled at compile time — skip the runtime bundle.
+        return asm_path
+    bundled_text = bundle_text(user_text, selective_libc=selective_libc)
     bundled = asm_path.with_suffix(".bundled.asm")
-    bundled.write_text(
-        "\n".join(out_lines) + "\n\n; ==== bundled libc ====\n"
-        + libc_text
-    )
+    bundled.write_text(bundled_text)
     return bundled
 
 

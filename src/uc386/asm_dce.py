@@ -307,6 +307,65 @@ def parse_asm(text: str) -> ParsedAsm:
     # `_bss_zero_end`) referenced by `_start`'s prologue when BSS init
     # is enabled. They appear in `_start`'s deps anyway.
 
+    # Address-alias detection: when a function's source is just its
+    # label line (no instructions, no data — it falls through to the
+    # NEXT function's body), treat it as an alias for that next
+    # function. The trampoline pattern this handles:
+    #     ___builtin_snprintf:
+    #             jmp _snprintf
+    # When peephole's `jmp_to_next_label` collapses the `jmp`
+    # because `_snprintf` is now adjacent (after asm DCE drops
+    # intervening libc functions), we get:
+    #     ___builtin_snprintf:
+    #     _snprintf:
+    #             push ebp ...
+    # `___builtin_snprintf:` is now a label-only definition that
+    # aliases `_snprintf`. Without this fix, asm DCE would drop
+    # `_snprintf` (no deps inbound) and leave `___builtin_snprintf`
+    # falling into whatever's next — the wrong function.
+    func_names = list(functions.keys())
+    for k, name in enumerate(func_names):
+        fn = functions[name]
+        # Body-is-empty: only the label line(s), no instruction
+        # lines. The label itself is `name:` possibly followed
+        # by whitespace; everything else should be blank or
+        # comment.
+        has_instruction = False
+        for line in fn.source:
+            stripped = line.strip()
+            if not stripped or stripped.startswith(";"):
+                continue
+            # Strip trailing comments.
+            comment_idx = stripped.find(";")
+            if comment_idx >= 0:
+                stripped = stripped[:comment_idx].rstrip()
+            if not stripped:
+                continue
+            # The label line itself: `name:` (possibly with the
+            # `:` followed by whitespace). NASM also allows
+            # `name:    instruction` on the same line; that has
+            # an instruction.
+            m_self = _TOP_LABEL_RE.match(stripped)
+            if m_self is not None:
+                # Check whether anything follows the colon.
+                rest = m_self.group(2).strip()
+                if rest:
+                    has_instruction = True
+                    break
+                # else just the label — no instruction
+                continue
+            # Non-label, non-comment, non-blank line: it's an
+            # instruction or directive.
+            has_instruction = True
+            break
+        if has_instruction:
+            continue
+        # Empty-body function. If there's a next function, it's
+        # the alias target.
+        if k + 1 < len(func_names):
+            next_name = func_names[k + 1]
+            fn.deps.add(next_name)
+
     return ParsedAsm(
         header=header,
         functions=functions,

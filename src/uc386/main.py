@@ -132,6 +132,11 @@ def main() -> int:
                     help="Disable asm-level peephole optimization")
     ap.add_argument("--no-asm-dce", action="store_true",
                     help="Disable post-codegen asm dead-code elimination")
+    ap.add_argument("--no-embed-runtime", action="store_true",
+                    help="Don't embed libc runtime into output asm. "
+                         "When disabled, output is user-only with extern "
+                         "declarations; runtime gets bundled at runtime "
+                         "by dos_emu (legacy behavior).")
     ap.add_argument("--int", dest="int_bits", type=int, choices=[16, 32],
                     help="int width in bits (default: 32 — Watcom flat-32)")
     ap.add_argument("--long", dest="long_bits", type=int, choices=[32, 64],
@@ -206,6 +211,24 @@ def main() -> int:
         if not args.no_asm_dce:
             from uc386.asm_dce import dce as asm_dce
             code = asm_dce(code)
+        # Embed libc into the asm at compile time so subsequent
+        # peephole + asm DCE passes optimize across user + runtime.
+        # Without this, libc functions never get peephole'd and any
+        # cascade DCE through libc is missed. (When --no-embed-runtime
+        # is set, output is user-only; dos_emu bundles at runtime.)
+        if not args.no_embed_runtime:
+            from uc386.dos_emu import bundle_text
+            code = bundle_text(code)
+            # Re-run peephole over the combined asm so libc functions
+            # benefit from the same optimization passes user code does.
+            if not args.no_peephole:
+                from uc386.peephole import optimize as peephole_optimize
+                code = peephole_optimize(code)
+            # Re-run asm DCE to catch cascades: libc functions whose
+            # only callers were dropped by the user-side DCE, or that
+            # peephole exposed as unreachable.
+            if not args.no_asm_dce:
+                code = asm_dce(code)
         output_path.write_text(code)
 
         if args.verbose:
