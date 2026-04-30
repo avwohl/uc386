@@ -1444,3 +1444,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete win on probe6's `_compute`**: saves 3 bytes (drops the dead `mov [ebp - 12], eax` before the push for printf). On probe5's `_main`: same shape, dropped `mov [ebp - 12], eax` before the printf push.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests (518 total). 963 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: dup_load_chain_to_copy**: collapse parallel duplicate load chains. Pattern (4 consecutive mov instructions): `mov R1, [m]; mov R1, [R1]; mov R2, [m]; mov R2, [R2]` (or `[R1+N]` / `[R2+N]` with matching offsets) → `mov R1, [m]; mov R1, [R1]; mov R2, R1`. Saves 4 bytes per match (drops two mem-loads, adds one reg-mov).
+  - **Common shape**: `p->x * p->x`-style code where the same struct member is accessed twice through different registers. The codegen evaluates each operand independently without memoization, producing two parallel address-deref chains that compute the same value.
+  - **Cascading effect**: after this pass produces `mov R1, [m]; mov R1, [R1]; mov R2, R1; imul R1, R2`, subsequent passes (`xfer_store_collapse`, `right_operand_retarget`) collapse the `mov R2, R1; imul R1, R2` to `imul R1, R1` directly. Total savings on `p->x * p->x`: ~6 bytes.
+  - **Conservative implementation**: requires 4 consecutive mov instructions with no intermediate code. Memory operand `[m]` must be textually identical between the two chains (so they reference the same source). Deref offsets (the `+ N` part) must match. Both registers must be 32-bit GP regs and distinct.
+  - **Real-world impact**: `_dist_sq` (3-component dot-product) goes from 13 instructions to 10. Each `p->x * p->x`-style pattern saves 6 bytes. Common in math-heavy code.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests (522 total). 967 unit tests total. Pipeline 1734/1734 (100%).

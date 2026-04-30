@@ -453,6 +453,7 @@ class PeepholeOptimizer:
             lines = self._pass_value_forward_to_reg(lines)
             lines = self._pass_xfer_store_collapse(lines)
             lines = self._pass_dead_store_before_push(lines)
+            lines = self._pass_dup_load_chain_to_copy(lines)
             lines = self._pass_load_add_xfer_forward(lines)
             lines = self._pass_byte_stores_to_dword(lines)
             lines = self._pass_pop_index_push_collapse(lines)
@@ -9749,6 +9750,134 @@ class PeepholeOptimizer:
                 n = -n
             result.append(n)
         return result
+
+    def _pass_dup_load_chain_to_copy(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse duplicate load chains. Pattern (4 adjacent instr
+        lines):
+            mov R1, [m]
+            mov R1, [R1] OR mov R1, [R1 + N]
+            mov R2, [m]
+            mov R2, [R2] OR mov R2, [R2 + N]
+        →
+            mov R1, [m]
+            mov R1, [R1] (or [R1 + N])
+            mov R2, R1
+
+        Saves 4 bytes per match (drops two mem-loads, adds one
+        reg-mov).
+
+        Common shape: `p->x * p->x`-style code where the same
+        struct member is accessed twice through different
+        registers. The codegen evaluates each operand independently
+        without memoization.
+
+        Conditions:
+        - R1 != R2 (else self-mov, irrelevant).
+        - Both must be 32-bit GP regs.
+        - The same memory operand `[m]` must be used in both chains.
+        - The deref offset (if any) must match between B and D.
+        - Lines must be back-to-back (no intermediate instrs).
+        - No write to `[m]` happens between (since they're
+          back-to-back, none can).
+        """
+        out = list(lines)
+        i = 0
+        while i + 3 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            c = out[i + 2]
+            d = out[i + 3]
+            # All four must be `mov` instructions.
+            if not all(
+                ln.kind == "instr" and ln.op == "mov"
+                for ln in (a, b, c, d)
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            cp = _operands_split(c.operands)
+            dp = _operands_split(d.operands)
+            if any(p is None for p in (ap, bp, cp, dp)):
+                i += 1
+                continue
+            # A: mov R1, [m]
+            r1 = ap[0].strip().lower()
+            a_src = ap[1].strip()
+            if (
+                not self._is_general_register(r1)
+                or not (a_src.startswith("[") and a_src.endswith("]"))
+            ):
+                i += 1
+                continue
+            # B: mov R1, [R1] or [R1 + N]
+            b_dst = bp[0].strip().lower()
+            b_src = bp[1].strip()
+            if b_dst != r1:
+                i += 1
+                continue
+            # Match `[r1]` or `[r1 + N]` or `[r1 - N]`.
+            b_match = re.match(
+                r"^\[\s*" + re.escape(r1)
+                + r"(?:\s*([+-])\s*(\d+))?\s*\]$",
+                b_src, re.IGNORECASE,
+            )
+            if b_match is None:
+                i += 1
+                continue
+            offset_b = 0
+            if b_match.group(1) is not None:
+                offset_b = int(b_match.group(2))
+                if b_match.group(1) == "-":
+                    offset_b = -offset_b
+            # C: mov R2, [m] (same as A's source)
+            r2 = cp[0].strip().lower()
+            c_src = cp[1].strip()
+            if (
+                not self._is_general_register(r2)
+                or r1 == r2
+                or c_src != a_src
+            ):
+                i += 1
+                continue
+            # D: mov R2, [R2] or [R2 + N] (same offset as B)
+            d_dst = dp[0].strip().lower()
+            d_src = dp[1].strip()
+            if d_dst != r2:
+                i += 1
+                continue
+            d_match = re.match(
+                r"^\[\s*" + re.escape(r2)
+                + r"(?:\s*([+-])\s*(\d+))?\s*\]$",
+                d_src, re.IGNORECASE,
+            )
+            if d_match is None:
+                i += 1
+                continue
+            offset_d = 0
+            if d_match.group(1) is not None:
+                offset_d = int(d_match.group(2))
+                if d_match.group(1) == "-":
+                    offset_d = -offset_d
+            if offset_b != offset_d:
+                i += 1
+                continue
+            # All checks pass. Replace lines C and D with
+            # `mov R2, R1`.
+            indent = self._extract_indent(c.raw)
+            new_raw = f"{indent}mov     {r2}, {r1}"
+            new_line = Line(
+                raw=new_raw, kind="instr", op="mov",
+                operands=f"{r2}, {r1}",
+            )
+            out = out[:i + 2] + [new_line] + out[i + 4:]
+            self.stats["dup_load_chain_to_copy"] = (
+                self.stats.get("dup_load_chain_to_copy", 0) + 1
+            )
+            # Don't advance — re-check from current pos.
+        return out
 
     def _pass_xfer_store_collapse(
         self, lines: list[Line]

@@ -5590,6 +5590,86 @@ def test_dead_store_before_push_skips_when_lea_taken():
     assert opt.stats.get("dead_store_before_push", 0) == 0
 
 
+# ── dup_load_chain_to_copy ─────────────────────────────────────────
+
+
+def test_dup_load_chain_to_copy_basic():
+    """`mov R1, [m]; mov R1, [R1]; mov R2, [m]; mov R2, [R2]` →
+    `mov R1, [m]; mov R1, [R1]; mov R2, R1`. Saves 4 bytes.
+
+    Cascade note: subsequent passes collapse the resulting
+    `mov ecx, eax; imul eax, ecx` to `imul eax, eax` for an extra
+    2 bytes. The test asserts the cascaded state."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax]\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        mov     ecx, [ecx]\n"
+        "        imul    eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The duplicate load chain is gone:
+    assert "mov     ecx, [ebp + 8]" not in out
+    # Pass fired:
+    assert opt.stats.get("dup_load_chain_to_copy") == 1
+    # Downstream cascade: imul eax, eax (squaring).
+    assert "imul    eax, eax" in out
+
+
+def test_dup_load_chain_to_copy_with_offset():
+    """`mov R1, [m]; mov R1, [R1+N]; mov R2, [m]; mov R2, [R2+N]`
+    folds when offsets match."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        mov     ecx, [ecx + 4]\n"
+        "        imul    eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("dup_load_chain_to_copy") == 1
+
+
+def test_dup_load_chain_to_copy_different_offset_skips():
+    """Mismatched offsets — different members of the same struct."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        mov     ecx, [ecx + 8]\n"  # different offset
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dup_load_chain_to_copy", 0) == 0
+
+
+def test_dup_load_chain_to_copy_skips_intermediate_instr():
+    """If an intermediate instruction is between the chains, the
+    pass doesn't fire (conservative)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax]\n"
+        "        nop\n"  # intermediate
+        "        mov     ecx, [ebp + 8]\n"
+        "        mov     ecx, [ecx]\n"
+        "        imul    eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dup_load_chain_to_copy", 0) == 0
+
+
 # ── xfer_store_collapse ───────────────────────────────────────────
 
 
