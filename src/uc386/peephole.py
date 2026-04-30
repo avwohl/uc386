@@ -2720,11 +2720,19 @@ class PeepholeOptimizer:
                 if target_idx is not None and target_idx <= k:
                     loop_top_labels.add(target)
 
+        # Per-function address-taken set: a register-base write
+        # (e.g. `mov [ecx], eax`) cannot alias `[ebp + N]` unless N is
+        # in the function's address-taken set. Without this analysis,
+        # the conservative `_mem_disjoint` would invalidate `reg_mem`
+        # on every register-base write — losing all redundant-reload
+        # opportunities through pointer-based stores.
+        addr_taken_per_line = self._compute_addr_taken_per_line(lines)
+
         out: list[Line] = []
         reg_mem: str | None = None  # The literal text of REG's known mem source
         jcc_states: dict[str, set[str | None]] = {}
         prev_unconditional = False
-        for line in lines:
+        for line_idx, line in enumerate(lines):
             if line.kind != "instr":
                 if line.kind == "label":
                     label = line.label
@@ -2781,8 +2789,15 @@ class PeepholeOptimizer:
                     if "[" in dest:
                         # Aliasing check: if the store might alias
                         # the currently-tracked memory, invalidate.
-                        if reg_mem is not None and not self._mem_disjoint(
-                            reg_mem, dest.strip()
+                        # Use the per-function address-taken set so
+                        # register-base writes are recognized as
+                        # disjoint from `[ebp + N]` reads when N is
+                        # not an address-taken slot.
+                        addr_taken = addr_taken_per_line[line_idx]
+                        if reg_mem is not None and not (
+                            self._mem_disjoint_with_taken(
+                                reg_mem, dest.strip(), addr_taken,
+                            )
                         ):
                             reg_mem = None
                         # Sub-reg dest: shouldn't happen with `[`,
@@ -2844,7 +2859,10 @@ class PeepholeOptimizer:
                 if parts is not None:
                     dest, _ = parts
                     if "[" in dest and reg_mem is not None and not (
-                        self._mem_disjoint(reg_mem, dest.strip())
+                        self._mem_disjoint_with_taken(
+                            reg_mem, dest.strip(),
+                            addr_taken_per_line[line_idx],
+                        )
                     ):
                         reg_mem = None
                 else:
@@ -2881,6 +2899,124 @@ class PeepholeOptimizer:
         if a_off is None or b_off is None:
             return False
         return a_off != b_off
+
+    @staticmethod
+    def _mem_disjoint_with_taken(
+        a: str, b: str, addr_taken: set[int] | None,
+    ) -> bool:
+        """Like ``_mem_disjoint`` but augmented with an address-taken
+        set: when one operand is ``[ebp + N]`` and the other is a
+        register-base deref, the two are provably disjoint iff N is
+        NOT in ``addr_taken`` (and the register isn't ``ebp``).
+
+        ``addr_taken`` is the set of ebp-offsets that the current
+        function explicitly takes the address of (via
+        ``lea X, [ebp ± N]``). Slots not in this set can never be
+        aliased by a write through any general-purpose register
+        because no register in the function ever holds an address
+        inside this frame.
+
+        ``addr_taken=None`` means "function-level analysis unavailable;
+        fall back to the static-method form".
+        """
+        if addr_taken is None:
+            return PeepholeOptimizer._mem_disjoint(a, b)
+        a_off = PeepholeOptimizer._ebp_offset(a)
+        b_off = PeepholeOptimizer._ebp_offset(b)
+        if a_off is not None and b_off is not None:
+            return a_off != b_off
+        if a_off is not None:
+            other = b
+            this_off = a_off
+        elif b_off is not None:
+            other = a
+            this_off = b_off
+        else:
+            return False
+        # The other side is not a literal `[ebp ± N]`. Check whether
+        # it's a register-base or other memory form.
+        other_stripped = other.strip()
+        for prefix in ("dword ", "word ", "byte ", "qword "):
+            if other_stripped.lower().startswith(prefix):
+                other_stripped = other_stripped[len(prefix):].lstrip()
+                break
+        # Non-memory form: not aliasing-relevant here.
+        if not (other_stripped.startswith("[")
+                and other_stripped.endswith("]")):
+            return False
+        inner = other_stripped[1:-1].strip().lower()
+        # If `ebp` appears anywhere in the deref, conservatively
+        # treat it as potentially aliasing (e.g. `[ebp + ecx*4]`).
+        if "ebp" in inner:
+            return False
+        # Otherwise the deref base/index registers are non-ebp GP
+        # regs. They can hold a frame address only if the function
+        # took an address of one — so disjoint iff this_off not in
+        # addr_taken.
+        return this_off not in addr_taken
+
+    @staticmethod
+    def _function_ranges(lines: list[Line]) -> list[tuple[int, int]]:
+        """Identify function boundaries via global labels.
+
+        A "global label" (in NASM terms) is one whose name doesn't
+        start with ``.`` (which would be a local-to-function label).
+        Each function spans from its global label's line to (but not
+        including) the next global label or end-of-lines.
+
+        Returns a list of ``(start_idx, end_idx)`` half-open intervals
+        covering the input — each line index falls in exactly one
+        range. The first range covers the prelude (before any global
+        label).
+        """
+        bounds: list[int] = []
+        for i, line in enumerate(lines):
+            if line.kind == "label" and not line.label.startswith("."):
+                bounds.append(i)
+        ranges: list[tuple[int, int]] = []
+        if not bounds:
+            return [(0, len(lines))]
+        if bounds[0] > 0:
+            ranges.append((0, bounds[0]))
+        for k, start in enumerate(bounds):
+            end = bounds[k + 1] if k + 1 < len(bounds) else len(lines)
+            ranges.append((start, end))
+        return ranges
+
+    @staticmethod
+    def _compute_addr_taken_per_line(
+        lines: list[Line],
+    ) -> list[set[int] | None]:
+        """For each line index, return the address-taken set of the
+        function containing that line.
+
+        The address-taken set for a function is the set of ebp-offsets
+        N such that ``lea X, [ebp ± N]`` appears in that function.
+        Slots in this set are potentially aliased by writes through
+        any GP register holding their address.
+
+        Returns a list of length ``len(lines)``. Lines outside any
+        function (prelude before first global label) get ``None`` —
+        no analysis available.
+        """
+        out: list[set[int] | None] = [None] * len(lines)
+        ranges = PeepholeOptimizer._function_ranges(lines)
+        for start, end in ranges:
+            taken: set[int] = set()
+            for i in range(start, end):
+                line = lines[i]
+                if line.kind != "instr" or line.op != "lea":
+                    continue
+                parts = _operands_split(line.operands)
+                if parts is None:
+                    continue
+                _, src = parts
+                off = PeepholeOptimizer._ebp_offset(src.strip())
+                if off is not None:
+                    taken.add(off)
+            for i in range(start, end):
+                out[i] = taken
+        return out
 
     @staticmethod
     def _ebp_offset(text: str) -> int | None:

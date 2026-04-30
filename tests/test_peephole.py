@@ -6141,6 +6141,67 @@ def test_redundant_ecx_load_through_jcc_fallthrough():
     assert opt.stats.get("redundant_ecx_load") == 1
 
 
+def test_redundant_ecx_load_through_register_base_store():
+    """When the function is address-clean (no `lea` instructions),
+    a `mov [ecx + offset], src` write doesn't invalidate ECX tracking
+    because the destination can't alias `[ebp + N]`."""
+    asm = (
+        "_set_point:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        mov     ecx, [ebp + 8]\n"
+        "        mov     eax, [ebp + 12]\n"
+        "        mov     [ecx], eax\n"
+        "        mov     ecx, [ebp + 8]\n"  # redundant — pure store via [ecx]
+        "        mov     eax, [ebp + 16]\n"
+        "        mov     [ecx + 4], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_ecx_load") == 1
+
+
+def test_redundant_ecx_load_NOT_collapsed_when_lea_present():
+    """When the function has `lea reg, [ebp ± N]`, `[ebp + N]` may
+    be address-taken — be conservative and invalidate on register-base
+    stores."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        lea     edx, [ebp + 8]\n"  # &param_8 escapes
+        "        mov     ecx, [ebp + 8]\n"
+        "        mov     eax, 5\n"
+        "        mov     [edx], eax\n"      # might write [ebp + 8]
+        "        mov     ecx, [ebp + 8]\n"  # NOT redundant — [edx] could be [ebp + 8]
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_ecx_load", 0) == 0
+
+
+def test_redundant_ecx_load_collapsed_when_lea_targets_other_slot():
+    """`lea reg, [ebp - 4]` makes `-4` address-taken, but `[ebp + 8]`
+    is still address-clean — its reload through a register-base store
+    can be collapsed."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        lea     edx, [ebp - 4]\n"  # only [ebp - 4] is taken
+        "        mov     ecx, [ebp + 8]\n"
+        "        mov     eax, 5\n"
+        "        mov     [ecx], eax\n"      # store via [ecx], ECX held [ebp + 8]
+        "        mov     ecx, [ebp + 8]\n"  # redundant — [ecx] != [ebp + 8]
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_ecx_load") == 1
+
+
 # ── self_mov_elimination ─────────────────────────────────────────
 
 
