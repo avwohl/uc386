@@ -7392,6 +7392,176 @@ def test_indirect_call_collapse_skips_direct_call():
     assert opt.stats.get("indirect_call_collapse", 0) == 0
 
 
+def test_cmp_load_promote_basic():
+    """Canonical loop-top pattern fires the rewrite."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        xor     eax, eax\n"
+        "        mov     [ebp - 8], eax\n"
+        ".L1_for_top:\n"
+        "        mov     eax, [ebp - 8]\n"
+        "        cmp     eax, [ebp + 12]\n"
+        "        jge     .L3_for_end\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        add     [ebp - 4], eax\n"
+        "        inc     dword [ebp - 8]\n"
+        "        jmp     .L1_for_top\n"
+        ".L3_for_end:\n"
+        "        mov     eax, [ebp - 4]\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Promoted: load to ecx instead of eax.
+    assert "mov     ecx, [ebp - 8]" in out
+    # Cmp retargeted to use ecx.
+    assert "cmp     ecx, [ebp + 12]" in out
+    # The duplicate `mov ecx, [ebp - 8]` after `mov eax, [ebp + 8]`
+    # is dropped — only one ecx-load now.
+    assert out.count("mov     ecx, [ebp - 8]") == 1
+    assert opt.stats.get("cmp_load_promote") == 1
+
+
+def test_cmp_load_promote_skips_non_loop_top():
+    """Without a preceding label, the pass doesn't fire."""
+    asm = (
+        "_f:\n"
+        "        enter   0, 0\n"
+        "        mov     eax, [ebp - 8]\n"  # not after label
+        "        cmp     eax, [ebp + 12]\n"
+        "        jge     .L_end\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        ".L_end:\n"
+        "        mov     eax, 0\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("cmp_load_promote", 0) == 0
+
+
+def test_cmp_load_promote_skips_self_rmw_d():
+    """If D references REG1 (self-RMW), the rewrite is unsafe — skip."""
+    asm = (
+        "_f:\n"
+        "        enter   0, 0\n"
+        ".L_top:\n"
+        "        mov     eax, [ebp - 8]\n"
+        "        cmp     eax, 10\n"
+        "        jge     .L_end\n"
+        "        mov     eax, [eax + 4]\n"  # D references EAX (self-RMW)
+        "        mov     ecx, [ebp - 8]\n"
+        "        ret\n"
+        ".L_end:\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("cmp_load_promote", 0) == 0
+
+
+def test_cmp_load_promote_skips_b_refs_reg2():
+    """If B's second operand references REG2, retargeting changes
+    cmp's semantics — skip."""
+    asm = (
+        "_f:\n"
+        "        enter   0, 0\n"
+        ".L_top:\n"
+        "        mov     eax, [ebp - 8]\n"
+        "        cmp     eax, ecx\n"  # B's other operand is ecx
+        "        jge     .L_end\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        ret\n"
+        ".L_end:\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("cmp_load_promote", 0) == 0
+
+
+def test_cmp_load_promote_skips_mismatched_mem():
+    """If A's [m] differs from E's [m], no redundancy — skip."""
+    asm = (
+        "_f:\n"
+        "        enter   0, 0\n"
+        ".L_top:\n"
+        "        mov     eax, [ebp - 8]\n"
+        "        cmp     eax, 10\n"
+        "        jge     .L_end\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 12]\n"  # different memory
+        "        ret\n"
+        ".L_end:\n"
+        "        mov     eax, 0\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("cmp_load_promote", 0) == 0
+
+
+def test_cmp_load_promote_skips_target_reads_reg1():
+    """If at the jcc target REG1 is read before being overwritten,
+    the rewrite would leak the wrong value to the target — skip."""
+    asm = (
+        "_f:\n"
+        "        enter   0, 0\n"
+        ".L_top:\n"
+        "        mov     eax, [ebp - 8]\n"
+        "        cmp     eax, 10\n"
+        "        jge     .L_end\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        ret\n"
+        ".L_end:\n"
+        "        add     [ebp - 4], eax\n"  # reads eax at target
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("cmp_load_promote", 0) == 0
+
+
+def test_cmp_load_promote_codegen_integration():
+    """End-to-end: a typical for-loop indexing pattern triggers
+    the rewrite."""
+    from uc386.codegen import CodeGenerator
+    from uc_core.lexer import Lexer
+    from uc_core.parser import Parser
+
+    src = (
+        "int sum_arr(int *arr, int n) {\n"
+        "    int s = 0;\n"
+        "    for (int i = 0; i < n; i++) {\n"
+        "        s += arr[i];\n"
+        "    }\n"
+        "    return s;\n"
+        "}\n"
+        "int main(void) { return 0; }\n"
+    )
+    tokens = list(Lexer(src, "test.c").tokenize())
+    tu = Parser(tokens).parse()
+    cg = CodeGenerator(peephole=True)
+    asm = cg.generate(tu)
+    # The loop top should now load i directly into ecx for the cmp.
+    assert "mov     ecx, [ebp - 8]" in asm
+    assert "cmp     ecx, [ebp + 12]" in asm
+    # No second `mov ecx, [ebp - 8]` (duplicate dropped).
+    assert asm.count("mov     ecx, [ebp - 8]") == 1
+
+
 def test_indirect_call_collapse_codegen_integration():
     """End-to-end: function pointer call lowers to a single
     `call dword [ebp + N]` after peephole."""

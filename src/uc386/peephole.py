@@ -438,6 +438,7 @@ class PeepholeOptimizer:
             lines = self._pass_push_index_collapse(lines)
             lines = self._pass_self_mov_elimination(lines)
             lines = self._pass_indirect_call_collapse(lines)
+            lines = self._pass_cmp_load_promote(lines)
             lines = self._pass_transfer_pop_collapse(lines)
             lines = self._pass_transfer_pop_cmp_collapse(lines)
             lines = self._pass_dup_push_pop_self_op(lines)
@@ -12056,6 +12057,227 @@ class PeepholeOptimizer:
                         )
                         continue
             out.append(line)
+        return out
+
+    def _pass_cmp_load_promote(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Promote `mov REG1, [m]` at the loop top to load into REG2
+        instead, when a later `mov REG2, [m]` (same memory) appears as
+        the SIB index load. Drops the redundant REG2 load and
+        retargets the cmp to use REG2.
+
+        Pattern (5 consecutive instructions following a label):
+            .L_xxx:
+            A: mov REG1, [m]
+            B: cmp REG1, X       (or test REG1, REG1)
+            C: jcc L
+            D: mov REG1, RHS     (RHS doesn't reference REG1)
+            E: mov REG2, [m]     (same [m] as A, REG2 != REG1)
+
+        Rewrite:
+            .L_xxx:
+            A': mov REG2, [m]    (promoted)
+            B': cmp REG2, X      (retargeted)
+            C: jcc L             (unchanged)
+            D: mov REG1, RHS     (unchanged)
+            (E dropped)
+
+        Saves 3 bytes per match (the dropped E).
+
+        Common shape: for-loops indexing into an array (`for (i=0;
+        i<n; i++) ... arr[i] ...`). Codegen evaluates `i` for the
+        cmp into EAX, then later loads `i` again into ECX for the
+        SIB index. After the rewrite, the loop top loads `i`
+        directly into ECX, skipping the second load.
+
+        Conditions (all required):
+        - A is immediately preceded by a label.
+        - B is `cmp REG1, X` or `test REG1, REG1` immediately after A.
+        - B's second operand X does NOT reference REG2 (else cmp's
+          semantics change after retargeting).
+        - C is jcc L immediately after B.
+        - D is `mov REG1, RHS` immediately after C, where RHS does not
+          reference REG1 (no self-RMW — D must overwrite REG1
+          cleanly so REG1's pre-A value isn't observable).
+        - E is `mov REG2, [m]` immediately after D, with same memory
+          operand as A, REG2 != REG1.
+        - At C's jump target L: both REG1 and REG2 are dead
+          (overwritten before read), so the L path doesn't depend on
+          REG1 holding [m] or REG2 holding pre-loop garbage.
+
+        Both REG1 and REG2 must be 32-bit GP registers.
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            # Need lookahead of 5 (A, B, C, D, E) plus a preceding
+            # label. So check i >= 1 (label) and i + 4 < len (E).
+            if not (
+                i >= 1
+                and i + 4 < len(lines)
+                and lines[i - 1].kind == "label"
+                and line.kind == "instr"
+                and line.op == "mov"
+            ):
+                out.append(line)
+                i += 1
+                continue
+            a = line
+            b = lines[i + 1]
+            c = lines[i + 2]
+            d = lines[i + 3]
+            e = lines[i + 4]
+            # All must be instructions.
+            if not all(
+                x.kind == "instr" for x in (b, c, d, e)
+            ):
+                out.append(line)
+                i += 1
+                continue
+            # Parse A: mov REG1, [m].
+            ap = _operands_split(a.operands)
+            if ap is None:
+                out.append(line)
+                i += 1
+                continue
+            reg1 = ap[0].strip().lower()
+            a_src = ap[1].strip()
+            if not self._is_general_register(reg1):
+                out.append(line)
+                i += 1
+                continue
+            if not (a_src.startswith("[") and a_src.endswith("]")):
+                out.append(line)
+                i += 1
+                continue
+            # Parse B: cmp REG1, X (or test REG1, REG1).
+            if b.op not in ("cmp", "test"):
+                out.append(line)
+                i += 1
+                continue
+            bp = _operands_split(b.operands)
+            if bp is None:
+                out.append(line)
+                i += 1
+                continue
+            b_first = bp[0].strip().lower()
+            b_second = bp[1].strip()
+            if b_first != reg1:
+                out.append(line)
+                i += 1
+                continue
+            # For test: second operand must equal first (test reg, reg).
+            if b.op == "test" and b_second.strip().lower() != reg1:
+                out.append(line)
+                i += 1
+                continue
+            # Parse C: jcc.
+            if not (
+                c.op.startswith("j")
+                and c.op != "jmp"
+            ):
+                out.append(line)
+                i += 1
+                continue
+            jcc_target = c.operands.strip()
+            # Parse D: mov REG1, RHS, RHS doesn't reference REG1.
+            if d.op != "mov":
+                out.append(line)
+                i += 1
+                continue
+            dp = _operands_split(d.operands)
+            if dp is None:
+                out.append(line)
+                i += 1
+                continue
+            d_dst = dp[0].strip().lower()
+            d_src = dp[1].strip()
+            if d_dst != reg1:
+                out.append(line)
+                i += 1
+                continue
+            if _references_register(d_src, reg1):
+                out.append(line)
+                i += 1
+                continue
+            # Parse E: mov REG2, [m] same as A, REG2 != REG1.
+            if e.op != "mov":
+                out.append(line)
+                i += 1
+                continue
+            ep = _operands_split(e.operands)
+            if ep is None:
+                out.append(line)
+                i += 1
+                continue
+            reg2 = ep[0].strip().lower()
+            e_src = ep[1].strip()
+            if not self._is_general_register(reg2):
+                out.append(line)
+                i += 1
+                continue
+            if reg2 == reg1:
+                out.append(line)
+                i += 1
+                continue
+            if e_src != a_src:
+                out.append(line)
+                i += 1
+                continue
+            # B's second operand X must not reference REG2.
+            if _references_register(b_second, reg2):
+                out.append(line)
+                i += 1
+                continue
+            # At C's jump target, both REG1 and REG2 must be dead.
+            target_idx = self._find_label_idx(
+                lines, jcc_target, from_idx=i + 2,
+            )
+            if target_idx is None:
+                out.append(line)
+                i += 1
+                continue
+            if not self._reg_dead_after(
+                lines, target_idx + 1, reg1,
+            ):
+                out.append(line)
+                i += 1
+                continue
+            if not self._reg_dead_after(
+                lines, target_idx + 1, reg2,
+            ):
+                out.append(line)
+                i += 1
+                continue
+            # Build rewrite: A → mov REG2, [m]; B → cmp REG2, X; drop E.
+            indent_a = self._extract_indent(a.raw)
+            indent_b = self._extract_indent(b.raw)
+            new_a_raw = f"{indent_a}mov     {reg2}, {a_src}"
+            new_a = Line(
+                raw=new_a_raw,
+                kind="instr",
+                op="mov",
+                operands=f"{reg2}, {a_src}",
+            )
+            spacer = " " * max(1, 8 - len(b.op))
+            new_b_raw = f"{indent_b}{b.op}{spacer}{reg2}, {b_second}"
+            new_b = Line(
+                raw=new_b_raw,
+                kind="instr",
+                op=b.op,
+                operands=f"{reg2}, {b_second}",
+            )
+            out.append(new_a)
+            out.append(new_b)
+            out.append(c)
+            out.append(d)
+            # E is dropped.
+            self.stats["cmp_load_promote"] = (
+                self.stats.get("cmp_load_promote", 0) + 1
+            )
+            i += 5
         return out
 
     def _pass_indirect_call_collapse(

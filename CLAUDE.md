@@ -1561,3 +1561,25 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Conditions**: 2 adjacent instr lines; A is `mov REG, MEM` where REG is a 32-bit GP register and MEM is a `[...]` memory operand; B is `call REG` (same REG, single operand). Source must be a memory operand — for direct calls `mov eax, _foo; call eax`, the codegen would have emitted `call _foo` directly. The mem-source restriction prevents accidental rewrite of any non-memory `mov reg, value; call reg` pattern (which doesn't appear in our codegen but is defensive).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +9 peephole tests. 1036 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: cmp_load_promote**: promote `mov REG1, [m]` at the loop top to load into REG2 instead, when a later `mov REG2, [m]` (same memory) appears as the SIB index load. Drops the redundant index load and retargets the cmp to use REG2. Saves 3 bytes per match.
+  - **Common shape**: for-loops indexing into an array. The codegen evaluates `i` for the loop-condition cmp into EAX, then later loads `i` again into ECX for the SIB index in the body. After this pass, the loop top loads `i` directly into ECX, skipping the second load.
+  - **Pattern (5 consecutive instructions following a label)**:
+    ```
+    .L_xxx:
+    A: mov REG1, [m]
+    B: cmp REG1, X        (or test REG1, REG1)
+    C: jcc L
+    D: mov REG1, RHS      (RHS doesn't reference REG1)
+    E: mov REG2, [m]      (same [m] as A, REG2 != REG1)
+    ```
+  - **Rewrite**: A → `mov REG2, [m]`; B → `cmp REG2, X`; C, D unchanged; E dropped. Saves 3 bytes (the dropped E).
+  - **Conditions** (all required):
+    1. A immediately preceded by a label (loop top — REG2 conventionally dead at the label).
+    2. B is `cmp REG1, X` or `test REG1, REG1`. B's other operand X must NOT reference REG2 (else cmp's semantics change after retargeting).
+    3. C is jcc (any conditional jump).
+    4. D is `mov REG1, RHS`. RHS must NOT reference REG1 (no self-RMW; D must overwrite REG1 cleanly).
+    5. E is `mov REG2, [m]` with same memory as A, REG2 != REG1.
+    6. At C's jump target L: both REG1 AND REG2 are dead (overwritten before read). For REG1, the L path doesn't observe its [m] value; for REG2, the L path doesn't observe pre-loop garbage that the rewrite replaces.
+  - **Concrete win**: `_compute` (dot-product) loop body 8 → 7 instructions per iteration; `_find_max` body 7 → 6; `_sum_arr` body 5 → 4. Saves 3 bytes per iteration.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests. 1043 unit tests total. Pipeline 1734/1734 (100%).
