@@ -413,6 +413,7 @@ class PeepholeOptimizer:
             lines = self._pass_mov_test_setcc_movzx_collapse(lines)
             lines = self._pass_shift_const_imm(lines)
             lines = self._pass_same_memory_operand_reuse(lines)
+            lines = self._pass_chain_binop_collapse(lines)
             lines = self._pass_fst_fstp_collapse(lines)
             lines = self._pass_fpu_op_collapse(lines)
             lines = self._pass_add_one_to_inc(lines)
@@ -5367,6 +5368,193 @@ class PeepholeOptimizer:
                                     )
                                     i += 2
                                     continue
+            out.append(line)
+            i += 1
+        return out
+
+    def _pass_chain_binop_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse the linear chain
+            mov   ECX, X
+            OP    ECX, Y
+            OP    EAX, ECX
+        to:
+            OP    EAX, X
+            OP    EAX, Y
+
+        when both inner and outer OP match and OP is associative
+        (add/and/or/xor/imul). Saves 1 instruction per match.
+
+        The original computes ``eax = eax OP (X OP Y)``; the rewrite
+        computes ``eax = (eax OP X) OP Y``. By associativity, both are
+        equal for OP ∈ {+, &, |, ^, *}. (NOT for sub: `eax - (X - Y) =
+        eax - X + Y ≠ (eax - X) - Y`.)
+
+        Common shape: ``a + b + c`` chains the codegen evaluates as
+        ``mov ecx, [b]; add ecx, [c]; add eax, ecx`` (after
+        binop_collapse already merged the inner b+c push/pop). After
+        this pass: ``add eax, [b]; add eax, [c]``.
+
+        Conditions:
+        - 3 consecutive instr lines.
+        - A is `mov ecx, X` (any source).
+        - B is `OP ecx, Y` where OP ∈ COMMUTATIVE_BINOPS.
+        - C is `OP eax, ecx` (same OP, same ECX).
+        - Y must NOT reference EAX (would be read with new EAX value
+          after the first rewritten op modifies EAX).
+        - Y must NOT reference ECX (would be read with pre-A ECX in
+          the rewrite, vs A's ECX=X in the original).
+        - X may reference EAX or ECX (both ops read with
+          pre-modification values, same in original).
+        - ECX dead after C (we drop the only definition of ECX from A).
+
+        Saves 3 bytes per match (drops the `mov ecx, X` line; the
+        rewritten ops have the same encoded length as the originals).
+        """
+        out: list[Line] = []
+        i = 0
+        n = len(lines)
+        while i < n:
+            line = lines[i]
+            if (
+                line.kind == "instr"
+                and line.op == "mov"
+                and i + 2 < n
+            ):
+                ap = _operands_split(line.operands)
+                if ap is not None:
+                    a_dst, a_src = ap
+                    a_dst_low = a_dst.strip().lower()
+                    a_src_norm = a_src.strip()
+                    if a_dst_low == "ecx":
+                        b = lines[i + 1]
+                        if (
+                            b.kind == "instr"
+                            and b.op in (
+                                PeepholeOptimizer._COMMUTATIVE_BINOPS
+                            )
+                        ):
+                            bp = _operands_split(b.operands)
+                            if bp is not None:
+                                b_dst, b_src = bp
+                                b_dst_low = b_dst.strip().lower()
+                                b_src_norm = b_src.strip()
+                                if b_dst_low == "ecx":
+                                    c = lines[i + 2]
+                                    if (
+                                        c.kind == "instr"
+                                        and c.op == b.op
+                                    ):
+                                        cp = _operands_split(
+                                            c.operands
+                                        )
+                                        if cp is not None:
+                                            c_dst, c_src = cp
+                                            c_dst_low = (
+                                                c_dst.strip().lower()
+                                            )
+                                            c_src_low = (
+                                                c_src.strip().lower()
+                                            )
+                                            if (
+                                                c_dst_low == "eax"
+                                                and c_src_low == "ecx"
+                                                and not (
+                                                    _references_register(
+                                                        b_src_norm,
+                                                        "eax",
+                                                    )
+                                                    or _references_register(
+                                                        b_src_norm,
+                                                        "ax",
+                                                    )
+                                                    or _references_register(
+                                                        b_src_norm,
+                                                        "al",
+                                                    )
+                                                    or _references_register(
+                                                        b_src_norm,
+                                                        "ah",
+                                                    )
+                                                )
+                                                and not (
+                                                    _references_register(
+                                                        b_src_norm,
+                                                        "ecx",
+                                                    )
+                                                    or _references_register(
+                                                        b_src_norm,
+                                                        "cx",
+                                                    )
+                                                    or _references_register(
+                                                        b_src_norm,
+                                                        "cl",
+                                                    )
+                                                    or _references_register(
+                                                        b_src_norm,
+                                                        "ch",
+                                                    )
+                                                )
+                                                and self._reg_dead_after(
+                                                    lines, i + 3,
+                                                    "ecx",
+                                                )
+                                            ):
+                                                # Build new lines.
+                                                indent_a = (
+                                                    self._extract_indent(
+                                                        line.raw
+                                                    )
+                                                )
+                                                indent_b = (
+                                                    self._extract_indent(
+                                                        b.raw
+                                                    )
+                                                )
+                                                spacer = " " * max(
+                                                    1, 8 - len(b.op)
+                                                )
+                                                new_a_raw = (
+                                                    f"{indent_a}{b.op}"
+                                                    f"{spacer}"
+                                                    f"eax, {a_src_norm}"
+                                                )
+                                                new_a = Line(
+                                                    raw=new_a_raw,
+                                                    kind="instr",
+                                                    op=b.op,
+                                                    operands=(
+                                                        f"eax, "
+                                                        f"{a_src_norm}"
+                                                    ),
+                                                )
+                                                new_b_raw = (
+                                                    f"{indent_b}{b.op}"
+                                                    f"{spacer}"
+                                                    f"eax, {b_src_norm}"
+                                                )
+                                                new_b = Line(
+                                                    raw=new_b_raw,
+                                                    kind="instr",
+                                                    op=b.op,
+                                                    operands=(
+                                                        f"eax, "
+                                                        f"{b_src_norm}"
+                                                    ),
+                                                )
+                                                out.append(new_a)
+                                                out.append(new_b)
+                                                self.stats[
+                                                    "chain_binop_collapse"
+                                                ] = (
+                                                    self.stats.get(
+                                                        "chain_binop_collapse",
+                                                        0,
+                                                    ) + 1
+                                                )
+                                                i += 3
+                                                continue
             out.append(line)
             i += 1
         return out

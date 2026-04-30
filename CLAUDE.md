@@ -1781,3 +1781,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Modest fire rate**: 2/200 torture, 2/220 c-testsuite — switches with empty case bodies are uncommon. Real-world impact on switch-heavy code (state machines, interpreters).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests. 1153 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: chain_binop_collapse**: collapse the linear `mov ecx, X; OP ecx, Y; OP eax, ecx` chain into `OP eax, X; OP eax, Y` for associative OPs (add/and/or/xor/imul). Saves 1 instruction (~3 bytes) per match.
+  - **Common shape**: `eax + (X + Y)`-style expressions where the codegen evaluates the rhs into ECX, then combines into EAX. After my pass, no scratch register is needed.
+  - **Why associativity matters**: original computes `eax = eax OP (X OP Y)`; rewrite computes `eax = (eax OP X) OP Y`. Equal for OP ∈ {+, &, |, ^, *}. Excluded: sub (`eax - (X - Y) = eax - X + Y ≠ (eax - X) - Y`).
+  - **Conditions**: 3 consecutive instr lines; A is `mov ecx, X`; B is `OP ecx, Y` for OP in COMMUTATIVE_BINOPS (add/and/or/xor/imul); C is the same OP `OP eax, ecx`; Y must NOT reference EAX or ECX (would be read with different values after the rewrite); ECX dead after C.
+  - **X may reference EAX or ECX** since both are read at the same conceptual time as the original A.
+  - **Differs from `right_operand_retarget`** (which handles push/pop save/restore framing) and `pop_op_chain_retarget` (handles short-form commutative tail). My pass handles the linear no-push case where ECX is just used as a scratch.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests. 1160 unit tests total. Pipeline 1734/1734 (100%).

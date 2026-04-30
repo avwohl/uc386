@@ -13246,3 +13246,110 @@ def test_trampoline_elimination_global_label_safe():
     out = opt.optimize(asm)
     # Global trampolines are NOT eliminated.
     assert opt.stats.get("trampoline_elimination", 0) == 0
+
+
+def test_chain_binop_collapse_add():
+    """`mov ecx, X; add ecx, Y; add eax, ecx` → `add eax, X; add eax, Y`."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        add     ecx, [ebp - 8]\n"
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("chain_binop_collapse", 0) == 1
+    assert "mov     ecx" not in out
+    assert "add     eax, [ebp - 4]" in out
+    assert "add     eax, [ebp - 8]" in out
+
+
+def test_chain_binop_collapse_skips_sub():
+    """sub is NOT associative under this rewrite —
+    `eax - (X - Y) ≠ (eax - X) - Y`. Don't fire."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        sub     ecx, [ebp - 8]\n"
+        "        sub     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("chain_binop_collapse", 0) == 0
+
+
+def test_chain_binop_collapse_skips_mismatched_ops():
+    """B and C must use the SAME op."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        add     ecx, [ebp - 8]\n"
+        "        xor     eax, ecx\n"  # diff op
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("chain_binop_collapse", 0) == 0
+
+
+def test_chain_binop_collapse_skips_y_references_eax():
+    """If Y references EAX, the rewrite changes its observed value."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        add     ecx, [eax + 4]\n"  # Y references EAX
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("chain_binop_collapse", 0) == 0
+
+
+def test_chain_binop_collapse_skips_y_references_ecx():
+    """If Y references ECX, the original reads ECX with A's value
+    but the rewrite would read with pre-A ECX. Don't fire."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        add     ecx, [ecx + 4]\n"  # Y references ECX
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("chain_binop_collapse", 0) == 0
+
+
+def test_chain_binop_collapse_skips_ecx_alive_after():
+    """If ECX is read after C, dropping the only definition is
+    unsafe."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        add     ecx, [ebp - 8]\n"
+        "        add     eax, ecx\n"
+        "        mov     [ebp - 12], ecx\n"  # ECX read here
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("chain_binop_collapse", 0) == 0
+
+
+def test_chain_binop_collapse_imul():
+    """imul is associative — chain rewrite is valid."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        imul    ecx, [ebp - 8]\n"
+        "        imul    eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("chain_binop_collapse", 0) == 1
+    assert "imul    eax, [ebp - 4]" in out
+    assert "imul    eax, [ebp - 8]" in out
