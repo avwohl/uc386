@@ -434,6 +434,7 @@ class PeepholeOptimizer:
             lines = self._pass_disp_load_collapse(lines)
             lines = self._pass_disp_store_collapse(lines)
             lines = self._pass_push_disp_collapse(lines)
+            lines = self._pass_index_store_xfer_collapse(lines)
             lines = self._pass_push_index_collapse(lines)
             lines = self._pass_self_mov_elimination(lines)
             lines = self._pass_transfer_pop_collapse(lines)
@@ -5882,6 +5883,192 @@ class PeepholeOptimizer:
             out = out[:i] + [new_line] + out[i + 2:]
             self.stats["push_disp_collapse"] = (
                 self.stats.get("push_disp_collapse", 0) + 1
+            )
+            continue
+        return out
+
+    def _pass_index_store_xfer_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse the codegen's array-index-store pattern by dropping
+        the address-transfer step.
+
+        Pattern (5 consecutive instrs):
+            shl IDX, N            ; A: scale idx
+            add BASE, IDX         ; B: BASE = address (base + idx*scale)
+            mov XFER, BASE        ; C: XFER = address (transfer)
+            mov BASE, SRC         ; D: BASE = src value (clobbers address)
+            mov [XFER], BASE      ; E: store src at address
+
+        Rewrite (drops C, swaps roles of XFER and BASE in D/E):
+            shl IDX, N            ; KEEP
+            add BASE, IDX         ; KEEP — BASE = address still
+            mov XFER, SRC         ; D': XFER = src value (BASE preserved)
+            mov [BASE], XFER      ; E': store via BASE (still address)
+
+        Saves 1 instruction per match (drops the xfer mov).
+
+        The codegen emits the original 5-line shape for every
+        ``arr[i] = val`` statement (or any single-step assignment to a
+        register-base lvalue). The xfer's only purpose is to free up
+        BASE so the rhs eval can reuse EAX. By using XFER as the rhs
+        target instead, BASE keeps the address and the xfer disappears.
+
+        Conditions:
+        - 5 consecutive instr lines (no labels/blanks/comments).
+        - A: ``shl IDX, N`` (N ∈ {1, 2, 3}).
+        - B: ``add BASE, IDX``, BASE != IDX, both GP regs.
+        - C: ``mov XFER, BASE``, XFER != BASE.
+        - D: ``mov/movsx/movzx BASE, SRC`` (BASE is dest, gets clobbered).
+        - E: ``mov [XFER], BASE`` (with optional size prefix).
+        - SRC must NOT reference XFER (or its sub-regs) — XFER's value
+          differs at the SRC-read site after the rewrite.
+        - All of BASE, IDX, XFER dead after E.
+        - Flags must be safe after E (we keep A and B's flag-setting,
+          so this is automatically OK — same flag state as before).
+        """
+        SCALE = {1: 2, 2: 4, 3: 8}
+        LOAD_OPS = {"mov", "movsx", "movzx"}
+        out = list(lines)
+        i = 0
+        while i + 4 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            c = out[i + 2]
+            d = out[i + 3]
+            e = out[i + 4]
+            if not (
+                a.kind == "instr" and a.op == "shl"
+                and b.kind == "instr" and b.op == "add"
+                and c.kind == "instr" and c.op == "mov"
+                and d.kind == "instr" and d.op in LOAD_OPS
+                and e.kind == "instr" and e.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            cp = _operands_split(c.operands)
+            dp = _operands_split(d.operands)
+            ep = _operands_split(e.operands)
+            if any(p is None for p in (ap, bp, cp, dp, ep)):
+                i += 1
+                continue
+            # Line A: shl IDX, N
+            idx_reg = ap[0].strip().lower()
+            try:
+                n = int(ap[1].strip())
+            except ValueError:
+                i += 1
+                continue
+            if (
+                n not in SCALE
+                or not self._is_general_register(idx_reg)
+            ):
+                i += 1
+                continue
+            # Line B: add BASE, IDX
+            base_reg = bp[0].strip().lower()
+            b_src = bp[1].strip().lower()
+            if (
+                not self._is_general_register(base_reg)
+                or b_src != idx_reg
+                or base_reg == idx_reg
+            ):
+                i += 1
+                continue
+            # Line C: mov XFER, BASE
+            xfer_reg = cp[0].strip().lower()
+            c_src = cp[1].strip().lower()
+            if (
+                not self._is_general_register(xfer_reg)
+                or c_src != base_reg
+                or xfer_reg == base_reg
+            ):
+                i += 1
+                continue
+            # Line D: mov BASE, SRC (D's dest must be BASE; gets clobbered)
+            d_dst = dp[0].strip().lower()
+            d_src = dp[1].strip()
+            if d_dst != base_reg:
+                i += 1
+                continue
+            # SRC must not reference XFER's family — XFER's value
+            # differs at the SRC-read site after the rewrite.
+            if self._references_reg_family(d_src, xfer_reg):
+                i += 1
+                continue
+            # Line E: mov [XFER], BASE (BASE as src; XFER as memory base)
+            e_dst = ep[0].strip()
+            e_src = ep[1].strip().lower()
+            if e_src != base_reg:
+                i += 1
+                continue
+            # E_dst must be `[XFER]` exactly (no displacement / index).
+            # Allow optional size prefix.
+            e_stripped = e_dst
+            size_prefix = ""
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if e_stripped.lower().startswith(prefix):
+                    size_prefix = e_stripped[:len(prefix)]
+                    e_stripped = e_stripped[len(prefix):].lstrip()
+                    break
+            mem_re = re.match(
+                r"^\[\s*([a-zA-Z]+)\s*\]$", e_stripped
+            )
+            if mem_re is None or mem_re.group(1).lower() != xfer_reg:
+                i += 1
+                continue
+            # Liveness: BASE, IDX, XFER all dead after E.
+            for reg in (base_reg, idx_reg, xfer_reg):
+                pass  # placeholder to make loop explicit
+            if not self._reg_dead_after(out, i + 5, base_reg):
+                i += 1
+                continue
+            if not self._reg_dead_after(out, i + 5, idx_reg):
+                i += 1
+                continue
+            if (
+                xfer_reg != idx_reg
+                and not self._reg_dead_after(out, i + 5, xfer_reg)
+            ):
+                i += 1
+                continue
+            # Build rewrite: drop C, replace D and E.
+            indent_d = self._extract_indent(d.raw)
+            indent_e = self._extract_indent(e.raw)
+            # D': mov/movsx/movzx XFER, SRC (use XFER as dest)
+            d_op = d.op
+            d_spacer = " " * max(8 - len(d_op), 1)
+            new_d_raw = (
+                f"{indent_d}{d_op}{d_spacer}{xfer_reg}, {d_src}"
+            )
+            new_d = Line(
+                raw=new_d_raw,
+                kind="instr",
+                op=d_op,
+                operands=f"{xfer_reg}, {d_src}",
+            )
+            # E': mov [BASE], XFER (use BASE as memory, XFER as src)
+            new_e_dst = f"{size_prefix}[{base_reg}]"
+            new_e_raw = (
+                f"{indent_e}mov     {new_e_dst}, {xfer_reg}"
+            )
+            new_e = Line(
+                raw=new_e_raw,
+                kind="instr",
+                op="mov",
+                operands=f"{new_e_dst}, {xfer_reg}",
+            )
+            out = (
+                out[:i]
+                + [a, b, new_d, new_e]
+                + out[i + 5:]
+            )
+            self.stats["index_store_xfer_collapse"] = (
+                self.stats.get(
+                    "index_store_xfer_collapse", 0
+                ) + 1
             )
             continue
         return out

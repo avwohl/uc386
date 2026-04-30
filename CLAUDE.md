@@ -1473,3 +1473,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`_set_point` (3-member struct setter)**: 2 redundant `mov ecx, [ebp + 8]` reloads dropped — saves 6 bytes per function. Same shape applies to every pointer-based mutator.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +3 peephole tests (532 total). 974 unit tests. Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: index_store_xfer_collapse**: drop the address-transfer step in the codegen's array-index store pattern. Saves 1 instruction per match.
+  - **Pattern (5 instructions)**: `shl IDX, N; add BASE, IDX; mov XFER, BASE; mov BASE, SRC; mov [XFER], BASE`. The codegen emits this for every `arr[i] = val` (or any single-step assignment to a register-base lvalue). The xfer's only purpose is to free up BASE so the rhs eval can reuse EAX.
+  - **Rewrite (4 instructions)**: `shl IDX, N; add BASE, IDX; mov XFER, SRC; mov [BASE], XFER`. Drops the xfer; uses XFER as the rhs target and BASE as the address (still holds it from line B). Saves 1 instruction (~2 bytes).
+  - **Conditions**: BASE != IDX, XFER != BASE; SRC must not reference XFER's family (XFER's value differs at the SRC-read site after dropping the xfer); BASE / IDX / XFER all dead after the store.
+  - **Liveness gating**: BASE is typically EAX, which is the cdecl return-value register. If the store is at end-of-function (next instr is `ret`), `_reg_dead_after` correctly returns False for EAX, blocking the rewrite — this is sound because the return value would change. The pass fires for the more common case where EAX is reloaded after the store (e.g., the next loop iteration's address load).
+  - **`_fill` (loop array fill)**: 7-line body shrinks to 6 lines; saves 2 bytes per iteration.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests (536 total). 978 unit tests. Pipeline 1734/1734 (100%).

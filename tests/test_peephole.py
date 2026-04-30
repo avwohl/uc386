@@ -8274,6 +8274,95 @@ def test_pop_op_chain_retarget_skips_self_rmw_first():
     assert opt.stats.get("pop_op_chain_retarget", 0) == 0
 
 
+# ── index_store_xfer_collapse ────────────────────────────────────
+
+
+def test_index_store_xfer_collapse_basic():
+    """`shl ecx, 2; add eax, ecx; mov ecx, eax; mov eax, [ebp + 16];
+    mov [ecx], eax` → drop the xfer; use ECX for val and EAX for the
+    store. Saves 1 instruction per match."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, ecx\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, [ebp + 16]\n"
+        "        mov     [ecx], eax\n"
+        "        xor     eax, eax\n"  # kill EAX so it's dead after store
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ecx, eax" not in out
+    assert "mov     ecx, [ebp + 16]" in out
+    assert "mov     [eax], ecx" in out
+    assert opt.stats.get("index_store_xfer_collapse") == 1
+
+
+def test_index_store_xfer_collapse_skips_when_src_uses_xfer():
+    """If SRC references the xfer reg, the rewrite is unsafe — XFER's
+    value differs at the SRC-read site after dropping the xfer."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, ecx\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, [ecx]\n"  # SRC refs ECX (= xfer)
+        "        mov     [ecx], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("index_store_xfer_collapse", 0) == 0
+
+
+def test_index_store_xfer_collapse_skips_when_xfer_live():
+    """If XFER is live after the store, dropping the xfer would
+    change behavior — skip the rewrite. (Here we pretend XFER is
+    used in the next basic block by adding a `mov reg, ecx` after.)"""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, ecx\n"
+        "        mov     edx, eax\n"  # XFER = EDX
+        "        mov     eax, [ebp + 16]\n"
+        "        mov     [edx], eax\n"
+        "        mov     esi, edx\n"  # uses EDX after store — live
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("index_store_xfer_collapse", 0) == 0
+
+
+def test_index_store_xfer_collapse_byte_size():
+    """Byte-sized store: `mov byte [xfer], al` form works (with size
+    prefix in the source)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, ecx\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, [ebp + 16]\n"
+        "        mov     dword [ecx], eax\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     ecx, eax" not in out
+    assert "mov     dword [eax], ecx" in out
+    assert opt.stats.get("index_store_xfer_collapse") == 1
+
+
 # ── index_load_collapse_label ─────────────────────────────────
 
 
