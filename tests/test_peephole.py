@@ -12535,3 +12535,311 @@ def test_same_imm_store_share_reg_skips_size_mismatch():
     # The chain breaks at the byte store. The dword stores aren't
     # adjacent (byte breaks them). No 2+ same-size adjacent. Skip.
     assert opt.stats.get("same_imm_store_share_reg", 0) == 0
+
+
+def test_dead_addr_recompute_basic_with_stores():
+    """Struct-array write loop pattern. Two address computes with
+    intermediate stores. The second compute is a redundant
+    recompute and gets dropped.
+
+    Block 1: computes &pts[i], stores to [eax + 0]
+    Block 2: recomputes &pts[i] (DEAD), stores to [eax + 4]
+
+    After: only block 1's compute survives; block 2's store uses
+    the same EAX with offset 4.
+    """
+    asm = (
+        "_f:\n"
+        "        enter   16, 0\n"
+        ".L_top:\n"
+        "        mov     ecx, [ebp - 4]\n"     # loop top: ECX = i
+        "        cmp     ecx, [ebp + 12]\n"
+        "        jge     .L_end\n"
+        # Block 1: pts[i].x = i
+        "        mov     eax, [ebp + 8]\n"     # A1
+        "        imul    ecx, ecx, 12\n"       # C1
+        "        add     eax, ecx\n"           # D1
+        "        mov     ecx, [ebp - 4]\n"     # rhs1: load i
+        "        mov     [eax], ecx\n"         # STORE1
+        # Block 2: pts[i].y = 2*i
+        "        mov     eax, [ebp + 8]\n"     # A2 (DROP)
+        "        imul    ecx, ecx, 12\n"       # C2 (DROP)
+        "        add     eax, ecx\n"           # D2 (DROP)
+        "        mov     ecx, [ebp - 4]\n"     # rhs2
+        "        add     ecx, ecx\n"
+        "        mov     [eax + 4], ecx\n"     # STORE2
+        "        inc     dword [ebp - 4]\n"
+        "        jmp     .L_top\n"
+        ".L_end:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Only ONE `mov eax, [ebp + 8]` (the first compute).
+    assert out.count("mov     eax, [ebp + 8]") == 1
+    # The pass should fire 3 times (3-line recompute).
+    assert opt.stats.get("dead_addr_recompute", 0) == 3
+
+
+def test_dead_addr_recompute_4line_with_explicit_g():
+    """When R2 is dirty between the two computes (e.g., post-rhs
+    has scaled value), the second compute uses an explicit G to
+    reload the index. The 4-line recompute is still droppable.
+    """
+    asm = (
+        "_f:\n"
+        "        enter   16, 0\n"
+        ".L_top:\n"
+        "        mov     ecx, [ebp - 4]\n"     # ECX = i
+        "        cmp     ecx, [ebp + 12]\n"
+        "        jge     .L_end\n"
+        "        mov     eax, [ebp + 8]\n"     # A1
+        "        imul    ecx, ecx, 12\n"       # C1
+        "        add     eax, ecx\n"           # D1
+        "        mov     ecx, [ebp - 4]\n"     # rhs1
+        "        add     ecx, ecx\n"           # ECX = 2*i (DIRTY)
+        "        mov     [eax], ecx\n"         # STORE1
+        # Second compute: 4-line with explicit G (reload i)
+        "        mov     eax, [ebp + 8]\n"     # A2 (DROP)
+        "        mov     ecx, [ebp - 4]\n"     # G2 (DROP — reload i)
+        "        imul    ecx, ecx, 12\n"       # C2 (DROP)
+        "        add     eax, ecx\n"           # D2 (DROP)
+        "        mov     ecx, [ebp - 4]\n"     # rhs2
+        "        imul    ecx, 3\n"
+        "        mov     [eax + 4], ecx\n"     # STORE2
+        "        inc     dword [ebp - 4]\n"
+        "        jmp     .L_top\n"
+        ".L_end:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Only ONE `mov eax, [ebp + 8]`
+    assert out.count("mov     eax, [ebp + 8]") == 1
+    # The pass should fire 4 times (4-line recompute dropped).
+    assert opt.stats.get("dead_addr_recompute", 0) == 4
+
+
+def test_dead_addr_recompute_three_blocks():
+    """Three consecutive compute+store blocks — block 2 and block 3
+    are both redundant."""
+    asm = (
+        "_f:\n"
+        "        enter   16, 0\n"
+        ".L_top:\n"
+        "        mov     ecx, [ebp - 4]\n"     # loop top
+        "        cmp     ecx, [ebp + 12]\n"
+        "        jge     .L_end\n"
+        "        mov     eax, [ebp + 8]\n"     # A1
+        "        imul    ecx, ecx, 12\n"       # C1
+        "        add     eax, ecx\n"           # D1
+        "        mov     ecx, [ebp - 4]\n"
+        "        mov     [eax], ecx\n"
+        "        mov     eax, [ebp + 8]\n"     # A2 (DROP)
+        "        imul    ecx, ecx, 12\n"       # C2 (DROP)
+        "        add     eax, ecx\n"           # D2 (DROP)
+        "        mov     ecx, [ebp - 4]\n"
+        "        add     ecx, ecx\n"
+        "        mov     [eax + 4], ecx\n"
+        "        mov     eax, [ebp + 8]\n"     # A3 (DROP)
+        "        mov     ecx, [ebp - 4]\n"     # G3 (DROP)
+        "        imul    ecx, ecx, 12\n"       # C3 (DROP)
+        "        add     eax, ecx\n"           # D3 (DROP)
+        "        mov     ecx, [ebp - 4]\n"
+        "        imul    ecx, 3\n"
+        "        mov     [eax + 8], ecx\n"
+        "        inc     dword [ebp - 4]\n"
+        "        jmp     .L_top\n"
+        ".L_end:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Only ONE `mov eax, [ebp + 8]`
+    assert out.count("mov     eax, [ebp + 8]") == 1
+    # 3 + 4 = 7 lines dropped
+    assert opt.stats.get("dead_addr_recompute", 0) == 7
+
+
+def test_dead_addr_recompute_skips_when_r1_modified():
+    """If R1 is modified between the two computes (e.g., via direct
+    `mov eax, X` reassignment), the recompute is NOT redundant —
+    the second compute is needed."""
+    asm = (
+        "_f:\n"
+        "        enter   16, 0\n"
+        ".L_top:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        mov     eax, [ebp + 8]\n"     # A1
+        "        imul    ecx, ecx, 12\n"       # C1
+        "        add     eax, ecx\n"           # D1
+        "        mov     [eax], ecx\n"
+        "        mov     eax, 999\n"           # R1 modified! Bail.
+        "        mov     [ebp - 8], eax\n"
+        "        mov     eax, [ebp + 8]\n"     # A2 (KEEP)
+        "        imul    ecx, ecx, 12\n"       # C2 (KEEP)
+        "        add     eax, ecx\n"           # D2 (KEEP)
+        "        mov     [eax + 4], ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("dead_addr_recompute", 0) == 0
+    # Both `mov eax, [ebp + 8]` survive
+    assert out.count("mov     eax, [ebp + 8]") == 2
+
+
+def test_dead_addr_recompute_skips_across_label():
+    """Basic block boundary: a label between the two computes
+    breaks equivalence (R1 might be re-entered with different
+    value)."""
+    asm = (
+        "_f:\n"
+        "        enter   16, 0\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        mov     eax, [ebp + 8]\n"     # A1
+        "        imul    ecx, ecx, 12\n"       # C1
+        "        add     eax, ecx\n"           # D1
+        "        mov     [eax], ecx\n"
+        ".L_inner:\n"                          # label breaks BB
+        "        mov     eax, [ebp + 8]\n"     # A2 (KEEP)
+        "        imul    ecx, ecx, 12\n"       # C2 (KEEP)
+        "        add     eax, ecx\n"           # D2 (KEEP)
+        "        mov     [eax + 4], ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("dead_addr_recompute", 0) == 0
+    assert out.count("mov     eax, [ebp + 8]") == 2
+
+
+def test_dead_addr_recompute_skips_when_mem1_changed():
+    """If MEM1's slot is written between the two computes, the
+    second compute reads a different value — NOT redundant."""
+    asm = (
+        "_f:\n"
+        "        enter   16, 0\n"
+        ".L_top:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        mov     eax, [ebp + 8]\n"     # A1
+        "        imul    ecx, ecx, 12\n"
+        "        add     eax, ecx\n"
+        "        mov     [eax], ecx\n"
+        "        mov     dword [ebp + 8], 0\n"  # MEM1 modified!
+        "        mov     eax, [ebp + 8]\n"     # A2 (KEEP)
+        "        imul    ecx, ecx, 12\n"
+        "        add     eax, ecx\n"
+        "        mov     [eax + 4], ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("dead_addr_recompute", 0) == 0
+
+
+def test_dead_addr_recompute_skips_when_mem2_changed():
+    """If MEM2's slot is written between, the second compute reads
+    a different index — NOT redundant."""
+    asm = (
+        "_f:\n"
+        "        enter   16, 0\n"
+        ".L_top:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        mov     eax, [ebp + 8]\n"     # A1
+        "        imul    ecx, ecx, 12\n"
+        "        add     eax, ecx\n"
+        "        mov     [eax], ecx\n"
+        "        inc     dword [ebp - 4]\n"     # MEM2 modified!
+        "        mov     eax, [ebp + 8]\n"     # A2 (KEEP)
+        "        mov     ecx, [ebp - 4]\n"
+        "        imul    ecx, ecx, 12\n"
+        "        add     eax, ecx\n"
+        "        mov     [eax + 4], ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("dead_addr_recompute", 0) == 0
+
+
+def test_dead_addr_recompute_with_shl():
+    """Power-of-two struct size uses shl instead of imul."""
+    asm = (
+        "_f:\n"
+        "        enter   16, 0\n"
+        ".L_top:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        mov     eax, [ebp + 8]\n"     # A1
+        "        shl     ecx, 4\n"             # C1 (struct size 16)
+        "        add     eax, ecx\n"           # D1
+        "        mov     ecx, [ebp - 4]\n"
+        "        mov     [eax], ecx\n"
+        "        mov     eax, [ebp + 8]\n"     # A2 (DROP)
+        "        shl     ecx, 4\n"             # C2 (DROP — wait, ECX was just reloaded as i, so this is i*16 again)
+        "        add     eax, ecx\n"           # D2 (DROP)
+        "        mov     ecx, [ebp - 4]\n"
+        "        mov     [eax + 4], ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("dead_addr_recompute", 0) == 3
+
+
+def test_dead_addr_recompute_skips_indirect_write_to_addr_taken():
+    """If MEM1's ebp-offset is address-taken, an indirect write
+    through a register-base operand could alias and so we bail."""
+    asm = (
+        "_f:\n"
+        "        enter   16, 0\n"
+        "        lea     edx, [ebp + 8]\n"     # ebp+8 is addr-taken
+        ".L_top:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        mov     eax, [ebp + 8]\n"     # A1
+        "        imul    ecx, ecx, 12\n"
+        "        add     eax, ecx\n"
+        "        mov     [edx], 999\n"          # indirect write, may alias [ebp + 8]
+        "        mov     eax, [ebp + 8]\n"     # A2 (KEEP — alias possible)
+        "        imul    ecx, ecx, 12\n"
+        "        add     eax, ecx\n"
+        "        mov     [eax + 4], ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("dead_addr_recompute", 0) == 0
+
+
+def test_dead_addr_recompute_allows_indirect_write_when_not_addr_taken():
+    """If neither MEM1 nor MEM2 is address-taken, indirect stores
+    via [eax] etc. can't alias them — pass should fire."""
+    asm = (
+        "_f:\n"
+        "        enter   16, 0\n"
+        ".L_top:\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        mov     eax, [ebp + 8]\n"     # A1
+        "        imul    ecx, ecx, 12\n"
+        "        add     eax, ecx\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        mov     [eax], ecx\n"          # store via eax (not addr-taken alias)
+        "        mov     eax, [ebp + 8]\n"     # A2 (DROP)
+        "        imul    ecx, ecx, 12\n"
+        "        add     eax, ecx\n"
+        "        mov     [eax + 4], ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("dead_addr_recompute", 0) == 3

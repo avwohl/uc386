@@ -1706,3 +1706,23 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Real-world fire rate**: 2 fires on `_sum_zero_init` write loop (saves ~6 bytes per loop). The lea form arises when the codegen materializes a local struct-array's base — common when the array is on the stack rather than passed as a pointer.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +1 peephole test. 1122 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: dead_addr_recompute**: more flexible sister of `dup_addr_compute_collapse`. Drops a redundant 3-or-4-line address recompute when an earlier identical compute in the same basic block produced the same address still held in R1. Allows arbitrary intermediate code (stores, rhs evaluation) instead of the rigid 9-line pattern that `dup_addr_compute_collapse` requires.
+  - **Compute pattern (3 or 4 instructions)**:
+    - A: `mov R1, MEM1`
+    - [G: `mov R2, MEM2`] (optional explicit index reload)
+    - C: `imul R2, R2, K` or `shl R2, N`
+    - D: `add R1, R2`
+  - **Equivalence key**: `(R1, MEM1, R2, K, scale_op, effective_MEM2)` where effective_MEM2 is from G if explicit, else the most recent backward write to R2 (must be `mov R2, MEM2`). Length 3-vs-4 doesn't matter for equivalence — what matters is the effective MEM2.
+  - **Drop conditions**: an earlier equivalent compute exists in the same basic block; R1 not written between the earlier D and the later A; MEM1 slot not written between; effective MEM2 slot not written between; R2 still holds its MEM2 value at the later C (verified by backward scan).
+  - **Indirect-write aliasing**: `_compute_addr_taken_per_line` is consulted. If MEM1's or MEM2's ebp-offset is address-taken via `lea`, indirect stores (`mov [ecx], val`) might alias and we bail. Non-ebp-relative MEM1/MEM2 (e.g., `[_glob]`) — conservatively bail on any indirect write since alias analysis is uncertain.
+  - **Common shape**: struct-array WRITE loops where the codegen emits the address compute once per member assignment.
+    ```
+    pts[i].x = i;       // block 1: A,C,D + rhs + store
+    pts[i].y = i*2;     // block 2: A,C,D (DROP) + rhs + store
+    pts[i].z = i*3;     // block 3: A,G,C,D (DROP) + rhs + store
+    ```
+    Saves 3 + 4 = 7 instructions per loop iteration.
+  - **Concrete win**: `_zero_init` (struct Point with 3 ints, size 12, 3 member writes) loop body 22 → 13 instructions per iteration (~17 bytes saved per iteration). Combined with cascade from existing `redundant_ecx_load`, the rhs-load `mov ecx, [ebp - 4]` between block 1's store and block 2's add is also dropped.
+  - **Limited fire rate** on test suites: 0 fires on first 500 torture tests + 50 c-testsuite (none use this idiom). Real-world programs (game engines, particle systems, struct-array databases) commonly hit it.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +10 peephole tests. 1132 unit tests total. Pipeline 1734/1734 (100%).

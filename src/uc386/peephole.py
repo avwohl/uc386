@@ -474,6 +474,7 @@ class PeepholeOptimizer:
             lines = self._pass_copy_save_deref_collapse(lines)
             lines = self._pass_dup_load_with_intermediate(lines)
             lines = self._pass_dup_addr_compute_collapse(lines)
+            lines = self._pass_dead_addr_recompute(lines)
             lines = self._pass_uncollapse_cmp_when_reload(lines)
             lines = self._pass_redundant_cmp_at_label(lines)
             lines = self._pass_op_mem_to_reg_collapse(lines)
@@ -12799,6 +12800,561 @@ class PeepholeOptimizer:
                     self.stats.get(
                         "dup_addr_compute_collapse", 0
                     ) + 1
+                )
+                continue
+            new_out.append(ln)
+        return new_out
+
+    def _pass_dead_addr_recompute(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Drop a redundant 3-or-4-line address recompute when an
+        earlier identical compute in the same basic block produced the
+        same address still held in R1.
+
+        Compute pattern:
+            A: mov R1, MEM1
+            [G: mov R2, MEM2  (optional explicit index reload)]
+            C: imul R2, R2, K  OR  shl R2, N
+            D: add R1, R2
+
+        Two computes are equivalent iff they have the same R1, MEM1,
+        R2, K, scale_op, and effective MEM2 (G's source if explicit,
+        else the most recent backward write to R2 — must be `mov R2,
+        MEM2`).
+
+        Drop the later compute (3 or 4 lines, ~9-15 bytes) when:
+        - An earlier equivalent compute exists in the current basic
+          block.
+        - R1 is not written between the earlier D and the later A
+          (intermediate stores via [R1 + off] are fine — they don't
+          modify R1).
+        - The MEM1 slot is not written between.
+        - The effective MEM2 slot is not written between.
+        - The R2 register is restored to its MEM2 value before the
+          later C reads it (verified by the find_r2_pre_value scan
+          on the later compute's start).
+
+        Differs from dup_addr_compute_collapse: that pass requires a
+        rigid 9-line pattern with E being a single load between two
+        compute sequences. This pass is more flexible — intermediate
+        code can be any number of stores, rhs evaluations, etc.
+
+        Common shape: struct-array WRITE loops where the codegen
+        emits the address compute once per member assignment.
+
+            pts[i].x = 1; pts[i].y = 2; pts[i].z = 3;
+
+        produces three identical address computes; the 2nd and 3rd
+        are dead.
+        """
+        out = list(lines)
+        drop_indices: set[int] = set()
+
+        def norm(s: str) -> str:
+            return " ".join(s.split())
+
+        def is_basic_block_break(ln: Line) -> bool:
+            if ln.kind == "label":
+                return True
+            if ln.kind != "instr":
+                return False
+            if ln.op in (
+                "call", "jmp", "ret", "retn", "retf", "iret",
+                "iretd", "leave",
+            ):
+                return True
+            if ln.op.startswith("j") and ln.op != "jmp":
+                return True
+            return False
+
+        def parse_scale_reg(c_ln: Line) -> str | None:
+            if c_ln.kind != "instr":
+                return None
+            if c_ln.op == "imul":
+                parts = [p.strip() for p in c_ln.operands.split(",")]
+                if (
+                    len(parts) == 3
+                    and parts[0].lower() == parts[1].lower()
+                ):
+                    r = parts[0].lower()
+                    if self._is_general_register(r):
+                        try:
+                            int(parts[2], 0)
+                            return r
+                        except ValueError:
+                            return None
+                return None
+            if c_ln.op in ("shl", "sal"):
+                cp = _operands_split(c_ln.operands)
+                if cp is not None:
+                    r = cp[0].strip().lower()
+                    if self._is_general_register(r):
+                        try:
+                            int(cp[1].strip(), 0)
+                            return r
+                        except ValueError:
+                            return None
+                return None
+            return None
+
+        def parse_scale_full(
+            c_ln: Line, expected_r: str
+        ) -> tuple[int, str] | None:
+            r = parse_scale_reg(c_ln)
+            if r != expected_r:
+                return None
+            if c_ln.op == "imul":
+                parts = [
+                    p.strip() for p in c_ln.operands.split(",")
+                ]
+                return (int(parts[2], 0), "imul")
+            cp = _operands_split(c_ln.operands)
+            return (int(cp[1].strip(), 0), c_ln.op)
+
+        def find_r2_pre_value(
+            start_idx: int, r2: str
+        ) -> str | None:
+            k = start_idx - 1
+            while k >= 0:
+                ln = out[k]
+                if ln.kind == "label":
+                    return None
+                if ln.kind != "instr":
+                    k -= 1
+                    continue
+                if ln.op == "mov":
+                    parts = _operands_split(ln.operands)
+                    if parts is not None:
+                        dst = parts[0].strip().lower()
+                        if dst == r2:
+                            src = parts[1].strip()
+                            if (
+                                src.startswith("[")
+                                and src.endswith("]")
+                            ):
+                                return src
+                            return None
+                ops_text = ln.operands or ""
+                if not self._references_reg_family(ops_text, r2):
+                    k -= 1
+                    continue
+                if ln.op in {
+                    "call", "iret", "iretd", "leave", "enter",
+                    "ret", "retn", "retf",
+                }:
+                    return None
+                parts = _operands_split(ops_text)
+                if parts is not None:
+                    dest = parts[0].strip().lower()
+                    if dest == r2:
+                        if ln.op not in ("cmp", "test"):
+                            return None
+                else:
+                    op_text = ops_text.strip().lower()
+                    if op_text == r2:
+                        return None
+                if (
+                    ln.op
+                    in PeepholeOptimizer._IMPLICIT_REG_USERS
+                ):
+                    if r2 in {
+                        "eax", "ecx", "edx", "esi", "edi",
+                    }:
+                        return None
+                k -= 1
+            return None
+
+        def detect_compute(
+            idx: int,
+        ) -> tuple | None:
+            """Return (length, r1, mem1_norm, r2, K, scale_op,
+            mem2_norm) or None.
+
+            length is 3 (no G) or 4 (with G).
+            """
+            if idx + 2 >= len(out):
+                return None
+            a = out[idx]
+            if a.kind != "instr" or a.op != "mov":
+                return None
+            ap = _operands_split(a.operands)
+            if ap is None:
+                return None
+            r1 = ap[0].strip().lower()
+            mem1 = ap[1].strip()
+            if not self._is_general_register(r1):
+                return None
+            if not (
+                mem1.startswith("[") and mem1.endswith("]")
+            ):
+                return None
+
+            # Try 4-line: A, G, C, D
+            if idx + 3 < len(out):
+                g = out[idx + 1]
+                c = out[idx + 2]
+                d = out[idx + 3]
+                if (
+                    g.kind == "instr"
+                    and g.op == "mov"
+                    and c.kind == "instr"
+                    and d.kind == "instr"
+                ):
+                    gp = _operands_split(g.operands)
+                    if gp is not None:
+                        r2 = gp[0].strip().lower()
+                        mem2 = gp[1].strip()
+                        if (
+                            self._is_general_register(r2)
+                            and r2 != r1
+                            and mem2.startswith("[")
+                            and mem2.endswith("]")
+                        ):
+                            cinfo = parse_scale_full(c, r2)
+                            if cinfo is not None and d.op == "add":
+                                dp = _operands_split(d.operands)
+                                if (
+                                    dp is not None
+                                    and dp[0].strip().lower() == r1
+                                    and dp[1].strip().lower() == r2
+                                ):
+                                    return (
+                                        4, r1, norm(mem1), r2,
+                                        cinfo[0], cinfo[1],
+                                        norm(mem2),
+                                    )
+
+            # Try 3-line: A, C, D
+            c = out[idx + 1]
+            d = out[idx + 2]
+            if c.kind != "instr" or d.kind != "instr":
+                return None
+            r2 = parse_scale_reg(c)
+            if r2 is None or r2 == r1:
+                return None
+            cinfo = parse_scale_full(c, r2)
+            if cinfo is None:
+                return None
+            if d.op != "add":
+                return None
+            dp = _operands_split(d.operands)
+            if dp is None:
+                return None
+            if (
+                dp[0].strip().lower() != r1
+                or dp[1].strip().lower() != r2
+            ):
+                return None
+            mem2_eff = find_r2_pre_value(idx, r2)
+            if mem2_eff is None:
+                return None
+            return (
+                3, r1, norm(mem1), r2,
+                cinfo[0], cinfo[1], norm(mem2_eff),
+            )
+
+        def line_writes_reg(
+            ln: Line, reg: str
+        ) -> bool:
+            if ln.kind != "instr":
+                return False
+            if ln.op == "call":
+                return reg in ("eax", "ecx", "edx")
+            ops_text = ln.operands or ""
+            parts = _operands_split(ops_text)
+            if parts is not None:
+                dst = parts[0].strip().lower()
+                if dst == reg:
+                    if ln.op in ("cmp", "test"):
+                        return False
+                    return True
+                # If dst is mem and op is `lea reg, ...`,
+                # check the dest separately.
+                if ln.op == "lea":
+                    if dst == reg:
+                        return True
+            else:
+                # Single-op form: inc/dec/neg/mul/div/etc.
+                op_text = ops_text.strip().lower()
+                if op_text == reg:
+                    return True
+            # Implicit-reg-writers
+            if (
+                ln.op in PeepholeOptimizer._IMPLICIT_REG_USERS
+                and reg in {"eax", "ecx", "edx", "esi", "edi"}
+            ):
+                return True
+            return False
+
+        def line_writes_mem(
+            ln: Line, mem_norm: str
+        ) -> bool:
+            """Conservatively detect whether ln writes to the slot
+            mem_norm. For ebp-relative slots, indirect stores via
+            [reg] are assumed to alias unless the addr-taken set
+            doesn't contain mem_norm's offset (handled by caller).
+            """
+            if ln.kind != "instr":
+                return False
+            if ln.op == "call":
+                return True  # call could write any global slot
+            ops_text = ln.operands or ""
+            parts = _operands_split(ops_text)
+            if parts is not None:
+                dst = parts[0].strip()
+                # Strip size prefix if any
+                for prefix in ("dword ", "word ", "byte ", "qword "):
+                    if dst.lower().startswith(prefix):
+                        dst = dst[len(prefix):].strip()
+                        break
+                if dst.startswith("[") and dst.endswith("]"):
+                    if ln.op in ("cmp", "test", "lea"):
+                        return False
+                    if norm(dst) == mem_norm:
+                        return True
+                    # Conservative: register-base derefs might alias
+                    # ebp-relative slots only if address-taken (caller
+                    # decides to skip pass entirely if so).
+                    return False  # conservative; caller handles
+            else:
+                op_text = ops_text.strip()
+                # `inc dword [m]` / `inc [m]`
+                for prefix in ("dword ", "word ", "byte ", "qword "):
+                    if op_text.lower().startswith(prefix):
+                        op_text = op_text[len(prefix):].strip()
+                        break
+                if (
+                    op_text.startswith("[")
+                    and op_text.endswith("]")
+                ):
+                    # 1-op RMW on memory
+                    if norm(op_text) == mem_norm:
+                        return True
+                    return False
+            return False
+
+        def has_indirect_mem_write(ln: Line) -> bool:
+            """Detect if ln writes through a register-base memory
+            operand (could alias address-taken stack slots).
+            """
+            if ln.kind != "instr":
+                return False
+            if ln.op == "call":
+                return True
+            if ln.op in (
+                "ret", "retn", "retf", "iret", "iretd",
+                "leave", "enter",
+            ):
+                return False
+            ops_text = ln.operands or ""
+            parts = _operands_split(ops_text)
+            if parts is not None:
+                dst = parts[0].strip()
+                for prefix in (
+                    "dword ", "word ", "byte ", "qword ",
+                ):
+                    if dst.lower().startswith(prefix):
+                        dst = dst[len(prefix):].strip()
+                        break
+                if (
+                    dst.startswith("[")
+                    and dst.endswith("]")
+                ):
+                    if ln.op in ("cmp", "test", "lea"):
+                        return False
+                    inner = dst[1:-1].strip().lower()
+                    # If inner mentions ebp without a register-base
+                    # only (just `ebp [+- N]`), it's a direct stack
+                    # slot, not indirect.
+                    # If it mentions any non-ebp gp register, it's
+                    # indirect.
+                    has_other_reg = any(
+                        re.search(rf"\b{r}\b", inner)
+                        for r in (
+                            "eax", "ecx", "edx", "ebx",
+                            "esi", "edi", "esp",
+                        )
+                    )
+                    return has_other_reg
+            else:
+                op_text = ops_text.strip()
+                for prefix in (
+                    "dword ", "word ", "byte ", "qword ",
+                ):
+                    if op_text.lower().startswith(prefix):
+                        op_text = op_text[len(prefix):].strip()
+                        break
+                if (
+                    op_text.startswith("[")
+                    and op_text.endswith("]")
+                ):
+                    inner = op_text[1:-1].strip().lower()
+                    has_other_reg = any(
+                        re.search(rf"\b{r}\b", inner)
+                        for r in (
+                            "eax", "ecx", "edx", "ebx",
+                            "esi", "edi", "esp",
+                        )
+                    )
+                    return has_other_reg
+            return False
+
+        def is_ebp_relative(mem_norm: str) -> bool:
+            """Return True iff mem_norm is exactly `[ebp + N]` or
+            `[ebp - N]` (literal disp8/disp32, no register index).
+            """
+            inner = mem_norm.strip()
+            if not (inner.startswith("[") and inner.endswith("]")):
+                return False
+            return bool(
+                re.match(
+                    r"^\[\s*ebp\s*([+-]\s*\d+)?\s*\]$",
+                    inner,
+                    re.IGNORECASE,
+                )
+            )
+
+        def ebp_offset(mem_norm: str) -> int | None:
+            m = re.match(
+                r"^\[\s*ebp\s*([+-])\s*(\d+)\s*\]$",
+                mem_norm.strip(),
+                re.IGNORECASE,
+            )
+            if m is None:
+                # Maybe `[ebp]` (offset 0)?
+                m2 = re.match(
+                    r"^\[\s*ebp\s*\]$",
+                    mem_norm.strip(),
+                    re.IGNORECASE,
+                )
+                if m2 is not None:
+                    return 0
+                return None
+            sign = 1 if m.group(1) == "+" else -1
+            return sign * int(m.group(2))
+
+        # Compute address-taken slots per line (for indirect-write
+        # alias check).
+        addr_taken_per_line = self._compute_addr_taken_per_line(out)
+
+        # Find compute starts.
+        computes = []
+        i = 0
+        while i < len(out):
+            info = detect_compute(i)
+            if info is not None:
+                computes.append((i, info))
+                i += info[0]
+            else:
+                i += 1
+
+        # For each later compute, find an earlier equivalent compute
+        # in the same basic block with no intervening writes.
+        for j in range(1, len(computes)):
+            later_idx, later_info = computes[j]
+            if later_idx in drop_indices:
+                continue
+            (
+                later_len, r1, mem1_norm, r2, K, scale_op,
+                mem2_norm,
+            ) = later_info
+
+            # Equivalence key excludes length (G optional vs not).
+            later_key = later_info[1:]
+
+            for k in range(j - 1, -1, -1):
+                earlier_idx, earlier_info = computes[k]
+                if earlier_idx in drop_indices:
+                    continue
+                # Compare keys (ignore length).
+                if earlier_info[1:] != later_key:
+                    continue
+                earlier_end = earlier_idx + earlier_info[0]
+                # Check basic block: no terminator/label between
+                # earlier_end and later_idx.
+                blocked = False
+                for m in range(earlier_end, later_idx):
+                    if is_basic_block_break(out[m]):
+                        blocked = True
+                        break
+                if blocked:
+                    break
+
+                # Check no writes to R1, MEM1 slot, MEM2 slot.
+                bad = False
+                mem1_off = (
+                    ebp_offset(mem1_norm)
+                    if is_ebp_relative(mem1_norm)
+                    else None
+                )
+                mem2_off = (
+                    ebp_offset(mem2_norm)
+                    if is_ebp_relative(mem2_norm)
+                    else None
+                )
+                for m in range(earlier_end, later_idx):
+                    ln = out[m]
+                    if line_writes_reg(ln, r1):
+                        bad = True
+                        break
+                    if line_writes_mem(ln, mem1_norm):
+                        bad = True
+                        break
+                    if line_writes_mem(ln, mem2_norm):
+                        bad = True
+                        break
+                    # Indirect memory write check: if mem1 or mem2 is
+                    # ebp-relative AND that slot's offset is
+                    # address-taken, an indirect write could alias.
+                    if has_indirect_mem_write(ln):
+                        addr_taken = addr_taken_per_line[m]
+                        if (
+                            mem1_off is not None
+                            and mem1_off in addr_taken
+                        ):
+                            bad = True
+                            break
+                        if (
+                            mem2_off is not None
+                            and mem2_off in addr_taken
+                        ):
+                            bad = True
+                            break
+                        # Non-ebp-relative MEM1 or MEM2 (e.g.
+                        # `[_glob]`) — conservatively assume indirect
+                        # might alias.
+                        if (
+                            mem1_off is None
+                            or mem2_off is None
+                        ):
+                            bad = True
+                            break
+                if bad:
+                    continue
+
+                # Verify R2 still has effective MEM2 value at later C.
+                # later C is at later_idx + (later_len - 2).
+                later_c_idx = later_idx + (later_len - 2)
+                later_pre_val = find_r2_pre_value(later_c_idx, r2)
+                if (
+                    later_pre_val is None
+                    or norm(later_pre_val) != mem2_norm
+                ):
+                    continue
+
+                # All conditions met — drop later compute.
+                for m in range(later_idx, later_idx + later_len):
+                    drop_indices.add(m)
+                break
+
+        if not drop_indices:
+            return out
+        new_out = []
+        for k, ln in enumerate(out):
+            if k in drop_indices:
+                self.stats["dead_addr_recompute"] = (
+                    self.stats.get("dead_addr_recompute", 0) + 1
                 )
                 continue
             new_out.append(ln)
