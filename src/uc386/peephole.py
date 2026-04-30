@@ -457,6 +457,7 @@ class PeepholeOptimizer:
             lines = self._pass_dup_load_chain_to_copy(lines)
             lines = self._pass_copy_save_deref_collapse(lines)
             lines = self._pass_dup_load_with_intermediate(lines)
+            lines = self._pass_uncollapse_cmp_when_reload(lines)
             lines = self._pass_redundant_mem_load_via_xfer(lines)
             lines = self._pass_load_add_xfer_forward(lines)
             lines = self._pass_byte_stores_to_dword(lines)
@@ -10963,6 +10964,175 @@ class PeepholeOptimizer:
             )
             self.stats["dup_load_with_intermediate"] = (
                 self.stats.get("dup_load_with_intermediate", 0) + 1
+            )
+        return out
+
+    def _pass_uncollapse_cmp_when_reload(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Reverse ``cmp_load_collapse`` when an immediate reload of
+        the same memory follows. Pattern (3 consecutive instr lines):
+
+            cmp <size> [m], OPND   ; A
+            jcc L                  ; B
+            mov reg, [m]           ; C — reload of [m] (same address)
+        →
+            mov reg, [m]           ; load
+            cmp reg, OPND          ; (or `test reg, reg` if OPND == 0)
+            jcc L
+
+        Saves 2 bytes per match in the common ``cmp dword [m], 0`` →
+        ``test reg, reg`` case (4-byte cmp-imm8 + 3-byte mov-rel32 →
+        3-byte mov-rel32 + 2-byte test). Saves 1 byte for non-zero
+        cmp-immediate or cmp-register forms.
+
+        Why this pattern arises: ``cmp_load_collapse`` greedily folds
+        ``mov reg, [m]; cmp reg, X`` into ``cmp dword [m], X`` when
+        reg is dead at the cmp. But if a downstream basic block
+        reloads the same [m] into a register, the load was needed
+        anyway — un-folding back to ``mov reg, [m]; cmp reg, X``
+        leaves the value usable.
+
+        Conditions:
+        - 3 adjacent instr lines with op = cmp/test, jcc, mov.
+        - Both A and C reference the same memory operand.
+        - The mov's destination is a 32-bit GP register.
+        - The cmp/test is on dword (explicit ``dword`` prefix or NASM
+          inferred from a register operand). Conservative: require
+          either explicit `dword` OR cmp's second operand is a
+          32-bit register or numeric literal (since byte/word forms
+          would have a sub-register or `byte`/`word` prefix).
+        - Mem operand has no register that conflicts with reg.
+        - reg is dead at jcc's ENTRY: must be dead at jcc target
+          (else target sees rewrite's M[m] instead of original
+          pre-A value) — `_reg_dead_after` from the jcc covers
+          both target and fallthrough paths.
+        """
+        out = list(lines)
+        i = 0
+        while i + 2 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            c = out[i + 2]
+            if not (
+                a.kind == "instr" and a.op in ("cmp", "test")
+                and b.kind == "instr"
+                and b.op.startswith("j") and b.op != "jmp"
+                and c.kind == "instr" and c.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            cp = _operands_split(c.operands)
+            if ap is None or cp is None:
+                i += 1
+                continue
+            a_mem = ap[0].strip()
+            a_opnd = ap[1].strip()
+            # Strip optional size prefix on A's mem operand for
+            # comparison with C's mem operand. Track whether the
+            # cmp was explicitly dword-sized.
+            a_size = None
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if a_mem.lower().startswith(prefix):
+                    a_size = prefix.strip()
+                    a_mem = a_mem[len(prefix):].lstrip()
+                    break
+            if not (a_mem.startswith("[") and a_mem.endswith("]")):
+                i += 1
+                continue
+            # C: mov reg, [m]
+            c_dst = cp[0].strip().lower()
+            c_src = cp[1].strip()
+            if not self._is_general_register(c_dst):
+                i += 1
+                continue
+            # Strip size prefix on C's source (rare for `mov reg32, [..]`
+            # but be defensive).
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if c_src.lower().startswith(prefix):
+                    c_src = c_src[len(prefix):].lstrip()
+                    break
+            if c_src != a_mem:
+                i += 1
+                continue
+            # Verify cmp/test was on dword (32-bit). If A had explicit
+            # `dword` we know it's safe. Otherwise a_opnd must be a
+            # 32-bit GP register (cmp [m], r32 → 32-bit) or numeric
+            # immediate (NASM rejects ambiguous size, so an emitted
+            # cmp without prefix and with imm operand is invalid; in
+            # our codegen we always emit `dword` for cmp on memory).
+            if a_size is not None and a_size != "dword":
+                # byte / word / qword cmp — sub-word/wide load
+                # mismatches a 32-bit reg load. Skip.
+                i += 1
+                continue
+            # If a_size is None, the cmp's second operand needs to
+            # be a 32-bit register (so NASM infers 32-bit). Numeric
+            # imm without explicit size would have been a NASM
+            # error. Skip if uncertain.
+            if a_size is None:
+                # Be conservative: the second operand must be a 32-bit
+                # GP register.
+                if not self._is_general_register(a_opnd.lower()):
+                    i += 1
+                    continue
+            # The mem operand must not reference c_dst (or its sub-
+            # aliases): if [m] references reg's family, then loading
+            # to reg first would change [m]'s computed address.
+            if self._references_reg_family(a_mem, c_dst):
+                i += 1
+                continue
+            # The cmp/test second operand must not reference c_dst's
+            # family either (would conflict with reg's new value).
+            if self._references_reg_family(a_opnd, c_dst):
+                i += 1
+                continue
+            # Reg must be dead at jcc's entry (covers both target and
+            # fallthrough paths via _reg_dead_after's CFG-aware scan).
+            # Note: in original, after C runs, reg = M[m] for
+            # downstream. After my rewrite, reg = M[m] BEFORE B too.
+            # Fallthrough is fine. Taken-jcc path: reg now has M[m]
+            # instead of pre-A value — must be dead at target.
+            if not self._reg_dead_after(out, i + 1, c_dst):
+                i += 1
+                continue
+            # All checks passed. Build the rewrite.
+            indent_a = self._extract_indent(a.raw)
+            indent_b = self._extract_indent(b.raw)
+            indent_c = self._extract_indent(c.raw)
+            # New first line: the load.
+            new_load_raw = f"{indent_c}mov     {c_dst}, {a_mem}"
+            new_load = Line(
+                raw=new_load_raw, kind="instr", op="mov",
+                operands=f"{c_dst}, {a_mem}",
+            )
+            # New second line: cmp/test against the operand.
+            # Special case: cmp/test with 0 → use test reg, reg
+            # (2-byte) instead of cmp reg, 0 (3-byte).
+            opnd_norm = a_opnd.strip()
+            if a.op == "cmp" and opnd_norm == "0":
+                new_cmp_raw = f"{indent_a}test    {c_dst}, {c_dst}"
+                new_cmp = Line(
+                    raw=new_cmp_raw, kind="instr", op="test",
+                    operands=f"{c_dst}, {c_dst}",
+                )
+            else:
+                new_cmp_raw = (
+                    f"{indent_a}{a.op}     {c_dst}, {opnd_norm}"
+                )
+                new_cmp = Line(
+                    raw=new_cmp_raw, kind="instr", op=a.op,
+                    operands=f"{c_dst}, {opnd_norm}",
+                )
+            # B unchanged.
+            out = (
+                out[:i]
+                + [new_load, new_cmp, b]
+                + out[i + 3:]
+            )
+            self.stats["uncollapse_cmp_when_reload"] = (
+                self.stats.get("uncollapse_cmp_when_reload", 0) + 1
             )
         return out
 

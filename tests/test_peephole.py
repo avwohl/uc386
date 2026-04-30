@@ -6079,6 +6079,164 @@ def test_dup_load_with_intermediate_skips_when_addr_taken():
     assert opt.stats.get("dup_load_with_intermediate", 0) == 0
 
 
+# ── uncollapse_cmp_when_reload ────────────────────────────────────
+
+
+def test_uncollapse_cmp_when_reload_zero():
+    """`cmp dword [m], 0; jcc L; mov reg, [m]` →
+    `mov reg, [m]; test reg, reg; jcc L`. Saves 2 bytes for the
+    zero-comparison case (shorter `test` form)."""
+    asm = (
+        "_f:\n"
+        "        cmp     dword [ebp + 8], 0\n"
+        "        jz      .L_end\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [eax]\n"
+        "        ret\n"
+        ".L_end:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("uncollapse_cmp_when_reload") == 1
+    # The cmp dword [m], 0 is gone; replaced with mov + test.
+    assert "cmp     dword [ebp + 8], 0" not in out
+    assert "mov     eax, [ebp + 8]" in out
+    assert "test    eax, eax" in out
+    # The redundant reload is gone.
+    assert out.count("mov     eax, [ebp + 8]") == 1
+
+
+def test_uncollapse_cmp_when_reload_nonzero():
+    """For non-zero CONST, we use cmp reg, CONST."""
+    asm = (
+        "_f:\n"
+        "        cmp     dword [ebp + 8], 42\n"
+        "        je      .L_end\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        ret\n"
+        ".L_end:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("uncollapse_cmp_when_reload") == 1
+    assert "cmp     dword [ebp + 8], 42" not in out
+    assert "mov     eax, [ebp + 8]" in out
+    assert "cmp     eax, 42" in out
+
+
+def test_uncollapse_cmp_when_reload_register_operand():
+    """`cmp dword [m], reg2; jcc L; mov reg, [m]` works too."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, 5\n"
+        "        cmp     dword [ebp + 8], edx\n"
+        "        jl      .L_end\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        ret\n"
+        ".L_end:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("uncollapse_cmp_when_reload") == 1
+    assert "cmp     eax, edx" in out
+
+
+def test_uncollapse_cmp_when_reload_skips_when_reg_live_at_target():
+    """If the jcc target reads `reg` (its pre-A value), the rewrite
+    breaks because in the rewrite reg now holds [m]'s value."""
+    asm = (
+        "_f:\n"
+        "        cmp     dword [ebp + 8], 0\n"
+        "        jz      .L_end\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        ret\n"
+        ".L_end:\n"
+        "        add     ecx, eax\n"  # reads EAX!
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("uncollapse_cmp_when_reload", 0) == 0
+
+
+def test_uncollapse_cmp_when_reload_skips_when_mem_differs():
+    """If A's mem operand differs from C's, no fold."""
+    asm = (
+        "_f:\n"
+        "        cmp     dword [ebp + 8], 0\n"
+        "        jz      .L_end\n"
+        "        mov     eax, [ebp + 12]\n"  # different slot
+        "        ret\n"
+        ".L_end:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("uncollapse_cmp_when_reload", 0) == 0
+
+
+def test_uncollapse_cmp_when_reload_skips_byte_cmp():
+    """A `byte` cmp would compare only the low 8 bits. A subsequent
+    `mov reg32, [m]` loads 4 bytes — sizes mismatch, so the rewrite
+    `mov reg, [m]; cmp reg, X` would compare all 32 bits, giving
+    different ZF for non-low-byte-zero values."""
+    asm = (
+        "_f:\n"
+        "        cmp     byte [ebp + 8], 0\n"
+        "        jz      .L_end\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        ret\n"
+        ".L_end:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("uncollapse_cmp_when_reload", 0) == 0
+
+
+def test_uncollapse_cmp_when_reload_skips_when_mem_uses_reg():
+    """If [m] references the load's destination register (e.g.
+    [eax + 4]), the rewrite would change the address calculation."""
+    asm = (
+        "_f:\n"
+        "        cmp     dword [eax + 4], 0\n"
+        "        jz      .L_end\n"
+        "        mov     eax, [eax + 4]\n"  # eax used as base for [m]
+        "        ret\n"
+        ".L_end:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("uncollapse_cmp_when_reload", 0) == 0
+
+
+def test_uncollapse_cmp_when_reload_jne_form():
+    """Any conditional jump variant works (jne, jl, jg, etc.)."""
+    asm = (
+        "_f:\n"
+        "        cmp     dword [ebp + 8], 0\n"
+        "        jne     .L_body\n"
+        "        ret\n"
+        ".L_body:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # No reload after jne — nothing to do.
+    assert opt.stats.get("uncollapse_cmp_when_reload", 0) == 0
+
+
 # ── xfer_store_collapse ───────────────────────────────────────────
 
 
