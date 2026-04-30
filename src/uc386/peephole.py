@@ -463,6 +463,7 @@ class PeepholeOptimizer:
             lines = self._pass_lea_forward_to_reg(lines)
             lines = self._pass_lea_store_collapse(lines)
             lines = self._pass_dead_stack_store(lines)
+            lines = self._pass_dead_unused_slot_stores(lines)
             lines = self._pass_reg_copy_addr_forward(lines)
             lines = self._pass_value_forward_to_reg(lines)
             lines = self._pass_xfer_store_collapse(lines)
@@ -10652,6 +10653,247 @@ class PeepholeOptimizer:
             out.append(line)
             i += 1
         return out
+
+    def _pass_dead_unused_slot_stores(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Drop stores to ``[ebp ± N]`` slots that are never read or
+        address-taken anywhere in the function.
+
+        Per-function analysis: identify each slot N where:
+        - No read reference (`mov reg, [ebp - N]`,
+          `cmp reg, [ebp - N]`, `push dword [ebp - N]`, etc.).
+        - No `lea reg, [ebp - N]` (address-taken would let reads
+          happen indirectly).
+        - No RMW (`add [ebp - N], X`, `inc dword [ebp - N]`, etc.).
+
+        Then drop all `mov [ebp ± N], SRC` (pure overwrite stores)
+        to that slot.
+
+        Common shape: a function with local `int d = ...; if (cond)
+        d = -d; return d;` where the codegen stores `d` to a frame
+        slot for "completeness" but never reads it back (the value
+        flows through EAX). The codegen pass doesn't currently do
+        this dead-store elimination, so peephole picks it up.
+
+        Saves 3+ bytes per dropped store.
+        """
+        # Build per-function reference set.
+        func_starts: list[int] = []
+        for k, ln in enumerate(lines):
+            if ln.kind == "label" and not ln.label.startswith("."):
+                func_starts.append(k)
+        if not func_starts:
+            return list(lines)
+        func_starts.append(len(lines))
+
+        out = list(lines)
+        # Collect indices to drop.
+        drop_indices: set[int] = set()
+        for fi in range(len(func_starts) - 1):
+            fstart = func_starts[fi]
+            fend = func_starts[fi + 1]
+            # Heuristic: only analyze functions with a real prologue
+            # (`enter` or `push ebp; mov ebp, esp`). Functions
+            # without a frame can't have stack-relative slots in
+            # the conventional sense; synthetic test asm fragments
+            # without a prologue are skipped.
+            has_prologue = False
+            for k in range(fstart, min(fstart + 5, fend)):
+                ln = lines[k]
+                if ln.kind != "instr":
+                    continue
+                if ln.op == "enter":
+                    has_prologue = True
+                    break
+                if (
+                    ln.op == "push"
+                    and ln.operands.strip().lower() == "ebp"
+                ):
+                    has_prologue = True
+                    break
+            if not has_prologue:
+                continue
+            # If the function has any `lea reg, [ebp ± N]` or
+            # `mov reg, ebp`, OR any SIB-form `[ebp + idx*K (+ N)]`
+            # access, the stack frame is potentially accessible
+            # through register-based indirect access (or through
+            # a runtime-computed index that we can't analyze
+            # statically). Bail on the whole function.
+            address_taken = False
+            for k in range(fstart, fend):
+                ln = lines[k]
+                if ln.kind != "instr":
+                    continue
+                if ln.op == "lea":
+                    if "ebp" in ln.operands.lower():
+                        address_taken = True
+                        break
+                if ln.op == "mov":
+                    parts = _operands_split(ln.operands)
+                    if parts is not None:
+                        src = parts[1].strip().lower()
+                        if src == "ebp":
+                            address_taken = True
+                            break
+                # Check for SIB-form `[ebp + idx*K (+ N)]` or
+                # `[ebp + idx (+ N)]` access. The literal form
+                # `[ebp + N]` and `[ebp - N]` are SAFE (we
+                # analyze those by offset). Anything else with
+                # `ebp` inside `[...]` means indirect access
+                # through a runtime-variable index.
+                ops_text = ln.operands or ""
+                # Find all `[...]` brackets containing `ebp`.
+                for m in re.finditer(
+                    r"\[([^\]]*ebp[^\]]*)\]",
+                    ops_text, re.IGNORECASE,
+                ):
+                    inner = m.group(1).strip().lower()
+                    # Safe form: `ebp + N` or `ebp - N` or
+                    # `ebp` (no offset; would mean disp=0).
+                    safe = re.fullmatch(
+                        r"\s*ebp\s*([+-]\s*\d+)?\s*",
+                        inner,
+                    )
+                    if safe is None:
+                        address_taken = True
+                        break
+                if address_taken:
+                    break
+            if address_taken:
+                continue
+            # Scan all lines in [fstart, fend).
+            # Track per-slot state: live (had read or address-take)
+            # vs only-stored.
+            slot_has_read: set[int] = set()
+            slot_stores: dict[int, list[int]] = {}
+            slot_has_other: set[int] = set()  # has RMW or ambiguous use
+
+            for k in range(fstart, fend):
+                ln = lines[k]
+                if ln.kind != "instr":
+                    continue
+                # Check operands for [ebp ± N] references.
+                ops_text = ln.operands
+                # Find all [ebp ± N] references.
+                slot_refs = re.findall(
+                    r"\[\s*ebp\s*([+-])\s*(\d+)\s*\]",
+                    ops_text,
+                    re.IGNORECASE,
+                )
+                referenced_slots = set()
+                for sign, num in slot_refs:
+                    n = int(num)
+                    if sign == "-":
+                        n = -n
+                    referenced_slots.add(n)
+                # Check if this is a pure-store to one of these.
+                store_offset = self._stack_store_offset(ln)
+                # `lea` reads its memory operand as an address —
+                # treat as address-taken (mark slot as having
+                # other use).
+                if ln.op == "lea":
+                    for slot in referenced_slots:
+                        slot_has_other.add(slot)
+                    continue
+                # If the store_offset is set, this is a pure store.
+                # Other slot references in this instruction are
+                # READS (e.g., `mov [ebp - 4], [ebp - 8]` is invalid
+                # in x86 anyway, so this case shouldn't arise).
+                if store_offset is not None:
+                    slot_stores.setdefault(
+                        store_offset, []
+                    ).append(k)
+                    # Other slots referenced (the source) are reads.
+                    for slot in referenced_slots:
+                        if slot != store_offset:
+                            slot_has_read.add(slot)
+                    continue
+                # If this is an RMW (`add [ebp - N], src` /
+                # `inc/dec dword [ebp - N]` / `xor [ebp - N], src` /
+                # etc.), it's a read-and-write. Mark as other.
+                # Detect by: dest is `[ebp - N]` and op is not `mov`
+                # or `lea`.
+                parts = _operands_split(ops_text)
+                if parts is not None:
+                    dest = parts[0].strip()
+                    m = re.match(
+                        r"^(?:dword|word|byte|qword)?\s*"
+                        r"\[\s*ebp\s*([+-])\s*(\d+)\s*\]$",
+                        dest,
+                        re.IGNORECASE,
+                    )
+                    if m is not None:
+                        n = int(m.group(2))
+                        if m.group(1) == "-":
+                            n = -n
+                        # RMW or other dest write.
+                        slot_has_other.add(n)
+                        # Other operands (the source) are reads.
+                        for slot in referenced_slots:
+                            if slot != n:
+                                slot_has_read.add(slot)
+                        continue
+                # 1-op forms like `inc dword [ebp - N]`,
+                # `dec dword [ebp - N]`, `not dword [ebp - N]`,
+                # `neg dword [ebp - N]`, `pop dword [ebp - N]`.
+                if ln.op in {
+                    "inc", "dec", "neg", "not", "pop", "push",
+                }:
+                    op_text = ops_text.strip()
+                    m1 = re.match(
+                        r"^(?:dword|word|byte|qword)?\s*"
+                        r"\[\s*ebp\s*([+-])\s*(\d+)\s*\]$",
+                        op_text,
+                        re.IGNORECASE,
+                    )
+                    if m1 is not None:
+                        n = int(m1.group(2))
+                        if m1.group(1) == "-":
+                            n = -n
+                        # inc/dec/neg/not = RMW; pop = pure write
+                        # (overwrites slot from stack); push = read.
+                        if ln.op == "push":
+                            slot_has_read.add(n)
+                        elif ln.op == "pop":
+                            # pop writes the slot. Treat as pure
+                            # store (we could collect it but for
+                            # simplicity treat as other use to be
+                            # safe — pop has stack side effects).
+                            slot_has_other.add(n)
+                        else:
+                            slot_has_other.add(n)
+                        continue
+                # Otherwise: any other instruction with a slot
+                # reference reads it.
+                for slot in referenced_slots:
+                    slot_has_read.add(slot)
+
+            # For each slot with stores and no reads/other uses,
+            # drop the stores.
+            for slot_n, store_lines in slot_stores.items():
+                if (
+                    slot_n in slot_has_read
+                    or slot_n in slot_has_other
+                ):
+                    continue
+                # All stores to this slot are dead.
+                for k in store_lines:
+                    drop_indices.add(k)
+
+        if not drop_indices:
+            return out
+        new_out = []
+        for k, ln in enumerate(out):
+            if k in drop_indices:
+                self.stats["dead_unused_slot_stores"] = (
+                    self.stats.get(
+                        "dead_unused_slot_stores", 0
+                    ) + 1
+                )
+                continue
+            new_out.append(ln)
+        return new_out
 
     @staticmethod
     def _stack_store_offset(line: Line) -> int | None:

@@ -2311,13 +2311,18 @@ def test_prologue_to_enter_skips_when_intervening_label():
 def test_prologue_to_enter_skips_when_static_link_save_first():
     """Lifted nested fns save ECX into a static-link slot AFTER the
     prologue, not within it. The pattern still matches (3 instr lines
-    are contiguous), and the ECX save is preserved untouched."""
+    are contiguous), and the ECX save is preserved untouched.
+
+    The trailing `mov eax, [ebp - 12]` simulates a nested-fn goto
+    site that reads the static link, keeping the slot live so
+    `dead_unused_slot_stores` doesn't fire."""
     asm = (
         "_inner:\n"
         "        push    ebp\n"
         "        mov     ebp, esp\n"
         "        sub     esp, 12\n"
         "        mov     [ebp - 12], ecx\n"
+        "        mov     eax, [ebp - 12]\n"
         "        ret\n"
     )
     opt = PeepholeOptimizer()
@@ -10233,6 +10238,196 @@ def test_mov_label_shl_add_load_to_sib_loop_body():
     out = opt.optimize(asm)
     assert "mov     eax, [_g + eax*4]" in out
     assert opt.stats.get("mov_label_shl_add_load_to_sib") == 1
+
+
+def test_dead_unused_slot_stores_basic():
+    """Function with `enter` and a slot that's never read or
+    address-taken — all stores to that slot are dead."""
+    asm = (
+        "_f:\n"
+        "        enter   4, 0\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     [ebp - 4], eax\n"  # dead store
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     [ebp - 4], eax" not in out
+    assert opt.stats.get("dead_unused_slot_stores") == 1
+
+
+def test_dead_unused_slot_stores_skips_no_prologue():
+    """Without a prologue (synthetic test fragments), my pass
+    doesn't fire — too risky to assume the test asm is a complete
+    function."""
+    asm = (
+        "_f:\n"
+        "        mov     [ebp - 4], eax\n"  # would be dead, but no prologue
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_unused_slot_stores", 0) == 0
+
+
+def test_dead_unused_slot_stores_skips_when_slot_read():
+    """If the slot is read anywhere in the function, all stores
+    to it are alive. Use `add eax, [ebp - 4]` as the read since
+    that doesn't get optimized away by other passes."""
+    asm = (
+        "_f:\n"
+        "        enter   4, 0\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     eax, 100\n"
+        "        add     eax, [ebp - 4]\n"  # read of slot
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     [ebp - 4], eax" in out
+    assert opt.stats.get("dead_unused_slot_stores", 0) == 0
+
+
+def test_dead_unused_slot_stores_skips_when_address_taken():
+    """If a `lea reg, [ebp - N]` exists in the function, the slot's
+    address might be passed elsewhere; can't drop stores."""
+    asm = (
+        "_f:\n"
+        "        enter   4, 0\n"
+        "        mov     [ebp - 4], eax\n"
+        "        lea     ecx, [ebp - 4]\n"  # address-take
+        "        push    ecx\n"
+        "        call    _helper\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     [ebp - 4], eax" in out
+    assert opt.stats.get("dead_unused_slot_stores", 0) == 0
+
+
+def test_dead_unused_slot_stores_skips_rmw():
+    """RMW ops on the slot count as reads (in the read part of
+    read-modify-write), so the slot is alive."""
+    asm = (
+        "_f:\n"
+        "        enter   4, 0\n"
+        "        mov     [ebp - 4], eax\n"
+        "        add     dword [ebp - 4], 1\n"  # RMW
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     [ebp - 4], eax" in out
+    assert opt.stats.get("dead_unused_slot_stores", 0) == 0
+
+
+def test_dead_unused_slot_stores_drops_multiple_stores():
+    """All stores to the unused slot are dropped. The earlier
+    `dead_stack_store` pass drops stores immediately overwritten
+    by another store; my pass picks up any remaining ones."""
+    asm = (
+        "_f:\n"
+        "        enter   4, 0\n"
+        "        mov     [ebp - 4], eax\n"  # store 1 — dead
+        "        add     eax, 5\n"
+        "        mov     [ebp - 4], eax\n"  # store 2 — dead
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     [ebp - 4], eax" not in out
+    # Combined: dead_stack_store drops the first; my pass drops
+    # the second (now no further overwrite, but slot never read).
+    total_drops = (
+        opt.stats.get("dead_stack_store", 0)
+        + opt.stats.get("dead_unused_slot_stores", 0)
+    )
+    assert total_drops == 2
+
+
+def test_dead_unused_slot_stores_independent_slots():
+    """Slot N1 with reads is alive; slot N2 without reads is dead.
+    Use `add edx, [ebp - 4]` as the read so other passes don't
+    optimize it away."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        mov     [ebp - 4], eax\n"  # alive (read below)
+        "        mov     [ebp - 8], ecx\n"  # dead
+        "        mov     edx, 100\n"
+        "        add     edx, [ebp - 4]\n"  # read of -4
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     [ebp - 4], eax" in out  # alive
+    assert "mov     [ebp - 8], ecx" not in out  # dead
+    assert opt.stats.get("dead_unused_slot_stores") == 1
+
+
+def test_dead_unused_slot_stores_skips_sib_ebp_access():
+    """A SIB-form access through ebp like `[ebp + ecx*4 - 32]` reads
+    a slot at runtime-variable offset. The pass can't analyze which
+    slot is read, so it must bail on the entire function. Without
+    this, array initializers (`int a[8] = {0..7}`) get dropped
+    when the array is read via SIB form in a loop."""
+    asm = (
+        "_f:\n"
+        "        enter   40, 0\n"
+        "        mov     dword [ebp - 32], 0\n"  # a[0]
+        "        mov     dword [ebp - 28], 1\n"  # a[1]
+        "        mov     dword [ebp - 24], 2\n"
+        "        mov     dword [ebp - 20], 3\n"
+        "        mov     dword [ebp - 16], 4\n"
+        "        mov     dword [ebp - 12], 5\n"
+        "        mov     dword [ebp - 8], 6\n"
+        "        mov     dword [ebp - 4], 7\n"  # a[7]
+        "        xor     eax, eax\n"
+        "        mov     ecx, 0\n"
+        ".L_top:\n"
+        "        cmp     ecx, 8\n"
+        "        jge     .L_end\n"
+        "        add     eax, [ebp + ecx*4 - 32]\n"  # SIB-form read
+        "        inc     ecx\n"
+        "        jmp     .L_top\n"
+        ".L_end:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # All array stores must be preserved (even though
+    # imm_store_collapse may rewrite `mov dword [ebp - 32], 0`
+    # to `mov [ebp - 32], eax` after `xor eax, eax`).
+    assert "[ebp - 32]" in out
+    assert "mov     dword [ebp - 28], 1" in out
+    assert "mov     dword [ebp - 4], 7" in out
+    assert opt.stats.get("dead_unused_slot_stores", 0) == 0
+
+
+def test_dead_unused_slot_stores_skips_sib_ebp_no_disp():
+    """SIB-form `[ebp + ecx*4]` (no displacement) also bails."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        mov     [ebp - 8], eax\n"  # would be dead w/o SIB
+        "        mov     [ebp - 4], eax\n"
+        "        mov     edx, [ebp + ecx*4]\n"  # SIB read
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     [ebp - 8], eax" in out
+    assert "mov     [ebp - 4], eax" in out
+    assert opt.stats.get("dead_unused_slot_stores", 0) == 0
 
 
 def test_dup_load_to_copy_basic():
