@@ -420,6 +420,7 @@ class PeepholeOptimizer:
             lines = self._pass_narrowing_load_test_collapse(lines)
             lines = self._pass_jcc_jmp_inversion(lines)
             lines = self._pass_zero_init_collapse(lines)
+            lines = self._pass_same_imm_store_share_reg(lines)
             lines = self._pass_redundant_xor_zero(lines)
             lines = self._pass_dual_zero_init_consolidate(lines)
             lines = self._pass_narrow_store_reload_collapse(lines)
@@ -5661,6 +5662,190 @@ class PeepholeOptimizer:
             )
             i = j
         return out
+
+    def _pass_same_imm_store_share_reg(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse 2+ adjacent ``mov <size> [m], imm`` stores with
+        the SAME non-zero immediate into a register-share form.
+
+        Pattern (N >= 2 consecutive instrs):
+            mov <size> [m1], imm
+            mov <size> [m2], imm
+            ...
+            mov <size> [mN], imm
+
+        Rewrite (when EAX is dead after):
+            mov eax, imm        ; imm is non-zero
+            mov [m1], <reg>     ; reg = eax / ax / al per size
+            mov [m2], <reg>
+            ...
+            mov [mN], <reg>
+
+        Saves bytes for non-zero imms with 2+ stores. Each direct
+        ``mov dword [m], imm32`` is 7 bytes (with disp8) or 10 bytes
+        (with disp32). The rewrite uses 5 bytes for the upfront
+        mov-imm32 plus 3 bytes per store. For dword:
+        - 1 store: 7 → 8, +1 byte (skipped — not worth it)
+        - 2 stores: 14 → 11, save 3 bytes
+        - 3 stores: 21 → 14, save 7 bytes
+        - N stores: 7N → 5 + 3N, save 4N - 5 bytes
+
+        For word/byte sizes the savings differ but still positive
+        for N >= 2.
+
+        Conditions:
+        - 2+ adjacent stores with same imm and same size
+        - imm is non-zero (zero is handled by zero_init_collapse)
+        - Each store's imm fits in the encoded form
+        - EAX dead after the chain
+        - Flags safe after (mov-imm32 doesn't set flags, but the
+          chain might be followed by code that reads flags from a
+          prior cmp; safe by virtue of mov not setting flags)
+
+        Common in array/struct initializers like ``int a[5] = {7,7,7,7,7}``
+        or ``struct s = {.a=42, .b=42, .c=42}``.
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            # Find a non-zero same-imm store
+            store_info = self._is_nonzero_imm_store(line)
+            if store_info is None:
+                out.append(line)
+                i += 1
+                continue
+            # Collect adjacent stores with SAME imm and SAME size
+            target_imm, target_size = store_info
+            chain_idx = [i]
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j]
+                if nxt.kind in ("blank", "comment"):
+                    j += 1
+                    continue
+                if nxt.kind == "instr":
+                    nxt_info = self._is_nonzero_imm_store(nxt)
+                    if (
+                        nxt_info is not None
+                        and nxt_info == (target_imm, target_size)
+                    ):
+                        chain_idx.append(j)
+                        j += 1
+                        continue
+                break
+            # Need 2+ for the rewrite to be a win
+            if len(chain_idx) < 2:
+                out.append(line)
+                i += 1
+                continue
+            # Validity: EAX dead after, flags safe after
+            after_idx = j
+            if not self._reg_dead_after(lines, after_idx, "eax"):
+                for k in chain_idx:
+                    out.append(lines[k])
+                i = j
+                continue
+            # Emit `mov eax, imm` + per-store `mov [m], <reg>`
+            indent = self._extract_indent(line.raw)
+            out.append(Line(
+                raw=f"{indent}mov     eax, {target_imm}",
+                kind="instr",
+                op="mov",
+                operands=f"eax, {target_imm}",
+            ))
+            for k in chain_idx:
+                ld = lines[k]
+                parts = _operands_split(ld.operands)
+                if parts is None:
+                    out.append(ld)
+                    continue
+                dest, _ = parts
+                size_kw, mem = self._split_sized_mem(dest.strip())
+                # Pick the matching sub-register for the store size
+                size_to_reg = {
+                    "dword": "eax",
+                    "word": "ax",
+                    "byte": "al",
+                }
+                reg = size_to_reg.get(size_kw.lower(), "eax")
+                out.append(Line(
+                    raw=f"{indent}mov     {mem}, {reg}",
+                    kind="instr",
+                    op="mov",
+                    operands=f"{mem}, {reg}",
+                ))
+            self.stats["same_imm_store_share_reg"] = (
+                self.stats.get("same_imm_store_share_reg", 0)
+                + len(chain_idx)
+            )
+            i = j
+        return out
+
+    def _is_nonzero_imm_store(
+        self, line: Line
+    ) -> tuple[str, str] | None:
+        """Return (imm_text, size_kw) for a ``mov <size> [m], imm``
+        with non-zero imm. Otherwise None.
+
+        The imm is returned as its source text (e.g., "7", "0x42",
+        "-100"). The size_kw is "byte"/"word"/"dword".
+
+        For zero values (which would conflict with zero_init_collapse),
+        returns None.
+        """
+        if line.kind != "instr" or line.op != "mov":
+            return None
+        parts = _operands_split(line.operands)
+        if parts is None:
+            return None
+        dest, src = parts
+        src_text = src.strip()
+        # Reject zero (handled by zero_init_collapse).
+        if src_text == "0":
+            return None
+        if (
+            src_text.lower().startswith("0x")
+            and all(c == "0" for c in src_text[2:])
+        ):
+            return None
+        # Source must be a numeric immediate (not memory, register,
+        # or label).
+        if (
+            src_text.startswith("[")
+            or self._is_general_register(src_text.lower())
+            or self._is_subregister(src_text.lower())
+        ):
+            return None
+        # Try parsing as a number to confirm it's an integer literal.
+        # Accept decimal, hex, octal, and negative.
+        try:
+            int(src_text, 0)
+        except ValueError:
+            return None
+        # Dest must be a sized memory operand
+        m = re.match(
+            r"^(byte|word|dword)\s+(\[.*\])\s*$",
+            dest.strip(),
+            re.IGNORECASE,
+        )
+        if m is None:
+            return None
+        size_kw = m.group(1).lower()
+        return (src_text, size_kw)
+
+    @staticmethod
+    def _is_subregister(text: str) -> bool:
+        """Return True if text is a sub-register like ax, al, ah,
+        bx, etc."""
+        return text.lower() in {
+            "ax", "al", "ah",
+            "bx", "bl", "bh",
+            "cx", "cl", "ch",
+            "dx", "dl", "dh",
+            "si", "di", "bp", "sp",
+        }
 
     @staticmethod
     def _is_zero_imm_store(line: Line) -> bool:

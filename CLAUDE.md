@@ -1680,3 +1680,14 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Limited fire rate** on test suites: 0 fires on c-testsuite/torture (none use this idiom). Real-world programs (game engines, particle systems, struct array databases) commonly have it.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests. 1112 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: same_imm_store_share_reg**: collapse 2+ adjacent `mov <size> [m], imm` stores with the SAME non-zero immediate into a register-share form.
+  - **Pattern**: `mov <size> [m1], IMM; mov <size> [m2], IMM; ...` (N >= 2 same-imm same-size adjacent stores) → `mov eax, IMM; mov [m1], <reg>; mov [m2], <reg>; ...` where reg = eax/ax/al per size.
+  - **Savings (dword stores)**: each direct `mov dword [m], imm32` is 7 bytes (with disp8). Rewrite uses 5 bytes for the upfront mov-imm32 plus 3 bytes per store.
+    - 2 stores: 14 → 11, save 3 bytes
+    - 3 stores: 21 → 14, save 7 bytes
+    - N stores: 7N → 5 + 3N, save 4N - 5 bytes
+  - **Conditions**: 2+ adjacent stores with same imm and same size; imm is non-zero (zero handled by `zero_init_collapse`); each size's store sources from the matching sub-register (eax for dword, ax for word, al for byte); EAX dead after the chain (CFG-aware via `_reg_dead_after`).
+  - **Common shape**: array initializers like `int a[5] = {7,7,7,7,7}`, struct member init with same values.
+  - **Concrete impact**: 4 c-testsuite files (00053, 00166, 00214, 00220) have 14 total fires (~20 bytes saved across c-testsuite). Real-world array/struct init patterns benefit more.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +9 peephole tests. 1121 unit tests total. Pipeline 1734/1734 (100%).

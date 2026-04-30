@@ -12320,3 +12320,181 @@ def test_dup_addr_compute_collapse_skips_r2_modified_before_a():
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
     assert opt.stats.get("dup_addr_compute_collapse", 0) == 0
+
+
+# ── same_imm_store_share_reg ──────────────────────────────────────
+
+
+def test_same_imm_store_share_reg_basic():
+    """4 same-imm dword stores collapse to mov eax, IMM + 4 reg-stores.
+    Use lea to take addresses so the address-taken bail prevents
+    dead_unused_slot_stores from dropping the stores."""
+    asm = (
+        "_f:\n"
+        "        enter   16, 0\n"
+        "        mov     dword [ebp - 4], 7\n"
+        "        mov     dword [ebp - 8], 7\n"
+        "        mov     dword [ebp - 12], 7\n"
+        "        mov     dword [ebp - 16], 7\n"
+        "        lea     ecx, [ebp - 16]\n"  # address-take: bails dead_unused_slot_stores
+        "        push    ecx\n"
+        "        call    _helper\n"
+        "        pop     ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    # Disable redundant_eax_load tracking by using imms that won't
+    # become register-cached. Just verify the pass fires.
+    out = opt.optimize(asm)
+    assert opt.stats.get("same_imm_store_share_reg", 0) >= 2
+
+
+def test_same_imm_store_share_reg_skips_single():
+    """Single store doesn't collapse (would lose 1 byte)."""
+    asm = (
+        "_f:\n"
+        "        enter   4, 0\n"
+        "        mov     dword [ebp - 4], 7\n"
+        "        mov     eax, [ebp - 4]\n"  # keep slot alive
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     dword [ebp - 4], 7" in out
+    assert opt.stats.get("same_imm_store_share_reg", 0) == 0
+
+
+def test_same_imm_store_share_reg_skips_different_imms():
+    """Different imms: doesn't collapse."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        mov     dword [ebp - 4], 7\n"
+        "        mov     dword [ebp - 8], 11\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        add     eax, [ebp - 8]\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Both stores preserved
+    assert "mov     dword [ebp - 4], 7" in out
+    assert "mov     dword [ebp - 8], 11" in out
+    assert opt.stats.get("same_imm_store_share_reg", 0) == 0
+
+
+def test_same_imm_store_share_reg_skips_zero():
+    """Zero imm is handled by zero_init_collapse, not this pass."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        mov     dword [ebp - 4], 0\n"
+        "        mov     dword [ebp - 8], 0\n"
+        "        mov     eax, 100\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # zero_init_collapse handles this; my pass doesn't fire
+    assert opt.stats.get("same_imm_store_share_reg", 0) == 0
+
+
+def test_same_imm_store_share_reg_skips_eax_live():
+    """If EAX is live (read) after the chain, can't clobber it."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        mov     dword [ebp - 4], 7\n"
+        "        mov     dword [ebp - 8], 7\n"
+        "        push    eax\n"  # EAX read — live
+        "        mov     ecx, [ebp - 4]\n"  # keep slots alive
+        "        add     ecx, [ebp - 8]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     dword [ebp - 4], 7" in out
+    assert "mov     dword [ebp - 8], 7" in out
+    assert opt.stats.get("same_imm_store_share_reg", 0) == 0
+
+
+def test_same_imm_store_share_reg_byte_size():
+    """Byte stores share AL."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        mov     byte [ebp - 1], 0x42\n"
+        "        mov     byte [ebp - 2], 0x42\n"
+        "        mov     byte [ebp - 3], 0x42\n"
+        "        mov     eax, 100\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, 0x42" in out
+    assert "mov     [ebp - 1], al" in out
+    assert "mov     [ebp - 2], al" in out
+    assert "mov     [ebp - 3], al" in out
+    assert opt.stats.get("same_imm_store_share_reg", 0) == 3
+
+
+def test_same_imm_store_share_reg_word_size():
+    """Word stores share AX."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        mov     word [ebp - 2], 0x1234\n"
+        "        mov     word [ebp - 4], 0x1234\n"
+        "        mov     eax, 100\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, 0x1234" in out
+    assert "mov     [ebp - 2], ax" in out
+    assert "mov     [ebp - 4], ax" in out
+    assert opt.stats.get("same_imm_store_share_reg", 0) == 2
+
+
+def test_same_imm_store_share_reg_negative_imm():
+    """Negative imms work."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        mov     dword [ebp - 4], -1\n"
+        "        mov     dword [ebp - 8], -1\n"
+        "        lea     ecx, [ebp - 8]\n"  # address-take
+        "        push    ecx\n"
+        "        call    _helper\n"
+        "        pop     ecx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("same_imm_store_share_reg", 0) >= 2
+
+
+def test_same_imm_store_share_reg_skips_size_mismatch():
+    """Mixed sizes don't merge into one chain."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        mov     dword [ebp - 4], 7\n"
+        "        mov     byte [ebp - 5], 7\n"  # different size
+        "        mov     dword [ebp - 12], 7\n"
+        "        mov     eax, 100\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The chain breaks at the byte store. The dword stores aren't
+    # adjacent (byte breaks them). No 2+ same-size adjacent. Skip.
+    assert opt.stats.get("same_imm_store_share_reg", 0) == 0
