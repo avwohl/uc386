@@ -460,6 +460,7 @@ class PeepholeOptimizer:
             lines = self._pass_push_pop_op_to_memop(lines)
             lines = self._pass_push_pop_register_op(lines)
             lines = self._pass_zero_load_after_zero_store(lines)
+            lines = self._pass_xor_then_and_collapse(lines)
             lines = self._pass_label_load_collapse(lines)
             lines = self._pass_label_push_collapse(lines)
             lines = self._pass_label_store_collapse(lines)
@@ -10511,6 +10512,87 @@ class PeepholeOptimizer:
             self.stats["push_pop_register_op"] = (
                 self.stats.get("push_pop_register_op", 0) + 1
             )
+            continue
+        return out
+
+    def _pass_xor_then_and_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Drop ``and REG, X`` immediately after ``xor REG, REG``.
+
+        After `xor REG, REG`, REG is 0. ANDing 0 with anything
+        leaves it 0. So the AND is dead.
+
+        Flag state is preserved: both `xor REG, REG` and `and REG, X`
+        (for REG=0) leave ZF=1, SF=0, PF=1, OF=0, CF=0 — identical.
+        So no flag-deadness check needed.
+
+        Saves 2-6 bytes per match (3-byte and-imm8-sign-ext or
+        6-byte and-imm32 → gone).
+
+        Common in bit-field init idioms after `zero_load_after_zero_store`
+        replaces a load with xor: the surrounding `and REG, MASK`
+        becomes a no-op.
+
+        Conditions:
+        - Adjacent instructions.
+        - Line A is `xor REG, REG` (REG is 32-bit GP).
+        - Line B is `and REG, X` (same REG; X is non-register
+          immediate or memory — not REG itself).
+        """
+        out = list(lines)
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            if a.kind != "instr" or a.op != "xor":
+                i += 1
+                continue
+            a_parts = _operands_split(a.operands)
+            if a_parts is None:
+                i += 1
+                continue
+            a_dst, a_src = a_parts
+            a_dst_low = a_dst.strip().lower()
+            a_src_low = a_src.strip().lower()
+            if (
+                a_dst_low not in PeepholeOptimizer._GP32
+                or a_dst_low != a_src_low
+            ):
+                i += 1
+                continue
+            # Find next instr (skip blanks/comments).
+            j = i + 1
+            while j < len(out) and out[j].kind in ("blank", "comment"):
+                j += 1
+            if j >= len(out):
+                i += 1
+                continue
+            b = out[j]
+            if b.kind != "instr" or b.op != "and":
+                i += 1
+                continue
+            b_parts = _operands_split(b.operands)
+            if b_parts is None:
+                i += 1
+                continue
+            b_dst, b_src = b_parts
+            b_dst_low = b_dst.strip().lower()
+            b_src_low = b_src.strip().lower()
+            if b_dst_low != a_dst_low:
+                i += 1
+                continue
+            # Skip if src is the same register (and reg, reg is a
+            # standard idiom — different shape; my pass shouldn't
+            # rewrite that).
+            if b_src_low == a_dst_low:
+                i += 1
+                continue
+            # Drop B.
+            del out[j]
+            self.stats["xor_then_and_collapse"] = (
+                self.stats.get("xor_then_and_collapse", 0) + 1
+            )
+            # Don't advance i — there may be another and after this.
             continue
         return out
 

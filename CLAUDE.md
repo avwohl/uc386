@@ -1896,3 +1896,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete impact on pr70602** (bit-field-init torture): 21 fires of the load-replacement, plus dramatic cascade. 471 → 277 lines (41% reduction) on top of all prior peephole work, including slice 29's `push_pop_register_op`. With the loads turned into xors, `dead_stack_store` and similar passes drop the now-unreferenced zero-stores. The bit-field init idiom is heavily simplified.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (1204 total). Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: xor_then_and_collapse**: drop `and REG, X` immediately after `xor REG, REG`. After xor, REG = 0; ANDing 0 with anything leaves it 0. Saves 2-6 bytes per match (3-byte and-imm8-sign-ext or 6-byte and-imm32 → gone).
+  - **Pattern**: `xor REG, REG; and REG, X` → `xor REG, REG`. The AND is dead: REG was just zeroed; ANDing 0 with X always yields 0.
+  - **Flags preserved**: both `xor REG, REG` and `and REG, X` (for REG=0) leave ZF=1, SF=0, PF=1, OF=0, CF=0 — identical. So no flag-deadness check needed; the rewrite is safe regardless of subsequent flag-readers.
+  - **Common shape**: bit-field init idioms after `zero_load_after_zero_store` (slice 30) replaces a load with xor: the surrounding `and REG, MASK` becomes a no-op. Without slice 30, the AND was needed (the load might have non-zero bits to mask). With slice 30, REG comes from xor, so AND is dead.
+  - **Conditions**: adjacent instructions; line A is `xor REG, REG` (REG is 32-bit GP); line B is `and REG, X` with same REG; X is not REG itself (`and reg, reg` is a different idiom — different shape).
+  - **Concrete impact on pr70602**: 47 fires combined with slice 30's cascade. 471 → 225 lines (52% reduction) on top of all prior peephole work. The bit-field init's `and REG, mask` operations are mostly redundant after the loaded value is known to be 0.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (1210 total). Pipeline 1734/1734 (100%).

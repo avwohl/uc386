@@ -14272,3 +14272,94 @@ def test_zero_load_after_zero_store_skips_when_flags_read():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("zero_load_after_zero_store", 0) == 0
+
+
+# ── xor_then_and_collapse ────────────────────────────────────────
+
+
+def test_xor_then_and_collapse_basic():
+    """`xor eax, eax; and eax, IMM` → `xor eax, eax`.
+    Drops the AND. After xor, eax=0; AND with anything gives 0.
+    Flag state identical (both produce ZF=1 etc.)."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        and     eax, 1\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "and     eax, 1" not in out
+    assert "xor     eax, eax" in out
+    assert opt.stats.get("xor_then_and_collapse", 0) == 1
+
+
+def test_xor_then_and_collapse_imm32():
+    """Large immediate ANDed against zero — same drop."""
+    asm = (
+        "_f:\n"
+        "        xor     ecx, ecx\n"
+        "        and     ecx, 4294967294\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "and     ecx, 4294967294" not in out
+    assert opt.stats.get("xor_then_and_collapse", 0) == 1
+
+
+def test_xor_then_and_collapse_chained():
+    """Multiple ANDs after xor — all dead."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        and     eax, 1\n"
+        "        and     eax, 2\n"
+        "        and     eax, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "and     eax, 1" not in out
+    assert "and     eax, 2" not in out
+    assert "and     eax, 4" not in out
+    assert opt.stats.get("xor_then_and_collapse", 0) == 3
+
+
+def test_xor_then_and_collapse_skips_different_reg():
+    """The AND must target the same reg as the xor."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        and     ecx, 1\n"   # different reg
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("xor_then_and_collapse", 0) == 0
+
+
+def test_xor_then_and_collapse_skips_non_xor():
+    """Without a preceding xor reg,reg, can't assume reg is 0."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 5\n"
+        "        and     eax, 1\n"   # eax=5, AND with 1 = 1, not dead
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("xor_then_and_collapse", 0) == 0
+
+
+def test_xor_then_and_collapse_skips_xor_diff_regs():
+    """xor reg1, reg2 (different regs) doesn't zero either; skip."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, ecx\n"
+        "        and     eax, 1\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("xor_then_and_collapse", 0) == 0
