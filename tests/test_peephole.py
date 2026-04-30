@@ -13176,3 +13176,73 @@ def test_uncollapse_cmp_when_reload_byte_nonzero_skipped():
     out = opt.optimize(asm)
     # Original cmp preserved
     assert "cmp     byte [eax], 5" in out
+
+
+def test_trampoline_elimination_basic():
+    """`jcc L1; ...; L1: jmp L3` — redirect jcc to L3 directly,
+    drop L1: jmp L3 trampoline. Realistic CFG."""
+    asm = (
+        "_f:\n"
+        ".L_loop:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        cmp     eax, 0\n"
+        "        je      .L_target\n"     # redirect target
+        "        add     eax, 1\n"
+        "        mov     [ebp - 4], eax\n"
+        "        jmp     .L_loop\n"
+        ".L_target:\n"
+        "        jmp     .L_loop\n"        # trampoline back to loop top
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # je should now go to .L_loop directly via trampoline elimination.
+    assert opt.stats.get("trampoline_elimination", 0) >= 1
+
+
+def test_trampoline_elimination_skips_when_fallthrough():
+    """If L1 has fallthrough from prior code, the trampoline can't
+    be safely eliminated (the fallthrough path would change)."""
+    asm = (
+        "_f:\n"
+        "        cmp     eax, 0\n"
+        "        je      .L_target\n"
+        # No terminator before .L_target — fallthrough applies
+        ".L_target:\n"
+        "        jmp     .L_real_dest\n"
+        ".L_real_dest:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # No trampoline elimination should fire
+    assert opt.stats.get("trampoline_elimination", 0) == 0
+
+
+def test_trampoline_elimination_skips_self_target():
+    """No infinite-loop trampoline (L1: jmp L1)."""
+    asm = (
+        "_f:\n"
+        "        ret\n"
+        ".L_loop:\n"
+        "        jmp     .L_loop\n"  # self-trampoline; bail
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("trampoline_elimination", 0) == 0
+
+
+def test_trampoline_elimination_global_label_safe():
+    """Global labels (no leading `.`) are not considered for
+    elimination — they may be exported."""
+    asm = (
+        "_f:\n"
+        "        ret\n"
+        "_global_target:\n"
+        "        jmp     .somewhere\n"
+        ".somewhere:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Global trampolines are NOT eliminated.
+    assert opt.stats.get("trampoline_elimination", 0) == 0

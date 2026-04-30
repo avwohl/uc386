@@ -498,6 +498,7 @@ class PeepholeOptimizer:
             lines = self._pass_push_pop_to_mov(lines)
             lines = self._pass_sib_const_index_fold(lines)
             lines = self._pass_push_const_index_fold(lines)
+            lines = self._pass_trampoline_elimination(lines)
             # Drop labels that aren't referenced anywhere. Other
             # passes may have replaced jcc/jmp targets, leaving some
             # labels orphaned. After dropping, dead_after_terminator
@@ -559,6 +560,211 @@ class PeepholeOptimizer:
                 )
             i = j
         return out
+
+    def _pass_trampoline_elimination(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Redirect jumps to a label that's just a `jmp` to another
+        label.
+
+        Pattern:
+            ; (somewhere)
+            jcc/jmp L1
+            ; ...
+            L1:
+                jmp L3   ; first instruction at L1 is unconditional jmp
+        →
+            ; (somewhere)
+            jcc/jmp L3   ; redirected
+            ; ...
+            (L1: jmp L3 — becomes unreferenced if all jumps redirected;
+             cleaned up by unreferenced_label_removal in the next
+             iteration)
+
+        Conditions:
+        - L1 is a NASM-local label (`.LX`)
+        - L1's first instruction (after blanks/comments) is an
+          unconditional `jmp` to some other label L3
+        - L3 != L1 (no infinite-loop trampoline)
+        - The jcc/jmp instruction's target is L1
+        - L1 must not be the implicit fall-through from any other
+          instruction (i.e., previous line is a terminator) — otherwise
+          the original code may fall through into L1, and dropping
+          the trampoline can change semantics.
+
+        Why this works: the only way to reach the trampoline is via
+        a jump targeting L1. Each such jump can be redirected to L3
+        directly, since the trampoline just forwards.
+
+        Saves 5 bytes per redirected jump (the `jmp imm32` form is
+        5 bytes; `jmp imm8` is 2 bytes — saves 1 byte minimum). After
+        all references are redirected, L1's def becomes unreferenced
+        and `unreferenced_label_removal` cleans it up.
+
+        Common shape: arises after `jcc_jmp_inversion` and other
+        passes that simplify control flow, leaving short trampoline
+        labels.
+        """
+        # Build map: (scope_owner, label) -> target_label for trampoline
+        # labels (L1: jmp L3 — first instr after L1: is jmp).
+        # NASM scopes local labels (.LX) per the most recent global
+        # label. Two functions can each have their own .L12_case: ; only
+        # one may be a trampoline. Track scope-aware to avoid redirecting
+        # references in the wrong function's scope.
+        trampolines: dict[tuple[str, str], str] = {}
+        # current_scope tracks the most recent global label as we scan.
+        current_scope = ""
+        i = 0
+        while i < len(lines):
+            ln = lines[i]
+            if ln.kind != "label":
+                i += 1
+                continue
+            stripped = ln.raw.strip()
+            if not stripped.endswith(":"):
+                i += 1
+                continue
+            label_name = stripped[:-1].strip()
+            if not label_name.startswith("."):
+                # Global label — update scope and skip (don't consider
+                # globals for elimination; may be exported).
+                current_scope = label_name
+                i += 1
+                continue
+            # Verify previous line is a terminator (no fallthrough
+            # into L1). If we don't, dropping the trampoline can
+            # change behavior on the fallthrough path.
+            prev_term = False
+            for k in range(i - 1, -1, -1):
+                pl = lines[k]
+                if pl.kind in ("blank", "comment"):
+                    continue
+                if pl.kind == "label":
+                    # Multiple labels in a row — fallthrough from
+                    # the prior label's predecessor. Bail (safer).
+                    prev_term = False
+                    break
+                if pl.kind == "instr":
+                    if pl.op in (
+                        "jmp", "ret", "retn", "retf",
+                        "iret", "iretd",
+                    ):
+                        prev_term = True
+                    # Also noreturn calls — skip for now (rare).
+                    break
+                # directive/data: also a boundary; treat as terminator
+                if pl.kind in ("directive", "data"):
+                    prev_term = True
+                    break
+            if not prev_term:
+                i += 1
+                continue
+            # Look for the first instruction after the label.
+            j = i + 1
+            while j < len(lines) and lines[j].kind in (
+                "blank", "comment", "label",
+            ):
+                # Multiple labels at same position: each is a separate
+                # alias for the next instruction. We're looking for
+                # what L1 maps to. If another label sits between L1
+                # and the first instr, our target is the same.
+                if lines[j].kind == "label":
+                    # Don't redirect through multiple labels
+                    # conservatively. Bail.
+                    j = len(lines)
+                    break
+                j += 1
+            if j >= len(lines):
+                i += 1
+                continue
+            first_instr = lines[j]
+            if first_instr.kind != "instr" or first_instr.op != "jmp":
+                i += 1
+                continue
+            target = first_instr.operands.strip()
+            # Don't redirect to self (infinite loop).
+            if target == label_name:
+                i += 1
+                continue
+            # Only same-scope redirects (NASM-local labels don't
+            # cross scopes).  We require both the trampoline label
+            # and its target to be local labels (`.X`) — emitting
+            # `je <target>` from this scope only resolves to the
+            # target if it's defined in this scope. Skip if target
+            # is not local (a `jmp _global_other` trampoline target
+            # is a different beast — punt for now).
+            if not target.startswith("."):
+                i += 1
+                continue
+            trampolines[(current_scope, label_name)] = target
+            i += 1
+
+        if not trampolines:
+            return list(lines)
+
+        # Now redirect every jcc/jmp targeting any L1 in trampolines.
+        # Each redirect saves nothing in bytes here (jmp/jcc to L1 =
+        # jmp/jcc to L3 — same instruction), but allows L1: jmp L3
+        # to be cleaned up.
+        out: list[Line] = []
+        fired = False
+        # Track the current scope as we walk the redirect pass too.
+        cur_scope_redir = ""
+        for ln in lines:
+            if ln.kind == "label":
+                stripped = ln.raw.strip()
+                if stripped.endswith(":"):
+                    name = stripped[:-1].strip()
+                    if not name.startswith("."):
+                        cur_scope_redir = name
+                out.append(ln)
+                continue
+            if ln.kind != "instr":
+                out.append(ln)
+                continue
+            # Match jmp or jcc with operand referencing a trampoline.
+            if not (
+                ln.op == "jmp"
+                or (ln.op.startswith("j") and ln.op != "jmp")
+                or ln.op.startswith("set")
+                or ln.op.startswith("cmov")
+            ):
+                out.append(ln)
+                continue
+            tgt = ln.operands.strip()
+            # Only consider local-label targets (qualified
+            # `_other.LX` references are cross-scope and we don't
+            # touch those).
+            if not tgt.startswith("."):
+                out.append(ln)
+                continue
+            key = (cur_scope_redir, tgt)
+            if key not in trampolines:
+                out.append(ln)
+                continue
+            # Build redirected instruction.
+            new_target = trampolines[key]
+            # Compute new raw line preserving indentation and op-text.
+            indent = self._extract_indent(ln.raw)
+            # Match how the original line was formatted: op,
+            # whitespace, target.
+            # Use the same op spelling (case) and a default
+            # tab-aligned form.
+            # The original's whitespace pattern is hard to replicate
+            # exactly; emit with the standard 8-char alignment used
+            # by the codegen.
+            new_raw = f"{indent}{ln.op:<8}{new_target}"
+            new_line = Line(
+                raw=new_raw, kind="instr", op=ln.op,
+                operands=new_target,
+            )
+            out.append(new_line)
+            fired = True
+            self.stats["trampoline_elimination"] = (
+                self.stats.get("trampoline_elimination", 0) + 1
+            )
+        # If nothing changed, return original; otherwise return out.
+        return out if fired else list(lines)
 
     def _pass_unreferenced_label_removal(
         self, lines: list[Line]
