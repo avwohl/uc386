@@ -472,6 +472,7 @@ class PeepholeOptimizer:
             lines = self._pass_dup_load_chain_to_copy(lines)
             lines = self._pass_copy_save_deref_collapse(lines)
             lines = self._pass_dup_load_with_intermediate(lines)
+            lines = self._pass_dup_addr_compute_collapse(lines)
             lines = self._pass_uncollapse_cmp_when_reload(lines)
             lines = self._pass_redundant_cmp_at_label(lines)
             lines = self._pass_op_mem_to_reg_collapse(lines)
@@ -12298,6 +12299,325 @@ class PeepholeOptimizer:
                 self.stats.get("dup_load_with_intermediate", 0) + 1
             )
         return out
+
+    def _pass_dup_addr_compute_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Drop a 4-line address-recompute sequence when an
+        immediately-preceding 3-line compute produced the same
+        address, separated by a deref that doesn't clobber the
+        address-holding register.
+
+        Pattern (9 consecutive instr lines):
+            A: mov R1, MEM1                ; load base
+            C: imul R2, R2, K  OR  shl R2, N  ; scale (R2 already
+                                              ; held the index)
+            D: add R1, R2                  ; R1 = &elem
+            E: mov R3, [R1 + off1]         ; first deref, R3 != R1
+            F: mov R1, MEM1                ; (drop) recompute starts
+            G: mov R2, MEM2                ; (drop) reload index
+            H: imul R2, R2, K              ; (drop)
+            I: add R1, R2                  ; (drop)
+            J: mov R4, [R1 + off2]         ; second deref
+
+        After:
+            A, C, D, E, J  (drop F, G, H, I)
+
+        Common in struct-array indexing in LOOPS where the struct
+        size doesn't fit SIB scale (sizeof not in {1, 2, 4, 8}).
+        The codegen evaluates `pts[i].x` and `pts[i].y` separately;
+        the second evaluation rebuilds `&pts[i]` from scratch.
+
+        For correctness, R2's value before A must equal what G
+        loads. Verified by scanning backward within the same basic
+        block from A: the most recent write to R2 must be a `mov
+        R2, MEM2` that textually matches G.
+
+        Saves 4 instructions per match (~13-17 bytes).
+        """
+        out = list(lines)
+        drop_indices: set[int] = set()
+
+        def norm_ops(ops: str) -> str:
+            return " ".join(ops.split())
+
+        def find_r2_pre_value(
+            start_idx: int, r2: str
+        ) -> str | None:
+            """Scan backward from start_idx within the same basic
+            block (until the previous label) for the most recent
+            `mov R2, MEM_Y`. Return MEM_Y or None.
+
+            Bails (returns None) on any non-mov write to R2 or any
+            R2 reference that we can't confidently classify as
+            read-only.
+            """
+            k = start_idx - 1
+            while k >= 0:
+                ln = out[k]
+                if ln.kind == "label":
+                    return None
+                if ln.kind != "instr":
+                    k -= 1
+                    continue
+                # Does this write R2 via a mov?
+                if ln.op == "mov":
+                    parts = _operands_split(ln.operands)
+                    if parts is not None:
+                        dst = parts[0].strip().lower()
+                        if dst == r2:
+                            src = parts[1].strip()
+                            if (
+                                src.startswith("[")
+                                and src.endswith("]")
+                            ):
+                                return src
+                            return None
+                # Check for potential writes to R2 from other ops.
+                ops_text = ln.operands or ""
+                if not self._references_reg_family(ops_text, r2):
+                    # No R2 mention; safe to continue.
+                    k -= 1
+                    continue
+                # R2 referenced. Check forms:
+                # - 1-op RMW (inc/dec/neg/not/shl/shr/sar/mul/div/
+                #   imul/idiv on a single register or memory) where
+                #   the operand IS R2 → write.
+                # - 2-op ops where dest is R2 → write (except cmp/
+                #   test which are read-only).
+                # - 1-op ops with R2 as memory base (e.g.,
+                #   `inc dword [ecx]`) → R2 is read, not written.
+                # - call/iret/leave/etc. → may clobber R2 implicitly.
+                if ln.op in {
+                    "call", "iret", "iretd", "leave", "enter",
+                    "ret", "retn", "retf",
+                }:
+                    return None
+                parts = _operands_split(ops_text)
+                if parts is not None:
+                    # 2-operand form
+                    dest = parts[0].strip().lower()
+                    if dest == r2:
+                        if ln.op not in ("cmp", "test"):
+                            return None
+                else:
+                    # 1-operand or no-operand form. If the single
+                    # operand is exactly R2 (a register), it's an
+                    # RMW.
+                    op_text = ops_text.strip().lower()
+                    if op_text == r2:
+                        return None
+                    # If R2 is mentioned inside a memory operand
+                    # (`[ecx]`), it's a memory address — R2 is
+                    # READ, not written. Continue.
+                # Implicit-reg writers
+                if ln.op in PeepholeOptimizer._IMPLICIT_REG_USERS:
+                    if r2 in {"eax", "ecx", "edx", "esi", "edi"}:
+                        return None
+                k -= 1
+            return None
+
+        i = 0
+        while i + 8 < len(out):
+            block = out[i:i + 9]
+            if not all(ln.kind == "instr" for ln in block):
+                i += 1
+                continue
+            a, c, d, e, f, g, h, ii_line, j = block
+
+            # A: mov R1, MEM1
+            if a.op != "mov":
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            if ap is None:
+                i += 1
+                continue
+            r1 = ap[0].strip().lower()
+            mem1 = ap[1].strip()
+            if not self._is_general_register(r1):
+                i += 1
+                continue
+            if not (mem1.startswith("[") and mem1.endswith("]")):
+                i += 1
+                continue
+
+            # C: imul R2, R2, K  OR  shl R2, N
+            r2 = None
+            if c.op == "imul":
+                parts = [
+                    p.strip() for p in c.operands.split(",")
+                ]
+                if len(parts) != 3:
+                    i += 1
+                    continue
+                if parts[0].lower() != parts[1].lower():
+                    i += 1
+                    continue
+                r2 = parts[0].lower()
+                if (
+                    not self._is_general_register(r2)
+                    or r2 == r1
+                ):
+                    i += 1
+                    continue
+                try:
+                    int(parts[2], 0)
+                except ValueError:
+                    i += 1
+                    continue
+            elif c.op in ("shl", "sal"):
+                cp = _operands_split(c.operands)
+                if cp is None:
+                    i += 1
+                    continue
+                r2 = cp[0].strip().lower()
+                if (
+                    not self._is_general_register(r2)
+                    or r2 == r1
+                ):
+                    i += 1
+                    continue
+                try:
+                    int(cp[1].strip(), 0)
+                except ValueError:
+                    i += 1
+                    continue
+            else:
+                i += 1
+                continue
+
+            # D: add R1, R2
+            if d.op != "add":
+                i += 1
+                continue
+            dp = _operands_split(d.operands)
+            if dp is None:
+                i += 1
+                continue
+            if (
+                dp[0].strip().lower() != r1
+                or dp[1].strip().lower() != r2
+            ):
+                i += 1
+                continue
+
+            # E: mov R3, [R1 + off1] with R3 != R1 and R3 != R2
+            if e.op != "mov":
+                i += 1
+                continue
+            ep = _operands_split(e.operands)
+            if ep is None:
+                i += 1
+                continue
+            r3 = ep[0].strip().lower()
+            if not self._is_general_register(r3):
+                i += 1
+                continue
+            if r3 == r1 or r3 == r2:
+                i += 1
+                continue
+            e_src = ep[1].strip()
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if e_src.lower().startswith(prefix):
+                    e_src = e_src[len(prefix):].lstrip()
+                    break
+            e_match = re.match(
+                r"^\[\s*" + re.escape(r1)
+                + r"(?:\s*([+-])\s*(\d+))?\s*\]$",
+                e_src, re.IGNORECASE,
+            )
+            if e_match is None:
+                i += 1
+                continue
+
+            # F = A textually
+            if f.op != a.op or norm_ops(f.operands) != norm_ops(a.operands):
+                i += 1
+                continue
+
+            # G: mov R2, MEM2_X (R2 reloaded — recompute's index load)
+            if g.op != "mov":
+                i += 1
+                continue
+            gp = _operands_split(g.operands)
+            if gp is None:
+                i += 1
+                continue
+            if gp[0].strip().lower() != r2:
+                i += 1
+                continue
+            mem2_x = gp[1].strip()
+            if not (
+                mem2_x.startswith("[") and mem2_x.endswith("]")
+            ):
+                i += 1
+                continue
+
+            # H = C textually
+            if h.op != c.op or norm_ops(h.operands) != norm_ops(c.operands):
+                i += 1
+                continue
+            # I = D textually
+            if (
+                ii_line.op != d.op
+                or norm_ops(ii_line.operands) != norm_ops(d.operands)
+            ):
+                i += 1
+                continue
+
+            # J: mov R4, [R1 + off2]
+            if j.op != "mov":
+                i += 1
+                continue
+            jp = _operands_split(j.operands)
+            if jp is None:
+                i += 1
+                continue
+            j_src = jp[1].strip()
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if j_src.lower().startswith(prefix):
+                    j_src = j_src[len(prefix):].lstrip()
+                    break
+            j_match = re.match(
+                r"^\[\s*" + re.escape(r1)
+                + r"(?:\s*([+-])\s*(\d+))?\s*\]$",
+                j_src, re.IGNORECASE,
+            )
+            if j_match is None:
+                i += 1
+                continue
+
+            # Verify: scan backward from A for the most recent
+            # write to R2. It must be `mov R2, MEM2_Y` where
+            # MEM2_Y matches G's source MEM2_X.
+            r2_pre_src = find_r2_pre_value(i, r2)
+            if r2_pre_src is None:
+                i += 1
+                continue
+            if norm_ops(r2_pre_src) != norm_ops(mem2_x):
+                i += 1
+                continue
+
+            # All conditions met. Drop F, G, H, I.
+            for k in range(i + 4, i + 8):
+                drop_indices.add(k)
+            i += 9
+            continue
+
+        if not drop_indices:
+            return out
+        new_out = []
+        for k, ln in enumerate(out):
+            if k in drop_indices:
+                self.stats["dup_addr_compute_collapse"] = (
+                    self.stats.get(
+                        "dup_addr_compute_collapse", 0
+                    ) + 1
+                )
+                continue
+            new_out.append(ln)
+        return new_out
 
     def _pass_uncollapse_cmp_when_reload(
         self, lines: list[Line]

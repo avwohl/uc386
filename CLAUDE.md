@@ -1661,3 +1661,22 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete win**: `_abs_diff` (probe) saves 6 bytes by dropping 2 dead stores. 30 c-testsuite files have 53 total fires (~159 bytes saved across c-testsuite).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +9 peephole tests. 1107 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: dup_addr_compute_collapse**: drop a 4-line address-recompute when an immediately-preceding 3-line compute produced the same address, separated by a deref that doesn't clobber the address-holding register.
+  - **Pattern (9 consecutive instr lines)**:
+    - A: `mov R1, MEM1` (load base)
+    - C: `imul R2, R2, K` or `shl R2, N` (scale; R2 already held the index)
+    - D: `add R1, R2` (R1 = &elem)
+    - E: `mov R3, [R1 + off1]` (first deref, R3 != R1, R3 != R2)
+    - F: `mov R1, MEM1` (= A; drop)
+    - G: `mov R2, MEM2` (drop)
+    - H: `imul R2, R2, K` (= C; drop)
+    - I: `add R1, R2` (= D; drop)
+    - J: `mov R4, [R1 + off2]` (second deref)
+  - **Why this works**: After E, R1 still holds &elem (since R3 != R1). After dropping F-I, R1 unchanged; J's deref via [R1 + off2] correctly accesses the second member.
+  - **Pre-value verification**: For correctness, R2's value before A must equal what G loads. Verified by scanning backward within the same basic block from A: the most recent write to R2 must be a `mov R2, MEM_Y` that textually matches G's source. Bails on any other write to R2 (RMW, implicit-reg-writer, function call, etc.).
+  - **Common shape**: struct-array indexing in LOOPS where the struct size doesn't fit SIB scale (sizeof not in {1, 2, 4, 8}). Codegen evaluates `pts[i].x` and `pts[i].y` independently; the second evaluation rebuilds `&pts[i]` from scratch. The recompute is redundant.
+  - **Saves 4 instructions per match** (~13-17 bytes). For struct sizes that DO fit SIB scale, `index_load_collapse` already handles the collapse; my pass picks up the residual non-SIB cases (sizeof = 12, 20, 28, 36, 40, 44, 48, 52, 56, etc.).
+  - **Concrete win**: `_sum_xy` (struct point with 3 ints, size 12) loop body 11 → 7 instructions per iteration. 4 lines saved per iteration. Same shape applies to any non-SIB-fitting struct array sum loop.
+  - **Limited fire rate** on test suites: 0 fires on c-testsuite/torture (none use this idiom). Real-world programs (game engines, particle systems, struct array databases) commonly have it.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests. 1112 unit tests total. Pipeline 1734/1734 (100%).

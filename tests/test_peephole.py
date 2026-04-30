@@ -12183,3 +12183,140 @@ def test_lea_sib_load_collapse_dest_overwrites_lea_reg():
     out = opt.optimize(asm)
     assert "lea     eax" not in out
     assert opt.stats.get("lea_sib_load_collapse", 0) == 1
+
+
+# ── dup_addr_compute_collapse ─────────────────────────────────────
+
+
+def test_dup_addr_compute_collapse_basic():
+    """The canonical loop-body shape: a 3-line address compute
+    followed by a deref preserving the address reg, followed by a
+    4-line recompute, followed by another deref. The recompute is
+    redundant and gets dropped.
+
+    Loop top has `mov ecx, [ebp - 8]` setting up R2's pre-A value.
+    """
+    asm = (
+        ".L1_for_top:\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        cmp     ecx, [ebp + 12]\n"
+        "        jge     .L_end\n"
+        "        mov     eax, [ebp + 8]\n"     # A
+        "        imul    ecx, ecx, 56\n"       # C
+        "        add     eax, ecx\n"           # D
+        "        mov     edx, [eax]\n"         # E (R3=edx, != eax/ecx)
+        "        mov     eax, [ebp + 8]\n"     # F = A (drop)
+        "        mov     ecx, [ebp - 8]\n"     # G (drop)
+        "        imul    ecx, ecx, 56\n"       # H = C (drop)
+        "        add     eax, ecx\n"           # I = D (drop)
+        "        mov     eax, [eax + 4]\n"     # J: 2nd deref
+        "        ret\n"
+        ".L_end:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The recompute (4 lines after edx deref) should be dropped.
+    # The remaining structure: mov eax,[ebp+8]; imul ...; add ...;
+    # mov edx,[eax]; mov eax,[eax+4]
+    # We should see only ONE `mov eax, [ebp + 8]` (the first one).
+    assert out.count("mov     eax, [ebp + 8]") == 1
+    # The pass should fire 4 times (4 lines dropped).
+    assert opt.stats.get("dup_addr_compute_collapse", 0) == 4
+
+
+def test_dup_addr_compute_collapse_skips_when_pre_value_differs():
+    """If R2's pre-A value (loaded at loop top) differs from G's
+    source MEM2_X, refuse to drop (would change R2 semantics)."""
+    asm = (
+        ".L1_for_top:\n"
+        "        mov     ecx, [ebp - 4]\n"     # pre-A: ECX = -4
+        "        mov     eax, [ebp + 8]\n"     # A
+        "        imul    ecx, ecx, 56\n"       # C
+        "        add     eax, ecx\n"           # D
+        "        mov     edx, [eax]\n"         # E
+        "        mov     eax, [ebp + 8]\n"     # F
+        "        mov     ecx, [ebp - 8]\n"     # G: loads from -8 (MISMATCH)
+        "        imul    ecx, ecx, 56\n"       # H
+        "        add     eax, ecx\n"           # I
+        "        mov     eax, [eax + 4]\n"     # J
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Should NOT drop the recompute since pre-value mismatch.
+    assert out.count("mov     ecx, [ebp - 8]") == 1
+    assert opt.stats.get("dup_addr_compute_collapse", 0) == 0
+
+
+def test_dup_addr_compute_collapse_skips_when_r3_eq_r1():
+    """If E's destination IS R1 (e.g., `mov eax, [eax]`), R1 gets
+    clobbered by the deref. Recompute is necessary, must not drop."""
+    asm = (
+        ".L_top:\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        mov     eax, [ebp + 8]\n"     # A
+        "        imul    ecx, ecx, 56\n"       # C
+        "        add     eax, ecx\n"           # D
+        "        mov     eax, [eax]\n"         # E: R3 = eax = R1!
+        "        mov     eax, [ebp + 8]\n"     # F (DON'T drop)
+        "        mov     ecx, [ebp - 8]\n"     # G
+        "        imul    ecx, ecx, 56\n"       # H
+        "        add     eax, ecx\n"           # I
+        "        mov     eax, [eax + 4]\n"     # J
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # All 5 instances of `mov eax, [ebp + 8]` etc. preserved
+    # since E clobbers R1 (eax).
+    assert out.count("mov     eax, [ebp + 8]") == 2
+    assert opt.stats.get("dup_addr_compute_collapse", 0) == 0
+
+
+def test_dup_addr_compute_collapse_with_imul_non_power_of_two():
+    """Pattern fires for non-power-of-2 scales (12, 20, 56, etc.)
+    where SIB-form addressing isn't possible. The `index_load_collapse`
+    pass already handles the shl/scale-pow-of-2 case via SIB."""
+    asm = (
+        ".L_top:\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        imul    ecx, ecx, 12\n"
+        "        add     eax, ecx\n"
+        "        mov     edx, [eax]\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        imul    ecx, ecx, 12\n"
+        "        add     eax, ecx\n"
+        "        mov     eax, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert out.count("mov     eax, [ebp + 8]") == 1
+    assert opt.stats.get("dup_addr_compute_collapse", 0) == 4
+
+
+def test_dup_addr_compute_collapse_skips_r2_modified_before_a():
+    """If R2 is modified by something other than `mov R2, [m]`
+    in the basic block before A, the pre-value is unknown and we
+    must bail."""
+    asm = (
+        ".L_top:\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        add     ecx, 1\n"             # modifies ECX
+        "        mov     eax, [ebp + 8]\n"     # A
+        "        imul    ecx, ecx, 56\n"
+        "        add     eax, ecx\n"
+        "        mov     edx, [eax]\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        imul    ecx, ecx, 56\n"
+        "        add     eax, ecx\n"
+        "        mov     eax, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("dup_addr_compute_collapse", 0) == 0
