@@ -1964,3 +1964,12 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete impact on pr70602**: 5 fires (one per dead bit-field assemble triplet). 471 → 67 lines (86% total reduction across all peephole work).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests (1239 total). Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: imm_store_then_imm_load_collapse**: reorder `mov <size> [m], IMM; mov reg32, IMM` (same IMM in both) into `mov reg32, IMM; mov [m], <reg/sub>`. Saves 4 bytes per match.
+  - **Pattern**: A is a sized memory store with numeric IMM; B is a register load of the same numeric IMM. The original `mov dword [m], 18` (~7 bytes) + `mov eax, 18` (5 bytes) = 12 bytes; rewrite is `mov eax, 18` (5 bytes) + `mov [m], eax` (3 bytes) = 8 bytes. Saves 4 bytes.
+  - **Sub-register selection** for byte/word stores: byte → al/bl/cl/dl; word → ax/bx/cx/dx/si/di. esi/edi are excluded for byte size (no 8-bit alias).
+  - **Conditions**: A's IMM and B's IMM compare equal numerically (handles `0x12` == `18`); A's memory operand m doesn't reference reg32 or its sub-aliases (else the new `mov reg32, IMM` would change the address `[m]` resolves to); A and B adjacent.
+  - **No oscillation with `imm_store_collapse`**: my rewrite produces `mov reg32, IMM; mov [m], reg32`. If the reg32 use is downstream (e.g., `push reg32`), `imm_store_collapse` won't fire (reg32 alive). If reg32 is dead, `imm_store_collapse` reverses my rewrite back to `mov dword [m], IMM` — net effect: drops the dead IMM load (5 bytes saved). Both directions improve.
+  - **Real-world impact**: pr70602's bit-field-init pattern fires 23 times (~92 bytes saved on that single test). Other torture/c-testsuite tests don't exercise this exact pattern (most codegen produces only one form or the other).
+  - **One existing test updated**: `test_zero_init_collapse_skips_nonzero_hex` was using `mov dword [m], 0x00000001; mov eax, 1` as input — slice 37 now legitimately reorders this. Updated test to use `push edx` (non-immediate-load) as the second instruction so slice 37 doesn't preempt the test of `zero_init_collapse`.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +9 peephole tests (1248 total). Pipeline 1734/1734 (100%).

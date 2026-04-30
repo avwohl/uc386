@@ -4748,11 +4748,14 @@ def test_zero_init_collapse_recognizes_hex_zero():
 
 
 def test_zero_init_collapse_skips_nonzero_hex():
-    """`mov dword [m], 0x00000001` is NOT zero — must NOT rewrite."""
+    """`mov dword [m], 0x00000001` is NOT zero — must NOT rewrite via
+    zero_init_collapse. (Other passes like
+    imm_store_then_imm_load_collapse may legitimately reorder, but
+    zero_init_collapse must not trigger.)"""
     asm = (
         "_f:\n"
         "        mov     dword [ebp - 4], 0x00000001\n"
-        "        mov     eax, 1\n"  # witness
+        "        push    edx\n"   # avoid imm_store_then_imm_load
         "        ret\n"
     )
     opt = PeepholeOptimizer()
@@ -14915,3 +14918,191 @@ def test_dead_xor_or_chain_drop_pr70602_pattern():
     assert "xor     ecx, ecx" not in out
     assert "or      ecx, eax" not in out
     assert opt.stats.get("dead_xor_or_chain_drop", 0) == 5
+
+
+# ── imm_store_then_imm_load_collapse ────────────────────────────
+
+
+def test_imm_store_then_imm_load_collapse_basic():
+    """`mov dword [m], 18; mov eax, 18` → `mov eax, 18; mov [m], eax`.
+    Then a use of EAX prevents imm_store_collapse from undoing.
+    Saves 4 bytes per match. Slot has a downstream read so
+    dead_unused_slot_stores doesn't drop the rewritten store."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 4], 18\n"
+        "        mov     eax, 18\n"
+        "        push    eax\n"
+        "        call    _g\n"
+        "        add     esp, 4\n"
+        "        mov     ecx, [ebp - 4]\n"   # keeps slot alive
+        "        push    ecx\n"
+        "        call    _h\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     dword [ebp - 4], 18" not in out
+    assert "mov     eax, 18" in out
+    assert "mov     [ebp - 4], eax" in out
+    assert opt.stats.get(
+        "imm_store_then_imm_load_collapse", 0
+    ) == 1
+
+
+def test_imm_store_then_imm_load_collapse_word():
+    """word size: rewrite stores `[m], ax` (16-bit alias)."""
+    asm = (
+        "_f:\n"
+        "        mov     word [ebp - 2], 100\n"
+        "        mov     eax, 100\n"
+        "        push    eax\n"
+        "        call    _g\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     [ebp - 2], ax" in out
+    assert opt.stats.get(
+        "imm_store_then_imm_load_collapse", 0
+    ) == 1
+
+
+def test_imm_store_then_imm_load_collapse_byte():
+    """byte size: rewrite stores `[m], al` (8-bit alias)."""
+    asm = (
+        "_f:\n"
+        "        mov     byte [ebp - 1], 5\n"
+        "        mov     eax, 5\n"
+        "        push    eax\n"
+        "        call    _g\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     [ebp - 1], al" in out
+    assert opt.stats.get(
+        "imm_store_then_imm_load_collapse", 0
+    ) == 1
+
+
+def test_imm_store_then_imm_load_collapse_skips_byte_esi():
+    """byte size with esi/edi has no 8-bit alias — must NOT fire."""
+    asm = (
+        "_f:\n"
+        "        mov     byte [ebp - 1], 5\n"
+        "        mov     esi, 5\n"
+        "        push    esi\n"
+        "        call    _g\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get(
+        "imm_store_then_imm_load_collapse", 0
+    ) == 0
+
+
+def test_imm_store_then_imm_load_collapse_skips_diff_imm():
+    """Different IMMs — must NOT fire."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 4], 18\n"
+        "        mov     eax, 19\n"   # different IMM
+        "        push    eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get(
+        "imm_store_then_imm_load_collapse", 0
+    ) == 0
+
+
+def test_imm_store_then_imm_load_collapse_skips_addr_refs_reg():
+    """If address references reg32 (e.g., `[eax]`), reordering
+    changes the effective address — must NOT fire."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [eax], 18\n"
+        "        mov     eax, 18\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get(
+        "imm_store_then_imm_load_collapse", 0
+    ) == 0
+
+
+def test_imm_store_then_imm_load_collapse_hex_imm_match():
+    """Hex literal matches decimal: `mov [m], 0x12; mov eax, 18`
+    where 0x12 == 18 — must fire. Slot has a downstream read so
+    dead_unused_slot_stores doesn't drop the rewritten store."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 4], 0x12\n"
+        "        mov     eax, 18\n"
+        "        push    eax\n"
+        "        call    _g\n"
+        "        add     esp, 4\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        push    ecx\n"
+        "        call    _h\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get(
+        "imm_store_then_imm_load_collapse", 0
+    ) == 1
+    assert "mov     [ebp - 4], eax" in out
+
+
+def test_imm_store_then_imm_load_collapse_skips_label_src():
+    """If A's source is a label (not numeric), can't compare —
+    must NOT fire."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 4], _glob\n"
+        "        mov     eax, _glob\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get(
+        "imm_store_then_imm_load_collapse", 0
+    ) == 0
+
+
+def test_imm_store_then_imm_load_collapse_pr70602_pattern():
+    """Real pattern from pr70602: bit-field-init slot store followed
+    by IMM load into EAX for the next operation. Slot has a
+    downstream read so dead_unused_slot_stores doesn't drop the
+    rewritten store."""
+    asm = (
+        "_f:\n"
+        "        mov     dword [ebp - 84], 18\n"
+        "        mov     eax, 18\n"
+        "        push    eax\n"
+        "        pop     edx\n"
+        "        cmp     dword [_b], 0\n"
+        "        mov     ecx, [ebp - 84]\n"   # keeps slot alive
+        "        push    ecx\n"
+        "        call    _h\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, 18" in out
+    assert "mov     [ebp - 84], eax" in out
+    assert "mov     dword [ebp - 84], 18" not in out
+    assert opt.stats.get(
+        "imm_store_then_imm_load_collapse", 0
+    ) == 1

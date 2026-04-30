@@ -378,6 +378,7 @@ class PeepholeOptimizer:
             lines = self._pass_store_collapse(lines)
             lines = self._pass_leave_collapse(lines)
             lines = self._pass_imm_store_collapse(lines)
+            lines = self._pass_imm_store_then_imm_load_collapse(lines)
             lines = self._pass_setcc_jcc_collapse(lines)
             lines = self._pass_push_immediate(lines)
             lines = self._pass_imm_binop_collapse(lines)
@@ -1819,6 +1820,177 @@ class PeepholeOptimizer:
             out_list.append(line)
             i += 1
         return out_list
+
+    def _pass_imm_store_then_imm_load_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Reorder `mov <size> [m], IMM; mov reg32, IMM` into
+        `mov reg32, IMM; mov [m], <reg/sub>`. Saves 4 bytes per match.
+
+        Pattern (2 adjacent instructions):
+            A: mov <size> [m], IMM_A
+            B: mov reg32, IMM_B   (IMM_A == IMM_B numerically)
+        Rewrite:
+            A': mov reg32, IMM_A
+            B': mov [m], <reg or sub-alias matching size>
+
+        Conditions:
+        - A's IMM is a numeric literal (not label arithmetic).
+        - B's IMM is a numeric literal equal to A's.
+        - A's memory operand m doesn't reference reg32 (or its
+          sub-aliases). Else writing reg32 first changes the
+          effective address.
+        - For byte size, reg32 must be eax/ebx/ecx/edx (have 8-bit
+          aliases). esi/edi rejected.
+
+        Both directions are semantically equivalent; the rewrite is
+        4 bytes shorter because:
+            - Original: `mov dword [m], IMM` (~7 bytes for ebp-rel
+              + imm32) + `mov reg32, IMM` (5 bytes for B8 + imm32)
+              = 12 bytes
+            - Rewrite: `mov reg32, IMM` (5 bytes) + `mov [m], reg32`
+              (3 bytes for ebp-rel + reg) = 8 bytes
+        """
+        sub_aliases = {
+            "eax": ("al", "ax"),
+            "ebx": ("bl", "bx"),
+            "ecx": ("cl", "cx"),
+            "edx": ("dl", "dx"),
+            "esi": (None, "si"),
+            "edi": (None, "di"),
+        }
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if (line.kind == "instr" and line.op == "mov"
+                    and i + 1 < len(lines)):
+                a_parts = _operands_split(line.operands)
+                if a_parts is not None:
+                    a_dst, a_src = a_parts
+                    a_dst_t = a_dst.strip()
+                    size = None
+                    addr = None
+                    if a_dst_t.startswith("dword "):
+                        size = "dword"
+                        addr = a_dst_t[6:].strip()
+                    elif a_dst_t.startswith("word "):
+                        size = "word"
+                        addr = a_dst_t[5:].strip()
+                    elif a_dst_t.startswith("byte "):
+                        size = "byte"
+                        addr = a_dst_t[5:].strip()
+                    if size is not None and addr is not None:
+                        a_imm_val = self._parse_imm_value(a_src.strip())
+                        if a_imm_val is not None:
+                            b_line = lines[i + 1]
+                            if (b_line.kind == "instr"
+                                    and b_line.op == "mov"):
+                                b_parts = _operands_split(b_line.operands)
+                                if b_parts is not None:
+                                    b_dst, b_src = b_parts
+                                    b_dst_low = b_dst.strip().lower()
+                                    if b_dst_low in sub_aliases:
+                                        b_imm_val = self._parse_imm_value(
+                                            b_src.strip()
+                                        )
+                                        if b_imm_val == a_imm_val:
+                                            reg32 = b_dst_low
+                                            sub8, sub16 = sub_aliases[
+                                                reg32
+                                            ]
+                                            ok = True
+                                            if size == "byte":
+                                                if sub8 is None:
+                                                    ok = False
+                                            if ok and self._addr_refs_reg(
+                                                addr, reg32
+                                            ):
+                                                ok = False
+                                            if ok:
+                                                if size == "dword":
+                                                    src_reg = reg32
+                                                elif size == "word":
+                                                    src_reg = sub16
+                                                else:
+                                                    src_reg = sub8
+                                                a_lead = re.match(
+                                                    r"^\s*", line.raw
+                                                ).group(0)
+                                                b_lead = re.match(
+                                                    r"^\s*", b_line.raw
+                                                ).group(0)
+                                                new_a_raw = (
+                                                    f"{a_lead}mov     "
+                                                    f"{reg32}, "
+                                                    f"{a_src.strip()}"
+                                                )
+                                                new_a = Line(
+                                                    raw=new_a_raw,
+                                                    kind="instr",
+                                                    op="mov",
+                                                    operands=(
+                                                        f"{reg32}, "
+                                                        f"{a_src.strip()}"
+                                                    ),
+                                                )
+                                                new_b_raw = (
+                                                    f"{b_lead}mov     "
+                                                    f"{addr}, {src_reg}"
+                                                )
+                                                new_b = Line(
+                                                    raw=new_b_raw,
+                                                    kind="instr",
+                                                    op="mov",
+                                                    operands=(
+                                                        f"{addr}, "
+                                                        f"{src_reg}"
+                                                    ),
+                                                )
+                                                out.append(new_a)
+                                                out.append(new_b)
+                                                self.stats[
+                                                    "imm_store_then_imm_load_collapse"
+                                                ] = (
+                                                    self.stats.get(
+                                                        "imm_store_then_imm_load_collapse",
+                                                        0,
+                                                    ) + 1
+                                                )
+                                                i += 2
+                                                continue
+            out.append(line)
+            i += 1
+        return out
+
+    @staticmethod
+    def _parse_imm_value(text: str) -> int | None:
+        """Parse a numeric immediate (decimal, hex). Returns None for
+        non-literals (labels, expressions, register names)."""
+        s = text.strip()
+        if not s:
+            return None
+        sign = 1
+        if s.startswith("-"):
+            sign = -1
+            s = s[1:].strip()
+        elif s.startswith("+"):
+            s = s[1:].strip()
+        if not s:
+            return None
+        try:
+            if s.lower().startswith("0x"):
+                return sign * int(s, 16)
+            if s.isdigit():
+                return sign * int(s, 10)
+        except ValueError:
+            return None
+        return None
+
+    def _addr_refs_reg(self, addr: str, reg32: str) -> bool:
+        """Does the memory operand `addr` (without size prefix)
+        reference reg32 or its sub-aliases?"""
+        return self._references_reg_family(addr, reg32)
 
     @staticmethod
     def _is_imm_to_eax(line: Line) -> bool:
