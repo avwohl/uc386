@@ -130,6 +130,8 @@ def main() -> int:
     ap.add_argument("--no-ast-optimize", action="store_true")
     ap.add_argument("--no-peephole", action="store_true",
                     help="Disable asm-level peephole optimization")
+    ap.add_argument("--no-asm-dce", action="store_true",
+                    help="Disable post-codegen asm dead-code elimination")
     ap.add_argument("--int", dest="int_bits", type=int, choices=[16, 32],
                     help="int width in bits (default: 32 — Watcom flat-32)")
     ap.add_argument("--long", dest="long_bits", type=int, choices=[32, 64],
@@ -201,6 +203,9 @@ def main() -> int:
         gen = CodeGenerator(module_name=input_paths[0].stem,
                             peephole=not args.no_peephole)
         code = gen.generate(unit)
+        if not args.no_asm_dce:
+            from uc386.asm_dce import dce as asm_dce
+            code = asm_dce(code)
         output_path.write_text(code)
 
         if args.verbose:

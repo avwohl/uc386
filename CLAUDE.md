@@ -2037,3 +2037,22 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Compile timeout bumped 120s → 300s.** On the new slower machine, pr23135 (~720K-line generated asm from chained vector ops) takes ~117s of peephole time vs the M4's 28.6s. The 120s margin was tight against system load variation; bumping to 300s gives safe headroom while still bounding pathological cases. The slowest tests still well under the new limit.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +10 peephole tests (1288 total). Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase B slice 1: asm DCE on user code**: parses uc386's codegen output into top-level functions + data labels with a dependency graph, walks reachability from `_start` / `_main` / `global _name` entry points, drops unreachable functions and data. Catches:
+  - `static` functions whose only call sites were inside a removed branch (uc_core's AST optimizer may not catch all cascades).
+  - Top-level functions whose only callers were themselves dropped (cascade through the call graph).
+  - Data/BSS labels referenced only by dead functions.
+  - **Module**: `src/uc386/asm_dce.py` with `parse_asm()`, `ParsedAsm.reachable_set()`, `ParsedAsm.emit()`, plus a one-shot `dce()` helper. Layout mirrors `libc_split.py` for consistency.
+  - **Wired into the driver** (`main.py`) post-codegen; `--no-asm-dce` flag to disable. Runs on the post-peephole asm so the input is already minimized before DCE.
+  - **NASM-flavored parsing**:
+    - Top-level labels: `_name:` at column 0 (multi-underscore prefixes like `__start`, `___builtin_*` accepted).
+    - Section directives: `section .text` / `.data` / `.bss`.
+    - `global _name` directives recognized anywhere (not just header) and added to entry points; the lines themselves are dropped from output (codegen re-emits `global _start` via its header).
+    - Local labels (`.LX:`) ignored — they're intra-function.
+    - Symbol-reference detection: any `_name`-style identifier in operand text. Comments stripped before scanning. The function's own label line is excluded (so `_helper_used:` parsing doesn't pick up `_helper_used` as a self-dep).
+    - `_start` / `__start` aliases: the codegen emits both labels at the same address; my parser merges `__start`'s body into `_start`'s function entry.
+  - **Conservative aliasing**: any `_name` reference in any operand counts as a dependency. Doesn't distinguish address-takes from memory accesses (both keep the symbol live, which is the correct semantics — the address might be stored elsewhere and used indirectly).
+  - **17 unit tests** in `tests/test_asm_dce.py` covering basic DCE, transitive reachability, `global` markers, data label drops, BSS label markers (`_bss_zero_start`/`_bss_zero_end`), function-pointer address-takes, jump-table entries, and local-label exclusion.
+  - **Modest direct impact** in single-file C (uc_core's AST optimizer already drops most unreferenced top-level decls). Wins where it does fire: programs with static helpers in dead branches, or with libc-style helper sets where some are unused.
+  - **Sets up Phase D part 2** — the next slice can re-walk libc closure with the post-DCE user references for further trim.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +17 unit tests (1305 total). Pipeline 1734/1734 (100%).
