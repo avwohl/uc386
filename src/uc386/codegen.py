@@ -425,6 +425,9 @@ class CodeGenerator:
         ]
         if not any(fn.name == "main" for fn in functions):
             raise CodegenError("uc386 requires a `main` function definition")
+        # Track user-defined function names so codegen rewrites (e.g.,
+        # printf → puts) can bail when the user shadows a libc function.
+        self._user_function_names: set[str] = {fn.name for fn in functions}
 
         # Names declared but not defined in this unit become NASM externs.
         # The parser represents bodyless function declarations as either a
@@ -13973,6 +13976,17 @@ class CodeGenerator:
                 args=expr.args,
                 location=expr.location,
             )
+
+        # NOTE: The PEEPHOLE_PLAN.md proposes a printf("...\n") → puts("...")
+        # rewrite as part of Phase E. For uc386 specifically this is a NET
+        # LOSS: `_printf` delegates to dos_emu's INT 21h AH=0x5F host-side
+        # printf (the format parser lives in dos_emu.py, not in libc), so
+        # the libc body is just ~13 instructions of "load fd, fmt, va; INT
+        # 21h; ret". `_puts` does its own char-by-char output loop and is
+        # actually larger (~19 instructions). On a real-DOS target without
+        # the AH=0x5F shortcut the rewrite would save ~500 bytes; on
+        # dos_emu it costs ~11 bytes per hello-world-class binary.
+        # Decision: don't rewrite while the only target is dos_emu.
 
         # Variadic builtins. `va_start(ap, last)` writes the address
         # past `last` into `ap`; `va_end(ap)` is a no-op (cdecl needs
