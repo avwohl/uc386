@@ -1583,3 +1583,16 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete win**: `_compute` (dot-product) loop body 8 → 7 instructions per iteration; `_find_max` body 7 → 6; `_sum_arr` body 5 → 4. Saves 3 bytes per iteration.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests. 1043 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: dead_cleanup_before_leave**: drop stack-cleanup instructions immediately before a function-exit `leave; ret`. `leave` is `mov esp, ebp; pop ebp` — it restores ESP to the saved frame pointer regardless of any prior `add esp, N` or scratch-register pops. Those cleanup instructions are dead. Saves 1-3 bytes per dropped instruction.
+  - **Common shape**: cdecl arg cleanup at the end of a function. After `add_esp_to_pop` converts small `add esp, N` cleanups to `pop ecx`, the trailing cleanup before the function-exit `leave; ret` is one or more `pop ecx`. Those are all dead.
+  - **Droppable instructions**:
+    - `pop ecx`, `pop edx`: caller-saved scratch regs are dead at function exit. Both ECX and EDX values after the pops are clobbered (the caller doesn't expect them preserved per cdecl).
+    - `add esp, N`, `sub esp, -N`: pure ESP adjustment, gone when `leave` runs.
+  - **NOT droppable**:
+    - `pop eax`: EAX is the return value register. A `pop eax` immediately before `leave` writes the return value (sometimes deliberately).
+    - `pop ebx/esi/edi/ebp`: callee-saved registers being restored from the prologue's pushes; dropping them breaks the cdecl contract with the caller.
+  - **Algorithm**: find each `leave` followed (modulo blanks/labels) by `ret`, walk backward through labels/blanks/comments to find consecutive droppable instructions, drop them.
+  - **Labels between cleanup and leave are unaffected** — they may be early-return targets that bypass the cleanup. Both paths converge on `leave; ret`.
+  - **Concrete win**: `_dispatch` (function-pointer dispatch with 2 args) drops 2 `pop ecx` before `.epilogue: leave; ret`. Saves 2 bytes per qualifying function. Combined with `indirect_call_collapse` (which fused the `mov eax, [m]; call eax`), `_dispatch` is now `enter; push args; call dword [m]; .epilogue: leave; ret` — minimal.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +9 peephole tests. 1052 unit tests total. Pipeline 1734/1734 (100%).

@@ -7392,6 +7392,171 @@ def test_indirect_call_collapse_skips_direct_call():
     assert opt.stats.get("indirect_call_collapse", 0) == 0
 
 
+def test_dead_cleanup_before_leave_pop_ecx():
+    """`pop ecx` immediately before `leave; ret` is dead — drop it."""
+    asm = (
+        "_f:\n"
+        "        enter   0, 0\n"
+        "        call    _g\n"
+        "        pop     ecx\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "pop     ecx" not in out
+    assert opt.stats.get("dead_cleanup_before_leave") == 1
+
+
+def test_dead_cleanup_before_leave_multiple_pops():
+    """Multiple consecutive `pop ecx` are all dropped."""
+    asm = (
+        "_f:\n"
+        "        enter   0, 0\n"
+        "        call    _g\n"
+        "        pop     ecx\n"
+        "        pop     ecx\n"
+        "        pop     ecx\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "pop     ecx" not in out
+    assert opt.stats.get("dead_cleanup_before_leave") == 3
+
+
+def test_dead_cleanup_before_leave_add_esp():
+    """`add esp, N` before `leave; ret` is dead — drop it."""
+    asm = (
+        "_f:\n"
+        "        enter   0, 0\n"
+        "        call    _g\n"
+        "        add     esp, 12\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "add     esp, 12" not in out
+    assert opt.stats.get("dead_cleanup_before_leave") == 1
+
+
+def test_dead_cleanup_before_leave_pop_edx():
+    """`pop edx` is also droppable (caller-saved scratch)."""
+    asm = (
+        "_f:\n"
+        "        enter   0, 0\n"
+        "        pop     edx\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "pop     edx" not in out
+    assert opt.stats.get("dead_cleanup_before_leave") == 1
+
+
+def test_dead_cleanup_before_leave_skips_pop_eax():
+    """`pop eax` is NOT dropped — EAX is the return value."""
+    asm = (
+        "_f:\n"
+        "        enter   0, 0\n"
+        "        pop     eax\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "pop     eax" in out
+    assert opt.stats.get("dead_cleanup_before_leave", 0) == 0
+
+
+def test_dead_cleanup_before_leave_skips_callee_saved():
+    """Pops of EBX/ESI/EDI/EBP are NOT dropped — they're restoring
+    callee-saved values from the prologue."""
+    for reg in ("ebx", "esi", "edi", "ebp"):
+        asm = (
+            "_f:\n"
+            "        push    {0}\n"
+            "        enter   0, 0\n"
+            "        pop     {0}\n"
+            ".epilogue:\n"
+            "        leave\n"
+            "        ret\n"
+        ).format(reg)
+        opt = PeepholeOptimizer()
+        out = opt.optimize(asm)
+        assert f"pop     {reg}" in out
+        assert opt.stats.get("dead_cleanup_before_leave", 0) == 0
+
+
+def test_dead_cleanup_before_leave_label_between_cleanup_and_leave():
+    """A label between cleanup and leave doesn't block dropping —
+    the cleanup is still dead."""
+    asm = (
+        "_f:\n"
+        "        enter   0, 0\n"
+        "        call    _g\n"
+        "        pop     ecx\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "pop     ecx" not in out
+    assert ".epilogue:" in out  # label preserved
+    assert opt.stats.get("dead_cleanup_before_leave") == 1
+
+
+def test_dead_cleanup_before_leave_skips_real_work():
+    """Non-cleanup instruction before leave is not dropped."""
+    asm = (
+        "_f:\n"
+        "        enter   0, 0\n"
+        "        mov     eax, 42\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, 42" in out
+    assert opt.stats.get("dead_cleanup_before_leave", 0) == 0
+
+
+def test_dead_cleanup_before_leave_codegen_integration():
+    """End-to-end: a function that calls another then exits drops
+    the cleanup pop."""
+    from uc386.codegen import CodeGenerator
+    from uc_core.lexer import Lexer
+    from uc_core.parser import Parser
+
+    src = (
+        "int g(int x) { return x * 2; }\n"
+        "int f(int x) { return g(x); }\n"
+        "int main(void) { return f(5); }\n"
+    )
+    tokens = list(Lexer(src, "test.c").tokenize())
+    tu = Parser(tokens).parse()
+    cg = CodeGenerator(peephole=True)
+    asm = cg.generate(tu)
+    # Function `_f` calls `_g`, then needs no cleanup before leave.
+    # Find `_f:` to `_main:` block.
+    fstart = asm.index("_f:")
+    fend = asm.index("_main:")
+    f_block = asm[fstart:fend]
+    # The cleanup `pop ecx` between the call and `.epilogue:` should
+    # be dropped.
+    assert "pop     ecx" not in f_block
+
+
 def test_cmp_load_promote_basic():
     """Canonical loop-top pattern fires the rewrite."""
     asm = (

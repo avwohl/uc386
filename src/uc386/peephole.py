@@ -439,6 +439,7 @@ class PeepholeOptimizer:
             lines = self._pass_self_mov_elimination(lines)
             lines = self._pass_indirect_call_collapse(lines)
             lines = self._pass_cmp_load_promote(lines)
+            lines = self._pass_dead_cleanup_before_leave(lines)
             lines = self._pass_transfer_pop_collapse(lines)
             lines = self._pass_transfer_pop_cmp_collapse(lines)
             lines = self._pass_dup_push_pop_self_op(lines)
@@ -12279,6 +12280,148 @@ class PeepholeOptimizer:
             )
             i += 5
         return out
+
+    def _pass_dead_cleanup_before_leave(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Drop stack-cleanup instructions immediately before a
+        function-exit ``leave; ret`` sequence.
+
+        ``leave`` is ``mov esp, ebp; pop ebp`` — it restores ESP to
+        the saved frame pointer regardless of any prior ``add esp, N``
+        or scratch-register pops. So those cleanup instructions are
+        dead.
+
+        Saves 1-3 bytes per dropped instruction.
+
+        Common shape: cdecl arg cleanup at the end of a function.
+        ``f(g());`` lowers to:
+            push g_args
+            call _g
+            add esp, X       ; cleanup g's args
+            push eax         ; pass g's result
+            call _f
+            add esp, 4       ; cleanup f's arg
+            (leave; ret)
+        After ``add_esp_to_pop`` converts the small ``add esp, N``
+        forms to ``pop ecx``, the trailing cleanup is one or more
+        ``pop ecx``. Those are all dead.
+
+        Droppable instructions:
+        - ``pop ecx``, ``pop edx``: caller-saved scratch regs are
+          dead at function exit. Both ECX and EDX values after the
+          pops are clobbered (the caller doesn't expect them
+          preserved per cdecl).
+        - ``add esp, N``, ``sub esp, -N``: pure ESP adjustment, gone
+          when ``leave`` runs.
+
+        Pop EAX is NEVER dropped — EAX is the return value register
+        and a ``pop eax`` immediately before ``leave`` writes the
+        return value (sometimes deliberately).
+        Pops of EBX/ESI/EDI/EBP are NEVER dropped — these are
+        callee-saved registers being restored from the prologue's
+        pushes; dropping them breaks the cdecl contract with the
+        caller.
+
+        Algorithm: find each ``leave`` followed (modulo blanks/labels)
+        by ``ret``, walk backward through labels/blanks/comments to
+        find consecutive droppable instructions, drop them.
+
+        Labels between cleanup and leave (e.g. ``.epilogue:``) are
+        unaffected — they may be early-return targets that bypass the
+        cleanup. Both paths converge on ``leave; ret``.
+        """
+        droppable_pops = {"pop"}
+        droppable_pop_targets = {"ecx", "edx"}
+
+        def is_droppable(line: Line) -> bool:
+            if line.kind != "instr":
+                return False
+            if line.op in droppable_pops:
+                return (
+                    line.operands.strip().lower()
+                    in droppable_pop_targets
+                )
+            if line.op == "add":
+                parts = _operands_split(line.operands)
+                if parts is None:
+                    return False
+                dst = parts[0].strip().lower()
+                src = parts[1].strip()
+                if dst != "esp":
+                    return False
+                try:
+                    val = int(src, 0)
+                except ValueError:
+                    return False
+                return val > 0
+            if line.op == "sub":
+                # `sub esp, -N` is rare but equivalent to `add esp, N`.
+                parts = _operands_split(line.operands)
+                if parts is None:
+                    return False
+                dst = parts[0].strip().lower()
+                src = parts[1].strip()
+                if dst != "esp":
+                    return False
+                try:
+                    val = int(src, 0)
+                except ValueError:
+                    return False
+                return val < 0
+            return False
+
+        # Identify each `leave` followed by `ret` (with optional
+        # blanks/comments between).
+        out = list(lines)
+        leave_idxs: list[int] = []
+        for i, line in enumerate(out):
+            if line.kind == "instr" and line.op == "leave":
+                # Look forward for ret skipping blanks/comments.
+                j = i + 1
+                while (
+                    j < len(out)
+                    and out[j].kind in ("blank", "comment")
+                ):
+                    j += 1
+                if (
+                    j < len(out)
+                    and out[j].kind == "instr"
+                    and out[j].op in ("ret", "iret", "iretd",
+                                      "retf", "retn")
+                ):
+                    leave_idxs.append(i)
+
+        # Walk backward from each leave, marking droppable cleanup.
+        # Process from last to first so indices stay valid as we drop.
+        drop_set: set[int] = set()
+        for leave_idx in reversed(leave_idxs):
+            j = leave_idx - 1
+            while j >= 0:
+                line = out[j]
+                if line.kind in ("label", "blank", "comment"):
+                    j -= 1
+                    continue
+                if is_droppable(line):
+                    drop_set.add(j)
+                    j -= 1
+                    continue
+                break
+
+        if not drop_set:
+            return out
+
+        new_out: list[Line] = []
+        for k, line in enumerate(out):
+            if k in drop_set:
+                self.stats["dead_cleanup_before_leave"] = (
+                    self.stats.get(
+                        "dead_cleanup_before_leave", 0
+                    ) + 1
+                )
+                continue
+            new_out.append(line)
+        return new_out
 
     def _pass_indirect_call_collapse(
         self, lines: list[Line]
