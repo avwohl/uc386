@@ -8279,8 +8279,9 @@ def test_pop_op_chain_retarget_skips_self_rmw_first():
 
 def test_index_store_xfer_collapse_basic():
     """`shl ecx, 2; add eax, ecx; mov ecx, eax; mov eax, [ebp + 16];
-    mov [ecx], eax` → drop the xfer; use ECX for val and EAX for the
-    store. Saves 1 instruction per match."""
+    mov [ecx], eax` → full SIB rewrite using EDX as free reg. Saves
+    3 instructions when EDX is unused in the function (drops shl,
+    add, and the xfer)."""
     asm = (
         "_f:\n"
         "        mov     eax, [ebp + 8]\n"
@@ -8295,10 +8296,41 @@ def test_index_store_xfer_collapse_basic():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    assert "mov     ecx, eax" not in out
+    assert "shl     ecx, 2" not in out
+    assert "add     eax, ecx" not in out
+    assert "mov     edx, [ebp + 16]" in out
+    assert "mov     [eax + ecx*4], edx" in out
+    assert opt.stats.get("index_store_sib_full") == 1
+
+
+def test_index_store_xfer_collapse_simple_when_all_free_busy():
+    """When all candidate free regs (EDX, ESI, EDI, EBX) are
+    referenced in the function, fall back to the simpler
+    xfer-collapse (drop only the xfer, save 1 instruction)."""
+    asm = (
+        "_f:\n"
+        "        cdq\n"             # uses EDX implicitly
+        "        lodsb\n"            # uses ESI implicitly
+        "        stosb\n"            # uses EDI implicitly
+        "        push    ebx\n"      # uses EBX explicitly
+        "        pop     ebx\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 4]\n"
+        "        shl     ecx, 2\n"
+        "        add     eax, ecx\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, [ebp + 16]\n"
+        "        mov     [ecx], eax\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Simple xfer-collapse fired
     assert "mov     ecx, [ebp + 16]" in out
     assert "mov     [eax], ecx" in out
     assert opt.stats.get("index_store_xfer_collapse") == 1
+    assert opt.stats.get("index_store_sib_full", 0) == 0
 
 
 def test_index_store_xfer_collapse_skips_when_src_uses_xfer():
@@ -8341,9 +8373,8 @@ def test_index_store_xfer_collapse_skips_when_xfer_live():
     assert opt.stats.get("index_store_xfer_collapse", 0) == 0
 
 
-def test_index_store_xfer_collapse_byte_size():
-    """Byte-sized store: `mov byte [xfer], al` form works (with size
-    prefix in the source)."""
+def test_index_store_xfer_collapse_size_prefix_dword():
+    """Size prefix `dword [...]` flows through to the SIB form."""
     asm = (
         "_f:\n"
         "        mov     eax, [ebp + 8]\n"
@@ -8358,9 +8389,9 @@ def test_index_store_xfer_collapse_byte_size():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    assert "mov     ecx, eax" not in out
-    assert "mov     dword [eax], ecx" in out
-    assert opt.stats.get("index_store_xfer_collapse") == 1
+    # SIB rewrite preserves the size prefix.
+    assert "mov     dword [eax + ecx*4], edx" in out
+    assert opt.stats.get("index_store_sib_full") == 1
 
 
 # ── index_load_collapse_label ─────────────────────────────────

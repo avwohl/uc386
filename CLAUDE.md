@@ -1481,3 +1481,14 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`_fill` (loop array fill)**: 7-line body shrinks to 6 lines; saves 2 bytes per iteration.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests (536 total). 978 unit tests. Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: index_store_xfer_collapse upgraded to full SIB rewrite**: extends the prior `index_store_xfer_collapse` to attempt a full SIB-form rewrite first, falling back to the simpler 1-instr drop only when no free register is available. Saves 3 instructions per match (drops shl, add, AND xfer), down to 2 instructions in the hot path.
+  - **Original 5-line pattern** (e.g., `arr[i] = val`):
+    `shl IDX, N; add BASE, IDX; mov XFER, BASE; mov BASE, SRC; mov [XFER], BASE`
+  - **Full SIB rewrite (2 lines)**: `mov R, SRC; mov [BASE + IDX*scale], R` where R is a free register.
+  - **`_compute_unused_regs_per_line`**: per-function analysis returning the set of GP registers that are NEVER referenced (read or written, including sub-aliases and implicit references via `cdq`/`mul`/`idiv`/`lodsd`/etc.). Such registers are safe to clobber by a peephole rewrite. More accurate than `_reg_dead_after`'s 20-instruction forward scan, which can return False for truly-unused registers in long loop bodies where the next pure-write isn't reachable within the scan limit.
+  - **Free register search order**: edx → esi → edi → ebx. EDX is the natural choice for our codegen (cdecl scratch).
+  - **Conditions for full SIB**: SRC must not reference BASE, IDX, or the chosen R (their values differ post-rewrite); flags must be safe after the store (we drop A/B's flag-setting); BASE/IDX/XFER all dead after the store.
+  - **Fallback**: when no free reg is available (e.g., function uses cdq, lodsd, etc.), emit the simpler 1-instr-saving xfer-collapse rewrite. Stats key `index_store_sib_full` for the SIB rewrite, `index_store_xfer_collapse` for the fallback.
+  - **`_fill` (loop array fill)**: 7-line loop body shrinks to 4 lines — `mov eax, [arr]; mov ecx, [i]; mov edx, [val]; mov [eax + ecx*4], edx`. Saves 3 instructions per loop iteration.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +1 peephole test (5 total in this slice). 979 unit tests. Pipeline 1734/1734 (100%).

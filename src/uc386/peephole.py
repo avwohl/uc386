@@ -2985,6 +2985,83 @@ class PeepholeOptimizer:
         return ranges
 
     @staticmethod
+    def _compute_unused_regs_per_line(
+        lines: list[Line],
+    ) -> list[set[str] | None]:
+        """For each line index, return the set of GP registers that are
+        UNUSED in the function containing this line.
+
+        A register is "unused" if no instruction in the function reads
+        or writes it (including sub-aliases). Such registers are safe
+        to clobber by a peephole rewrite — no prior write would have a
+        future read, and no future read of pre-clobber state matters.
+
+        Returns a list of length ``len(lines)``. Lines outside any
+        function (prelude before first global label) get ``None``.
+
+        Note: implicit register users (e.g., ``cdq``, ``idiv``,
+        ``mul``) are caught by their explicit operands when present;
+        we additionally treat the bare-form opcodes as reads of EAX
+        and EDX in those cases.
+        """
+        # Implicit register users: ops that reference EAX/EDX (or
+        # other regs) via implicit semantics, not just operands.
+        IMPLICIT_EAX_USERS = {
+            "cdq", "cwd", "cwde", "lodsd", "lodsw", "lodsb",
+            "stosd", "stosw", "stosb", "scasd", "scasw", "scasb",
+            "mul", "imul", "div", "idiv",
+        }
+        IMPLICIT_EDX_USERS = {
+            "cdq", "cwd", "mul", "imul", "div", "idiv",
+        }
+        IMPLICIT_ESI_USERS = {
+            "lodsd", "lodsw", "lodsb", "movsd", "movsw", "movsb",
+            "scasd", "scasw", "scasb",
+        }
+        IMPLICIT_EDI_USERS = {
+            "stosd", "stosw", "stosb", "movsd", "movsw", "movsb",
+            "scasd", "scasw", "scasb",
+        }
+        IMPLICIT_ECX_USERS = {
+            "rep", "repe", "repne", "repnz", "loope", "loopne",
+            "loopz", "loopnz", "loop",
+        }
+        ALL_GP = {"eax", "ecx", "edx", "ebx", "esi", "edi"}
+        out: list[set[str] | None] = [None] * len(lines)
+        ranges = PeepholeOptimizer._function_ranges(lines)
+        for start, end in ranges:
+            referenced: set[str] = set()
+            for i in range(start, end):
+                line = lines[i]
+                if line.kind != "instr":
+                    continue
+                # Operand-level reference check.
+                ops = line.operands
+                for reg in ALL_GP:
+                    if reg in referenced:
+                        continue
+                    if PeepholeOptimizer._references_reg_family(
+                        ops, reg
+                    ):
+                        referenced.add(reg)
+                # Implicit-reference ops.
+                op = line.op
+                if op in IMPLICIT_EAX_USERS:
+                    referenced.add("eax")
+                if op in IMPLICIT_EDX_USERS:
+                    referenced.add("edx")
+                if op in IMPLICIT_ESI_USERS:
+                    referenced.add("esi")
+                if op in IMPLICIT_EDI_USERS:
+                    referenced.add("edi")
+                if op in IMPLICIT_ECX_USERS:
+                    referenced.add("ecx")
+            unused = ALL_GP - referenced
+            for i in range(start, end):
+                out[i] = unused
+        return out
+
+    @staticmethod
     def _compute_addr_taken_per_line(
         lines: list[Line],
     ) -> list[set[int] | None]:
@@ -5887,6 +5964,12 @@ class PeepholeOptimizer:
             continue
         return out
 
+    def _pass_index_store_xfer_collapse_pre_compute(self, lines: list[Line]):
+        """Pre-compute unused-regs per line for use in the full SIB
+        rewrite. Returns a per-line list (or empty list if no SIB
+        opportunities are likely)."""
+        return self._compute_unused_regs_per_line(lines)
+
     def _pass_index_store_xfer_collapse(
         self, lines: list[Line]
     ) -> list[Line]:
@@ -5930,6 +6013,7 @@ class PeepholeOptimizer:
         SCALE = {1: 2, 2: 4, 3: 8}
         LOAD_OPS = {"mov", "movsx", "movzx"}
         out = list(lines)
+        unused_per_line: list[set[str] | None] | None = None
         i = 0
         while i + 4 < len(out):
             a = out[i]
@@ -6020,8 +6104,6 @@ class PeepholeOptimizer:
                 i += 1
                 continue
             # Liveness: BASE, IDX, XFER all dead after E.
-            for reg in (base_reg, idx_reg, xfer_reg):
-                pass  # placeholder to make loop explicit
             if not self._reg_dead_after(out, i + 5, base_reg):
                 i += 1
                 continue
@@ -6034,7 +6116,85 @@ class PeepholeOptimizer:
             ):
                 i += 1
                 continue
-            # Build rewrite: drop C, replace D and E.
+            # Try the FULL SIB rewrite first: drop A, B, C, D, E and
+            # emit `mov R, SRC; mov [BASE + IDX*scale], R` where R is
+            # a free register distinct from BASE/IDX/XFER and not
+            # referenced in SRC. Saves 3 instructions instead of 1.
+            #
+            # Conditions for full SIB:
+            # - SRC must not reference BASE or IDX (their values
+            #   differ post-rewrite — A/B are dropped, so BASE/IDX
+            #   stay at pre-pattern values, not address/scaled).
+            # - A free register R available (try EDX, ESI, EDI, EBX
+            #   in order). R must not be BASE, IDX, XFER. R must be
+            #   dead after E. R must not be referenced in SRC.
+            # - Flags must be safe after E (we drop A's and B's
+            #   flag-setting).
+            full_sib_done = False
+            if (
+                not self._references_reg_family(d_src, base_reg)
+                and not self._references_reg_family(d_src, idx_reg)
+                and self._flags_safe_after(out, i + 5)
+            ):
+                # Find a free register. A register is "free" if it's
+                # unused throughout the entire current function — no
+                # instruction reads or writes it. That's strictly
+                # safer than a forward `_reg_dead_after` scan, which
+                # may return False for a register that's truly
+                # unused but whose pure-write isn't found within the
+                # 20-instruction scan limit.
+                if unused_per_line is None:
+                    unused_per_line = (
+                        self._compute_unused_regs_per_line(out)
+                    )
+                func_unused = unused_per_line[i] or set()
+                for free_reg in ("edx", "esi", "edi", "ebx"):
+                    if free_reg in (base_reg, idx_reg, xfer_reg):
+                        continue
+                    if self._references_reg_family(d_src, free_reg):
+                        continue
+                    if free_reg not in func_unused:
+                        continue
+                    # Build full SIB rewrite.
+                    scale = SCALE[n]
+                    indent_d = self._extract_indent(d.raw)
+                    indent_e = self._extract_indent(e.raw)
+                    d_op = d.op
+                    d_spacer = " " * max(8 - len(d_op), 1)
+                    new_d_raw = (
+                        f"{indent_d}{d_op}{d_spacer}{free_reg}, "
+                        f"{d_src}"
+                    )
+                    new_d = Line(
+                        raw=new_d_raw,
+                        kind="instr",
+                        op=d_op,
+                        operands=f"{free_reg}, {d_src}",
+                    )
+                    new_e_dst = (
+                        f"{size_prefix}[{base_reg} + "
+                        f"{idx_reg}*{scale}]"
+                    )
+                    new_e_raw = (
+                        f"{indent_e}mov     {new_e_dst}, {free_reg}"
+                    )
+                    new_e = Line(
+                        raw=new_e_raw,
+                        kind="instr",
+                        op="mov",
+                        operands=f"{new_e_dst}, {free_reg}",
+                    )
+                    out = out[:i] + [new_d, new_e] + out[i + 5:]
+                    self.stats["index_store_sib_full"] = (
+                        self.stats.get(
+                            "index_store_sib_full", 0
+                        ) + 1
+                    )
+                    full_sib_done = True
+                    break
+            if full_sib_done:
+                continue
+            # Fall back to simpler rewrite: drop C, replace D and E.
             indent_d = self._extract_indent(d.raw)
             indent_e = self._extract_indent(e.raw)
             # D': mov/movsx/movzx XFER, SRC (use XFER as dest)
