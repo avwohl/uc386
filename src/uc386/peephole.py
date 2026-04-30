@@ -18630,31 +18630,72 @@ class PeepholeOptimizer:
                 or out[start].label.startswith(".")
             ):
                 continue
-            # The prologue must be exactly `push ebp` + `mov ebp, esp`
-            # at start+1, +2 (after possible blank lines).
+            # The prologue must be one of:
+            #   `push ebp; mov ebp, esp`           (no locals)
+            #   `push ebp; mov ebp, esp; sub esp, K`  (with locals)
+            #   `enter K, 0`                        (collapsed form)
+            # Find the prologue end. We accept frame_size == 0 OR
+            # frame_size != 0 with no `[ebp - N]` accesses in body
+            # (the locals are dead — peephole's other passes
+            # collapsed them away). When frame_size != 0 AND body
+            # does access [ebp - N], we'd need static scratch — not
+            # yet implemented, so bail.
             i = start + 1
             while i < end and out[i].kind in ("blank", "comment"):
                 i += 1
-            if not (
+            push_idx = -1
+            mov_idx = -1
+            enter_idx = -1
+            if (
                 i < end
                 and out[i].kind == "instr"
                 and out[i].op == "push"
                 and out[i].operands.strip().lower() == "ebp"
             ):
-                continue
-            push_idx = i
-            i += 1
-            while i < end and out[i].kind in ("blank", "comment"):
+                push_idx = i
                 i += 1
-            if not (
+                while i < end and out[i].kind in ("blank", "comment"):
+                    i += 1
+                if not (
+                    i < end
+                    and out[i].kind == "instr"
+                    and out[i].op == "mov"
+                    and out[i].operands.strip().lower() == "ebp, esp"
+                ):
+                    continue
+                mov_idx = i
+                body_start = mov_idx + 1
+                # Optional `sub esp, K`.
+                while i + 1 < end and out[i + 1].kind in (
+                    "blank", "comment",
+                ):
+                    i += 1
+                if (
+                    i + 1 < end
+                    and out[i + 1].kind == "instr"
+                    and out[i + 1].op == "sub"
+                    and re.match(
+                        r"^\s*esp\s*,\s*\d+\s*$",
+                        out[i + 1].operands or "", re.IGNORECASE,
+                    )
+                ):
+                    body_start = i + 2
+            elif (
                 i < end
                 and out[i].kind == "instr"
-                and out[i].op == "mov"
-                and out[i].operands.strip().lower() == "ebp, esp"
+                and out[i].op == "enter"
             ):
+                # enter K, 0 — accept.
+                m_enter = re.match(
+                    r"^\s*(\d+)\s*,\s*0\s*$",
+                    out[i].operands or "", re.IGNORECASE,
+                )
+                if m_enter is None:
+                    continue
+                enter_idx = i
+                body_start = i + 1
+            else:
                 continue
-            mov_idx = i
-            body_start = mov_idx + 1
             # The function must end with `leave` then `ret` (with
             # optional blanks in between). Find them.
             j = end - 1
@@ -18691,16 +18732,19 @@ class PeepholeOptimizer:
                 for line in out[body_start:leave_idx]
             ):
                 continue
-            # Build the rewrite: drop push_idx, mov_idx, leave_idx.
+            # Build the rewrite: drop the prologue and `leave`.
             # Rewrite all body lines' [ebp + N] → [esp + (N - 4)].
             new_body = [
                 self._rewrite_ebp_to_esp_in_line(line)
                 for line in out[body_start:leave_idx]
             ]
             # The new function range:
-            # [out[start]] + (any blanks/comments before push) +
+            # [label] + (any blanks/comments before prologue) +
             # new_body + (any blanks between leave and ret + the ret).
-            head = [out[start]] + out[start + 1:push_idx]
+            prologue_first = (
+                push_idx if push_idx >= 0 else enter_idx
+            )
+            head = [out[start]] + out[start + 1:prologue_first]
             tail = out[leave_idx + 1:end]
             new_lines = head + new_body + tail
             replacements.append((start, end, new_lines))

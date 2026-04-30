@@ -13660,20 +13660,61 @@ def test_pure_leaf_drop_frame_skips_when_call_in_body():
 
 
 def test_pure_leaf_drop_frame_skips_when_sub_esp_in_body():
-    """Body with `sub esp, ...` (e.g., FPU scratch) is not pure-leaf
-    — ESP shifts after the prologue."""
+    """A sub-esp AFTER body code (not the prologue) means ESP
+    shifts mid-function — bail. (A sub-esp immediately after the
+    prologue is now treated as part of the prologue and accepted.)"""
     asm = (
         "_f:\n"
         "        push    ebp\n"
         "        mov     ebp, esp\n"
-        "        sub     esp, 4\n"  # FPU scratch alloc
-        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [ebp + 8]\n"  # first body instruction
+        "        sub     esp, 4\n"  # FPU scratch alloc — mid-body
         "        leave\n"
         "        ret\n"
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
     assert opt.stats.get("pure_leaf_drop_frame", 0) == 0
+
+
+def test_pure_leaf_drop_frame_with_enter_form():
+    """`enter K, 0` form is also recognized as the prologue."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        imul    eax, eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "enter" not in out
+    assert "leave" not in out
+    assert "[esp + 4]" in out
+    assert opt.stats.get("pure_leaf_drop_frame", 0) == 1
+
+
+def test_pure_leaf_drop_frame_with_sub_esp_in_prologue():
+    """`push ebp; mov ebp, esp; sub esp, K` form (frame allocation
+    via `sub`). Body has no `[ebp - K]` accesses — locals are
+    dead after peephole's other passes. Drop the frame."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        sub     esp, 8\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        add     eax, eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    ebp" not in out
+    assert "sub     esp" not in out
+    assert "leave" not in out
+    assert opt.stats.get("pure_leaf_drop_frame", 0) == 1
 
 
 def test_pure_leaf_drop_frame_skips_when_locals_present():

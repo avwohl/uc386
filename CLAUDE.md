@@ -2088,3 +2088,13 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **`--no-embed-runtime` CLI flag** falls back to legacy behavior (output user-only with extern declarations; runtime bundles at runtime).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. Same test count (1314 total). Pipeline 1734/1734 (100%).
+- **2026-04-30 — Slice Y v1: pure_leaf_drop_frame extended to enter form + sub-esp prologue**: extends Phase F slice 1 to recognize two more prologue forms.
+  - **Pattern 1**: `enter K, 0` (which `prologue_to_enter` peephole emits when frame_size > 0). Previously bailed because the pass only matched `push ebp + mov ebp, esp`. Now the `enter K, 0` form is also accepted as a prologue.
+  - **Pattern 2**: `push ebp; mov ebp, esp; sub esp, K`. The `sub esp, K` immediately after the prologue pair is consumed as part of the prologue.
+  - **Both gates** still require: body has at least one `[ebp + N]` (param) reference, no `[ebp - N]` (locals — peephole's other passes must have collapsed any local accesses), no `push`/`pop`/`call`/etc. (pure leaf), function ends with `leave; ret`.
+  - **Why this slice is "Slice Y v1"**: the proper Slice Y per uc80's model would be call-graph SCC analysis with shared static scratch. On i386 the savings are smaller — the prologue overhead is only 4-5 bytes per function, and moving locals from `[ebp - N]` (3-byte ebp-rel disp8) to `[_static + N]` (5-byte label-rel) costs 2 bytes per local access. Breakeven is "≤ 1-2 local accesses". For i386, the higher-leverage win is just dropping the frame on functions where the LOCALS ARE ALREADY DEAD post-peephole — which the existing peephole optimizers achieve for many simple expression-tree leaf functions (`int sq(int x){return x*x;}`-style after `right_operand_retarget` etc. eliminate the stack-machine push/pop).
+  - **Sample fire rate**: 8 fires per 50 random torture tests (same as before extension — the additional pattern-form recognition fires on a small number of programs already visible). Each saves 4-5 bytes.
+  - **Concrete example**: `int leaf(int x) { int t = x*2; int s = t+1; return s; }` lowered with `enter 8, 0; mov eax, [ebp+8]; add eax, eax; inc eax; .epilogue: leave; ret` becomes `mov eax, [esp+4]; add eax, eax; inc eax; .epilogue: ret` — saves 4 bytes.
+  - **Real Slice Y (call-graph SCC + shared scratch)**: not implemented for uc386. Per-function savings on i386 too small to justify the implementation complexity given Phase A peephole already achieves most of the realistic win on real-world i386 code.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +2 peephole tests (1316 total). Pipeline 1734/1734 (100%).
