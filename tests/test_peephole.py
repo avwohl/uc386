@@ -5712,15 +5712,16 @@ def test_dup_load_chain_to_copy_with_offset():
 
 def test_dup_load_chain_to_copy_different_offset_fires():
     """Mismatched offsets — different members of the same struct.
-    Drops the redundant `mov R2, [m]` and inserts a `mov R2, R1`
-    BEFORE B (so R2 has base before R1 is clobbered by the deref).
-    Saves 1 byte (3-byte ebp-rel mem load → 2-byte reg-reg copy).
+    First pass drops the redundant `mov R2, [m]` and inserts a
+    `mov R2, R1` BEFORE B; then `copy_save_deref_collapse` cascades
+    to drop that newly-inserted register copy too. Combined: 5
+    bytes saved.
 
-    Original:                       Rewrite:
-        mov eax, [ebp + 8]              mov eax, [ebp + 8]
-        mov eax, [eax + 4]              mov ecx, eax        ; new
-        mov ecx, [ebp + 8]              mov eax, [eax + 4]
-        mov ecx, [ecx + 8]              mov ecx, [ecx + 8]
+    Original:                       After both passes:
+        mov eax, [ebp + 8]              mov ecx, [ebp + 8]
+        mov eax, [eax + 4]              mov eax, [ecx + 4]
+        mov ecx, [ebp + 8]              mov ecx, [ecx + 8]
+        mov ecx, [ecx + 8]
     """
     asm = (
         "_f:\n"
@@ -5733,11 +5734,18 @@ def test_dup_load_chain_to_copy_different_offset_fires():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    assert "mov     ecx, [ebp + 8]" not in out
-    assert "mov     ecx, eax" in out
-    # The original same-offset stat doesn't fire here.
+    # Final form: load to ECX directly, then derefs through it.
+    assert "mov     ecx, [ebp + 8]" in out
+    assert "mov     eax, [ecx + 4]" in out
+    assert "mov     ecx, [ecx + 8]" in out
+    # The intermediate register copy is gone.
+    assert "mov     ecx, eax" not in out
+    # The duplicate load is gone — only one `mov ecx, [ebp + 8]`.
+    assert out.count("mov     ecx, [ebp + 8]") == 1
+    # Both passes fire.
     assert opt.stats.get("dup_load_chain_to_copy", 0) == 0
     assert opt.stats.get("dup_load_chain_to_copy_diff_off") == 1
+    assert opt.stats.get("copy_save_deref_collapse", 0) >= 1
 
 
 def test_dup_load_chain_to_copy_skips_intermediate_instr():
@@ -5756,6 +5764,160 @@ def test_dup_load_chain_to_copy_skips_intermediate_instr():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("dup_load_chain_to_copy", 0) == 0
+
+
+# ── copy_save_deref_collapse ──────────────────────────────────────
+
+
+def test_copy_save_deref_collapse_basic():
+    """The codegen's "save pointer before deref" idiom for s->a + s->b:
+        mov R1, [SRC]
+        mov R2, R1
+        mov R1, [R1]
+        mov R2, [R2 + 4]
+    →
+        mov R2, [SRC]
+        mov R1, [R2]
+        mov R2, [R2 + 4]
+    Saves 2 bytes (drops the `mov R2, R1` register copy).
+    """
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, [eax]\n"
+        "        mov     ecx, [ecx + 4]\n"
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("copy_save_deref_collapse") == 1
+    # The register-copy line is gone.
+    assert "mov     ecx, eax" not in out
+    # The rewrite now loads the source directly to ECX.
+    assert "mov     ecx, [ebp + 8]" in out
+    # The first deref (offset 0) targets EAX via ECX.
+    assert "mov     eax, [ecx]" in out
+    # The second deref unchanged.
+    assert "mov     ecx, [ecx + 4]" in out
+
+
+def test_copy_save_deref_collapse_both_with_offset():
+    """Both derefs have offsets — covers `s->b + s->c` style code."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, [eax + 4]\n"
+        "        mov     ecx, [ecx + 8]\n"
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("copy_save_deref_collapse") == 1
+    assert "mov     ecx, eax" not in out
+    assert "mov     ecx, [ebp + 8]" in out
+    assert "mov     eax, [ecx + 4]" in out
+    assert "mov     ecx, [ecx + 8]" in out
+
+
+def test_copy_save_deref_collapse_with_label_source():
+    """Source can be a global label memory operand."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [_g]\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, [eax]\n"
+        "        mov     ecx, [ecx + 4]\n"
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("copy_save_deref_collapse") == 1
+    assert "mov     ecx, [_g]" in out
+
+
+def test_copy_save_deref_collapse_negative_offset():
+    """Negative offsets are handled (uncommon but possible)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, [eax - 4]\n"
+        "        mov     ecx, [ecx + 8]\n"
+        "        add     eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("copy_save_deref_collapse") == 1
+    assert "mov     eax, [ecx - 4]" in out
+
+
+def test_copy_save_deref_collapse_skips_intermediate():
+    """If an intermediate instruction breaks the 4-line pattern,
+    the pass doesn't fire."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, eax\n"
+        "        nop\n"
+        "        mov     eax, [eax]\n"
+        "        mov     ecx, [ecx + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("copy_save_deref_collapse", 0) == 0
+
+
+def test_copy_save_deref_collapse_skips_when_b_not_register_copy():
+    """B must be a register-to-register copy (not a memory load)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp + 12]\n"  # not a copy of eax
+        "        mov     eax, [eax]\n"
+        "        mov     ecx, [ecx + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("copy_save_deref_collapse", 0) == 0
+
+
+def test_copy_save_deref_collapse_skips_when_c_not_self_deref():
+    """C must deref through R1 (the loaded register), not through
+    a different register or memory."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, [edx]\n"  # derefs edx, not eax
+        "        mov     ecx, [ecx + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("copy_save_deref_collapse", 0) == 0
+
+
+def test_copy_save_deref_collapse_skips_when_r1_eq_r2():
+    """R1 must differ from R2 (no self-mov)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, eax\n"  # self-mov, not copy to a different reg
+        "        mov     eax, [eax]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("copy_save_deref_collapse", 0) == 0
 
 
 # ── xfer_store_collapse ───────────────────────────────────────────

@@ -455,6 +455,7 @@ class PeepholeOptimizer:
             lines = self._pass_xfer_store_collapse(lines)
             lines = self._pass_dead_store_before_push(lines)
             lines = self._pass_dup_load_chain_to_copy(lines)
+            lines = self._pass_copy_save_deref_collapse(lines)
             lines = self._pass_redundant_mem_load_via_xfer(lines)
             lines = self._pass_load_add_xfer_forward(lines)
             lines = self._pass_byte_stores_to_dword(lines)
@@ -10617,6 +10618,118 @@ class PeepholeOptimizer:
                     ) + 1
                 )
             # Don't advance — re-check from current pos.
+        return out
+
+    def _pass_copy_save_deref_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse the codegen's "save pointer before deref" idiom:
+
+            mov R1, [SRC]
+            mov R2, R1
+            mov R1, [R1] or [R1 +/- N1]
+            mov R2, [R2 +/- N2]
+        →
+            mov R2, [SRC]
+            mov R1, [R2] or [R2 +/- N1]
+            mov R2, [R2 +/- N2]
+
+        Saves 2 bytes per match (drops the `mov R2, R1` register
+        copy).
+
+        Common shape: `s->a + s->b`-style code where the codegen
+        evaluates s->a (clobbering the base pointer in R1) and needs
+        the original pointer for s->b (saved in R2).
+        """
+        out = list(lines)
+        i = 0
+        while i + 3 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            c = out[i + 2]
+            d = out[i + 3]
+            if not all(
+                ln.kind == "instr" and ln.op == "mov"
+                for ln in (a, b, c, d)
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            cp = _operands_split(c.operands)
+            dp = _operands_split(d.operands)
+            if any(p is None for p in (ap, bp, cp, dp)):
+                i += 1
+                continue
+            # A: mov R1, [SRC]
+            r1 = ap[0].strip().lower()
+            a_src = ap[1].strip()
+            if (
+                not self._is_general_register(r1)
+                or not (a_src.startswith("[") and a_src.endswith("]"))
+            ):
+                i += 1
+                continue
+            # B: mov R2, R1
+            r2 = bp[0].strip().lower()
+            b_src = bp[1].strip().lower()
+            if (
+                not self._is_general_register(r2)
+                or r2 == r1
+                or b_src != r1
+            ):
+                i += 1
+                continue
+            # C: mov R1, [R1] or [R1 +/- N1]
+            c_dst = cp[0].strip().lower()
+            c_src = cp[1].strip()
+            if c_dst != r1:
+                i += 1
+                continue
+            c_match = re.match(
+                r"^\[\s*" + re.escape(r1)
+                + r"(?:\s*([+-])\s*(\d+))?\s*\]$",
+                c_src, re.IGNORECASE,
+            )
+            if c_match is None:
+                i += 1
+                continue
+            # D: mov R2, [R2 +/- N2]
+            d_dst = dp[0].strip().lower()
+            d_src = dp[1].strip()
+            if d_dst != r2:
+                i += 1
+                continue
+            d_match = re.match(
+                r"^\[\s*" + re.escape(r2)
+                + r"(?:\s*([+-])\s*(\d+))?\s*\]$",
+                d_src, re.IGNORECASE,
+            )
+            if d_match is None:
+                i += 1
+                continue
+            indent_a = self._extract_indent(a.raw)
+            indent_c = self._extract_indent(c.raw)
+            new_a_raw = f"{indent_a}mov     {r2}, {a_src}"
+            new_a = Line(
+                raw=new_a_raw, kind="instr", op="mov",
+                operands=f"{r2}, {a_src}",
+            )
+            if c_match.group(1) is None:
+                new_c_addr = f"[{r2}]"
+            else:
+                new_c_addr = (
+                    f"[{r2} {c_match.group(1)} {c_match.group(2)}]"
+                )
+            new_c_raw = f"{indent_c}mov     {r1}, {new_c_addr}"
+            new_c = Line(
+                raw=new_c_raw, kind="instr", op="mov",
+                operands=f"{r1}, {new_c_addr}",
+            )
+            out = out[:i] + [new_a, new_c, d] + out[i + 4:]
+            self.stats["copy_save_deref_collapse"] = (
+                self.stats.get("copy_save_deref_collapse", 0) + 1
+            )
         return out
 
     def _pass_xfer_store_collapse(
