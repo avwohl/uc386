@@ -1615,3 +1615,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete win**: `_sum_y` (sum of `pts[i].y` over a global `struct{int x,y;} pts[5]`) loop body shrinks from 9 instructions to 6 — `mov edx, _pts; shl eax, 3; add eax, edx; mov eax, [eax + 4]` becomes `mov eax, [_pts + eax*8 + 4]`.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +3 peephole tests. 1045 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: chain_label_to_add_operand**: fold a `mov BASE, LABEL` setup into a later `add OTHER, BASE` (or sub/and/or/xor/cmp/test/adc/sbb), turning it into `<OP> OTHER, LABEL`. Drops the 5-byte mov-imm32; the original 2-byte reg-reg op becomes a 5-byte op-imm32 (or 6-byte for non-EAX dest). Net savings: 2 bytes for EAX dest, 1 byte otherwise.
+  - **Common shape**: codegen for non-power-of-2 struct arrays (sizeof not in {1, 2, 4, 8}), where `mov_label_shl_add_load_to_sib` can't fire because the address arithmetic uses `imul` instead of `shl`. Pattern: `mov BASE, LABEL; mov IDX, [m]; imul IDX, IDX, K; add IDX, BASE`. After the rewrite: `mov IDX, [m]; imul IDX, IDX, K; add IDX, LABEL` — drops the `mov BASE, LABEL` entirely.
+  - **Walks through up to 8 intermediate instructions** that don't read/write BASE, with no labels/jumps/calls (calls would clobber caller-saved BASE). BASE dead after the OP via `_reg_dead_after(treat_as_scratch=True)` since BASE is just a label holder, not a return-value setup.
+  - **imul is excluded** because x86's 2-operand imul has no `imul reg, imm32` form (only the 3-operand form supports immediates).
+  - **Concrete win on `_set_xyz` (3-member struct setter)**: 28 instructions → 23 — each of the 3 member-store sequences drops its `mov BASE, _g_arr` instruction. Saves ~5 bytes per qualifying function. `_sum_all` (3-member struct sum) similarly drops 3 mov-LABEL instructions per loop iteration.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +8 peephole tests. 1053 unit tests total. Pipeline 1734/1734 (100%).

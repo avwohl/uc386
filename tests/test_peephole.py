@@ -10235,6 +10235,141 @@ def test_mov_label_shl_add_load_to_sib_loop_body():
     assert opt.stats.get("mov_label_shl_add_load_to_sib") == 1
 
 
+def test_chain_label_to_add_operand_basic():
+    """`mov edx, _g; mov eax, [ebp + 8]; imul eax, eax, 12;
+    add eax, edx` → drops the mov, rewrites add to use the LABEL
+    directly. Saves 1 instruction (~3 bytes net for non-EAX, 5 for
+    EAX dest)."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, _g_arr\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        imul    eax, eax, 12\n"
+        "        add     eax, edx\n"
+        "        mov     [eax], ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     edx, _g_arr" not in out
+    assert "add     eax, _g_arr" in out
+    assert opt.stats.get("chain_label_to_add_operand") == 1
+
+
+def test_chain_label_to_add_operand_through_intermediates():
+    """Up to 8 intermediate instructions allowed between the mov
+    and the add, as long as none touch BASE."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, _glob\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        shl     eax, 2\n"
+        "        mov     ecx, [ebp + 12]\n"
+        "        and     eax, ecx\n"
+        "        add     eax, edx\n"
+        "        mov     [ebp - 4], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     edx, _glob" not in out
+    assert "add     eax, _glob" in out
+    assert opt.stats.get("chain_label_to_add_operand") == 1
+
+
+def test_chain_label_to_add_operand_skips_when_base_read():
+    """If intermediate code reads BASE, the chain is broken."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, _glob\n"
+        "        mov     eax, edx\n"  # reads edx
+        "        add     eax, edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("chain_label_to_add_operand", 0) == 0
+
+
+def test_chain_label_to_add_operand_skips_when_base_written():
+    """If intermediate code overwrites BASE before the add, the
+    pass should fire only on the SECOND mov (matching the second
+    add). Verify it doesn't double-fire."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, _foo\n"
+        "        mov     edx, _bar\n"  # overwrites edx
+        "        add     eax, edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Only the second `mov edx, _bar` is a valid chain start; the
+    # first `mov edx, _foo` is dead before any use.
+    assert "add     eax, _bar" in out
+    assert opt.stats.get("chain_label_to_add_operand") == 1
+
+
+def test_chain_label_to_add_operand_skips_call():
+    """Calls clobber caller-saved regs, so a call between mov and
+    add invalidates the chain when BASE is caller-saved."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, _glob\n"
+        "        call    _helper\n"  # clobbers edx
+        "        add     eax, edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("chain_label_to_add_operand", 0) == 0
+
+
+def test_chain_label_to_add_operand_handles_other_ops():
+    """Pass also fires for sub/and/or/xor/cmp/test/adc/sbb."""
+    for op in ("sub", "and", "or", "xor", "cmp", "test"):
+        asm = (
+            "_f:\n"
+            f"        mov     edx, _glob\n"
+            f"        {op:<8}eax, edx\n"
+            f"        ret\n"
+        )
+        opt = PeepholeOptimizer()
+        out = opt.optimize(asm)
+        assert "mov     edx, _glob" not in out, f"failed for {op}"
+        assert f"{op:<8}eax, _glob" in out, f"failed for {op}"
+
+
+def test_chain_label_to_add_operand_skips_imul():
+    """imul has no `imul reg, imm` 2-operand form; only 3-operand
+    `imul reg, reg, imm`. Pass should not fire on imul."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, _glob\n"
+        "        imul    eax, edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("chain_label_to_add_operand", 0) == 0
+
+
+def test_chain_label_to_add_operand_skips_label_jump():
+    """Control-flow boundary (label) ends the chain."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, _glob\n"
+        "        cmp     eax, 0\n"
+        "        jne     .L_skip\n"  # control flow boundary
+        "        add     eax, edx\n"
+        ".L_skip:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("chain_label_to_add_operand", 0) == 0
+
+
 def test_same_memory_operand_reuse_add():
     """`mov reg, [m]; add reg, [m]` → `mov reg, [m]; add reg, reg`.
 

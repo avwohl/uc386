@@ -427,6 +427,13 @@ class PeepholeOptimizer:
             lines = self._pass_index_load_collapse(lines)
             lines = self._pass_index_load_collapse_label(lines)
             lines = self._pass_mov_label_shl_add_load_to_sib(lines)
+            # Runs AFTER mov_label_shl_add_load_to_sib so that pass
+            # can consume the 4-line `mov BASE, LABEL; shl IDX, N;
+            # add IDX, BASE; load` pattern entirely. My pass picks
+            # up the remaining cases where the shift between mov
+            # and add is non-power-of-2 (imul) or otherwise can't
+            # fold into SIB.
+            lines = self._pass_chain_label_to_add_operand(lines)
             # Runs AFTER index_load_collapse_label so that pass can
             # consume the `shl + add LABEL + load` pattern entirely
             # (saves more bytes). My pass picks up the remaining cases
@@ -6222,6 +6229,188 @@ class PeepholeOptimizer:
                     "mov_label_shl_add_load_to_sib", 0
                 ) + 1
             )
+            continue
+        return out
+
+    def _pass_chain_label_to_add_operand(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Fold a `mov BASE, LABEL` setup into a later `add OTHER,
+        BASE` (or sub/and/or/xor/cmp/test/adc/sbb), turning it into
+        `add OTHER, LABEL`. Saves 1-2 bytes per match (the dropped
+        `mov BASE, LABEL` is 5 bytes; the new `<OP> OTHER, LABEL`
+        with imm32 source is 5 bytes for EAX, 6 for other regs —
+        net savings 2 bytes for EAX dest, 1 byte otherwise; the
+        original `<OP> OTHER, BASE` reg-reg form was 2 bytes).
+
+        Common shape: codegen for non-power-of-2 struct arrays:
+            mov     edx, _g_arr           ; A
+            mov     eax, [ebp + 8]
+            imul    eax, eax, 12          ; intermediate
+            add     eax, edx              ; B
+        After the rewrite:
+            mov     eax, [ebp + 8]
+            imul    eax, eax, 12
+            add     eax, _g_arr
+
+        Pattern:
+        - Line A: `mov BASE, LABEL` where BASE is 32-bit GP reg,
+          LABEL is non-numeric/non-memory/non-register.
+        - Up to 8 intermediate instructions that don't read or
+          write BASE, don't have calls (caller-saved BASE would
+          clobber), don't have labels or control flow boundaries.
+        - Line B: `<OP> OTHER, BASE` where OP ∈ {add, sub, and,
+          or, xor, cmp, test, adc, sbb}, OTHER != BASE, OTHER is
+          a 32-bit GP reg.
+        - BASE dead after Line B (treat_as_scratch=True since
+          BASE is a scratch holding a label address).
+
+        imul is excluded because x86 has no `imul reg, imm32` form
+        compatible with our 2-operand pattern (only the 3-operand
+        form supports immediates, which is a different shape).
+        """
+        OPS = {
+            "add", "sub", "and", "or", "xor",
+            "cmp", "test", "adc", "sbb",
+        }
+        out = list(lines)
+        i = 0
+        while i < len(out):
+            a = out[i]
+            if not (
+                a.kind == "instr" and a.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            if ap is None:
+                i += 1
+                continue
+            base_reg = ap[0].strip().lower()
+            label = ap[1].strip()
+            if not self._is_general_register(base_reg):
+                i += 1
+                continue
+            # LABEL must be non-register, non-numeric, non-memory.
+            if self._is_general_register(label.lower()):
+                i += 1
+                continue
+            try:
+                int(label)
+                i += 1
+                continue
+            except ValueError:
+                pass
+            try:
+                int(label, 16)
+                i += 1
+                continue
+            except ValueError:
+                pass
+            if "[" in label:
+                i += 1
+                continue
+            # Walk forward up to 8 instructions looking for
+            # `<OP> OTHER, BASE`.
+            found = False
+            j = i + 1
+            scanned = 0
+            while j < len(out) and scanned < 8:
+                ln = out[j]
+                if ln.kind in ("blank", "comment"):
+                    j += 1
+                    continue
+                if ln.kind in ("label", "directive", "data"):
+                    break  # control-flow boundary
+                if ln.kind != "instr":
+                    break
+                # Calls clobber caller-saved regs.
+                if ln.op == "call":
+                    break
+                # jmp/jcc/ret end the chain.
+                if ln.op == "jmp" or (
+                    ln.op.startswith("j") and ln.op != "jmp"
+                ):
+                    break
+                if ln.op in {
+                    "ret", "iret", "iretd", "retf", "retn",
+                    "leave", "enter",
+                }:
+                    break
+                # Check if this is line B.
+                if ln.op in OPS:
+                    bp = _operands_split(ln.operands)
+                    if bp is not None:
+                        b_dst = bp[0].strip().lower()
+                        b_src = bp[1].strip().lower()
+                        if (
+                            b_src == base_reg
+                            and b_dst != base_reg
+                            and self._is_general_register(b_dst)
+                        ):
+                            # Make sure b_dst isn't BASE-itself
+                            # (handled above) and that B reads
+                            # only BASE in the source position.
+                            # Now check intermediates don't touch
+                            # BASE (we walked past them). Also
+                            # check BASE dead after B.
+                            if self._reg_dead_after(
+                                out, j + 1, base_reg,
+                                treat_as_scratch=True,
+                            ):
+                                found = True
+                                b_idx = j
+                                b_line = ln
+                            break
+                # If this instruction reads or writes BASE,
+                # bail (chain is broken).
+                if self._references_reg_family(
+                    ln.operands, base_reg
+                ):
+                    break
+                # If implicit-reg-using instr (cdq/idiv/mul/etc.)
+                # touches our reg family, bail.
+                base_to_implicit = {
+                    "eax": True, "edx": True,
+                }
+                if base_reg in base_to_implicit:
+                    if not (
+                        PeepholeOptimizer
+                        ._has_explicit_operands_only(ln)
+                    ):
+                        break
+                scanned += 1
+                j += 1
+            if not found:
+                i += 1
+                continue
+            # Rewrite: drop line A, replace line B with `OP b_dst,
+            # LABEL`.
+            indent = self._extract_indent(b_line.raw)
+            opname = b_line.op
+            spacer = " " * max(8 - len(opname), 1)
+            new_raw = (
+                f"{indent}{opname}{spacer}{b_dst}, {label}"
+            )
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op=opname,
+                operands=f"{b_dst}, {label}",
+            )
+            new_out = (
+                out[:i] + out[i + 1:b_idx]
+                + [new_line] + out[b_idx + 1:]
+            )
+            out = new_out
+            self.stats["chain_label_to_add_operand"] = (
+                self.stats.get(
+                    "chain_label_to_add_operand", 0
+                ) + 1
+            )
+            # Don't advance i — the rewrite may have shifted
+            # things and the same i could match again with a
+            # different mov.
             continue
         return out
 
