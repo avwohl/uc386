@@ -1904,3 +1904,12 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete impact on pr70602**: 47 fires combined with slice 30's cascade. 471 → 225 lines (52% reduction) on top of all prior peephole work. The bit-field init's `and REG, mask` operations are mostly redundant after the loaded value is known to be 0.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (1210 total). Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: zero-reg state tracking (or_with_zero_reg_drop + and_on_zero_reg_drop)**: track per-block "register is known 0" state and use it to drop subsequent ops that become no-ops. Generalization of slice 31's adjacent-only `xor_then_and_collapse`.
+  - **Tracking model**: maintain a `zero_regs` set per basic block. Set on `xor reg, reg`; cleared on any write to reg (including sub-register writes via `_SUBREG_TO_GP32` map), at labels (control flow boundaries), at calls/jumps/ret/leave/enter, and on implicit-reg writers (cdq writes EDX, mul/div write EAX/EDX, 1-operand imul writes EDX:EAX).
+  - **Pattern 1 — `or REG_T, REG_S` where REG_S ∈ zero_regs**: drop the OR. `REG_T | 0 = REG_T` — value unchanged. Saves 2 bytes per match. Common after slice 30 + 31 cascade in bit-field init code where the codegen ORs zeroed registers together.
+  - **Pattern 2 — `and REG, X` where REG ∈ zero_regs**: drop the AND. `0 AND X = 0` — REG stays 0. Saves 2-6 bytes per match. Catches the non-adjacent case slice 31 misses (where intervening writes to OTHER registers don't affect REG's zero state).
+  - **Both patterns require flag-deadness check** (`_flags_safe_after`) — original `or`/`and` set flags based on result; without them, flag state diverges.
+  - **REG_T != REG_S restriction** for OR (else `or reg, reg` keeps reg unchanged, set flags — different idiom). Same for AND with `dst != src`.
+  - **Concrete impact on pr70602** (bit-field-init torture): 21 OR drops + 42 AND drops = 63 fires. 471 → 183 lines (61% total reduction) on top of all prior peephole work, including slices 29-31. The bit-field init's redundant masking ORs/ANDs are eliminated wholesale.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests (1215 total). Pipeline 1734/1734 (100%).

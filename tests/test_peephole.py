@@ -14363,3 +14363,92 @@ def test_xor_then_and_collapse_skips_xor_diff_regs():
     opt = PeepholeOptimizer()
     opt.optimize(asm)
     assert opt.stats.get("xor_then_and_collapse", 0) == 0
+
+
+# ── or_with_zero_reg_drop / and_on_zero_reg_drop ─────────────────
+
+
+def test_or_with_zero_reg_drop_basic():
+    """`xor eax, eax; xor ecx, ecx; or ecx, eax` → drop the OR.
+    eax is known 0 from the prior xor; OR with 0 is a no-op."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        xor     ecx, ecx\n"
+        "        or      ecx, eax\n"
+        "        mov     [ebp - 4], ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "or      ecx, eax" not in out
+    assert opt.stats.get("or_with_zero_reg_drop", 0) == 1
+
+
+def test_or_with_zero_reg_drop_skips_when_src_modified():
+    """If REG_S was modified after the xor, it's no longer 0."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        mov     eax, 5\n"   # eax no longer 0
+        "        xor     ecx, ecx\n"
+        "        or      ecx, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("or_with_zero_reg_drop", 0) == 0
+
+
+def test_and_on_zero_reg_drop_non_adjacent():
+    """`xor ecx, ecx; <other writes>; and ecx, MASK` → drop AND.
+    Non-adjacent case missed by xor_then_and_collapse."""
+    asm = (
+        "_f:\n"
+        "        xor     ecx, ecx\n"
+        "        mov     eax, 9\n"
+        "        shl     eax, 1\n"
+        "        and     ecx, 4292870145\n"   # ecx still 0
+        "        or      ecx, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "and     ecx, 4292870145" not in out
+    assert opt.stats.get("and_on_zero_reg_drop", 0) == 1
+
+
+def test_or_with_zero_reg_drop_skips_label():
+    """Label clears tracking — REG could enter at label with
+    different value."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        ".L_top:\n"   # label resets tracking
+        "        xor     ecx, ecx\n"
+        "        or      ecx, eax\n"   # eax could be non-0 from back-edge
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("or_with_zero_reg_drop", 0) == 0
+
+
+def test_and_on_zero_reg_drop_skips_when_flags_read():
+    """Dropping the AND changes flag state. If a flag-reader follows
+    before the next flag-clobber, don't drop."""
+    asm = (
+        "_f:\n"
+        "        xor     ecx, ecx\n"
+        "        mov     eax, 9\n"
+        "        and     ecx, 0xFF\n"
+        "        je      .L\n"   # reads ZF
+        "        ret\n"
+        ".L:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    # The AND sets ZF=1 (since reg was 0); without it, je's input
+    # depends on prior flag state. Skip drop.
+    assert opt.stats.get("and_on_zero_reg_drop", 0) == 0

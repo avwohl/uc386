@@ -461,6 +461,7 @@ class PeepholeOptimizer:
             lines = self._pass_push_pop_register_op(lines)
             lines = self._pass_zero_load_after_zero_store(lines)
             lines = self._pass_xor_then_and_collapse(lines)
+            lines = self._pass_or_with_zero_reg_drop(lines)
             lines = self._pass_label_load_collapse(lines)
             lines = self._pass_label_push_collapse(lines)
             lines = self._pass_label_store_collapse(lines)
@@ -10513,6 +10514,156 @@ class PeepholeOptimizer:
                 self.stats.get("push_pop_register_op", 0) + 1
             )
             continue
+        return out
+
+    def _pass_or_with_zero_reg_drop(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Drop ``or REG_T, REG_S`` when REG_S is known to be 0.
+
+        After ``xor REG_S, REG_S`` (and no subsequent write to REG_S),
+        REG_S = 0. ``or REG_T, 0 = REG_T`` — the OR is a no-op for
+        the value. Flags differ in general (or sets flags based on
+        REG_T's value; pre-OR flags reflect whatever set them last),
+        so we require the flags to be dead after the OR.
+
+        Saves 2 bytes per match (drops the `or reg, reg`).
+
+        Common after slice 30 + 31 cascade in bit-field init code:
+        the codegen ORs zeroed registers together, but the ORs are
+        all no-ops when both regs are 0.
+
+        Conditions:
+        - Track per-register `zero_regs` state in a basic block.
+          Set on `xor reg, reg`; cleared on any write to reg or at
+          control-flow boundaries.
+        - At `or REG_T, REG_S` where REG_S ∈ zero_regs, drop the OR.
+        - Flag state safe at the drop point (no flag-reader between
+          the would-be OR and the next flag-clobber).
+        """
+        out = list(lines)
+        i = 0
+        zero_regs: set[str] = set()
+        while i < len(out):
+            ln = out[i]
+            if ln.kind == "label":
+                zero_regs.clear()
+                i += 1
+                continue
+            if ln.kind != "instr":
+                i += 1
+                continue
+            op = ln.op
+            # Control flow boundaries: clear all tracking.
+            if op in (
+                "call", "ret", "iret", "iretd", "retf", "retn",
+                "leave", "jmp", "enter",
+            ) or (op.startswith("j") and op != "jmp"):
+                zero_regs.clear()
+                i += 1
+                continue
+            # `xor reg, reg`: reg is now 0.
+            if op == "xor":
+                op_parts = _operands_split(ln.operands)
+                if op_parts is not None:
+                    a_dst, a_src = op_parts
+                    a_dst_low = a_dst.strip().lower()
+                    a_src_low = a_src.strip().lower()
+                    if (
+                        a_dst_low in PeepholeOptimizer._GP32
+                        and a_dst_low == a_src_low
+                    ):
+                        zero_regs.add(a_dst_low)
+                        i += 1
+                        continue
+            # `or REG_T, REG_S` where REG_S ∈ zero_regs: drop.
+            if op == "or":
+                op_parts = _operands_split(ln.operands)
+                if op_parts is not None:
+                    t_dst, t_src = op_parts
+                    t_dst_low = t_dst.strip().lower()
+                    t_src_low = t_src.strip().lower()
+                    if (
+                        t_dst_low in PeepholeOptimizer._GP32
+                        and t_src_low in zero_regs
+                        and t_src_low != t_dst_low
+                        and self._flags_safe_after(out, i + 1)
+                    ):
+                        # Drop the OR. zero_regs unchanged (REG_T's
+                        # zero status is unaffected by the no-op OR;
+                        # if REG_T was 0, it still is. If REG_T was
+                        # not 0, it stays not 0).
+                        del out[i]
+                        self.stats["or_with_zero_reg_drop"] = (
+                            self.stats.get(
+                                "or_with_zero_reg_drop", 0
+                            ) + 1
+                        )
+                        # Don't advance i; new content at i.
+                        continue
+            # `and REG, X` where REG ∈ zero_regs: drop (REG | 0
+            # would be REG, but 0 AND X = 0 — REG stays 0).
+            if op == "and":
+                op_parts = _operands_split(ln.operands)
+                if op_parts is not None:
+                    t_dst, t_src = op_parts
+                    t_dst_low = t_dst.strip().lower()
+                    t_src_low = t_src.strip().lower()
+                    # Require dst is a known-zero reg, AND src is
+                    # not the same reg (`and reg, reg` keeps reg
+                    # unchanged but sets flags — different idiom).
+                    if (
+                        t_dst_low in zero_regs
+                        and t_src_low != t_dst_low
+                        and self._flags_safe_after(out, i + 1)
+                    ):
+                        del out[i]
+                        self.stats["and_on_zero_reg_drop"] = (
+                            self.stats.get(
+                                "and_on_zero_reg_drop", 0
+                            ) + 1
+                        )
+                        # zero_regs unchanged — REG was 0, still 0.
+                        continue
+            # Generic: any write to a reg invalidates its zero state.
+            op_parts = _operands_split(ln.operands or "")
+            if op_parts is not None:
+                dest = op_parts[0].strip().lower()
+                # Sub-register write invalidates the canonical 32-bit.
+                dest_canon = (
+                    PeepholeOptimizer._SUBREG_TO_GP32.get(
+                        dest, dest
+                    )
+                )
+                if dest_canon in zero_regs:
+                    # Read-write ops like add/sub/and/or/xor/shl
+                    # — they modify the register, but if they're
+                    # `op reg, 0` they preserve. We're conservative:
+                    # any write clears.
+                    zero_regs.discard(dest_canon)
+            else:
+                # Single-operand RMW (inc/dec/neg/not/pop/etc.).
+                operand = (ln.operands or "").strip().lower()
+                operand_canon = (
+                    PeepholeOptimizer._SUBREG_TO_GP32.get(
+                        operand, operand
+                    )
+                )
+                if operand_canon in zero_regs and op in (
+                    "inc", "dec", "neg", "not", "pop",
+                    "mul", "div", "idiv",
+                ):
+                    zero_regs.discard(operand_canon)
+            # Implicit reg writers.
+            if op == "cdq":
+                zero_regs.discard("edx")
+            if op in ("mul", "div", "idiv"):
+                zero_regs.discard("eax")
+                zero_regs.discard("edx")
+            if op == "imul" and ln.operands and "," not in ln.operands:
+                zero_regs.discard("eax")
+                zero_regs.discard("edx")
+            i += 1
         return out
 
     def _pass_xor_then_and_collapse(
