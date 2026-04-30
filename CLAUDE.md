@@ -1433,3 +1433,14 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Real-world fires**: every x87-using function with the `fild ... add esp, 4; pop ecx` save-restore-address pattern (used by float arithmetic on int operands). Several occurrences per torture test that does float work.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +1 peephole test (514 total). 959 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: dead_store_before_push**: drop `mov [m], REG; push REG; ...; ret` when the slot [m] is never read again before function exit. Saves 3 bytes per match (the dropped `mov [m], REG`).
+  - **Common shape**: codegen saves a call result to a frame slot immediately before pushing it as a printf-style argument. `mov [ebp - 12], eax; push eax; ...; call _printf; ret`. The slot's value is captured via the push, but the slot itself is never read again — so the store is dead.
+  - **Restricted form of dead-store-elimination**. Earlier I tried a fully general `dead_stack_store_at_exit` pass, but it conflicted with 31 unit tests (which test other passes' behavior on minimal asm fragments where the slot is technically dead). This more targeted version only fires on the specific `mov [m], REG; push REG` pattern — which is recognizable codegen, not an artifact of synthetic test asm.
+  - **Critical correctness fix**: the pass must NOT match `mov [m], REG; push dword [m]` — the push READS [m], so the store is alive. My initial implementation incorrectly accepted both forms; the fix gates on `push REG` specifically (where REG is the same register that was stored).
+  - **Pre-conditions** (per-function):
+    - No `lea reg, [ebp ± N]` anywhere (address-take prevents tracking)
+    - No SIB-form `[ebp + reg*N + disp]` accesses (could touch any range)
+    - No backward jumps from after the store landing at or before it (loop body could re-execute reads)
+  - **Concrete win on probe6's `_compute`**: saves 3 bytes (drops the dead `mov [ebp - 12], eax` before the push for printf). On probe5's `_main`: same shape, dropped `mov [ebp - 12], eax` before the printf push.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests (518 total). 963 unit tests total. Pipeline 1734/1734 (100%).

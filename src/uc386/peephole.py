@@ -452,6 +452,7 @@ class PeepholeOptimizer:
             lines = self._pass_reg_copy_addr_forward(lines)
             lines = self._pass_value_forward_to_reg(lines)
             lines = self._pass_xfer_store_collapse(lines)
+            lines = self._pass_dead_store_before_push(lines)
             lines = self._pass_load_add_xfer_forward(lines)
             lines = self._pass_byte_stores_to_dword(lines)
             lines = self._pass_pop_index_push_collapse(lines)
@@ -9567,6 +9568,187 @@ class PeepholeOptimizer:
             )
             continue
         return out
+
+    def _pass_dead_store_before_push(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Drop ``mov [m], REG`` when followed by ``push REG`` (or
+        ``push dword [m]``) and [m] isn't read again before function
+        exit.
+
+        Common shape: codegen saves a call result to a frame slot
+        immediately before pushing it as an argument:
+        ``mov [ebp - 12], eax; push eax; ...; call _printf; ...; ret``
+        — the slot's value is captured in the push, but the slot
+        itself is never read again. The store is dead.
+
+        Saves 3 bytes per match (the dropped ``mov [m], REG``).
+
+        Conditions:
+        - Line A: ``mov [m], REG`` where m is an ebp-offset and REG
+          is a 32-bit GP reg.
+        - Line B: ``push REG`` (same REG) OR ``push dword [m]``
+          (same memory).
+        - In the rest of the function (until next global label or
+          ret), [m] is never read AND not address-taken.
+        - No backward jump targeting before the store (loop body
+          might re-enter and read [m]).
+
+        This is a restricted form of dead-store-elimination at
+        function exit. The pre-condition `push REG` distinguishes
+        the save-then-push pattern from synthetic unit-test cases
+        where a store is followed only by `ret`.
+        """
+        out = list(lines)
+        # Find function boundaries.
+        func_starts: list[int] = []
+        for k, ln in enumerate(out):
+            if ln.kind == "label" and not ln.label.startswith("."):
+                func_starts.append(k)
+        if not func_starts:
+            return out
+        func_starts.append(len(out))
+        for fi in range(len(func_starts) - 1):
+            fstart = func_starts[fi]
+            fend = func_starts[fi + 1]
+            # Stop at section directives.
+            for k in range(fstart, fend):
+                if out[k].kind == "directive" and out[k].raw.strip(
+                ).lower().startswith("section"):
+                    fend = k
+                    break
+            # Per-function label_pos for backward-jump check.
+            label_pos: dict[str, int] = {}
+            for k in range(fstart, fend):
+                ln = out[k]
+                if ln.kind == "label":
+                    label_pos[ln.label] = k
+            # Check function for any complex ebp use (lea, SIB).
+            ebp_re_full = re.compile(
+                r"\[\s*ebp\b[^\]]*\]", re.IGNORECASE
+            )
+            ebp_re_simple = re.compile(
+                r"^\[\s*ebp\s*[+-]\s*\d+\s*\]$", re.IGNORECASE
+            )
+            any_complex_ebp = False
+            for k in range(fstart, fend):
+                ln = out[k]
+                if ln.kind != "instr":
+                    continue
+                for m in ebp_re_full.finditer(ln.operands):
+                    expr = m.group(0)
+                    if not ebp_re_simple.match(expr):
+                        any_complex_ebp = True
+                        break
+                if any_complex_ebp:
+                    break
+                if ln.op == "lea":
+                    offsets = self._extract_ebp_offsets(
+                        ln.operands
+                    )
+                    if offsets:
+                        any_complex_ebp = True
+                        break
+            if any_complex_ebp:
+                continue
+            # For each store followed by a matching push, check if
+            # the slot is dead.
+            i = fstart
+            while i < fend:
+                ln = out[i]
+                if ln.kind != "instr":
+                    i += 1
+                    continue
+                n_disp = self._stack_store_offset(ln)
+                if n_disp is None:
+                    i += 1
+                    continue
+                # Get the register source from the store.
+                parts = _operands_split(ln.operands)
+                if parts is None:
+                    i += 1
+                    continue
+                store_dest = parts[0].strip()
+                store_src = parts[1].strip().lower()
+                if store_src not in PeepholeOptimizer._GP32:
+                    i += 1
+                    continue
+                # Find the next instruction.
+                j = i + 1
+                while j < fend:
+                    nl = out[j]
+                    if nl.kind in ("blank", "comment"):
+                        j += 1
+                        continue
+                    break
+                if j >= fend:
+                    i += 1
+                    continue
+                nl = out[j]
+                # Must be `push REG` (same as store_src). The case
+                # `push dword [m]` would actually READ [m] — not a
+                # candidate for elimination.
+                if nl.kind != "instr" or nl.op != "push":
+                    i += 1
+                    continue
+                push_op = nl.operands.strip().lower()
+                if push_op != store_src:
+                    i += 1
+                    continue
+                # Now check that [n_disp] isn't read in the rest of
+                # the function. The store and push are at i and j.
+                # Scan from j+1 to fend.
+                slot_alive = False
+                for k in range(j + 1, fend):
+                    bln = out[k]
+                    if bln.kind != "instr":
+                        continue
+                    # Check for read of [ebp ± n_disp] in operands.
+                    offsets = self._extract_ebp_offsets(
+                        bln.operands
+                    )
+                    if n_disp in offsets:
+                        slot_alive = True
+                        break
+                    # Check for backward jump landing at or before
+                    # the store (loop body re-entry).
+                    if bln.op == "jmp" or bln.op.startswith("j"):
+                        target = _branch_target(bln)
+                        if target is not None:
+                            tpos = label_pos.get(target)
+                            if (
+                                tpos is not None
+                                and tpos <= i
+                                and tpos >= fstart
+                            ):
+                                slot_alive = True
+                                break
+                if slot_alive:
+                    i += 1
+                    continue
+                # Drop the store.
+                out[i] = None  # type: ignore
+                self.stats["dead_store_before_push"] = (
+                    self.stats.get("dead_store_before_push", 0) + 1
+                )
+                i += 1
+        return [ln for ln in out if ln is not None]
+
+    @staticmethod
+    def _extract_ebp_offsets(text: str) -> list[int]:
+        """Find all `[ebp +/- N]` literals in `text` and return their
+        signed offsets (negative for [ebp - N], positive for
+        [ebp + N]). Tolerates optional size prefix and whitespace."""
+        result: list[int] = []
+        for m in re.finditer(
+            r"\[\s*ebp\s*([+-])\s*(\d+)\s*\]",
+            text, re.IGNORECASE,
+        ):
+            n = int(m.group(2))
+            if m.group(1) == "-":
+                n = -n
+            result.append(n)
+        return result
 
     def _pass_xfer_store_collapse(
         self, lines: list[Line]

@@ -5501,6 +5501,95 @@ def test_disp_store_collapse_skips_when_intermediate_reads_flags():
     assert opt.stats.get("disp_store_collapse", 0) == 0
 
 
+# ── dead_store_before_push ─────────────────────────────────────────
+
+
+def test_dead_store_before_push_basic():
+    """`mov [m], REG; push REG; ...; ret` where [m] is never read.
+    The store is dead — only the push consumes the value."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 42\n"
+        "        mov     [ebp - 12], eax\n"  # dead store
+        "        push    eax\n"
+        "        push    _str\n"
+        "        call    _printf\n"
+        "        add     esp, 8\n"
+        "        xor     eax, eax\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    out_lines = out.split("\n")
+    has_store = any(
+        "[ebp - 12]" in line for line in out_lines
+    )
+    assert not has_store
+    assert opt.stats.get("dead_store_before_push") == 1
+
+
+def test_dead_store_before_push_skips_when_slot_read_after():
+    """If [m] is read later in the function, the store is alive."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 42\n"
+        "        mov     [ebp - 12], eax\n"
+        "        push    eax\n"
+        "        push    dword [ebp - 12]\n"  # reads [ebp - 12]
+        "        call    _foo\n"
+        "        add     esp, 8\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     [ebp - 12], eax" in out
+    assert opt.stats.get("dead_store_before_push", 0) == 0
+
+
+def test_dead_store_before_push_skips_when_next_is_push_mem():
+    """`mov [m], R; push dword [m]` — the push reads [m], so the
+    store is alive."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, 42\n"
+        "        mov     [ebp - 4], edx\n"
+        "        push    dword [ebp - 4]\n"  # reads [ebp - 4]
+        "        call    _foo\n"
+        "        pop     ecx\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Store should remain.
+    assert "mov     [ebp - 4], edx" in out
+    assert opt.stats.get("dead_store_before_push", 0) == 0
+
+
+def test_dead_store_before_push_skips_when_lea_taken():
+    """If any function uses `lea` on an ebp-offset slot, the address
+    might escape and we can't safely eliminate stores."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp - 8]\n"  # address-take
+        "        mov     [ebp - 12], eax\n"
+        "        push    eax\n"
+        "        call    _foo\n"
+        "        pop     ecx\n"
+        ".epilogue:\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_store_before_push", 0) == 0
+
+
 # ── xfer_store_collapse ───────────────────────────────────────────
 
 
