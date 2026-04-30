@@ -6403,15 +6403,16 @@ class PeepholeOptimizer:
 
         Drop everything from `xor` to the consumer `jnz` and rewrite
         every prior `jcc .L_true` reference to `jcc .L_target`. Save
-        7+ bytes per match (the dropped 5-line block).
+        7+ bytes per match (the dropped 7-line block).
 
         For the `jz` consumer form (`jz .L_target` taken when result
-        is 0 = no jcc fired), the rewrite needs an extra `jmp
-        .L_target` at the end to handle the all-conditions-met fall-
-        through path. Each prior `jcc .L_true` becomes `jcc <line
-        after the consumer>` (i.e., skip past the jmp). Since we
-        can't always cleanly identify "the line after", we restrict
-        to the jnz case for safety.
+        is 0 = no jcc fired), the rewrite generates a synthetic
+        label `.bm_skip_N` after the dropped block, retargets each
+        prior `jcc .L_true` to `.bm_skip_N`, and inserts `jmp
+        .L_target` where the block was. Net savings: 7 lines dropped,
+        2 lines added (jmp + label) = 5 lines saved per match. Each
+        retargeted jcc keeps its operator; only the target name
+        changes.
 
         Conditions:
         - The pattern is exactly: `xor eax, eax; jmp .L_end;
@@ -6495,11 +6496,12 @@ class PeepholeOptimizer:
             if f.operands.replace(" ", "").lower() != "eax,eax":
                 i += 1
                 continue
-            # G: jnz .L_target
+            # G: jnz .L_target  OR  jz .L_target
             g = out[i + 6] if i + 6 < n else None
-            if g is None or g.kind != "instr" or g.op != "jnz":
+            if g is None or g.kind != "instr" or g.op not in ("jnz", "jz"):
                 i += 1
                 continue
+            consumer_op = g.op
             l_target = g.operands.strip()
             if not l_target.startswith("."):
                 i += 1
@@ -6564,26 +6566,88 @@ class PeepholeOptimizer:
             if other_ref or not jcc_indices:
                 i += 1
                 continue
-            # All checks passed. Rewrite each jcc to point at l_target.
-            for k in jcc_indices:
-                pk = out[k]
-                indent = self._extract_indent(pk.raw)
-                spacer = " " * max(1, 8 - len(pk.op))
-                new_raw = f"{indent}{pk.op}{spacer}{l_target}"
-                out[k] = Line(
-                    raw=new_raw, kind="instr",
-                    op=pk.op, operands=l_target,
+            # All checks passed.
+            if consumer_op == "jnz":
+                # Rewrite each jcc to point at l_target.
+                for k in jcc_indices:
+                    pk = out[k]
+                    indent = self._extract_indent(pk.raw)
+                    spacer = " " * max(1, 8 - len(pk.op))
+                    new_raw = f"{indent}{pk.op}{spacer}{l_target}"
+                    out[k] = Line(
+                        raw=new_raw, kind="instr",
+                        op=pk.op, operands=l_target,
+                    )
+                # Drop A through G (indices i to i+6).
+                del out[i:i + 7]
+                n -= 7
+                fires += 1
+                self.stats["bool_materialize_collapse"] = (
+                    self.stats.get("bool_materialize_collapse", 0) + 1
                 )
-            # Drop A through G (indices i to i+6).
-            del out[i:i + 7]
-            n -= 7
-            fires += 1
-            self.stats["bool_materialize_collapse"] = (
-                self.stats.get("bool_materialize_collapse", 0) + 1
-            )
+            else:
+                # consumer_op == "jz": replace the 7-line block with
+                # `jmp .L_target` + new synthetic skip label. Each
+                # prior jcc retargets .L_or_true → .L_skip.
+                # Generate a unique skip label name.
+                skip_label = self._unique_local_label(
+                    out, base="bm_skip"
+                )
+                # Rewrite each jcc's target.
+                for k in jcc_indices:
+                    pk = out[k]
+                    indent = self._extract_indent(pk.raw)
+                    spacer = " " * max(1, 8 - len(pk.op))
+                    new_raw = f"{indent}{pk.op}{spacer}{skip_label}"
+                    out[k] = Line(
+                        raw=new_raw, kind="instr",
+                        op=pk.op, operands=skip_label,
+                    )
+                # Replace 7-line block with `jmp .L_target` + label.
+                indent_a = self._extract_indent(out[i].raw)
+                jmp_raw = f"{indent_a}jmp     {l_target}"
+                jmp_line = Line(
+                    raw=jmp_raw, kind="instr",
+                    op="jmp", operands=l_target,
+                )
+                lbl_raw = f"{skip_label}:"
+                lbl_line = Line(
+                    raw=lbl_raw, kind="label",
+                    label=skip_label,
+                )
+                out[i:i + 7] = [jmp_line, lbl_line]
+                n -= 5  # 7 dropped, 2 added
+                fires += 1
+                self.stats["bool_materialize_collapse"] = (
+                    self.stats.get("bool_materialize_collapse", 0) + 1
+                )
             # Don't advance i — the new state at i is whatever
             # followed G; let the loop reconsider.
         return out
+
+    def _unique_local_label(
+        self, lines: list[Line], base: str = "bm_skip",
+    ) -> str:
+        """Return a synthetic local label name (`.<base>_N`) that's
+        not already defined or referenced anywhere in `lines`. Used
+        when a peephole pass needs to insert a new label."""
+        # Collect all label names defined or referenced.
+        used: set[str] = set()
+        for ln in lines:
+            if ln.kind == "label":
+                used.add(ln.label)
+            if ln.kind == "instr" and ln.operands:
+                for tok in ln.operands.split(","):
+                    tok = tok.strip()
+                    if tok.startswith("."):
+                        used.add(tok)
+        # Find first unused.
+        n = 0
+        while True:
+            cand = f".{base}_{n}"
+            if cand not in used:
+                return cand
+            n += 1
 
     # Map NASM size keyword to the EAX-family sub-register that
     # carries 0 when EAX = 0.

@@ -13684,9 +13684,9 @@ def test_bool_materialize_collapse_skips_eax_live_after():
     assert opt.stats.get("bool_materialize_collapse", 0) == 0
 
 
-def test_bool_materialize_collapse_skips_jz_consumer():
-    """jz consumer requires more complex rewrite (need extra jmp);
-    we restrict to jnz for safety."""
+def test_bool_materialize_collapse_jz_consumer():
+    """jz consumer also collapses, with a synthetic skip label and
+    `jmp .L_target` inserted at the dropped block's location."""
     asm = (
         "_main:\n"
         "        cmp     eax, 1\n"
@@ -13697,7 +13697,7 @@ def test_bool_materialize_collapse_skips_jz_consumer():
         "        mov     eax, 1\n"
         ".L4_or_end:\n"
         "        test    eax, eax\n"
-        "        jz      .L_target\n"  # jz, not jnz
+        "        jz      .L_target\n"  # jz consumer
         "        push    42\n"
         "        call    _foo\n"
         "        pop     ecx\n"
@@ -13708,7 +13708,17 @@ def test_bool_materialize_collapse_skips_jz_consumer():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    assert opt.stats.get("bool_materialize_collapse", 0) == 0
+    assert opt.stats.get("bool_materialize_collapse", 0) == 1
+    # Block is dropped; replaced with jmp .L_target + a skip label.
+    # The original jne path now jumps past the new jmp to fall through.
+    assert ".L3_or_true:" not in out
+    assert ".L4_or_end:" not in out
+    assert "test    eax, eax" not in out
+    # A `jmp .L_target` is inserted; the .bm_skip_N label may further
+    # cascade with jcc_jmp_inversion. After cascade, the jne becomes
+    # `je .L_target` (inverted to point at target, since jne to skip
+    # followed by jmp to target inverts to je).
+    assert "je      .L_target" in out
 
 
 def test_bool_materialize_collapse_multiple_jccs_to_true():

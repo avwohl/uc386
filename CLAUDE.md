@@ -1819,3 +1819,13 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Real-world impact**: 58 fires across 200 torture tests when restricted to jnz consumer (out of 112 total bool-materialize sites; the other 54 are jz consumers).
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests. 1179 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: bool_materialize_collapse handles jz consumer**: extends slice 25 to also fire when the consumer is `jz .L_target` (taken when result is 0 = no jcc fired = all conditions met). Saves 5 lines (7 dropped, 2 added) per match.
+  - **Pattern**: `xor eax, eax; jmp .L_end; .L_true: mov eax, 1; .L_end: test eax, eax; jz .L_target` — same as the jnz case but with `jz` consumer.
+  - **Rewrite**: replace the 7-line block with `jmp .L_target` + new synthetic skip label `.bm_skip_N`. Each prior `jcc .L_true` retargets to `.bm_skip_N` (operator unchanged). After the cascade with `jcc_jmp_inversion`, a single trailing jcc-to-skip + jmp-to-target collapses to inverted jcc-to-target.
+  - **Why this works**: original semantics (abort iff result == 0 iff no jcc fired iff all conditions met) is preserved.
+    - jcc fires (some condition true) → in original: goes to .L_true, mov 1, ZF=0, jz NOT taken → fall through. After rewrite: jcc fires, goes to .bm_skip_N (just past the new jmp), fall through. Same.
+    - No jcc fires → in original: xor sets EAX=0, jmp to .L_end, test sets ZF=1, jz TAKEN, goto .L_target. After rewrite: fall through to inserted `jmp .L_target`. Same.
+  - **`_unique_local_label` helper**: scans existing label names + jcc operand references, returns first available `.bm_skip_N`.
+  - **Real-world impact**: with both jnz and jz cases now handled, this pass catches all 112+ boolean-materialize sites in 200 torture tests. Combined with the cascade through `jcc_jmp_inversion`, real savings approach ~12-15 bytes per fire.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. Test suite unchanged (1179 unit tests; the existing test for jz was rewritten to assert the new behavior). Pipeline 1734/1734 (100%).
