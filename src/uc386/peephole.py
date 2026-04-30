@@ -3112,24 +3112,40 @@ class PeepholeOptimizer:
 
         out: list[Line] = []
         reg_mem: str | None = None  # The literal text of REG's known mem source
+        # Independent tracker for "extension form": after `movsx reg, byte
+        # [...]` or `movsx reg, low_byte_of_reg`, EAX bits 8-31 are sign-
+        # extended from bit 7 of AL. A subsequent `movsx reg, al` is then
+        # redundant. Same for movzx and word forms.
+        # Values: None / "movsx_byte" / "movzx_byte" / "movsx_word" /
+        # "movzx_word". Conservatively cleared on any write to reg32 or
+        # any sub-register of reg32.
+        ext_form: str | None = None
         jcc_states: dict[str, set[str | None]] = {}
+        ext_jcc_states: dict[str, set[str | None]] = {}
         prev_unconditional = False
         for line_idx, line in enumerate(lines):
             if line.kind != "instr":
                 if line.kind == "label":
                     label = line.label
                     saved = jcc_states.pop(label, None)
+                    saved_ext = ext_jcc_states.pop(label, None)
                     if label in loop_top_labels:
                         # Loop top: a back-edge may store to memory
                         # between iterations, invalidating any cached
                         # reg_mem value. Conservatively reset.
                         reg_mem = None
+                        ext_form = None
                     elif prev_unconditional:
                         if saved is not None and len(saved) == 1:
                             (only,) = saved
                             reg_mem = only
                         else:
                             reg_mem = None
+                        if saved_ext is not None and len(saved_ext) == 1:
+                            (only,) = saved_ext
+                            ext_form = only
+                        else:
+                            ext_form = None
                     else:
                         if saved is None:
                             pass
@@ -3140,6 +3156,15 @@ class PeepholeOptimizer:
                                 reg_mem = only
                             else:
                                 reg_mem = None
+                        if saved_ext is None:
+                            pass
+                        else:
+                            states_ext = saved_ext | {ext_form}
+                            if len(states_ext) == 1:
+                                (only,) = states_ext
+                                ext_form = only
+                            else:
+                                ext_form = None
                     prev_unconditional = False
                 out.append(line)
                 continue
@@ -3153,12 +3178,51 @@ class PeepholeOptimizer:
                 # movsx byte vs movsx word) are textually distinct
                 # and don't match each other — correct, since they
                 # produce different register values.
+                #
+                # ALSO: `movsx <reg>, <low_byte_of_reg>` is redundant
+                # when reg already holds a sign-extended byte (set
+                # via `movsx <reg>, byte [...]` previously, or via
+                # any other `movsx <reg>, byte X` regardless of X's
+                # location). Same for movzx and word forms. Tracked
+                # via the independent ``ext_form`` field.
                 parts = _operands_split(ops)
                 if parts is not None:
                     dest, src = parts
                     dest_low = dest.strip().lower()
                     src_norm = src.strip()
                     if dest_low == reg32:
+                        # Determine reg32's low byte and low word
+                        # sub-registers (eax → al/ax, ecx → cl/cx, etc.)
+                        low_byte = reg32[1] + "l"  # eax → al, ecx → cl
+                        low_word = reg32[1:]  # eax → ax, ecx → cx
+                        src_low = src_norm.lower()
+                        # Self-extension form: movsx eax, al / movzx eax, ax
+                        if src_low == low_byte:
+                            # Redundant if ext_form matches
+                            target_form = f"{op}_byte"
+                            if ext_form == target_form:
+                                self.stats[stat_key] = (
+                                    self.stats.get(stat_key, 0) + 1
+                                )
+                                continue
+                            # Otherwise the operation changes EAX
+                            # extension semantic. Set new state.
+                            ext_form = target_form
+                            reg_mem = None  # value is now ext-of-AL, not memory
+                            out.append(line)
+                            continue
+                        if src_low == low_word:
+                            target_form = f"{op}_word"
+                            if ext_form == target_form:
+                                self.stats[stat_key] = (
+                                    self.stats.get(stat_key, 0) + 1
+                                )
+                                continue
+                            ext_form = target_form
+                            reg_mem = None
+                            out.append(line)
+                            continue
+                        # Source is a memory operand (or other reg).
                         full_key = f"{op} {src_norm}"
                         if (
                             reg_mem is not None
@@ -3173,6 +3237,25 @@ class PeepholeOptimizer:
                             reg_mem = full_key
                         else:
                             reg_mem = None
+                        # Set ext_form based on the size in src_norm.
+                        # Strip optional size prefix and detect.
+                        src_lower = src_norm.lower()
+                        if (
+                            src_lower.startswith("byte ")
+                            or "byte [" in src_lower
+                            or src_lower in {"al", "bl", "cl", "dl",
+                                             "ah", "bh", "ch", "dh"}
+                        ):
+                            ext_form = f"{op}_byte"
+                        elif (
+                            src_lower.startswith("word ")
+                            or "word [" in src_lower
+                            or src_lower in {"ax", "bx", "cx", "dx",
+                                             "si", "di", "bp", "sp"}
+                        ):
+                            ext_form = f"{op}_word"
+                        else:
+                            ext_form = None
                         out.append(line)
                         continue
                     # Fall through: unusual forms (sub-reg dest etc.)
@@ -3182,6 +3265,7 @@ class PeepholeOptimizer:
                     # form), but be defensive.
                     if dest_low in sub_regs:
                         reg_mem = None
+                        ext_form = None
                     out.append(line)
                     continue
             if op == "mov":
@@ -3205,6 +3289,10 @@ class PeepholeOptimizer:
                             reg_mem = src_norm
                         else:
                             reg_mem = None
+                        # Mov writes the full register; ext_form
+                        # property no longer holds (we don't know
+                        # if the source was sign/zero-extended).
+                        ext_form = None
                         out.append(line)
                         continue
                     if "[" in dest:
@@ -3225,6 +3313,7 @@ class PeepholeOptimizer:
                         # but be defensive.
                         if dest_low in sub_regs:
                             reg_mem = None
+                            ext_form = None
                         # If the store is `mov [m], REG` where m is
                         # an ebp-offset, then after the store REG
                         # equals what's at m. Track that — a later
@@ -3239,14 +3328,25 @@ class PeepholeOptimizer:
                             and self._is_ebp_offset_mem(dest.strip())
                         ):
                             reg_mem = dest.strip()
+                        # Memory store doesn't modify the register
+                        # itself, so ext_form is preserved (unless
+                        # alias-invalidation already handled).
                         out.append(line)
                         continue
                     if dest_low in sub_regs:
+                        # Sub-register write (mov al, X / mov ax, X).
+                        # Bits not written (e.g., 8-31 for `mov al, X`)
+                        # are unchanged. The sign/zero-extension
+                        # property is broken: even if reg32 was
+                        # sign-extended from old AL, the new AL might
+                        # not match bits 8-31. Reset both.
                         reg_mem = None
+                        ext_form = None
                     out.append(line)
                     continue
             if op == "call":
                 reg_mem = None
+                ext_form = None
                 prev_unconditional = False
                 out.append(line)
                 continue
@@ -3255,13 +3355,18 @@ class PeepholeOptimizer:
                 if op == "jmp":
                     target = line.operands.strip()
                     jcc_states.setdefault(target, set()).add(reg_mem)
+                    ext_jcc_states.setdefault(target, set()).add(
+                        ext_form
+                    )
                 reg_mem = None
+                ext_form = None
                 prev_unconditional = op != "enter"
                 out.append(line)
                 continue
             if op.startswith("j"):
                 target = line.operands.strip()
                 jcc_states.setdefault(target, set()).add(reg_mem)
+                ext_jcc_states.setdefault(target, set()).add(ext_form)
                 prev_unconditional = False
                 out.append(line)
                 continue
@@ -3273,6 +3378,7 @@ class PeepholeOptimizer:
                 or op in PeepholeOptimizer._IMPLICIT_REG_USERS
             ):
                 reg_mem = None
+                ext_form = None
                 out.append(line)
                 continue
             if "[" in ops:
@@ -3529,8 +3635,20 @@ class PeepholeOptimizer:
     @staticmethod
     def _ebp_offset(text: str) -> int | None:
         """Extract the offset from `[ebp + N]` / `[ebp - N]`. Returns
-        None for non-matching forms."""
+        None for non-matching forms.
+
+        Also accepts the redundant_reg_load tracker's prefixed
+        forms: ``movsx byte [ebp - 4]``, ``movzx word [ebp + 8]``,
+        etc. The ``op_prefix size_prefix`` are stripped before the
+        offset match.
+        """
         stripped = text.strip()
+        # Strip optional movsx/movzx op prefix (used by
+        # redundant_reg_load's tracker for sub-word loads).
+        for op_prefix in ("movsx ", "movzx "):
+            if stripped.lower().startswith(op_prefix):
+                stripped = stripped[len(op_prefix):].lstrip()
+                break
         for prefix in ("dword ", "word ", "byte ", "qword "):
             if stripped.lower().startswith(prefix):
                 stripped = stripped[len(prefix):].lstrip()

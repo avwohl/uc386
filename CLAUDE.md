@@ -1744,3 +1744,20 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Stat key shared with `mov` tracking** (`redundant_eax_load` / `redundant_ecx_load`). Code structure already passed `stat_key` per pass — splitting into separate keys would require refactoring; not worth it.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +8 peephole tests. 1140 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: redundant_eax/ecx_load drops self-extension forms**: extends slice 17's movsx/movzx tracking to also drop redundant `movsx <reg>, <low_byte_of_reg>` (and `movzx`, word variants). After `movsx <reg>, byte X` (any source — memory, register, or another sub-reg), `<reg>` holds sign-extend(low byte). A subsequent `movsx <reg>, <low_byte_of_reg>` is therefore redundant — sign-extending AL gives the same value EAX already has.
+  - **New independent tracker `ext_form`**: per-register state tracking the most recent extension form (`"movsx_byte"` / `"movzx_byte"` / `"movsx_word"` / `"movzx_word"` / None). Set by movsx/movzx with byte/word source. Cleared by any reg32 or sub-register write that breaks the property (e.g., `mov al, X` writes only the low byte but leaves bits 8-31 unchanged — bits 8-31 may no longer match the new AL).
+  - **Independent of `reg_mem`**: previous tracking was tied to ebp-relative memory. The ext_form tracker fires for any source — including non-ebp memory like `byte [eax]` (typical when dereferencing a runtime pointer). Common in strcpy/strncmp where the source byte comes from a pointer-derived address.
+  - **`_ebp_offset` extended**: now strips `movsx ` and `movzx ` prefixes (in addition to `dword`/`word`/`byte`/`qword`) so the alias-disjoint check works correctly when `reg_mem` holds the prefixed form set by slice 17.
+  - **Common shape**: strcpy idiom.
+    ```
+    movsx eax, byte [eax]   ; load src byte sign-extended
+    mov byte [ecx], al       ; store low byte to dst
+    movsx eax, al            ; REDUNDANT — EAX already sign-extended
+    test eax, eax
+    jnz .L_top
+    ```
+    Drops the third instruction. Saves 3 bytes per iteration of the strcpy/strncmp loop.
+  - **Conditions**: source must be the low byte/word of the target register (e.g., `al` for EAX). Sign-extension after a movzx (or vice versa) is NOT collapsed — different ops produce different values for sign-bit-set bytes.
+  - **High fire rate**: 82/100 torture tests (82%) had self-extension drops, totaling 272 drops in 100 tests. Each saves 3 bytes — ~816 bytes across 100 torture tests. Combined with slice 17, the total movsx/movzx-related savings is substantial.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests. 1145 unit tests total. Pipeline 1734/1734 (100%).

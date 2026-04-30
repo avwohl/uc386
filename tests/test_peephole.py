@@ -12984,7 +12984,7 @@ def test_redundant_movsx_invalidated_by_reg_write():
         "_f:\n"
         "        movsx   eax, byte [ebp - 4]\n"
         "        mov     [ebp - 12], eax\n"  # use first value
-        "        mov     eax, 1\n"            # EAX clobbered
+        "        add     eax, eax\n"          # EAX clobbered (RMW)
         "        mov     [ebp - 16], eax\n"
         "        movsx   eax, byte [ebp - 4]\n"  # reload — NOT redundant
         "        add     eax, [ebp - 16]\n"
@@ -13012,3 +13012,80 @@ def test_redundant_movzx_for_ecx():
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
     assert out.count("movzx   ecx, byte [ebp - 4]") == 1
+
+
+def test_self_extension_movsx_after_movsx_byte():
+    """The strcpy idiom: `movsx eax, byte [m]` (or `[reg]`) sets
+    EAX = sign-extend(byte). A subsequent `movsx eax, al` is
+    redundant — AL is already that byte's value, sign-extending
+    gives the same EAX value."""
+    asm = (
+        "_f:\n"
+        "        movsx   eax, byte [eax]\n"     # non-ebp source
+        "        mov     byte [ebp - 4], al\n"   # store AL elsewhere
+        "        movsx   eax, al\n"              # REDUNDANT
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "movsx   eax, al" not in out
+
+
+def test_self_extension_movzx():
+    """Same pattern for movzx."""
+    asm = (
+        "_f:\n"
+        "        movzx   eax, byte [eax]\n"
+        "        mov     byte [ebp - 4], al\n"
+        "        movzx   eax, al\n"              # REDUNDANT
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "movzx   eax, al" not in out
+
+
+def test_self_extension_invalidated_by_al_write():
+    """If AL is written between the movsx and the self-extension,
+    the property is broken — the second movsx is NOT redundant."""
+    asm = (
+        "_f:\n"
+        "        movsx   eax, byte [eax]\n"
+        "        mov     al, 5\n"             # AL clobbered
+        "        movsx   eax, al\n"           # NOT redundant
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "movsx   eax, al" in out
+
+
+def test_self_extension_movsx_after_movzx_byte_not_dropped():
+    """movsx eax, al is NOT redundant after movzx eax, byte [m] —
+    sign vs zero extension gives different values for negative
+    bytes."""
+    asm = (
+        "_f:\n"
+        "        movzx   eax, byte [eax]\n"   # zero-extends
+        "        mov     byte [ebp - 4], al\n"
+        "        movsx   eax, al\n"           # NOT redundant — different op
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The movsx is preserved (different op from movzx)
+    assert "movsx   eax, al" in out
+
+
+def test_self_extension_movsx_after_movsx_word():
+    """movsx eax, ax is redundant after movsx eax, word [m]."""
+    asm = (
+        "_f:\n"
+        "        movsx   eax, word [eax]\n"
+        "        mov     word [ebp - 4], ax\n"
+        "        movsx   eax, ax\n"           # REDUNDANT
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "movsx   eax, ax" not in out
