@@ -460,6 +460,7 @@ class PeepholeOptimizer:
             lines = self._pass_uncollapse_cmp_when_reload(lines)
             lines = self._pass_redundant_cmp_at_label(lines)
             lines = self._pass_op_mem_to_reg_collapse(lines)
+            lines = self._pass_push_pop_to_free_reg(lines)
             lines = self._pass_redundant_mem_load_via_xfer(lines)
             lines = self._pass_load_add_xfer_forward(lines)
             lines = self._pass_byte_stores_to_dword(lines)
@@ -3014,10 +3015,14 @@ class PeepholeOptimizer:
         IMPLICIT_EAX_USERS = {
             "cdq", "cwd", "cwde", "lodsd", "lodsw", "lodsb",
             "stosd", "stosw", "stosb", "scasd", "scasw", "scasb",
-            "mul", "imul", "div", "idiv",
+            "mul", "div", "idiv",
+            # `imul` only implicitly touches EAX/EDX in 1-operand
+            # form. The 2- and 3-operand forms have explicit
+            # destinations and don't touch EAX/EDX implicitly. We
+            # detect via operand-count below.
         }
         IMPLICIT_EDX_USERS = {
-            "cdq", "cwd", "mul", "imul", "div", "idiv",
+            "cdq", "cwd", "mul", "div", "idiv",
         }
         IMPLICIT_ESI_USERS = {
             "lodsd", "lodsw", "lodsb", "movsd", "movsw", "movsb",
@@ -3054,6 +3059,12 @@ class PeepholeOptimizer:
                 if op in IMPLICIT_EAX_USERS:
                     referenced.add("eax")
                 if op in IMPLICIT_EDX_USERS:
+                    referenced.add("edx")
+                # Special case for `imul`: only the 1-operand form
+                # implicitly touches EAX/EDX. 2-/3-operand forms
+                # have explicit destinations and don't.
+                if op == "imul" and "," not in (ops or ""):
+                    referenced.add("eax")
                     referenced.add("edx")
                 if op in IMPLICIT_ESI_USERS:
                     referenced.add("esi")
@@ -11343,6 +11354,246 @@ class PeepholeOptimizer:
                 self.stats.get("op_mem_to_reg_collapse", 0) + 1
             )
         return out
+
+    def _pass_push_pop_to_free_reg(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Replace ``push <SRC>; ...chain...; pop REG; <consumer
+        using REG>`` with ``mov FREE_REG, <SRC>; ...chain...;
+        <consumer using FREE_REG>``, dropping the push and pop
+        entirely.
+
+        Saves 4 bytes per match (drops 3-byte push + 1-byte pop).
+
+        Common shape: dot-product or other dual-array loops where
+        the codegen pushes one operand (computed via SIB-form
+        load), then computes the other operand in EAX (clobbering
+        EAX), then pops the saved operand and combines:
+
+            push    dword [eax + ecx*4]   ; save a[i]
+            mov     eax, [ebp + 12]       ; b base
+            mov     eax, [eax + ecx*4]    ; b[i]
+            pop     ecx                   ; restore a[i] in ecx
+            imul    eax, ecx              ; eax = a[i] * b[i]
+
+        With EDX free, this becomes:
+
+            mov     edx, [eax + ecx*4]    ; save a[i] in EDX
+            mov     eax, [ebp + 12]
+            mov     eax, [eax + ecx*4]    ; b[i]
+            imul    eax, edx              ; eax = a[i] * b[i]
+
+        Differs from ``push_pop_to_mov`` (which also drops the
+        push/pop): that pass places the mov at the POP position,
+        reading SRC there. If SRC references registers the chain
+        modified, the post-chain values are wrong — so it
+        restricts to ebp-relative SRC. My pass places the mov at
+        the PUSH position, reading SRC there (pre-chain), then
+        carries the value through the chain in a free register.
+        Works for arbitrary SRC including SIB-form memory.
+
+        Conditions:
+        - Chain is stack-balanced (no unbalanced inner pushes/pops).
+        - Chain has no labels, jumps, calls, ret/leave/enter.
+        - Chain doesn't reference ESP (else dropping the push
+          changes ESP-relative addressing in chain).
+        - A free GP register exists (unused in the function);
+          prefer EDX (cdecl scratch).
+        - Free register isn't referenced in the chain (automatic
+          since it's unused in the function).
+        - Consumer is the immediately-next instruction after pop.
+        - Consumer reads REG (the pop's target).
+        - REG dead after the consumer.
+        """
+        out = list(lines)
+        unused_per_line = self._compute_unused_regs_per_line(out)
+        # Preference order for the free register: EDX (cdecl
+        # scratch, no callee-save cost) > caller-saved scratch.
+        FREE_REG_ORDER = ["edx", "esi", "edi", "ebx"]
+        i = 0
+        while i + 2 < len(out):
+            a = out[i]
+            if not (a.kind == "instr" and a.op == "push"):
+                i += 1
+                continue
+            push_op = a.operands.strip()
+            # Strip optional size prefix.
+            stripped = push_op
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if stripped.lower().startswith(prefix):
+                    stripped = stripped[len(prefix):].lstrip()
+                    break
+            # We don't fire for register pushes (those are saving
+            # callee values for restore, distinct codegen pattern).
+            if self._is_general_register(push_op.lower()):
+                i += 1
+                continue
+            if self._is_general_register(stripped.lower()):
+                i += 1
+                continue
+            # Walk forward looking for matching pop, tracking depth.
+            depth = 1
+            match_idx = None
+            failed = False
+            j = i + 1
+            while j < len(out):
+                ln = out[j]
+                if ln.kind == "label":
+                    failed = True
+                    break
+                if ln.kind != "instr":
+                    j += 1
+                    continue
+                if ln.op == "push":
+                    depth += 1
+                    j += 1
+                    continue
+                if ln.op == "pop":
+                    if depth == 1:
+                        match_idx = j
+                        break
+                    depth -= 1
+                    j += 1
+                    continue
+                if ln.op in {
+                    "call", "ret", "iret", "iretd", "retf",
+                    "retn", "leave", "enter",
+                }:
+                    failed = True
+                    break
+                if ln.op.startswith("j"):
+                    failed = True
+                    break
+                if "esp" in (ln.operands or "").lower():
+                    failed = True
+                    break
+                j += 1
+            if failed or match_idx is None:
+                i += 1
+                continue
+            # The pop must target a GP register.
+            pop_line = out[match_idx]
+            target_reg = pop_line.operands.strip().lower()
+            if not self._is_general_register(target_reg):
+                i += 1
+                continue
+            # The next instruction after pop is the consumer. It
+            # must reference target_reg AND target_reg must be dead
+            # after it.
+            cons_idx = None
+            for k in range(match_idx + 1, len(out)):
+                ln = out[k]
+                if ln.kind in ("blank", "comment"):
+                    continue
+                if ln.kind != "instr":
+                    break
+                cons_idx = k
+                break
+            if cons_idx is None:
+                i += 1
+                continue
+            consumer = out[cons_idx]
+            if not self._references_reg_family(
+                consumer.operands or "", target_reg,
+            ):
+                i += 1
+                continue
+            # Disallow consumers that have implicit-reg semantics
+            # we can't safely retarget (cdq/idiv/mul/etc. use
+            # specific registers).
+            if not PeepholeOptimizer._has_explicit_operands_only(
+                consumer
+            ):
+                i += 1
+                continue
+            if not self._reg_dead_after(out, cons_idx + 1, target_reg):
+                i += 1
+                continue
+            # Pick a free register.
+            unused = unused_per_line[i] or set()
+            free_reg = None
+            for cand in FREE_REG_ORDER:
+                if cand in unused and cand != target_reg:
+                    free_reg = cand
+                    break
+            if free_reg is None:
+                i += 1
+                continue
+            # Build the rewrite. The SRC operand in the original
+            # push must not reference target_reg (else after we
+            # drop the push, the source reads the SAME register
+            # at the new mov position — fine since we're at the
+            # push position, pre-chain registers). But we should
+            # also make sure SRC doesn't reference free_reg (it
+            # doesn't, since free_reg is unused in function).
+            indent = self._extract_indent(a.raw)
+            new_mov = Line(
+                raw=f"{indent}mov     {free_reg}, {stripped}",
+                kind="instr", op="mov",
+                operands=f"{free_reg}, {stripped}",
+            )
+            # Retarget the consumer: replace target_reg with
+            # free_reg in its operands, including sub-aliases.
+            new_consumer_operands = self._retarget_reg_in_operands(
+                consumer.operands or "", target_reg, free_reg,
+            )
+            cons_indent = self._extract_indent(consumer.raw)
+            cons_op = consumer.op
+            spacer = " " * max(1, 8 - len(cons_op))
+            new_consumer = Line(
+                raw=(
+                    f"{cons_indent}{cons_op}{spacer}"
+                    f"{new_consumer_operands}"
+                ),
+                kind="instr", op=cons_op,
+                operands=new_consumer_operands,
+            )
+            out = (
+                out[:i] + [new_mov]
+                + out[i + 1:match_idx]
+                # drop pop
+                + [new_consumer]
+                + out[cons_idx + 1:]
+            )
+            unused_per_line = self._compute_unused_regs_per_line(out)
+            self.stats["push_pop_to_free_reg"] = (
+                self.stats.get("push_pop_to_free_reg", 0) + 1
+            )
+            # Don't advance — re-check from current pos.
+        return out
+
+    @staticmethod
+    def _retarget_reg_in_operands(
+        operands: str, src_reg: str, dst_reg: str,
+    ) -> str:
+        """Replace src_reg (and its sub-aliases) with dst_reg (and
+        the corresponding sub-aliases) in operands string."""
+        REG_FAMILIES = {
+            "eax": ("eax", "ax", "al", "ah"),
+            "ebx": ("ebx", "bx", "bl", "bh"),
+            "ecx": ("ecx", "cx", "cl", "ch"),
+            "edx": ("edx", "dx", "dl", "dh"),
+            "esi": ("esi", "si"),
+            "edi": ("edi", "di"),
+            "ebp": ("ebp", "bp"),
+            "esp": ("esp", "sp"),
+        }
+        # Map src family member at index i → dst family member at
+        # index i. If the destination family has fewer aliases
+        # (no high-byte for esi/edi/ebp/esp), we drop those mappings.
+        src_family = REG_FAMILIES.get(src_reg, (src_reg,))
+        dst_family = REG_FAMILIES.get(dst_reg, (dst_reg,))
+        result = operands
+        # Replace each alias. Use word-boundary regex.
+        for k, src_alias in enumerate(src_family):
+            if k >= len(dst_family):
+                break
+            dst_alias = dst_family[k]
+            result = re.sub(
+                r"\b" + re.escape(src_alias) + r"\b",
+                dst_alias, result, flags=re.IGNORECASE,
+            )
+        return result
 
     def _pass_xfer_store_collapse(
         self, lines: list[Line]

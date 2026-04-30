@@ -6493,6 +6493,119 @@ def test_op_mem_to_reg_collapse_and_xor():
     assert "xor     [ebp - 8], eax" in out
 
 
+# ── push_pop_to_free_reg ──────────────────────────────────────────
+
+
+def test_push_pop_to_free_reg_basic():
+    """Dot-product loop body: push a[i] saves across b[i]
+    computation; pop ecx + imul consumes. With EDX free, we save
+    in EDX directly."""
+    asm = (
+        "_compute:\n"
+        "        push    dword [eax + ecx*4]\n"
+        "        mov     eax, [ebp + 12]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        pop     ecx\n"
+        "        imul    eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("push_pop_to_free_reg") == 1
+    # Push and pop both gone.
+    assert "push    dword [eax + ecx*4]" not in out
+    assert "pop     ecx" not in out
+    # mov edx, [eax + ecx*4] now at the push position.
+    assert "mov     edx, [eax + ecx*4]" in out
+    # imul retargeted to use EDX.
+    assert "imul    eax, edx" in out
+
+
+def test_push_pop_to_free_reg_skips_when_no_free_reg():
+    """If all GP regs are touched in the function, no free reg is
+    available."""
+    asm = (
+        "_compute:\n"
+        "        push    dword [eax + ecx*4]\n"
+        "        mov     eax, [ebp + 12]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        pop     ecx\n"
+        "        imul    eax, ecx\n"
+        "        mov     edx, 5\n"  # uses EDX
+        "        mov     esi, 7\n"  # uses ESI
+        "        mov     edi, 9\n"  # uses EDI
+        "        mov     ebx, 1\n"  # uses EBX
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_to_free_reg", 0) == 0
+
+
+def test_push_pop_to_free_reg_skips_when_chain_uses_esp():
+    """Chain referencing [esp + N] would break after the push is
+    dropped — ESP doesn't decrement, so addresses shift."""
+    asm = (
+        "_f:\n"
+        "        push    dword [eax + ecx*4]\n"
+        "        mov     eax, [esp + 4]\n"  # ESP-relative!
+        "        pop     ecx\n"
+        "        imul    eax, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_to_free_reg", 0) == 0
+
+
+def test_push_pop_to_free_reg_skips_when_consumer_doesnt_use_reg():
+    """If the consumer (next instr after pop) doesn't read REG,
+    the pop is doing something we don't model — bail."""
+    asm = (
+        "_f:\n"
+        "        push    dword [eax + ecx*4]\n"
+        "        mov     eax, [ebp + 12]\n"
+        "        pop     ecx\n"
+        "        ret\n"  # consumer doesn't ref ECX
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_to_free_reg", 0) == 0
+
+
+def test_push_pop_to_free_reg_skips_when_reg_live_after():
+    """If REG is read after the consumer, we can't retarget just
+    the consumer — would leave subsequent uses with wrong value."""
+    asm = (
+        "_f:\n"
+        "        push    dword [eax + ecx*4]\n"
+        "        mov     eax, [ebp + 12]\n"
+        "        pop     ecx\n"
+        "        imul    eax, ecx\n"
+        "        add     eax, ecx\n"  # second use of ECX
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_to_free_reg", 0) == 0
+
+
+def test_push_pop_to_free_reg_skips_imul_with_implicit_reg():
+    """Implicit-reg consumers (cdq, idiv, mul, etc.) can't be
+    safely retargeted."""
+    asm = (
+        "_f:\n"
+        "        push    dword [eax + ecx*4]\n"
+        "        mov     eax, [ebp + 12]\n"
+        "        pop     ecx\n"
+        "        idiv    ecx\n"  # implicit EDX:EAX
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("push_pop_to_free_reg", 0) == 0
+
+
 # ── xfer_store_collapse ───────────────────────────────────────────
 
 
@@ -7935,12 +8048,14 @@ def test_sib_const_index_fold_negative_result_disp():
 
 
 def test_push_pop_to_mov_label():
-    """`push _label; chain; pop ecx` → `chain; mov ecx, _label`.
-    Drops the push, replaces pop with mov.
+    """`push _label; chain; pop ecx` becomes either:
+    - `mov ecx, _label; chain; consumer` via push_pop_to_mov
+    - `mov edx, _label; chain; consumer-using-edx` via the
+      newer push_pop_to_free_reg (which fires first and produces
+      tighter code by dropping BOTH push and pop entirely).
 
-    A subsequent imm_binop_collapse pass may further collapse
-    `mov ecx, _label; add eax, ecx` to `add eax, _label`. Test
-    asserts only the structural drop of push/pop."""
+    Either way the push and pop are gone; we assert only that
+    structural property."""
     asm = (
         "_f:\n"
         "        push    _g\n"
@@ -7953,8 +8068,12 @@ def test_push_pop_to_mov_label():
     out = opt.optimize(asm)
     assert "push    _g" not in out
     assert "pop     ecx" not in out
-    assert "mov     ecx, _g" in out
-    assert opt.stats.get("push_pop_to_mov") == 1
+    # Either pass should have fired.
+    fired = (
+        opt.stats.get("push_pop_to_mov", 0)
+        + opt.stats.get("push_pop_to_free_reg", 0)
+    )
+    assert fired >= 1
 
 
 def test_push_pop_to_mov_immediate():
