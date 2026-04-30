@@ -475,6 +475,13 @@ class PeepholeOptimizer:
             lines = self._pass_redundant_recompute_after_cmp(lines)
             lines = self._pass_redundant_mem_load_via_xfer(lines)
             lines = self._pass_load_add_xfer_forward(lines)
+            # Runs AFTER load_add_xfer_forward so that pass gets first
+            # crack on the `mov R1, SRC; add R1, IMM; mov R2, R1` shape.
+            # My pass picks up the residual `mov XFER, BASE; mov BASE,
+            # SRC; mov [XFER], BASE` triple that survives — common in
+            # struct-array stores where the address arithmetic uses
+            # imul, not add+disp.
+            lines = self._pass_xfer_load_store_collapse(lines)
             lines = self._pass_byte_stores_to_dword(lines)
             lines = self._pass_pop_index_push_collapse(lines)
             lines = self._pass_pop_index_load_collapse(lines)
@@ -12416,6 +12423,137 @@ class PeepholeOptimizer:
             out = out[:i] + [new_line] + out[i + 2:]
             self.stats["xfer_store_collapse"] = (
                 self.stats.get("xfer_store_collapse", 0) + 1
+            )
+            continue
+        return out
+
+    def _pass_xfer_load_store_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse the codegen's xfer-then-load-then-store pattern.
+
+        Pattern (3 consecutive instr lines):
+            A: mov XFER, BASE       ; xfer the address
+            B: mov BASE, SRC        ; load value into BASE
+            C: mov [XFER], BASE     ; store BASE through XFER
+
+        Rewrite (2 lines):
+            A': mov XFER, SRC       ; load value into XFER
+            C': mov [BASE], XFER    ; store XFER through BASE
+
+        Saves 1 instruction (~2 bytes).
+
+        Common shape: codegen pattern after computing an address
+        in BASE — `mov ECX, EAX; mov EAX, [ebp + N]; mov [ECX], EAX`.
+        The xfer to ECX is to free EAX for the value load. We can
+        instead load the value directly into ECX and use EAX as
+        the address.
+
+        Conditions:
+        - A: `mov XFER, BASE` (register-to-register copy).
+        - B: `mov BASE, SRC` where SRC doesn't reference XFER (else
+          rewrite's `mov XFER, SRC` would self-reference).
+        - C: `mov [XFER], BASE` (plain store with XFER as address).
+        - XFER and BASE both dead after C (the rewrite swaps which
+          register holds the value vs the address; downstream reads
+          of either would observe different values).
+        - C's address operand uses XFER directly (not a SIB form
+          with XFER as base/index — too many cases to handle here).
+        """
+        out = list(lines)
+        i = 0
+        while i + 2 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            c = out[i + 2]
+            if not (
+                a.kind == "instr" and a.op == "mov"
+                and b.kind == "instr" and b.op == "mov"
+                and c.kind == "instr" and c.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            cp = _operands_split(c.operands)
+            if ap is None or bp is None or cp is None:
+                i += 1
+                continue
+            xfer = ap[0].strip().lower()
+            base = ap[1].strip().lower()
+            if (
+                not self._is_general_register(xfer)
+                or not self._is_general_register(base)
+                or xfer == base
+            ):
+                i += 1
+                continue
+            # B: `mov BASE, SRC`.
+            b_dst = bp[0].strip().lower()
+            b_src = bp[1].strip()
+            if b_dst != base:
+                i += 1
+                continue
+            # SRC must not reference XFER.
+            if self._references_reg_family(b_src, xfer):
+                i += 1
+                continue
+            # C: `mov [XFER], BASE`.
+            c_dst = cp[0].strip()
+            c_src = cp[1].strip().lower()
+            if c_src != base:
+                i += 1
+                continue
+            # Strip optional size prefix to inspect dst.
+            c_size_prefix = ""
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if c_dst.lower().startswith(prefix):
+                    c_size_prefix = c_dst[:len(prefix)]
+                    c_dst = c_dst[len(prefix):].lstrip()
+                    break
+            # C's address must be exactly `[XFER]` (no SIB or disp).
+            mem_re = re.match(
+                r"^\[\s*([a-zA-Z]+)\s*\]$",
+                c_dst,
+            )
+            if mem_re is None:
+                i += 1
+                continue
+            mem_reg = mem_re.group(1).lower()
+            if mem_reg != xfer:
+                i += 1
+                continue
+            # XFER dead after C — the rewrite leaves XFER = SRC value
+            # instead of the original (= address).
+            if not self._reg_dead_after(out, i + 3, xfer):
+                i += 1
+                continue
+            # BASE dead after C — the rewrite leaves BASE = address
+            # (its pre-A value) instead of the original (= SRC).
+            if not self._reg_dead_after(
+                out, i + 3, base, treat_as_scratch=True
+            ):
+                i += 1
+                continue
+            # Rewrite. A': `mov XFER, SRC`; C': `mov [BASE], XFER`.
+            a_indent = self._extract_indent(a.raw)
+            c_indent = self._extract_indent(c.raw)
+            new_a_raw = f"{a_indent}mov     {xfer}, {b_src}"
+            new_c_dst = f"{c_size_prefix}[{base}]"
+            new_c_raw = f"{c_indent}mov     {new_c_dst}, {xfer}"
+            new_a = Line(
+                raw=new_a_raw, kind="instr", op="mov",
+                operands=f"{xfer}, {b_src}",
+            )
+            new_c = Line(
+                raw=new_c_raw, kind="instr", op="mov",
+                operands=f"{new_c_dst}, {xfer}",
+            )
+            out = out[:i] + [new_a, new_c] + out[i + 3:]
+            self.stats["xfer_load_store_collapse"] = (
+                self.stats.get(
+                    "xfer_load_store_collapse", 0
+                ) + 1
             )
             continue
         return out

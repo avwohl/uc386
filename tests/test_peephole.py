@@ -10235,6 +10235,133 @@ def test_mov_label_shl_add_load_to_sib_loop_body():
     assert opt.stats.get("mov_label_shl_add_load_to_sib") == 1
 
 
+def test_xfer_load_store_collapse_basic():
+    """`mov ecx, eax; mov eax, [m]; mov [ecx], eax` collapses to
+    `mov ecx, [m]; mov [eax], ecx`. Drops the xfer; saves 1 instr.
+
+    Common shape: codegen pattern after computing an address in
+    EAX — xfer to ECX, load value into EAX, store via ECX. After
+    rewrite: load value into ECX directly, store via EAX.
+
+    Use an address-arithmetic preamble (add) so value_forward_to_reg
+    can't pre-collapse the `mov ecx, eax` — the existing helpers
+    only look at simple mov-then-mov patterns."""
+    asm = (
+        "_f:\n"
+        "        add     eax, _g_arr\n"  # address arithmetic
+        "        mov     ecx, eax\n"  # xfer
+        "        mov     eax, [ebp + 12]\n"  # load value
+        "        mov     [ecx], eax\n"  # store via xfer
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The xfer line is gone.
+    assert "mov     ecx, eax" not in out
+    # The new sequence has the SRC loaded into ECX directly.
+    assert "mov     ecx, [ebp + 12]" in out
+    # The store goes through the original BASE register.
+    assert "mov     [eax], ecx" in out
+    assert opt.stats.get("xfer_load_store_collapse") == 1
+
+
+def test_xfer_load_store_collapse_skips_when_xfer_alive():
+    """If XFER is read after the store, the rewrite would observe
+    a different XFER value (= SRC instead of address). Don't fire."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, [ebp + 12]\n"
+        "        mov     [ecx], eax\n"
+        "        mov     [ebp - 4], ecx\n"  # ECX read after
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("xfer_load_store_collapse", 0) == 0
+
+
+def test_xfer_load_store_collapse_skips_when_base_alive():
+    """If BASE is read after the store, the rewrite would observe
+    a different BASE value (= address instead of SRC). Don't fire."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, [ebp + 12]\n"
+        "        mov     [ecx], eax\n"
+        "        mov     [ebp - 4], eax\n"  # EAX read after
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("xfer_load_store_collapse", 0) == 0
+
+
+def test_xfer_load_store_collapse_skips_when_src_refs_xfer():
+    """If SRC references XFER, the rewrite's `mov XFER, SRC` would
+    self-reference (changing semantics). Don't fire."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, [ecx + 12]\n"  # SRC refs XFER (ECX)
+        "        mov     [ecx], eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("xfer_load_store_collapse", 0) == 0
+
+
+def test_xfer_load_store_collapse_skips_when_store_addr_has_disp():
+    """The store address must be plain `[XFER]` (no disp/SIB). The
+    cascade with disp_store_collapse handles the post-rewrite case
+    if the original had `add eax, K` before the xfer."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, [ebp + 12]\n"
+        "        mov     [ecx + 4], eax\n"  # disp on store
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    # Currently the pass requires plain `[XFER]`; the disp case is
+    # left alone. (Could be extended in the future.)
+    assert opt.stats.get("xfer_load_store_collapse", 0) == 0
+
+
+def test_xfer_load_store_collapse_struct_store_pattern():
+    """End-to-end struct-store pattern. Should collapse via
+    cascade with chain_label_to_add_operand and xfer_load_store."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, _g_arr\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        imul    eax, eax, 12\n"
+        "        add     eax, edx\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, [ebp + 16]\n"
+        "        mov     [ecx], eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # After cascade: `mov eax, [ebp+8]; imul eax, eax, 12;
+    # add eax, _g_arr; mov ecx, [ebp+16]; mov [eax], ecx`.
+    assert "mov     edx, _g_arr" not in out
+    assert "mov     ecx, eax" not in out  # xfer dropped
+    assert "mov     ecx, [ebp + 16]" in out  # SRC into ECX
+    assert "mov     [eax], ecx" in out  # store via EAX
+    assert opt.stats.get("xfer_load_store_collapse") == 1
+    assert opt.stats.get("chain_label_to_add_operand") == 1
+
+
 def test_chain_label_to_add_operand_basic():
     """`mov edx, _g; mov eax, [ebp + 8]; imul eax, eax, 12;
     add eax, edx` → drops the mov, rewrites add to use the LABEL
