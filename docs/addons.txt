@@ -1,5 +1,5 @@
-port gnu utilites to this compiler
-a full binary install should install the gnu utils
+Port gnu utilites to this compiler
+Set a dos installer in the github release area of this project
 some  gnu utils dont make sence like chroot, groups 
 also include gawk
 make scripts to download , build , test
@@ -8,3 +8,10 @@ duke nukem, etc. we dan't ship the built executables due to licensing
 but we can ship build scripts.
 note we think we did all sorts of watcom compatibility to be able
 to build the games.  build them to see if that worked
+Make two installers, one for free open source with clear provenances like gnu utils.
+Other installer for things like doom? duke nukem? which may have bizzare or
+abandonware licenses.
+
+Build all of the above with this compiler and competitive compilers
+ (gcc, watcom, djcpp?) and show the sizes with each build for comparison
+ 
