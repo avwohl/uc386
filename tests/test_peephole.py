@@ -12481,6 +12481,43 @@ def test_same_imm_store_share_reg_negative_imm():
     assert opt.stats.get("same_imm_store_share_reg", 0) >= 2
 
 
+def test_cmp_load_promote_with_lea_d():
+    """Extended: D may be `lea reg1, [...]` (in addition to `mov
+    reg1, RHS`). The lea writes reg1 cleanly (doesn't read reg1),
+    so it qualifies the same as mov for the promote rewrite.
+
+    Common in struct-array index loops where the body opens with
+    `lea reg1, [ebp - struct_base]` rather than a slot load.
+
+    Need .L_end to have an EAX overwrite before leave/ret so the
+    EAX-dead-at-target check passes."""
+    asm = (
+        ".L_top:\n"
+        "        mov     eax, [ebp - 8]\n"     # A
+        "        cmp     eax, [ebp + 8]\n"     # B
+        "        jge     .L_end\n"             # C
+        "        lea     eax, [ebp - 120]\n"   # D (lea, not mov)
+        "        mov     ecx, [ebp - 8]\n"     # E
+        "        imul    ecx, ecx, 12\n"
+        "        add     eax, ecx\n"
+        "        mov     [eax], ecx\n"
+        "        jmp     .L_top\n"
+        ".L_end:\n"
+        "        mov     eax, 0\n"             # EAX overwrite (so EAX dead at jump target)
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # A/B should now use ECX (promoted), and E should be dropped.
+    assert "cmp     ecx, [ebp + 8]" in out
+    assert "mov     eax, [ebp - 8]" not in out  # original A gone
+    # E was `mov ecx, [ebp - 8]` and gets dropped — but the
+    # promoted A is `mov ecx, [ebp - 8]`. So one occurrence remains.
+    assert out.count("mov     ecx, [ebp - 8]") == 1
+    assert opt.stats.get("cmp_load_promote", 0) == 1
+
+
 def test_same_imm_store_share_reg_skips_size_mismatch():
     """Mixed sizes don't merge into one chain."""
     asm = (

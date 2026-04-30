@@ -1691,3 +1691,18 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete impact**: 4 c-testsuite files (00053, 00166, 00214, 00220) have 14 total fires (~20 bytes saved across c-testsuite). Real-world array/struct init patterns benefit more.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +9 peephole tests. 1121 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: cmp_load_promote with lea D**: extends the existing `cmp_load_promote` pass to accept `lea reg1, [...]` as the D instruction (in addition to `mov reg1, RHS`). The `lea` form is also a fresh write to REG1 that doesn't read REG1 — it reads the bracketed memory operands (ebp/etc.) but the destination register isn't an input. So it qualifies the same as `mov` for the promote rewrite.
+  - **Common shape**: struct-array index loops where the body opens with `lea reg1, [ebp - struct_base]` (materialize the local struct array's base) rather than a slot load. Pattern shape (5 instrs after a label):
+    ```
+    .L_top:
+    A: mov REG1, [m]      ; loop counter
+    B: cmp REG1, X         ; loop bound check
+    C: jcc L_end           ; exit
+    D: lea REG1, [...]     ; materialize struct base — NEW
+    E: mov REG2, [m]       ; reload counter for SIB index
+    ```
+    After: A loads into REG2 (promoted), B uses REG2; D unchanged; E dropped.
+  - **Saves 3 bytes per iteration** in qualifying loops.
+  - **Real-world fire rate**: 2 fires on `_sum_zero_init` write loop (saves ~6 bytes per loop). The lea form arises when the codegen materializes a local struct-array's base — common when the array is on the stack rather than passed as a pointer.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +1 peephole test. 1122 unit tests total. Pipeline 1734/1734 (100%).

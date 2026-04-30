@@ -14134,8 +14134,11 @@ class PeepholeOptimizer:
                 i += 1
                 continue
             jcc_target = c.operands.strip()
-            # Parse D: mov REG1, RHS, RHS doesn't reference REG1.
-            if d.op != "mov":
+            # Parse D: mov/lea REG1, RHS, RHS doesn't reference REG1.
+            # `lea reg, [m]` is also a fresh write to REG1 (the
+            # bracket form reads memory operands like ebp/etc., not
+            # REG1's value), so it qualifies the same as `mov`.
+            if d.op not in ("mov", "lea"):
                 out.append(line)
                 i += 1
                 continue
