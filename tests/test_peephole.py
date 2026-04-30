@@ -13089,3 +13089,90 @@ def test_self_extension_movsx_after_movsx_word():
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
     assert "movsx   eax, ax" not in out
+
+
+def test_uncollapse_cmp_when_reload_movsx_byte():
+    """`cmp byte [m], 0; jz; movsx eax, byte [m]` is rewritten to
+    `movsx eax, byte [m]; test eax, eax; jz`. Saves 2 bytes
+    (cmp byte 4 → test 2; movsx position unchanged).
+    """
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        cmp     byte [eax], 0\n"
+        "        jz      .L_zero\n"
+        "        movsx   eax, byte [eax]\n"
+        "        ret\n"
+        ".L_zero:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The byte cmp is gone; replaced with movsx + test
+    assert "cmp     byte [eax], 0" not in out
+    assert "movsx   eax, byte [eax]" in out
+    assert "test    eax, eax" in out
+
+
+def test_uncollapse_cmp_when_reload_movzx_byte():
+    """movzx version: only safe with ZF-only Jcc (since movzx's
+    SF differs from byte cmp's SF for negative bytes).
+    """
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        cmp     byte [eax], 0\n"
+        "        jz      .L_zero\n"        # ZF-only Jcc
+        "        movzx   eax, byte [eax]\n"
+        "        ret\n"
+        ".L_zero:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The byte cmp is gone; replaced with movzx + test
+    assert "cmp     byte [eax], 0" not in out
+    assert "movzx   eax, byte [eax]" in out
+    assert "test    eax, eax" in out
+
+
+def test_uncollapse_cmp_when_reload_movzx_with_signed_jcc_skipped():
+    """movzx with non-ZF Jcc (e.g., jl/jg) — SF differs, must NOT
+    rewrite."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        cmp     byte [eax], 0\n"
+        "        jl      .L_neg\n"         # SF-reading Jcc
+        "        movzx   eax, byte [eax]\n"
+        "        ret\n"
+        ".L_neg:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The original cmp byte is preserved
+    assert "cmp     byte [eax], 0" in out
+
+
+def test_uncollapse_cmp_when_reload_byte_nonzero_skipped():
+    """Non-zero immediate operand for byte cmp — different signed
+    interpretation than 32-bit cmp, must NOT rewrite."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        cmp     byte [eax], 5\n"   # non-zero
+        "        je      .L_match\n"
+        "        movsx   eax, byte [eax]\n"
+        "        ret\n"
+        ".L_match:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Original cmp preserved
+    assert "cmp     byte [eax], 5" in out

@@ -13568,7 +13568,8 @@ class PeepholeOptimizer:
                 a.kind == "instr" and a.op in ("cmp", "test")
                 and b.kind == "instr"
                 and b.op.startswith("j") and b.op != "jmp"
-                and c.kind == "instr" and c.op == "mov"
+                and c.kind == "instr"
+                and c.op in ("mov", "movsx", "movzx")
             ):
                 i += 1
                 continue
@@ -13581,7 +13582,7 @@ class PeepholeOptimizer:
             a_opnd = ap[1].strip()
             # Strip optional size prefix on A's mem operand for
             # comparison with C's mem operand. Track whether the
-            # cmp was explicitly dword-sized.
+            # cmp was explicitly dword/byte/word-sized.
             a_size = None
             for prefix in ("dword ", "word ", "byte ", "qword "):
                 if a_mem.lower().startswith(prefix):
@@ -13591,46 +13592,65 @@ class PeepholeOptimizer:
             if not (a_mem.startswith("[") and a_mem.endswith("]")):
                 i += 1
                 continue
-            # C: mov reg, [m]
+            # C: mov/movsx/movzx reg, [m] (with optional size prefix)
             c_dst = cp[0].strip().lower()
             c_src = cp[1].strip()
             if not self._is_general_register(c_dst):
                 i += 1
                 continue
-            # Strip size prefix on C's source (rare for `mov reg32, [..]`
-            # but be defensive).
+            # Strip size prefix on C's source.
+            c_size = None
             for prefix in ("dword ", "word ", "byte ", "qword "):
                 if c_src.lower().startswith(prefix):
+                    c_size = prefix.strip()
                     c_src = c_src[len(prefix):].lstrip()
                     break
             if c_src != a_mem:
                 i += 1
                 continue
-            # Verify cmp/test was on dword (32-bit). If A had explicit
-            # `dword` we know it's safe. Otherwise a_opnd must be a
-            # 32-bit GP register (cmp [m], r32 → 32-bit) or numeric
-            # immediate (NASM rejects ambiguous size, so an emitted
-            # cmp without prefix and with imm operand is invalid; in
-            # our codegen we always emit `dword` for cmp on memory).
-            if a_size is not None and a_size != "dword":
-                # byte / word / qword cmp — sub-word/wide load
-                # mismatches a 32-bit reg load. Skip.
-                i += 1
-                continue
-            # If a_size is None, the cmp's second operand needs to
-            # be a 32-bit register (so NASM infers 32-bit). Numeric
-            # imm without explicit size would have been a NASM
-            # error. Skip if uncertain.
-            if a_size is None:
-                # Be conservative: the second operand must be a 32-bit
-                # GP register.
-                if not self._is_general_register(a_opnd.lower()):
+            # Size matching: cmp's size must match C's load size.
+            # For mov: A must be dword (or no prefix + reg operand).
+            # For movsx/movzx: A's size must match C's source size.
+            if c.op == "mov":
+                if a_size is not None and a_size != "dword":
                     i += 1
                     continue
+                if a_size is None:
+                    # Be conservative: the second operand must be a
+                    # 32-bit GP register.
+                    if not self._is_general_register(a_opnd.lower()):
+                        i += 1
+                        continue
+            else:
+                # movsx/movzx — both A and C must have explicit
+                # matching size.
+                if c_size is None or a_size != c_size:
+                    i += 1
+                    continue
+                # Restrict to byte/word loads.
+                if c_size not in ("byte", "word"):
+                    i += 1
+                    continue
+                # For sub-word movsx/movzx, only the cmp-with-0
+                # rewrite is safe across all jcc — non-zero immediate
+                # operands have potentially-different signed/unsigned
+                # interpretation between byte cmp and 32-bit cmp.
+                # Restrict to OPND == 0.
+                if a_opnd.strip() != "0":
+                    i += 1
+                    continue
+                # For movzx (zero-extension), SF differs from byte
+                # cmp's SF. Restrict to ZF-only Jcc.
+                if c.op == "movzx":
+                    if b.op not in self._ZF_ONLY_FLAG_READERS:
+                        i += 1
+                        continue
             # The mem operand must not reference c_dst (or its sub-
-            # aliases): if [m] references reg's family, then loading
-            # to reg first would change [m]'s computed address.
-            if self._references_reg_family(a_mem, c_dst):
+            # aliases) — for the dword `mov` case. For movsx/movzx
+            # of byte/word, the load reads [m] BEFORE writing reg,
+            # and `_reg_dead_after` covers the post-jcc state, so
+            # the rewrite is safe even when [m] references reg.
+            if c.op == "mov" and self._references_reg_family(a_mem, c_dst):
                 i += 1
                 continue
             # The cmp/test second operand must not reference c_dst's
@@ -13638,24 +13658,51 @@ class PeepholeOptimizer:
             if self._references_reg_family(a_opnd, c_dst):
                 i += 1
                 continue
-            # Reg must be dead at jcc's entry (covers both target and
-            # fallthrough paths via _reg_dead_after's CFG-aware scan).
-            # Note: in original, after C runs, reg = M[m] for
-            # downstream. After my rewrite, reg = M[m] BEFORE B too.
-            # Fallthrough is fine. Taken-jcc path: reg now has M[m]
-            # instead of pre-A value — must be dead at target.
-            if not self._reg_dead_after(out, i + 1, c_dst):
-                i += 1
-                continue
+            # Reg must be dead at jcc target only (not fallthrough).
+            # Reasoning: in the rewrite, the fallthrough state of reg
+            # is the same as the original (C runs on the fallthrough
+            # in both versions, just hoisted earlier in mine). Only
+            # the JCC-TAKEN path differs — original keeps reg's pre-A
+            # value, my rewrite has reg = M[m]. So reg must be dead
+            # at the jcc target.
+            #
+            # For mov: stay with the existing fallthrough+target check
+            # (`_reg_dead_after`) since the dword-mov branch doesn't
+            # need the looser semantics, and the existing tests assume
+            # this stricter check.
+            #
+            # For movsx/movzx: only target-path-dead is required.
+            if c.op == "mov":
+                if not self._reg_dead_after(out, i + 1, c_dst):
+                    i += 1
+                    continue
+            else:
+                # movsx/movzx: check just the jcc target path.
+                target = b.operands.strip()
+                target_idx = self._find_label_idx(out, target, i + 1)
+                if target_idx is None:
+                    i += 1
+                    continue
+                if not self._reg_dead_after(
+                    out, target_idx + 1, c_dst,
+                ):
+                    i += 1
+                    continue
             # All checks passed. Build the rewrite.
             indent_a = self._extract_indent(a.raw)
-            indent_b = self._extract_indent(b.raw)
             indent_c = self._extract_indent(c.raw)
-            # New first line: the load.
-            new_load_raw = f"{indent_c}mov     {c_dst}, {a_mem}"
+            # New first line: the load (mov / movsx / movzx).
+            if c.op == "mov":
+                new_load_raw = f"{indent_c}mov     {c_dst}, {a_mem}"
+                new_load_ops = f"{c_dst}, {a_mem}"
+            else:
+                new_load_raw = (
+                    f"{indent_c}{c.op}   {c_dst}, {c_size} {a_mem}"
+                )
+                new_load_ops = f"{c_dst}, {c_size} {a_mem}"
             new_load = Line(
-                raw=new_load_raw, kind="instr", op="mov",
-                operands=f"{c_dst}, {a_mem}",
+                raw=new_load_raw, kind="instr", op=c.op,
+                operands=new_load_ops,
             )
             # New second line: cmp/test against the operand.
             # Special case: cmp/test with 0 → use test reg, reg

@@ -1761,3 +1761,15 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **High fire rate**: 82/100 torture tests (82%) had self-extension drops, totaling 272 drops in 100 tests. Each saves 3 bytes — ~816 bytes across 100 torture tests. Combined with slice 17, the total movsx/movzx-related savings is substantial.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests. 1145 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: uncollapse_cmp_when_reload extends to byte/word movsx/movzx**: extends the existing pass to also handle byte/word `cmp <size> [m], 0` followed by `movsx/movzx <reg>, <size> [m]` reload. Previously only the dword `mov` case was handled.
+  - **Common shape**: strcmp/strcpy idioms where the codegen first tests `*p == 0`, branches, then loads `*p` for further use. The `cmp byte [m], 0; jcc; movsx reg, byte [m]` pattern is rewritten to `movsx reg, byte [m]; test reg, reg; jcc`. Saves 2 bytes per match (cmp byte 4 → test 2; movsx hoisted; jcc unchanged).
+  - **Restrictions**:
+    - Source size matches: byte/byte or word/word.
+    - Immediate operand is 0 (non-zero values have potentially-different signed/unsigned interpretation between byte cmp and 32-bit cmp).
+    - For `movzx` (zero-extension): only ZF-only Jcc allowed (`je`/`jne`/`jz`/`jnz`/etc.). The zero-extended high bits set SF=0 always, differing from byte cmp's SF=bit 7 of byte. Sign-comparing Jcc would observe different flags — unsafe.
+    - For `movsx` (sign-extension): any Jcc is safe (sign-extension preserves the byte's bit 7 at bit 31 of EAX, so SF matches).
+  - **Liveness check tweaked for movsx/movzx**: only the jcc TARGET path needs reg dead (not fallthrough). The fallthrough is fine because the original pattern's load (C) ran on the fallthrough — same final reg state in both versions. The jcc-taken path differs (original keeps pre-A reg value, rewrite has loaded value), so dead-at-target is required.
+  - **Memory operand allowed to reference reg** for movsx/movzx (e.g., `movsx eax, byte [eax]` where eax is the pointer). The single instruction reads memory before writing reg, so the rewrite is safe; the fallthrough liveness is maintained.
+  - **Modest fire rate**: 10/200 torture tests (5%) with 13 total fires. Shows up in strcmp-style code where `cmp byte [m], 0` is followed by sign-extending the same byte.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests. 1149 unit tests total. Pipeline 1734/1734 (100%).
