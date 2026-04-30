@@ -15082,16 +15082,16 @@ def test_imm_store_then_imm_load_collapse_skips_label_src():
 
 def test_imm_store_then_imm_load_collapse_pr70602_pattern():
     """Real pattern from pr70602: bit-field-init slot store followed
-    by IMM load into EAX for the next operation. Slot has a
-    downstream read so dead_unused_slot_stores doesn't drop the
-    rewritten store."""
+    by IMM load into EAX for the next operation. Use a non-foldable
+    chain (call/push) and downstream slot read to prevent dead-store
+    elimination from preempting the test."""
     asm = (
         "_f:\n"
         "        mov     dword [ebp - 84], 18\n"
         "        mov     eax, 18\n"
         "        push    eax\n"
-        "        pop     edx\n"
-        "        cmp     dword [_b], 0\n"
+        "        call    _consume_eax\n"   # uses eax, prevents dead_mov
+        "        add     esp, 4\n"
         "        mov     ecx, [ebp - 84]\n"   # keeps slot alive
         "        push    ecx\n"
         "        call    _h\n"
@@ -15106,3 +15106,106 @@ def test_imm_store_then_imm_load_collapse_pr70602_pattern():
     assert opt.stats.get(
         "imm_store_then_imm_load_collapse", 0
     ) == 1
+
+
+# ── dead_push_pop_pair ───────────────────────────────────────────
+
+
+def test_dead_push_pop_pair_basic():
+    """`push eax; pop edx` with edx dead — drop both. Saves 2 bytes."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        pop     edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    eax" not in out
+    assert "pop     edx" not in out
+    assert opt.stats.get("dead_push_pop_pair", 0) == 1
+
+
+def test_dead_push_pop_pair_skips_when_reg2_alive():
+    """If reg2 is alive after, can't drop — value matters."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        pop     edx\n"
+        "        push    edx\n"
+        "        call    _g\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # edx is read by `push edx`, so the original pair is alive.
+    assert opt.stats.get("dead_push_pop_pair", 0) == 0
+
+
+def test_dead_push_pop_pair_same_reg_drops_unconditionally():
+    """`push eax; pop eax` is a no-op. Drop both regardless of
+    liveness. (Even if eax is alive after, push/pop preserves it.)"""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        pop     eax\n"
+        "        push    eax\n"   # eax is alive
+        "        call    _g\n"
+        "        add     esp, 4\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Same-register push/pop is a no-op — drop unconditionally.
+    # (Note: there's still ONE `push eax` left for the `call _g` arg.)
+    assert opt.stats.get("dead_push_pop_pair", 0) == 1
+
+
+def test_dead_push_pop_pair_skips_non_register_push():
+    """`push <imm>; pop reg` is handled by push_pop_to_mov, not us."""
+    asm = (
+        "_f:\n"
+        "        push    5\n"
+        "        pop     edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("dead_push_pop_pair", 0) == 0
+
+
+def test_dead_push_pop_pair_skips_non_adjacent():
+    """If push and pop aren't adjacent, my pass doesn't apply."""
+    asm = (
+        "_f:\n"
+        "        push    eax\n"
+        "        nop\n"
+        "        pop     edx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("dead_push_pop_pair", 0) == 0
+
+
+def test_dead_push_pop_pair_pr70602_pattern():
+    """Real pattern from pr70602: `push eax; pop edx` where edx is
+    never read in the surrounding body."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 18\n"
+        "        mov     [ebp - 84], eax\n"
+        "        push    eax\n"
+        "        pop     edx\n"
+        "        cmp     dword [_b], 0\n"
+        "        jnz     .L_or_true\n"
+        "        and     eax, 1\n"
+        ".L_or_true:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("dead_push_pop_pair", 0) == 1
+    assert "push    eax" not in out
+    assert "pop     edx" not in out

@@ -515,6 +515,7 @@ class PeepholeOptimizer:
             lines = self._pass_pop_op_chain_retarget(lines)
             lines = self._pass_pop_cmp_chain_retarget(lines)
             lines = self._pass_push_pop_to_mov(lines)
+            lines = self._pass_dead_push_pop_pair(lines)
             lines = self._pass_sib_const_index_fold(lines)
             lines = self._pass_push_const_index_fold(lines)
             lines = self._pass_trampoline_elimination(lines)
@@ -12125,6 +12126,71 @@ class PeepholeOptimizer:
             )
             # Don't advance i (might match again from the same i).
             continue
+        return out
+
+    def _pass_dead_push_pop_pair(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Drop adjacent ``push reg1; pop reg2`` pairs when the popped
+        register is dead after.
+
+        Pattern:
+            push reg1     (any GP32 register)
+            pop  reg2     (any GP32 register)
+
+        Cases:
+        - reg1 == reg2: no-op (push then pop same register restores
+          its value); drop both unconditionally.
+        - reg1 != reg2 AND reg2 dead after: drop both. The pair sets
+          reg2 = reg1 transiently; if reg2 isn't read before its
+          next overwrite, the entire pair is dead.
+
+        Saves 2 bytes per match (push reg = 1 byte, pop reg = 1 byte).
+
+        Note: ``push_pop_to_mov`` (which handles non-register pushes)
+        explicitly skips register pushes and the codegen's
+        ``push reg; pop reg2`` save-restore pattern. My pass picks up
+        the residual case where the popped register's transient value
+        isn't actually used.
+
+        Common after slice 37 (imm_store_then_imm_load_collapse) — the
+        codegen sometimes emits ``push eax; pop edx`` to save a value
+        into EDX when EDX is conventionally scratch but the surrounding
+        code never actually reads EDX.
+        """
+        out: list[Line] = []
+        i = 0
+        while i < len(lines):
+            a = lines[i]
+            if (a.kind == "instr" and a.op == "push"
+                    and i + 1 < len(lines)):
+                a_op = a.operands.strip().lower()
+                if a_op in PeepholeOptimizer._GP32:
+                    b = lines[i + 1]
+                    if b.kind == "instr" and b.op == "pop":
+                        b_op = b.operands.strip().lower()
+                        if b_op in PeepholeOptimizer._GP32:
+                            # Case 1: same register — true no-op.
+                            same = (a_op == b_op)
+                            # Case 2: reg2 dead after.
+                            dead = False
+                            if not same:
+                                dead = self._reg_dead_after(
+                                    lines, i + 2, b_op,
+                                    treat_as_scratch=True,
+                                )
+                            if same or dead:
+                                self.stats[
+                                    "dead_push_pop_pair"
+                                ] = (
+                                    self.stats.get(
+                                        "dead_push_pop_pair", 0
+                                    ) + 1
+                                )
+                                i += 2
+                                continue
+            out.append(a)
+            i += 1
         return out
 
     def _pass_sib_const_index_fold(

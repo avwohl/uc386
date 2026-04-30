@@ -1973,3 +1973,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **One existing test updated**: `test_zero_init_collapse_skips_nonzero_hex` was using `mov dword [m], 0x00000001; mov eax, 1` as input — slice 37 now legitimately reorders this. Updated test to use `push edx` (non-immediate-load) as the second instruction so slice 37 doesn't preempt the test of `zero_init_collapse`.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +9 peephole tests (1248 total). Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: dead_push_pop_pair**: drop adjacent `push reg1; pop reg2` pairs when the popped register is dead after, or when reg1 == reg2 (no-op). Saves 2 bytes per match.
+  - **Common shape**: residual codegen patterns where the codegen emits `push reg1; pop reg2` to save a value into reg2 but reg2 is never actually read in the surrounding body. e.g., pr70602 emits `push eax; pop edx` after the bit-field init but EDX is dead.
+  - **Conditions**: A is `push reg1` (GP32); B is `pop reg2` (GP32); A and B adjacent; either reg1 == reg2 (no-op) or reg2 dead after B (`treat_as_scratch=True`).
+  - **Differs from `push_pop_to_mov`**: that pass explicitly skips register pushes (it handles imm/label/memory pushes with possibly-non-adjacent pop). My pass picks up the residual register-push case.
+  - **Real-world impact**: 1 fire on pr70602 (rare overall — most codegen-emitted register push/pop save-restore patterns DO have a downstream use). 0 fires on a 100-test torture sample. Modest direct impact but cleans up a specific idiom.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (1254 total). Pipeline 1734/1734 (100%).
