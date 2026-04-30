@@ -3756,6 +3756,13 @@ class PeepholeOptimizer:
         # on every register-base write — losing all redundant-reload
         # opportunities through pointer-based stores.
         addr_taken_per_line = self._compute_addr_taken_per_line(lines)
+        # Per-function label-address-taken set: enables tracking of
+        # `[_label]` loads — a register-base write can only alias a
+        # global if its address has been exposed somewhere in the
+        # function (via `mov reg, _label`, `lea reg, [_label]`, etc.).
+        label_addr_taken_per_line = (
+            self._compute_label_addr_taken_per_line(lines)
+        )
 
         out: list[Line] = []
         reg_mem: str | None = None  # The literal text of REG's known mem source
@@ -3871,16 +3878,20 @@ class PeepholeOptimizer:
                             continue
                         # Source is a memory operand (or other reg).
                         full_key = f"{op} {src_norm}"
+                        trackable = (
+                            self._is_ebp_offset_mem(src_norm)
+                            or self._is_label_mem(src_norm)
+                        )
                         if (
                             reg_mem is not None
-                            and self._is_ebp_offset_mem(src_norm)
+                            and trackable
                             and reg_mem == full_key
                         ):
                             self.stats[stat_key] = (
                                 self.stats.get(stat_key, 0) + 1
                             )
                             continue
-                        if self._is_ebp_offset_mem(src_norm):
+                        if trackable:
                             reg_mem = full_key
                         else:
                             reg_mem = None
@@ -3923,16 +3934,20 @@ class PeepholeOptimizer:
                     src_norm = src.strip()
                     if dest_low == reg32:
                         # mov REG, X
+                        trackable = (
+                            self._is_ebp_offset_mem(src_norm)
+                            or self._is_label_mem(src_norm)
+                        )
                         if (
                             reg_mem is not None
-                            and self._is_ebp_offset_mem(src_norm)
+                            and trackable
                             and src_norm == reg_mem
                         ):
                             self.stats[stat_key] = (
                                 self.stats.get(stat_key, 0) + 1
                             )
                             continue
-                        if self._is_ebp_offset_mem(src_norm):
+                        if trackable:
                             reg_mem = src_norm
                         else:
                             reg_mem = None
@@ -3945,14 +3960,19 @@ class PeepholeOptimizer:
                     if "[" in dest:
                         # Aliasing check: if the store might alias
                         # the currently-tracked memory, invalidate.
-                        # Use the per-function address-taken set so
+                        # Use the per-function address-taken sets so
                         # register-base writes are recognized as
-                        # disjoint from `[ebp + N]` reads when N is
-                        # not an address-taken slot.
+                        # disjoint from `[ebp + N]` and `[_label]`
+                        # reads when the slot/label isn't address-
+                        # taken.
                         addr_taken = addr_taken_per_line[line_idx]
+                        label_taken = (
+                            label_addr_taken_per_line[line_idx]
+                        )
                         if reg_mem is not None and not (
                             self._mem_disjoint_with_taken(
                                 reg_mem, dest.strip(), addr_taken,
+                                label_taken,
                             )
                         ):
                             reg_mem = None
@@ -3962,17 +3982,21 @@ class PeepholeOptimizer:
                             reg_mem = None
                             ext_form = None
                         # If the store is `mov [m], REG` where m is
-                        # an ebp-offset, then after the store REG
-                        # equals what's at m. Track that — a later
-                        # `mov REG, m` is then redundant. Only set
-                        # when reg_mem was None (we don't want to
-                        # overwrite a still-valid prior tracking
-                        # entry; full multi-location tracking would
-                        # be ideal but reg_mem is single-valued).
+                        # a tracked memory form, then after the
+                        # store REG equals what's at m. Track that
+                        # — a later `mov REG, m` is then redundant.
+                        # Only set when reg_mem was None (we don't
+                        # want to overwrite a still-valid prior
+                        # tracking entry; full multi-location
+                        # tracking would be ideal but reg_mem is
+                        # single-valued).
                         if (
                             reg_mem is None
                             and src_norm.lower() == reg32
-                            and self._is_ebp_offset_mem(dest.strip())
+                            and (
+                                self._is_ebp_offset_mem(dest.strip())
+                                or self._is_label_mem(dest.strip())
+                            )
                         ):
                             reg_mem = dest.strip()
                         # Memory store doesn't modify the register
@@ -4036,6 +4060,7 @@ class PeepholeOptimizer:
                         self._mem_disjoint_with_taken(
                             reg_mem, dest.strip(),
                             addr_taken_per_line[line_idx],
+                            label_addr_taken_per_line[line_idx],
                         )
                     ):
                         reg_mem = None
@@ -4060,6 +4085,37 @@ class PeepholeOptimizer:
         ))
 
     @staticmethod
+    def _is_label_mem(text: str) -> bool:
+        """Match exactly `[_label]` (or with optional size prefix
+        `dword`/`word`/`byte`/`qword`). Matches global-label-only
+        forms with no offset and no SIB index — `[_g + 4]` and
+        `[_g + reg*4]` do NOT match (they aren't constant memory
+        references over the lifetime of a basic block under
+        plausible aliasing assumptions)."""
+        stripped = text.strip()
+        for prefix in ("dword ", "word ", "byte ", "qword "):
+            if stripped.lower().startswith(prefix):
+                stripped = stripped[len(prefix):].lstrip()
+                break
+        return bool(re.fullmatch(
+            r"\[\s*_[A-Za-z_][A-Za-z0-9_]*\s*\]", stripped
+        ))
+
+    @staticmethod
+    def _label_in_mem(text: str) -> str | None:
+        """Extract the label name from a `[_label]` operand, or None
+        if not a label-only memory operand."""
+        stripped = text.strip()
+        for prefix in ("dword ", "word ", "byte ", "qword "):
+            if stripped.lower().startswith(prefix):
+                stripped = stripped[len(prefix):].lstrip()
+                break
+        m = re.fullmatch(
+            r"\[\s*(_[A-Za-z_][A-Za-z0-9_]*)\s*\]", stripped
+        )
+        return m.group(1) if m else None
+
+    @staticmethod
     def _mem_disjoint(a: str, b: str) -> bool:
         """Conservative aliasing check: True if `a` and `b` are
         provably-disjoint memory references. Only handles literal
@@ -4077,11 +4133,21 @@ class PeepholeOptimizer:
     @staticmethod
     def _mem_disjoint_with_taken(
         a: str, b: str, addr_taken: set[int] | None,
+        label_addr_taken: set[str] | None = None,
     ) -> bool:
-        """Like ``_mem_disjoint`` but augmented with an address-taken
-        set: when one operand is ``[ebp + N]`` and the other is a
-        register-base deref, the two are provably disjoint iff N is
-        NOT in ``addr_taken`` (and the register isn't ``ebp``).
+        """Like ``_mem_disjoint`` but augmented with address-taken
+        sets:
+
+        - When one operand is ``[ebp + N]`` and the other is a
+          register-base deref, the two are provably disjoint iff N is
+          NOT in ``addr_taken`` (and the register isn't ``ebp``).
+        - When one operand is ``[_label]`` and the other is a
+          register-base deref, disjoint iff ``_label`` is NOT in
+          ``label_addr_taken``.
+        - ``[ebp + N]`` and ``[_label]`` are always disjoint (frame
+          and global storage never alias).
+        - Two ``[_label]`` operands are disjoint iff label names
+          differ.
 
         ``addr_taken`` is the set of ebp-offsets that the current
         function explicitly takes the address of (via
@@ -4090,44 +4156,88 @@ class PeepholeOptimizer:
         because no register in the function ever holds an address
         inside this frame.
 
-        ``addr_taken=None`` means "function-level analysis unavailable;
-        fall back to the static-method form".
+        ``label_addr_taken`` is the set of label names whose address
+        is taken (loaded as immediate or via ``lea``) in the current
+        function. Globals not in this set can never be aliased by a
+        register-base write.
+
+        Either (or both) ``addr_taken`` / ``label_addr_taken`` may be
+        None; ``addr_taken=None`` falls back to the static
+        ``_mem_disjoint``. ``label_addr_taken=None`` means label-vs-
+        register-base aliasing is conservatively unknown.
         """
-        if addr_taken is None:
+        if addr_taken is None and label_addr_taken is None:
             return PeepholeOptimizer._mem_disjoint(a, b)
         a_off = PeepholeOptimizer._ebp_offset(a)
         b_off = PeepholeOptimizer._ebp_offset(b)
         if a_off is not None and b_off is not None:
             return a_off != b_off
-        if a_off is not None:
-            other = b
-            this_off = a_off
-        elif b_off is not None:
-            other = a
-            this_off = b_off
-        else:
-            return False
-        # The other side is not a literal `[ebp ± N]`. Check whether
-        # it's a register-base or other memory form.
-        other_stripped = other.strip()
-        for prefix in ("dword ", "word ", "byte ", "qword "):
-            if other_stripped.lower().startswith(prefix):
-                other_stripped = other_stripped[len(prefix):].lstrip()
-                break
-        # Non-memory form: not aliasing-relevant here.
-        if not (other_stripped.startswith("[")
-                and other_stripped.endswith("]")):
-            return False
-        inner = other_stripped[1:-1].strip().lower()
-        # If `ebp` appears anywhere in the deref, conservatively
-        # treat it as potentially aliasing (e.g. `[ebp + ecx*4]`).
-        if "ebp" in inner:
-            return False
-        # Otherwise the deref base/index registers are non-ebp GP
-        # regs. They can hold a frame address only if the function
-        # took an address of one — so disjoint iff this_off not in
-        # addr_taken.
-        return this_off not in addr_taken
+        a_lbl = PeepholeOptimizer._label_in_mem(a)
+        b_lbl = PeepholeOptimizer._label_in_mem(b)
+        # Both label-only.
+        if a_lbl is not None and b_lbl is not None:
+            return a_lbl != b_lbl
+        # Frame vs label: always disjoint.
+        if a_off is not None and b_lbl is not None:
+            return True
+        if b_off is not None and a_lbl is not None:
+            return True
+        # One is frame, other is something else.
+        if a_off is not None or b_off is not None:
+            if a_off is not None:
+                other = b
+                this_off = a_off
+            else:
+                other = a
+                this_off = b_off
+            other_stripped = other.strip()
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if other_stripped.lower().startswith(prefix):
+                    other_stripped = other_stripped[
+                        len(prefix):
+                    ].lstrip()
+                    break
+            if not (
+                other_stripped.startswith("[")
+                and other_stripped.endswith("]")
+            ):
+                return False
+            inner = other_stripped[1:-1].strip().lower()
+            if "ebp" in inner:
+                return False
+            if addr_taken is None:
+                return False
+            return this_off not in addr_taken
+        # One is label-only, other is something else.
+        if a_lbl is not None or b_lbl is not None:
+            if a_lbl is not None:
+                other = b
+                this_lbl = a_lbl
+            else:
+                other = a
+                this_lbl = b_lbl
+            other_stripped = other.strip()
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if other_stripped.lower().startswith(prefix):
+                    other_stripped = other_stripped[
+                        len(prefix):
+                    ].lstrip()
+                    break
+            if not (
+                other_stripped.startswith("[")
+                and other_stripped.endswith("]")
+            ):
+                return False
+            inner = other_stripped[1:-1].strip().lower()
+            # `ebp` appearing in the other deref means it touches
+            # the frame — frame and global storage are disjoint.
+            if "ebp" in inner:
+                return True
+            if label_addr_taken is None:
+                return False
+            return this_lbl not in label_addr_taken
+        # Neither side is a recognized literal form.
+        return False
 
     @staticmethod
     def _function_ranges(lines: list[Line]) -> list[tuple[int, int]]:
@@ -4275,6 +4385,62 @@ class PeepholeOptimizer:
                 off = PeepholeOptimizer._ebp_offset(src.strip())
                 if off is not None:
                     taken.add(off)
+            for i in range(start, end):
+                out[i] = taken
+        return out
+
+    @staticmethod
+    def _compute_label_addr_taken_per_line(
+        lines: list[Line],
+    ) -> list[set[str] | None]:
+        """For each line index, return the set of label names whose
+        address is taken (could end up in a register) in the function
+        containing that line.
+
+        A label ``_foo`` is address-taken if it appears anywhere in
+        the function as:
+        - An immediate operand (e.g., ``mov reg, _foo``,
+          ``push _foo``, ``add reg, _foo``).
+        - A bracketed operand of ``lea`` (``lea reg, [_foo]``,
+          ``lea reg, [_foo + 4]``, etc.).
+
+        Labels that only appear as memory operands of normal
+        instructions (e.g., ``mov reg, [_foo]``) are NOT address-
+        taken — those access memory but don't expose the address.
+
+        Lines outside any function (prelude before first global
+        label) get ``None`` — no analysis available.
+        """
+        out: list[set[str] | None] = [None] * len(lines)
+        ranges = PeepholeOptimizer._function_ranges(lines)
+        # A label ref starts with `_` followed by ident chars.
+        # NASM-local labels (`.L1_for_top`) start with `.` and
+        # contain underscores embedded — those won't match because
+        # the leading `_` requirement enforces a word-start `_`.
+        label_re = re.compile(r"\b_[A-Za-z_][A-Za-z0-9_]*\b")
+        bracket_re = re.compile(r"\[[^\]]*\]")
+        for start, end in ranges:
+            taken: set[str] = set()
+            for i in range(start, end):
+                line = lines[i]
+                if line.kind != "instr":
+                    continue
+                ops = line.operands or ""
+                if line.op == "lea":
+                    # Every label reference inside `lea`'s operands
+                    # (including those inside brackets) is an
+                    # address-take.
+                    for m in label_re.finditer(ops):
+                        taken.add(m.group(0))
+                else:
+                    # For any other op, label refs INSIDE brackets
+                    # are memory operands — they read/write memory
+                    # at the label's address but don't expose the
+                    # address itself. Refs OUTSIDE brackets are
+                    # immediate-form address-takes.
+                    outside = bracket_re.sub("", ops)
+                    for m in label_re.finditer(outside):
+                        taken.add(m.group(0))
             for i in range(start, end):
                 out[i] = taken
         return out

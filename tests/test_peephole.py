@@ -2471,6 +2471,173 @@ def test_redundant_eax_load_after_store_to_unknown():
     assert opt.stats.get("redundant_eax_load") == 1
 
 
+def test_redundant_eax_load_global_label_basic():
+    """Slice 42: `[_glob]` loads are tracked alongside `[ebp ± N]`.
+    A second load of the same global is redundant if EAX wasn't
+    written and `[_glob]` wasn't stored to between them."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [_g]\n"
+        "        mov     [ebp - 4], eax\n"  # store; doesn't write EAX
+        "        mov     eax, [_g]\n"  # redundant — EAX still has [_g]
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert out.count("mov     eax, [_g]") == 1
+    assert opt.stats.get("redundant_eax_load") == 1
+
+
+def test_redundant_eax_load_global_skips_eax_clobber():
+    """Between two `mov eax, [_g]` loads, if EAX is overwritten the
+    second load is NOT redundant."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [_g]\n"
+        "        add     eax, [ebp + 8]\n"  # writes EAX
+        "        mov     [ebp - 4], eax\n"
+        "        mov     eax, [_g]\n"  # not redundant — EAX clobbered
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert out.count("mov     eax, [_g]") == 2
+    assert opt.stats.get("redundant_eax_load", 0) == 0
+
+
+def test_redundant_eax_load_global_skips_same_label_store():
+    """A store to `[_g]` invalidates a tracked `[_g]` value."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [_g]\n"
+        "        mov     [_g], ecx\n"  # writes [_g]; reg_mem invalid
+        "        mov     eax, [_g]\n"  # not redundant — [_g] changed
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("redundant_eax_load", 0) == 0
+
+
+def test_redundant_eax_load_global_disjoint_other_label_safe():
+    """A store to `[_other]` (different label) is disjoint from a
+    tracked `[_g]` — second `[_g]` load is redundant."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [_g]\n"
+        "        mov     [ebp - 4], eax\n"  # use EAX (so first load isn't dead)
+        "        mov     [_other], ecx\n"  # different label; disjoint
+        "        mov     eax, [_g]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert out.count("mov     eax, [_g]") == 1
+    assert opt.stats.get("redundant_eax_load") == 1
+
+
+def test_redundant_eax_load_global_disjoint_frame_safe():
+    """A frame slot store is disjoint from a tracked `[_g]` load."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [_g]\n"
+        "        mov     [ebp - 4], eax\n"  # use EAX (so first load isn't dead)
+        "        mov     [ebp + 8], ecx\n"  # frame; disjoint from globals
+        "        mov     eax, [_g]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert out.count("mov     eax, [_g]") == 1
+    assert opt.stats.get("redundant_eax_load") == 1
+
+
+def test_redundant_eax_load_global_address_taken_invalidates():
+    """If `_g`'s address is exposed via `mov reg, _g` (or `lea`), a
+    register-base store could alias `[_g]` — the second load must
+    survive."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, _g\n"  # exposes &_g into ECX
+        "        mov     eax, [_g]\n"
+        "        mov     [ecx], 99\n"  # might alias [_g]
+        "        mov     eax, [_g]\n"  # not redundant
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("redundant_eax_load", 0) == 0
+
+
+def test_redundant_eax_load_global_addr_not_taken_safe():
+    """If `_g`'s address is never taken in the function, a
+    register-base store cannot alias `[_g]` — the second load IS
+    redundant."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [_g]\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     ecx, [ebp + 8]\n"  # ecx <- caller's pointer
+        "        mov     dword [ecx], 99\n"  # cannot alias [_g] — &_g not exposed in this fn
+        "        mov     eax, [_g]\n"  # redundant
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert out.count("mov     eax, [_g]") == 1
+    assert opt.stats.get("redundant_eax_load") == 1
+
+
+def test_redundant_eax_load_global_lea_in_other_fn_doesnt_leak():
+    """Address-taken analysis is per-function. `lea reg, [_g]` in
+    `_other` doesn't make `_g` address-taken in `_f`."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [_g]\n"
+        "        mov     [ebp - 4], eax\n"  # use EAX so first load isn't dead
+        "        mov     ecx, [ebp + 8]\n"
+        "        mov     dword [ecx], 99\n"
+        "        mov     eax, [_g]\n"
+        "        ret\n"
+        "_other:\n"
+        "        lea     eax, [_g]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("redundant_eax_load") == 1
+
+
+def test_redundant_eax_load_global_lea_makes_addr_taken():
+    """`lea reg, [_g]` is an address-take just like `mov reg, _g`."""
+    asm = (
+        "_f:\n"
+        "        lea     ecx, [_g]\n"  # exposes &_g
+        "        mov     eax, [_g]\n"
+        "        mov     dword [ecx], 99\n"  # might alias [_g]
+        "        mov     eax, [_g]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("redundant_eax_load", 0) == 0
+
+
+def test_redundant_ecx_load_global_basic():
+    """Slice 42 also wires through ECX tracker."""
+    asm = (
+        "_f:\n"
+        "        mov     ecx, [_g]\n"
+        "        mov     [ebp - 4], ecx\n"
+        "        mov     ecx, [_g]\n"  # redundant
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert out.count("mov     ecx, [_g]") == 1
+    assert opt.stats.get("redundant_ecx_load") == 1
+
+
 # ── label_offset_fold ────────────────────────────────────────────
 
 
