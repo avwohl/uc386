@@ -8291,6 +8291,13 @@ class CodeGenerator:
         if stmt.expr is None:
             return []
         # Result is discarded; we still evaluate for side effects (assignment).
+        # Float-typed expressions: evaluate to st(0) then drop, instead of
+        # going through `_eval_expr_to_eax` (which does a 9-instruction
+        # truncate-to-int conversion that's wasted when the result is dropped).
+        if self._is_float_type(self._type_of(stmt.expr, ctx)):
+            out = self._eval_float_to_st0(stmt.expr, ctx)
+            out.append("        fstp    st0")
+            return out
         return self._eval_expr_to_eax(stmt.expr, ctx)
 
     def _var_init(self, decl: ast.VarDecl, ctx: _FuncCtx) -> list[str]:
