@@ -454,6 +454,7 @@ class PeepholeOptimizer:
             lines = self._pass_xfer_store_collapse(lines)
             lines = self._pass_dead_store_before_push(lines)
             lines = self._pass_dup_load_chain_to_copy(lines)
+            lines = self._pass_redundant_mem_load_via_xfer(lines)
             lines = self._pass_load_add_xfer_forward(lines)
             lines = self._pass_byte_stores_to_dword(lines)
             lines = self._pass_pop_index_push_collapse(lines)
@@ -9750,6 +9751,242 @@ class PeepholeOptimizer:
                 n = -n
             result.append(n)
         return result
+
+    def _pass_redundant_mem_load_via_xfer(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Drop ``mov R2, [m]`` when an earlier ``mov [m], R1; mov
+        R2, R1`` chain already established R2 = [m]'s value, and
+        nothing in between modified R2 or [m].
+
+        Saves 3 bytes per match (the dropped memory load).
+
+        Common shape: codegen patterns like
+            mov [ebp - 4], eax
+            mov ecx, eax
+            ...some chain that doesn't touch ECX or [ebp - 4]...
+            mov ecx, [ebp - 4]   <-- redundant: ECX still equals [ebp - 4]
+
+        The codegen emits the reload because it doesn't track
+        register aliases across passes; this peephole catches the
+        cross-register equivalence.
+
+        Conditions:
+        - Pattern start: line A `mov [m], R1` immediately followed
+          by line B `mov R2, R1` (R1 != R2, m is ebp-offset).
+        - Pattern end: line C `mov R2, [m]` (same m).
+        - Between B and C: no write to R2 (or sub-regs), no write
+          to [m].
+        - Between A and B: must be back-to-back (already implied).
+
+        Aliasing analysis: register-base derefs (`[reg]`,
+        `[reg + N]`) are treated as non-aliasing with stack slot
+        [m] PROVIDED [m]'s address isn't taken via `lea` anywhere
+        in the function (precomputed as a per-function set).
+        """
+        out = list(lines)
+        # Pre-compute per-function set of address-taken stack
+        # slots. Any `lea reg, [ebp - N]` causes [ebp - N] to
+        # potentially escape into a register, after which any
+        # deref `[reg]` could alias [ebp - N].
+        addr_taken_by_func: list[tuple[int, int, set[int]]] = []
+        # (fstart, fend, addr_taken_set)
+        # Find function boundaries.
+        func_starts: list[int] = []
+        for k, ln in enumerate(out):
+            if ln.kind == "label" and not ln.label.startswith("."):
+                func_starts.append(k)
+        if not func_starts:
+            return out
+        func_starts.append(len(out))
+        for fi in range(len(func_starts) - 1):
+            fstart = func_starts[fi]
+            fend = func_starts[fi + 1]
+            for k in range(fstart, fend):
+                if out[k].kind == "directive" and out[k].raw.strip(
+                ).lower().startswith("section"):
+                    fend = k
+                    break
+            addr_taken: set[int] = set()
+            for k in range(fstart, fend):
+                ln = out[k]
+                if ln.kind == "instr" and ln.op == "lea":
+                    for off in self._extract_ebp_offsets(
+                        ln.operands
+                    ):
+                        addr_taken.add(off)
+            addr_taken_by_func.append(
+                (fstart, fend, addr_taken)
+            )
+        def find_func(idx: int) -> set[int]:
+            for fs, fe, at in addr_taken_by_func:
+                if fs <= idx < fe:
+                    return at
+            return set()
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op == "mov"
+                and b.kind == "instr" and b.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            if ap is None or bp is None:
+                i += 1
+                continue
+            # Line A: mov [m], R1
+            a_dst = ap[0].strip()
+            a_src = ap[1].strip().lower()
+            if not (a_dst.startswith("[") and a_dst.endswith("]")):
+                i += 1
+                continue
+            if not self._is_general_register(a_src):
+                i += 1
+                continue
+            # m must be an ebp-offset (for safe aliasing analysis).
+            if not self._is_ebp_offset_mem(a_dst):
+                i += 1
+                continue
+            r1 = a_src
+            mem_addr = a_dst
+            # Line B: mov R2, R1
+            b_dst = bp[0].strip().lower()
+            b_src = bp[1].strip().lower()
+            if (
+                not self._is_general_register(b_dst)
+                or b_src != r1
+                or b_dst == r1
+            ):
+                i += 1
+                continue
+            r2 = b_dst
+            # Scan forward for `mov R2, [m]`. Bail on any write to
+            # R2 or to [m].
+            found_redundant_idx = None
+            scan_count = 0
+            j = i + 2
+            while j < len(out) and scan_count <= 16:
+                ln = out[j]
+                if ln.kind in ("blank", "comment"):
+                    j += 1
+                    continue
+                if ln.kind != "instr":
+                    break
+                # Check if this is the candidate redundant load.
+                if ln.op == "mov":
+                    p = _operands_split(ln.operands)
+                    if p is not None:
+                        ld_dst = p[0].strip().lower()
+                        ld_src = p[1].strip()
+                        if (
+                            ld_dst == r2
+                            and ld_src == mem_addr
+                        ):
+                            found_redundant_idx = j
+                            break
+                # Bail on writes to R2 (any form: mov R2, X; pop R2;
+                # arithmetic with R2 as dest; etc.).
+                p = _operands_split(ln.operands)
+                if p is not None:
+                    dst_low = p[0].strip().lower()
+                    if dst_low == r2:
+                        break
+                if ln.op == "pop":
+                    if ln.operands.strip().lower() == r2:
+                        break
+                # Sub-register writes also clobber R2.
+                sub_regs_r2 = self._sub_regs_for(r2)
+                if p is not None and p[0].strip().lower() in sub_regs_r2:
+                    break
+                # Bail on writes to [m] (besides line A itself).
+                if (
+                    ln.op == "mov"
+                    and p is not None
+                    and "[" in p[0]
+                ):
+                    dest_str = p[0].strip()
+                    # Strip optional size prefix.
+                    dest_chk = dest_str
+                    for prefix in (
+                        "dword ", "word ", "byte ", "qword "
+                    ):
+                        if dest_chk.lower().startswith(prefix):
+                            dest_chk = dest_chk[
+                                len(prefix):
+                            ].lstrip()
+                            break
+                    # If dest is also ebp-offset, do regular
+                    # disjoint check.
+                    if self._is_ebp_offset_mem(dest_chk):
+                        if not self._mem_disjoint(
+                            dest_str, mem_addr
+                        ):
+                            break
+                    else:
+                        # Register-base deref. Could alias [m]
+                        # only if m's address has been taken
+                        # via lea anywhere in the function.
+                        m_offset = self._ebp_offset(mem_addr)
+                        addr_taken = find_func(j)
+                        if (
+                            m_offset is not None
+                            and m_offset in addr_taken
+                        ):
+                            break
+                # Bail on calls (might clobber regs/memory through
+                # globals).
+                if ln.op == "call":
+                    break
+                # Bail on instructions that implicitly clobber R2.
+                if (
+                    ln.op in PeepholeOptimizer._IMPLICIT_REG_USERS
+                    and self._references_reg_family(
+                        ln.operands, r2
+                    )
+                ):
+                    break
+                # Conditional or unconditional control flow breaks
+                # the scan (we don't track across CFG boundaries).
+                if (
+                    ln.op == "jmp"
+                    or ln.op.startswith("j")
+                    or ln.op in (
+                        "ret", "iret", "retf", "retn", "leave",
+                        "enter",
+                    )
+                ):
+                    break
+                scan_count += 1
+                j += 1
+            if found_redundant_idx is None:
+                i += 1
+                continue
+            # Drop line at found_redundant_idx.
+            del out[found_redundant_idx]
+            self.stats["redundant_mem_load_via_xfer"] = (
+                self.stats.get("redundant_mem_load_via_xfer", 0) + 1
+            )
+            # Don't advance i — re-check from current position.
+        return out
+
+    @staticmethod
+    def _sub_regs_for(reg: str) -> set[str]:
+        """Sub-register names for a 32-bit GP reg."""
+        m = {
+            "eax": {"al", "ah", "ax"},
+            "ebx": {"bl", "bh", "bx"},
+            "ecx": {"cl", "ch", "cx"},
+            "edx": {"dl", "dh", "dx"},
+            "esi": {"si"},
+            "edi": {"di"},
+            "ebp": {"bp"},
+            "esp": {"sp"},
+        }
+        return m.get(reg, set())
 
     def _pass_dup_load_chain_to_copy(
         self, lines: list[Line]

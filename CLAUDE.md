@@ -1451,3 +1451,14 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Real-world impact**: `_dist_sq` (3-component dot-product) goes from 13 instructions to 10. Each `p->x * p->x`-style pattern saves 6 bytes. Common in math-heavy code.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests (522 total). 967 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: redundant_mem_load_via_xfer**: drop `mov R2, [m]` when an earlier `mov [m], R1; mov R2, R1` chain already established R2 = [m]'s value. Saves 3 bytes per match.
+  - **Common shape**: codegen patterns like `mov [ebp - 4], eax; mov ecx, eax; ...chain that doesn't touch ECX or [ebp - 4]...; mov ecx, [ebp - 4]`. The reload is unnecessary because ECX still holds [ebp - 4]'s value through the cross-register equivalence (ECX = EAX = [ebp - 4]).
+  - **Function-level address-taken analysis**: register-base derefs (`[ecx]`, etc.) are treated as non-aliasing with stack slot [m] PROVIDED [m]'s address isn't taken via `lea` anywhere in the function. Pre-computes a per-function set of address-taken offsets; uses this to allow the pass to fire even when intermediate code does pointer derefs through registers (which would otherwise be conservatively assumed to alias).
+  - **Conditions**:
+    - Pattern start: line A `mov [m], R1` immediately followed by line B `mov R2, R1` (R1 != R2, m is ebp-offset).
+    - Pattern end: line C `mov R2, [m]` somewhere later.
+    - Between B and C: no write to R2 (or sub-regs), no write to [m], no calls, no control flow.
+    - Address-taken aware: register-base writes only block if [m] is in the address-taken set.
+  - **Concrete win on `_new_node` (probe7)**: drops `mov ecx, [ebp - 4]` after `mov [ebp - 4], eax; mov ecx, eax`. Body shrinks from 14 lines to 12. Common in malloc + struct-init patterns where the pointer is saved-then-aliased.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +4 peephole tests (526 total). 971 unit tests total. Pipeline 1734/1734 (100%).

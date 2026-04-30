@@ -5590,6 +5590,80 @@ def test_dead_store_before_push_skips_when_lea_taken():
     assert opt.stats.get("dead_store_before_push", 0) == 0
 
 
+# ── redundant_mem_load_via_xfer ────────────────────────────────────
+
+
+def test_redundant_mem_load_via_xfer_basic():
+    """`mov [m], R1; mov R2, R1; ...; mov R2, [m]` drops the final
+    load (R2 still holds [m]'s value via the xfer)."""
+    asm = (
+        "_f:\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     ecx, eax\n"
+        "        mov     eax, 5\n"  # doesn't touch ECX or [ebp - 4]
+        "        mov     ecx, [ebp - 4]\n"  # redundant
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("redundant_mem_load_via_xfer") == 1
+    # The mov ecx, [ebp - 4] should be gone (only the original
+    # mov ecx, eax remains for ECX).
+    out_lines = out.split("\n")
+    assert not any(
+        line.strip() == "mov     ecx, [ebp - 4]" for line in out_lines
+    )
+
+
+def test_redundant_mem_load_via_xfer_skips_when_r2_clobbered():
+    """If R2 is written between the xfer and the candidate load,
+    the load isn't redundant."""
+    asm = (
+        "_f:\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     ecx, eax\n"
+        "        mov     ecx, 99\n"  # ECX clobbered
+        "        mov     ecx, [ebp - 4]\n"  # NOT redundant
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_mem_load_via_xfer", 0) == 0
+
+
+def test_redundant_mem_load_via_xfer_skips_when_mem_clobbered():
+    """If [m] is written between the xfer and the load, the load
+    isn't redundant."""
+    asm = (
+        "_f:\n"
+        "        mov     [ebp - 4], eax\n"
+        "        mov     ecx, eax\n"
+        "        mov     dword [ebp - 4], 42\n"  # [m] clobbered
+        "        mov     ecx, [ebp - 4]\n"  # NOT redundant
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_mem_load_via_xfer", 0) == 0
+
+
+def test_redundant_mem_load_via_xfer_skips_when_addr_taken():
+    """If [m]'s address is taken via lea, register-base derefs
+    could alias it. Conservatively skip."""
+    asm = (
+        "_f:\n"
+        "        lea     edx, [ebp - 4]\n"  # address-take
+        "        mov     [ebp - 4], eax\n"
+        "        mov     ecx, eax\n"
+        "        mov     [edx], 99\n"  # alias write through edx
+        "        mov     ecx, [ebp - 4]\n"  # NOT redundant
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_mem_load_via_xfer", 0) == 0
+
+
 # ── dup_load_chain_to_copy ─────────────────────────────────────────
 
 
