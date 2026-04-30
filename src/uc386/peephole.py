@@ -11053,8 +11053,56 @@ class PeepholeOptimizer:
                 continue
             # Mask to 32 bits.
             acc = acc & 0xFFFFFFFF
+            # Look past intervening non-reg-writing instructions to
+            # find the chain start. Allow: instructions that don't
+            # write reg, don't contain labels, don't make calls, and
+            # aren't unconditional control flow. Disallow: any write
+            # to reg, labels (incoming jumps), calls (callee clobber),
+            # unconditional jumps (chain becomes unreachable; dead).
+            chain_start = i + 1
+            while chain_start < len(out):
+                ln = out[chain_start]
+                if ln.kind in ("blank", "comment"):
+                    chain_start += 1
+                    continue
+                if ln.kind == "label":
+                    break
+                if ln.kind != "instr":
+                    break
+                op = ln.op
+                # Calls clobber caller-saved regs (eax, ecx, edx).
+                if op == "call" and a_dst_low in (
+                    "eax", "ecx", "edx"
+                ):
+                    break
+                # Unconditional flow ends fall-through to chain.
+                if op in (
+                    "ret", "iret", "iretd", "retf", "retn",
+                    "leave", "jmp", "enter",
+                ):
+                    break
+                # Foldable chain op on reg = chain start.
+                if op in (
+                    "and", "or", "xor", "add", "sub",
+                    "shl", "shr", "sar", "sal",
+                ):
+                    op_parts = _operands_split(ln.operands)
+                    if op_parts is None:
+                        break
+                    op_dst, op_src = op_parts
+                    if op_dst.strip().lower() == a_dst_low:
+                        try:
+                            int(op_src.strip(), 0)
+                            # This is the chain start.
+                            break
+                        except ValueError:
+                            break
+                # Otherwise: check the instruction doesn't write reg.
+                if self._instr_writes_reg(ln, a_dst_low):
+                    break
+                chain_start += 1
             # Walk forward consuming chain ops on reg.
-            chain_end = i + 1
+            chain_end = chain_start
             chain_count = 0
             chain_acc = acc
             while chain_end < len(out):
@@ -11112,16 +11160,31 @@ class PeepholeOptimizer:
             if not self._flags_safe_after(out, chain_end):
                 i += 1
                 continue
-            # Rewrite. Replace the original mov with the folded value.
+            # Rewrite. The folded mov replaces the chain region.
+            # When there's no intervening (chain_start == i + 1), we
+            # replace A directly (drops the original `mov reg, IMM`
+            # since the folded mov supersedes it). When there IS
+            # intervening code (chain_start > i + 1), we KEEP A and
+            # the intervening so the intervening code still sees the
+            # original IMM in reg; the folded mov goes after the
+            # intervening, replacing the chain.
             indent = self._extract_indent(a.raw)
             new_raw = f"{indent}mov     {a_dst_low}, {chain_acc}"
             new_mov = Line(
                 raw=new_raw, kind="instr",
                 op="mov", operands=f"{a_dst_low}, {chain_acc}",
             )
-            new_out = list(out[:i])
-            new_out.append(new_mov)
-            new_out.extend(out[chain_end:])
+            if chain_start == i + 1:
+                # No intervening — original behavior.
+                new_out = list(out[:i])
+                new_out.append(new_mov)
+                new_out.extend(out[chain_end:])
+            else:
+                # Keep A, keep intervening, replace chain.
+                new_out = list(out[:i + 1])
+                new_out.extend(out[i + 1:chain_start])
+                new_out.append(new_mov)
+                new_out.extend(out[chain_end:])
             out = new_out
             self.stats["const_fold_chain"] = (
                 self.stats.get("const_fold_chain", 0) + chain_count

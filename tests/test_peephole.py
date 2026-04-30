@@ -15209,3 +15209,98 @@ def test_dead_push_pop_pair_pr70602_pattern():
     assert opt.stats.get("dead_push_pop_pair", 0) == 1
     assert "push    eax" not in out
     assert "pop     edx" not in out
+
+
+# ── const_fold_chain — extended past intervening non-writes ──────
+
+
+def test_const_fold_chain_with_intervening_store():
+    """Chain folding should skip past intervening non-reg-writing
+    instructions (memory stores) to find the chain start."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 18\n"
+        "        mov     [ebp - 4], eax\n"   # intervening, doesn't write eax
+        "        and     eax, 1\n"           # chain start
+        "        shl     eax, 31\n"
+        "        sar     eax, 31\n"
+        "        push    eax\n"               # consumer
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # 18 & 1 = 0; 0 << 31 = 0; 0 sar 31 = 0.
+    assert "shl     eax, 31" not in out
+    assert "sar     eax, 31" not in out
+    assert "and     eax, 1" not in out
+    assert opt.stats.get("const_fold_chain", 0) >= 3
+
+
+def test_const_fold_chain_with_intervening_cmp_jcc():
+    """Allow intervening cmp + jcc (jump OUT) before the chain."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 18\n"
+        "        cmp     dword [_b], 0\n"
+        "        jnz     .L_target\n"
+        "        and     eax, 1\n"
+        "        shl     eax, 31\n"
+        "        sar     eax, 31\n"
+        "        push    eax\n"
+        "        ret\n"
+        ".L_target:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "shl     eax, 31" not in out
+    assert "sar     eax, 31" not in out
+    assert opt.stats.get("const_fold_chain", 0) >= 3
+
+
+def test_const_fold_chain_skips_when_intervening_writes_reg():
+    """If intervening code WRITES eax, my pass should not assume
+    eax = IMM at the chain start."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 18\n"
+        "        xor     eax, eax\n"   # writes eax
+        "        and     eax, 1\n"
+        "        push    eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+
+
+def test_const_fold_chain_skips_when_label_in_intervening():
+    """If a label is in the intervening region, control flow could
+    enter from elsewhere — bail."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 18\n"
+        ".L_loop:\n"   # label — incoming branch invalidates init
+        "        and     eax, 1\n"
+        "        push    eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Should not fold because the label could be entered with eax != 18.
+    assert "and     eax, 1" in out
+
+
+def test_const_fold_chain_skips_when_call_clobbers_eax():
+    """If intervening code calls a function (cdecl clobbers eax),
+    can't trust eax = IMM at the chain."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, 18\n"
+        "        call    _g\n"   # eax clobbered by call
+        "        and     eax, 1\n"
+        "        push    eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "and     eax, 1" in out

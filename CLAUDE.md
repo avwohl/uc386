@@ -1980,3 +1980,17 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Real-world impact**: 1 fire on pr70602 (rare overall — most codegen-emitted register push/pop save-restore patterns DO have a downstream use). 0 fires on a 100-test torture sample. Modest direct impact but cleans up a specific idiom.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (1254 total). Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: const_fold_chain extended past intervening non-writes**: extend slice 35's `const_fold_chain` to skip past intervening non-reg-writing instructions before the chain start. Now folds chains where the IMM init is separated from the imm-op chain by side-effect-free code (memory stores, comparisons, jcc going OUT, etc.).
+  - **Pattern (extended)**:
+    ```
+    A:  mov reg, IMM_INIT
+    [non-reg-writing instructions]   ; allowed
+    chain start: OP reg, IMM
+    chain ops...
+    ```
+  - **Allowed in intervening region**: instructions that don't write reg (or sub-aliases). Notably: memory stores using the reg as source (`mov [m], reg`); cmp/test (sets flags but doesn't write reg); push reg (reads); jcc going OUT (taken path goes elsewhere with reg = IMM, fall-through reaches chain).
+  - **Disallowed in intervening region**: writes to reg, labels (incoming flow could violate IMM invariant), calls (callee clobbers EAX/ECX/EDX per cdecl), unconditional jumps (chain unreachable from local fall-through; harmless but pointless to fold dead code).
+  - **Rewrite**: when there's no intervening (chain immediately follows A), original behavior — replace A with folded mov. When intervening exists, KEEP A + intervening unchanged, replace chain with folded mov. Latter preserves any uses of reg = IMM_INIT in the intervening region (e.g., `mov [m], eax` storing IMM to slot).
+  - **Concrete impact on pr70602**: chain `and eax, 1; shl eax, 31; sar eax, 31` (separated from `mov eax, 18` by `mov [m], eax; cmp [_b], 0; jnz`) now folds to 0. Combined with mov_zero_to_xor + jcc_jmp_inversion cascades, the boolean-OR-materialize-then-test pattern collapses dramatically. pr70602: 64 → 58 lines.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests (1259 total). Pipeline 1734/1734 (100%).
