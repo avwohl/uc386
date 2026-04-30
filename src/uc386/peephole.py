@@ -3386,6 +3386,27 @@ class PeepholeOptimizer:
                                     + 1
                                 )
                                 continue
+            # `xor reg, reg` is a fresh write to reg (sets reg=0
+            # plus flags). If reg is dead before any read AND flags
+            # are dead before the next flag-clobber, the xor is
+            # entirely dead.
+            if line.kind == "instr" and line.op == "xor":
+                parts = _operands_split(line.operands)
+                if parts is not None:
+                    dest, src = parts
+                    dest_low = dest.strip().lower()
+                    src_low = src.strip().lower()
+                    if (
+                        dest_low == "eax"
+                        and dest_low == src_low
+                        and self._reg_dead_after(lines, i + 1, "eax")
+                        and self._flags_safe_after(lines, i + 1)
+                    ):
+                        self.stats["dead_xor_zero_drop"] = (
+                            self.stats.get("dead_xor_zero_drop", 0)
+                            + 1
+                        )
+                        continue
             out.append(line)
         return out
 
@@ -10600,6 +10621,24 @@ class PeepholeOptimizer:
                             ) + 1
                         )
                         # Don't advance i; new content at i.
+                        continue
+            # `shl/shr/sar/sal/rol/ror REG, X` where REG ∈ zero_regs:
+            # all bit shifts/rotates of 0 yield 0. Drop.
+            if op in ("shl", "shr", "sar", "sal", "rol", "ror"):
+                op_parts = _operands_split(ln.operands)
+                if op_parts is not None:
+                    t_dst, t_src = op_parts
+                    t_dst_low = t_dst.strip().lower()
+                    if (
+                        t_dst_low in zero_regs
+                        and self._flags_safe_after(out, i + 1)
+                    ):
+                        del out[i]
+                        self.stats["shift_on_zero_reg_drop"] = (
+                            self.stats.get(
+                                "shift_on_zero_reg_drop", 0
+                            ) + 1
+                        )
                         continue
             # `and REG, X` where REG ∈ zero_regs: drop (REG | 0
             # would be REG, but 0 AND X = 0 — REG stays 0).

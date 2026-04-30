@@ -1605,7 +1605,15 @@ def test_mov_zero_to_xor_safe_when_arithmetic_follows():
 
 
 def test_mov_zero_to_xor_safe_when_call_follows():
-    """`mov eax, 0; call X` — call clobbers flags via callee."""
+    """`mov eax, 0; call X` — verify mov_zero_to_xor fires when a
+    call follows (call clobbers flags via callee).
+
+    Slice 33 (dead_xor_zero_drop) drops the xor entirely as a
+    cascade — EAX is dead through the call (callee writes EAX as
+    return value). The intermediate `xor eax, eax` no longer
+    appears in the output; just verify mov_zero_to_xor's stat
+    fired and the final output is the optimal `call; ret`.
+    """
     asm = (
         "_f:\n"
         "        mov     eax, 0\n"
@@ -1614,8 +1622,13 @@ def test_mov_zero_to_xor_safe_when_call_follows():
     )
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
-    assert "xor     eax, eax" in out
+    # mov_zero_to_xor still fires (the conversion mov→xor happens
+    # before the cascade drops the xor).
     assert opt.stats.get("mov_zero_to_xor", 0) == 1
+    # Both the original mov and the converted xor were dropped via
+    # the slice 33 cascade — the final output is just call+ret.
+    assert "mov     eax, 0" not in out
+    assert "xor     eax, eax" not in out
 
 
 def test_mov_zero_to_xor_other_registers():
@@ -14452,3 +14465,102 @@ def test_and_on_zero_reg_drop_skips_when_flags_read():
     # The AND sets ZF=1 (since reg was 0); without it, je's input
     # depends on prior flag state. Skip drop.
     assert opt.stats.get("and_on_zero_reg_drop", 0) == 0
+
+
+# ── dead_xor_zero_drop ───────────────────────────────────────────
+
+
+def test_dead_xor_zero_drop_call_clobbers():
+    """`xor eax, eax; call _bar; ret` — call clobbers EAX (writes
+    return value), so the xor's value is dead. Drop."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        call    _bar\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "xor     eax, eax" not in out
+    assert opt.stats.get("dead_xor_zero_drop", 0) == 1
+
+
+def test_dead_xor_zero_drop_skips_when_value_used():
+    """If eax's value is consumed before being overwritten, skip."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        mov     [ebp - 4], eax\n"   # uses eax
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_xor_zero_drop", 0) == 0
+
+
+def test_dead_xor_zero_drop_skips_when_flags_read():
+    """xor sets flags. If a flag-reader follows, the xor's flag
+    setting matters — skip."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        je      .L\n"   # reads ZF set by xor
+        "        mov     eax, 5\n"
+        "        ret\n"
+        ".L:\n"
+        "        mov     eax, 99\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("dead_xor_zero_drop", 0) == 0
+
+
+# ── shift_on_zero_reg_drop ───────────────────────────────────────
+
+
+def test_shift_on_zero_reg_drop_basic():
+    """`xor eax, eax; shl eax, 3` → drop the shl. eax=0; 0 << anything
+    is 0. Saves 3 bytes."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        shl     eax, 3\n"
+        "        mov     [ebp - 4], eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "shl     eax, 3" not in out
+    assert opt.stats.get("shift_on_zero_reg_drop", 0) == 1
+
+
+def test_shift_on_zero_reg_drop_sar():
+    """`sar` works the same way for zero values."""
+    asm = (
+        "_f:\n"
+        "        xor     ecx, ecx\n"
+        "        sar     ecx, 5\n"
+        "        mov     [ebp - 4], ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "sar     ecx, 5" not in out
+    assert opt.stats.get("shift_on_zero_reg_drop", 0) == 1
+
+
+def test_shift_on_zero_reg_drop_skips_when_flags_read():
+    """`shl` sets flags; if a flag-reader follows, skip."""
+    asm = (
+        "_f:\n"
+        "        xor     eax, eax\n"
+        "        shl     eax, 1\n"
+        "        je      .L\n"
+        "        ret\n"
+        ".L:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("shift_on_zero_reg_drop", 0) == 0

@@ -1913,3 +1913,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete impact on pr70602** (bit-field-init torture): 21 OR drops + 42 AND drops = 63 fires. 471 → 183 lines (61% total reduction) on top of all prior peephole work, including slices 29-31. The bit-field init's redundant masking ORs/ANDs are eliminated wholesale.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +5 peephole tests (1215 total). Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: dead_xor_zero_drop + shift_on_zero_reg_drop**: complete the zero-tracking suite. Drop dead `xor reg, reg` writes, and drop shifts on known-zero registers.
+  - **dead_xor_zero_drop**: extend `_pass_dead_mov_to_reg` to also handle `xor reg, reg`. After `xor REG, REG`, REG = 0. If REG is dead before any read AND flags are dead before next clobber, the entire `xor REG, REG` is dead. Saves 2 bytes per match.
+  - **Restricted to EAX** (matches `dead_mov_to_reg`'s scope). Common after `mov_zero_to_xor` (slice 18) converts `mov eax, 0` to `xor eax, eax` in a context where the value is then dead (e.g., subsequent call clobbers EAX with return value). Pre-slice 33, the xor remained; post-slice 33, both the original mov AND the converted xor are dropped via cascade.
+  - **shift_on_zero_reg_drop**: extend the zero-state tracker (slice 32) to also drop `shl/shr/sar/sal/rol/ror REG, X` when REG ∈ zero_regs. Shifts of 0 yield 0 — operation is dead. Saves 3 bytes per match (3-byte shl-imm8 → gone). Same flag-deadness check as the OR/AND drops.
+  - **Test update**: `test_mov_zero_to_xor_safe_when_call_follows` was checking the intermediate state (xor remained after `mov eax, 0; call; ret`). With slice 33, the xor is dropped further — strictly better. Test updated to verify the optimal final state (both mov and xor gone, just `call; ret`).
+  - **Concrete impact on pr70602**: 26 `dead_xor_zero_drop` + 5 `shift_on_zero_reg_drop` fires combined with the OR/AND/load drops. 471 → 147 lines (69% total reduction) on top of all prior peephole work. The bit-field init code is now near-minimal — just the value computations and the final stores.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests (1221 total). Pipeline 1734/1734 (100%).
