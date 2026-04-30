@@ -173,6 +173,9 @@ _INSTR_RE = re.compile(r"^(\s+)([a-zA-Z][a-zA-Z0-9]*)(?:\s+(.*?))?\s*$")
 # Examples: `_main:`, `.L1_for_top:`, `__start:`
 _LABEL_RE = re.compile(r"^(\.?[A-Za-z_][A-Za-z0-9_]*)\s*:\s*$")
 
+# `[ebp + N]` / `[ebp - N]` reference (literal-offset form).
+_EBP_OFFSET_RE = re.compile(r"\[\s*ebp\s*([+-])\s*(\d+)\s*\]")
+
 # Top-level directives we treat as fences (end any dead-zone).
 # `section .text` / `section .data` / `section .bss` / `bits 32` /
 # `global _name` / `extern _name`.
@@ -14073,28 +14076,48 @@ class PeepholeOptimizer:
                     break
             if sib_or_lea:
                 continue
-            # Find entry-block end: prologue + linear code until first
-            # control flow boundary (any jcc/jmp/call/ret/leave) or any
-            # non-start label. Writers outside the entry block can be
-            # conditional and don't dominate downstream reads — unsafe
-            # to propagate.
-            entry_block_end = end
-            seen_start_label = False
+            # First-reference check: for each slot, find the first
+            # line that references the slot (read OR write). If first
+            # ref is a write of an IMM literal, record the IMM. If
+            # first ref is a read or non-IMM write, the slot's initial
+            # value is undefined or caller-set; we won't propagate.
+            slot_first_is_imm_write: dict[int, int] = {}
+            slot_seen: set[int] = set()
             for k in range(start, end):
                 ln = out[k]
-                if ln.kind == "label":
-                    if not seen_start_label:
-                        seen_start_label = True
+                if ln.kind != "instr":
+                    continue
+                ops = ln.operands or ""
+                if "ebp" not in ops.lower():
+                    continue
+                for m in _EBP_OFFSET_RE.finditer(ops):
+                    sign = m.group(1)
+                    n = int(m.group(2))
+                    offset = -n if sign == "-" else n
+                    if offset >= 0:
+                        continue  # parameter, skip
+                    if offset in slot_seen:
                         continue
-                    entry_block_end = k
-                    break
-                if ln.kind == "instr":
-                    if (ln.op.startswith("j")
-                            or ln.op == "call"
-                            or ln.op in ("ret", "leave", "iret",
-                                         "retn", "retf")):
-                        entry_block_end = k
-                        break
+                    slot_seen.add(offset)
+                    # Record IMM write only when THIS line writes the
+                    # slot from an IMM literal.
+                    if ln.op == "mov":
+                        parts = _operands_split(ln.operands)
+                        if parts is not None:
+                            dst, src = parts
+                            dst_t = dst.strip()
+                            for prefix in ("dword ", "word ", "byte ",
+                                           "qword "):
+                                if dst_t.lower().startswith(prefix):
+                                    dst_t = dst_t[len(prefix):].lstrip()
+                                    break
+                            dst_off = self._ebp_offset(dst_t)
+                            if dst_off == offset:
+                                imm_val = self._parse_imm_value(
+                                    src.strip()
+                                )
+                                if imm_val is not None:
+                                    slot_first_is_imm_write[offset] = imm_val
             # Collect per-slot writers (with entry-block flag) and RMW.
             slot_writers: dict[int, list[tuple[int, int, bool]]] = {}
             slot_rmw: set[int] = set()
@@ -14129,10 +14152,9 @@ class PeepholeOptimizer:
                             if imm_val is None:
                                 slot_rmw.add(offset)
                             else:
-                                in_entry = k < entry_block_end
                                 slot_writers.setdefault(
                                     offset, []
-                                ).append((k, imm_val, in_entry))
+                                ).append((k, imm_val))
                 # RMW ops with [ebp ± N] dest.
                 elif op in ("add", "sub", "and", "or", "xor",
                             "inc", "dec", "shl", "shr", "sar",
@@ -14154,9 +14176,10 @@ class PeepholeOptimizer:
                         if offset is not None:
                             slot_rmw.add(offset)
             # Determine constant slots.
-            #   - All writers (entry + conditional) write same IMM.
-            #   - At least one writer is in the entry block (it
-            #     dominates all reads).
+            #   - All writers write the same IMM.
+            #   - First reference of the slot is a write of that IMM
+            #     (so any read sees the writer's value, never the
+            #     pre-write garbage / caller value).
             constant_slots: dict[int, int] = {}
             for offset, writes in slot_writers.items():
                 if offset in slot_rmw:
@@ -14164,8 +14187,12 @@ class PeepholeOptimizer:
                 imms = {w[1] for w in writes}
                 if len(imms) != 1:
                     continue
-                if not any(w[2] for w in writes):
-                    # No entry-block writer: pre-write value undefined.
+                # First-reference of this slot must be a write with
+                # the same IMM as all writers.
+                first_imm = slot_first_is_imm_write.get(offset)
+                if first_imm is None:
+                    continue
+                if first_imm != writes[0][1]:
                     continue
                 constant_slots[offset] = writes[0][1]
             if not constant_slots:
