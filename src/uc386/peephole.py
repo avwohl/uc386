@@ -458,6 +458,7 @@ class PeepholeOptimizer:
             lines = self._pass_label_store_collapse(lines)
             lines = self._pass_lea_load_collapse(lines)
             lines = self._pass_lea_sib_load_collapse(lines)
+            lines = self._pass_lea_sib_label_load_collapse(lines)
             lines = self._pass_lea_offset_fold(lines)
             lines = self._pass_lea_forward_to_reg(lines)
             lines = self._pass_lea_store_collapse(lines)
@@ -10113,6 +10114,236 @@ class PeepholeOptimizer:
         else:
             return None
         return f"{size_kw}[{new_inner}]"
+
+    def _pass_lea_sib_label_load_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse `lea REG, [LABEL + REG*scale (+ DISP_A)?]; <op>
+        ..., [REG (+ DISP_B)?]` into a single op with the SIB form
+        directly: `<op> ..., [LABEL + REG*scale + (DISP_A + DISP_B)]`.
+
+        Drops the 6-byte+ LEA instruction. Saves 6+ bytes per match.
+
+        Common shape: `if (g[i] == target)` or other operations on
+        a global array element where the codegen materializes the
+        address with `lea REG, [_g + REG*4]` then accesses via [REG].
+
+        Pattern:
+        - Line A: `lea REG, [LABEL + REG*N (+ DISP_A)?]` where:
+          - REG is a 32-bit GP register
+          - LABEL is a non-numeric, non-register expression
+          - N ∈ {1, 2, 4, 8} (SIB scale factor; note: N=1 is the
+            implicit scale, but we accept it explicitly)
+          - DISP_A is optional integer displacement
+
+        - Line B: an op whose memory operand is `[REG (+ DISP_B)?]`
+          (plain or with displacement; no SIB).
+
+        Rewrite: drop A, replace B's `[REG ± DISP_B]` operand with
+        `[LABEL + REG*scale + (DISP_A ± DISP_B)]`.
+
+        Conditions:
+        - The op in B must support a memory-form operand (excludes
+          ops that strictly use registers).
+        - REG dead after B (treat_as_scratch=True since the lea was
+          setting up an address scratch). Or REG == DST of B (load
+          overwrites REG).
+        - [REG ± DISP_B] is the ONLY memory operand (no other regs
+          referenced in addressing).
+
+        Supported B ops (memory-source operations):
+        - `mov DST, [REG]` (load via REG)
+        - `cmp/test [REG], X` (read-and-compare via REG)
+        - `add/sub/and/or/xor/inc/dec [REG], X` (RMW via REG)
+        - `push <size?> [REG]` (push from REG's deref)
+        """
+        SUPPORTED_OPS = {
+            "mov", "cmp", "test", "add", "sub", "and", "or", "xor",
+            "inc", "dec", "push",
+        }
+        out = list(lines)
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op == "lea"
+                and b.kind == "instr" and b.op in SUPPORTED_OPS
+            ):
+                i += 1
+                continue
+            # Parse A: `lea REG, [LABEL + REG*N (+ DISP_A)?]`.
+            ap = _operands_split(a.operands)
+            if ap is None:
+                i += 1
+                continue
+            r1 = ap[0].strip().lower()
+            lea_src = ap[1].strip()
+            if not self._is_general_register(r1):
+                i += 1
+                continue
+            # Match `[LABEL + REG*N]` or `[LABEL + REG*N + D]` or
+            # `[LABEL + REG*N - D]`.
+            m = re.match(
+                r"^\[\s*([^\[\]]+?)\s*\+\s*([a-zA-Z]+)\s*\*\s*"
+                r"(\d+)\s*(?:([+-])\s*(\d+))?\s*\]$",
+                lea_src,
+            )
+            if m is None:
+                i += 1
+                continue
+            label = m.group(1).strip()
+            sib_reg = m.group(2).lower()
+            scale = int(m.group(3))
+            disp_a_sign = m.group(4)
+            disp_a_val = m.group(5)
+            disp_a = 0
+            if disp_a_sign and disp_a_val:
+                disp_a = int(disp_a_val)
+                if disp_a_sign == "-":
+                    disp_a = -disp_a
+            if scale not in (1, 2, 4, 8):
+                i += 1
+                continue
+            if sib_reg != r1:
+                i += 1
+                continue
+            # LABEL must be non-numeric, non-register.
+            if self._is_general_register(label.lower()):
+                i += 1
+                continue
+            try:
+                int(label)
+                i += 1
+                continue
+            except ValueError:
+                pass
+            try:
+                int(label, 16)
+                i += 1
+                continue
+            except ValueError:
+                pass
+            # Inspect B's operand structure.
+            # For ops that take 2 operands (mov, cmp, test, add, sub,
+            # and, or, xor): one of them must be `[REG (+ M)?]`.
+            # For 1-op (inc, dec, push): the operand must be
+            # `[REG (+ M)?]`.
+            bp = _operands_split(b.operands)
+            mem_operand_text = None
+            mem_operand_idx = None  # 0 = first, 1 = second, None = N/A
+            if bp is None:
+                # 1-operand op.
+                opnd = b.operands.strip()
+                mem_operand_text = opnd
+                mem_operand_idx = 0
+            else:
+                # 2-operand op.
+                op0 = bp[0].strip()
+                op1 = bp[1].strip()
+                if op0.startswith("[") or op0.lower().startswith(
+                    ("dword ", "word ", "byte ", "qword ")
+                ) and "[" in op0:
+                    mem_operand_text = op0
+                    mem_operand_idx = 0
+                elif op1.startswith("[") or op1.lower().startswith(
+                    ("dword ", "word ", "byte ", "qword ")
+                ) and "[" in op1:
+                    mem_operand_text = op1
+                    mem_operand_idx = 1
+                else:
+                    i += 1
+                    continue
+            if mem_operand_text is None:
+                i += 1
+                continue
+            # Strip size prefix.
+            size_kw = ""
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if mem_operand_text.lower().startswith(prefix):
+                    size_kw = mem_operand_text[:len(prefix)]
+                    mem_operand_text = mem_operand_text[
+                        len(prefix):
+                    ].lstrip()
+                    break
+            # Match `[REG]` or `[REG ± M]`. No SIB form allowed in B.
+            mb_plain = re.match(
+                r"^\[\s*([a-zA-Z]+)\s*\]$",
+                mem_operand_text,
+            )
+            mb_disp = re.match(
+                r"^\[\s*([a-zA-Z]+)\s*([+-])\s*(\d+)\s*\]$",
+                mem_operand_text,
+            )
+            if mb_plain:
+                base_reg = mb_plain.group(1).lower()
+                disp_b = 0
+            elif mb_disp:
+                base_reg = mb_disp.group(1).lower()
+                disp_b = int(mb_disp.group(3))
+                if mb_disp.group(2) == "-":
+                    disp_b = -disp_b
+            else:
+                i += 1
+                continue
+            if base_reg != r1:
+                i += 1
+                continue
+            # Determine DST register (for the load case where REG ==
+            # DST, REG's post-state is overwritten anyway).
+            dst_reg = None
+            if b.op == "mov" and bp is not None and mem_operand_idx == 1:
+                # `mov DST, [REG]` (load).
+                dst_candidate = bp[0].strip().lower()
+                if self._is_general_register(dst_candidate):
+                    dst_reg = dst_candidate
+            # REG dead after B, OR REG == DST (load overwrites).
+            if dst_reg != r1:
+                if not self._reg_dead_after(
+                    out, i + 2, r1, treat_as_scratch=True,
+                ):
+                    i += 1
+                    continue
+            # Build the new memory operand.
+            combined_disp = disp_a + disp_b
+            if combined_disp == 0:
+                new_mem_inner = f"{label} + {r1}*{scale}"
+            elif combined_disp > 0:
+                new_mem_inner = (
+                    f"{label} + {r1}*{scale} + {combined_disp}"
+                )
+            else:
+                new_mem_inner = (
+                    f"{label} + {r1}*{scale} - {-combined_disp}"
+                )
+            new_mem_text = f"{size_kw}[{new_mem_inner}]"
+            # Reconstruct B's operands with the substituted memory.
+            if bp is None:
+                # 1-op.
+                new_operands = new_mem_text
+            else:
+                if mem_operand_idx == 0:
+                    new_operands = f"{new_mem_text}, {bp[1].strip()}"
+                else:
+                    new_operands = f"{bp[0].strip()}, {new_mem_text}"
+            indent = self._extract_indent(b.raw)
+            opname = b.op
+            spacer = " " * max(8 - len(opname), 1)
+            new_raw = f"{indent}{opname}{spacer}{new_operands}"
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op=opname,
+                operands=new_operands,
+            )
+            out = out[:i] + [new_line] + out[i + 2:]
+            self.stats["lea_sib_label_load_collapse"] = (
+                self.stats.get(
+                    "lea_sib_label_load_collapse", 0
+                ) + 1
+            )
+            continue
+        return out
 
     def _pass_lea_offset_fold(
         self, lines: list[Line]

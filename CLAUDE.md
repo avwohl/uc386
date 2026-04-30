@@ -1636,3 +1636,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Conservative aliasing**: any memory write invalidates all tracking (no alias analysis). SIB-form memory operands (containing `*`) are excluded from tracking.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests. 1065 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: lea_sib_label_load_collapse**: collapse `lea REG, [LABEL + REG*scale (+ DISP_A)?]; <op> ..., [REG (+ DISP_B)?]` (or vice versa for stores) into a single op with the SIB form directly: `<op> ..., [LABEL + REG*scale + (DISP_A + DISP_B)]`. Drops the 6+ byte LEA. Saves 6+ bytes per match.
+  - **Common shape**: `if (g[i] == target)` and similar patterns where the codegen materializes the address of `g[i]` with `lea REG, [_g + REG*4]` then accesses via `[REG]`. After my pass: `cmp dword [_g + REG*4], target` directly.
+  - **Supported B ops**: mov (load), cmp, test, add, sub, and, or, xor, inc, dec (RMW), push (deref). Both single-operand (push, inc, dec) and 2-operand forms work.
+  - **Conditions**: A is `lea REG, [SIB-form involving REG]` where the source contains REG itself with scale ∈ {1, 2, 4, 8}; B's memory operand is `[REG (+ M)?]` (no SIB on B); REG dead after B (`treat_as_scratch=True`) or REG == DST of B's load.
+  - **Concrete win on `_find` (linear search)**: `lea eax, [_g + eax*4]; cmp dword [eax], edx; jne .L_skip; mov eax, [ebp - 4]; jmp .epilogue` cascades through to `cmp dword [_g + eax*4], edx; je .epilogue`. Saves 4+ instructions per qualifying loop iteration.
+  - **Cascades** with `jcc_jmp_inversion` and `redundant_eax_load` to drop the redundant `mov eax, [ebp - 4]; jmp .epilogue` (since EAX already holds [ebp - 4]'s value at the je point).
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +7 peephole tests. 1072 unit tests total. Pipeline 1734/1734 (100%).

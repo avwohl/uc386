@@ -10235,6 +10235,121 @@ def test_mov_label_shl_add_load_to_sib_loop_body():
     assert opt.stats.get("mov_label_shl_add_load_to_sib") == 1
 
 
+def test_lea_sib_label_load_collapse_cmp():
+    """`lea eax, [_g + eax*4]; cmp dword [eax], edx` collapses to
+    `cmp dword [_g + eax*4], edx`. Drops the 6-byte+ LEA. Common in
+    `if (g[i] == target)` patterns."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [_g + eax*4]\n"
+        "        cmp     dword [eax], edx\n"
+        "        je      .L_found\n"
+        "        ret\n"
+        ".L_found:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "lea     eax, [_g + eax*4]" not in out
+    assert "cmp     dword [_g + eax*4], edx" in out
+    assert opt.stats.get("lea_sib_label_load_collapse") == 1
+
+
+def test_lea_sib_label_load_collapse_load():
+    """`lea eax, [_g + eax*4]; mov esi, [eax]` collapses. DST != REG
+    means we need REG dead after the load."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [_g + eax*4]\n"
+        "        mov     esi, [eax]\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # EAX dead at ret (treat_as_scratch=True), so collapse fires.
+    assert "lea     eax, [_g + eax*4]" not in out
+    assert "mov     esi, [_g + eax*4]" in out
+    assert opt.stats.get("lea_sib_label_load_collapse") == 1
+
+
+def test_lea_sib_label_load_collapse_load_dst_eq_reg():
+    """`lea eax, [_g + eax*4]; mov eax, [eax]` collapses. DST == REG
+    means the load overwrites REG, so we don't need REG dead after."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [_g + eax*4]\n"
+        "        mov     eax, [eax]\n"
+        "        mov     [ebp - 4], eax\n"  # eax read after — alive!
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # DST == REG, so REG-alive doesn't matter — the load itself
+    # overwrites REG.
+    assert "lea     eax, [_g + eax*4]" not in out
+    assert "mov     eax, [_g + eax*4]" in out
+    assert opt.stats.get("lea_sib_label_load_collapse") == 1
+
+
+def test_lea_sib_label_load_collapse_with_disp():
+    """`lea eax, [_g + eax*4 + 4]; mov eax, [eax]` folds the
+    displacement into the SIB form."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [_g + eax*4 + 4]\n"
+        "        mov     eax, [eax]\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [_g + eax*4 + 4]" in out
+    assert opt.stats.get("lea_sib_label_load_collapse") == 1
+
+
+def test_lea_sib_label_load_collapse_disp_combine():
+    """Both A and B have displacements — they combine."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [_g + eax*4 + 8]\n"
+        "        mov     eax, [eax + 4]\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Combined disp = 8 + 4 = 12.
+    assert "mov     eax, [_g + eax*4 + 12]" in out
+
+
+def test_lea_sib_label_load_collapse_skips_non_sib_form():
+    """If A's source doesn't match `[LABEL + REG*N]`, bail."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [ebp - 8]\n"  # not LABEL+REG*N
+        "        mov     ebx, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("lea_sib_label_load_collapse", 0) == 0
+
+
+def test_lea_sib_label_load_collapse_skips_invalid_scale():
+    """Scale must be in {1, 2, 4, 8} (SIB scale)."""
+    asm = (
+        "_f:\n"
+        "        lea     eax, [_g + eax*16]\n"  # invalid scale
+        "        mov     ebx, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("lea_sib_label_load_collapse", 0) == 0
+
+
 def test_push_memory_to_push_reg_basic():
     """`mov eax, [m]; cmp eax, X; jge L; push dword [m]` collapses
     push's memory operand to `push eax`. Saves 2 bytes per match.
