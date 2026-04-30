@@ -458,6 +458,7 @@ class PeepholeOptimizer:
             lines = self._pass_copy_save_deref_collapse(lines)
             lines = self._pass_dup_load_with_intermediate(lines)
             lines = self._pass_uncollapse_cmp_when_reload(lines)
+            lines = self._pass_redundant_cmp_at_label(lines)
             lines = self._pass_redundant_mem_load_via_xfer(lines)
             lines = self._pass_load_add_xfer_forward(lines)
             lines = self._pass_byte_stores_to_dword(lines)
@@ -11134,6 +11135,112 @@ class PeepholeOptimizer:
             self.stats["uncollapse_cmp_when_reload"] = (
                 self.stats.get("uncollapse_cmp_when_reload", 0) + 1
             )
+        return out
+
+    def _pass_redundant_cmp_at_label(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Drop a duplicate cmp/test at a label whose only predecessor
+        is a Jcc with a matching cmp. Pattern:
+
+            cmp [m], X         ; A
+            jcc L              ; B
+            ... unconditional terminator before L ...
+            L:
+            cmp [m], X         ; D — duplicate of A
+            jcc2 L2            ; (or anything else)
+        →
+            cmp [m], X         ; A
+            jcc L              ; B
+            ... terminator ...
+            L:
+            jcc2 L2            ; (cmp at L dropped)
+
+        Saves 4-7 bytes per match (drops one cmp/test instruction).
+        Common in if-elif chains where each branch tests the same
+        expression against different constants.
+
+        The flags from A still hold at L's entry because:
+        - L has only one predecessor: the Jcc B.
+        - The path A → B → L doesn't modify flags (jcc itself
+          doesn't write flags; the cmp is right before the jcc).
+        - L is preceded by an unconditional terminator, so no
+          text-fallthrough into L.
+
+        Conditions:
+        - A is `cmp` or `test`, B is Jcc, both adjacent (B at A+1).
+        - B's target L is referenced exactly twice in the file
+          (definition + the one Jcc operand).
+        - L is preceded by an unconditional terminator (so no
+          fallthrough; only the Jcc reaches L).
+        - The first instruction after L's definition is D, with
+          op == A's op and operands == A's operands.
+        - No flag-clobbering instructions between L's def and D
+          (in practice they're adjacent).
+        """
+        out = list(lines)
+        # Build label-reference textual count.
+        label_pattern = re.compile(r"\.[A-Za-z_]\w*")
+        counts: dict[str, int] = {}
+        for line in out:
+            for match in label_pattern.finditer(line.raw):
+                counts[match.group()] = (
+                    counts.get(match.group(), 0) + 1
+                )
+        # Walk and find cmp/test followed by jcc.
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op in ("cmp", "test")
+                and b.kind == "instr"
+                and b.op.startswith("j") and b.op != "jmp"
+            ):
+                i += 1
+                continue
+            target = _branch_target(b)
+            if target is None or not target.startswith("."):
+                i += 1
+                continue
+            if counts.get(target, 0) != 2:
+                i += 1
+                continue
+            target_idx = self._find_label_idx(out, target, i)
+            if target_idx is None:
+                i += 1
+                continue
+            if not self._preceded_by_terminator(out, target_idx):
+                i += 1
+                continue
+            # Find the first instruction after the label.
+            d_idx = None
+            for k in range(target_idx + 1, len(out)):
+                ln = out[k]
+                if ln.kind in ("blank", "comment", "label"):
+                    continue
+                if ln.kind != "instr":
+                    break  # directive/data
+                d_idx = k
+                break
+            if d_idx is None:
+                i += 1
+                continue
+            d = out[d_idx]
+            if not (
+                d.kind == "instr" and d.op == a.op
+                and (d.operands or "").strip()
+                    == (a.operands or "").strip()
+            ):
+                i += 1
+                continue
+            # All checks passed. Drop D.
+            out = out[:d_idx] + out[d_idx + 1:]
+            self.stats["redundant_cmp_at_label"] = (
+                self.stats.get("redundant_cmp_at_label", 0) + 1
+            )
+            # Don't advance — re-check from current pos in case
+            # cascading effects (e.g., another duplicate cmp pattern).
         return out
 
     def _pass_xfer_store_collapse(

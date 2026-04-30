@@ -1523,3 +1523,10 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete win on `_sum_list` (linked list traversal)**: loop body 8 instructions → 7. Saves 2 bytes per iteration from the test-eax-eax replacing cmp-dword-mem-imm.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +8 peephole tests. 1004 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: redundant_cmp_at_label**: drop a duplicate cmp/test at a label whose only predecessor is a Jcc with a matching cmp. Pattern `cmp [m], X; jcc L; ...terminator...; L: cmp [m], X; jcc2 L2` → drops the second cmp. Saves 4-7 bytes per match (size of the dropped cmp).
+  - **Why this pattern arises**: if-elif chains where each branch tests the same expression against different constants (`if (x < 0) ...; if (x == 0) ...; if (x < 10) ...`) — the codegen lowers each test independently with its own cmp. After the first cmp+jcc, flags still reflect the cmp at the jcc-taken label.
+  - **Safety**: at L's entry, flags reflect the original cmp because (1) L has only one predecessor (the Jcc B, verified via textual reference count == 2), (2) the path A → B → L doesn't modify flags (jcc itself doesn't write flags; the cmp is right before the jcc), (3) L is preceded by an unconditional terminator (jmp/ret/etc.), so no text-fallthrough into L.
+  - **Conditions**: A is `cmp` or `test`, B is Jcc adjacent to A; L is preceded by an unconditional terminator; L referenced exactly twice in file (def + jcc operand); first instr after L is D = cmp/test with operands matching A.
+  - **Concrete win on `_classify` (4-way if-elif chain)**: drops the duplicate `cmp dword [ebp + 8], 0` at `.L2_endif:`. Saves 4 bytes per qualifying duplicate. Other labels with different operands (`.L4_endif: cmp ..., 10`) correctly retained.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests. 1010 unit tests total. Pipeline 1734/1734 (100%).

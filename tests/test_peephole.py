@@ -6237,6 +6237,157 @@ def test_uncollapse_cmp_when_reload_jne_form():
     assert opt.stats.get("uncollapse_cmp_when_reload", 0) == 0
 
 
+# ── redundant_cmp_at_label ────────────────────────────────────────
+
+
+def test_redundant_cmp_at_label_basic():
+    """If/elif chain testing the same expression. Each label after
+    a Jcc has flags from the original cmp; the duplicate cmp is
+    redundant.
+
+    Original:                       After:
+        cmp [m], 0                      cmp [m], 0
+        jge .L_else                     jge .L_else
+        mov eax, -1                     mov eax, -1
+        jmp .epilogue                   jmp .epilogue
+        .L_else:                        .L_else:
+        cmp [m], 0     ; DROP           jne .L_other
+        jne .L_other
+    """
+    asm = (
+        "_f:\n"
+        "        cmp     dword [ebp + 8], 0\n"
+        "        jge     .L_else\n"
+        "        mov     eax, -1\n"
+        "        jmp     .epilogue\n"
+        ".L_else:\n"
+        "        cmp     dword [ebp + 8], 0\n"
+        "        jne     .L_other\n"
+        "        xor     eax, eax\n"
+        "        jmp     .epilogue\n"
+        ".L_other:\n"
+        "        mov     eax, 1\n"
+        ".epilogue:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("redundant_cmp_at_label") == 1
+    # The first cmp is preserved, the duplicate at .L_else: is dropped.
+    assert out.count("cmp     dword [ebp + 8], 0") == 1
+
+
+def test_redundant_cmp_at_label_skips_when_operands_differ():
+    """If the cmp at the label has different operands, it's not
+    a duplicate."""
+    asm = (
+        "_f:\n"
+        "        cmp     dword [ebp + 8], 0\n"
+        "        jge     .L_else\n"
+        "        mov     eax, -1\n"
+        "        jmp     .epilogue\n"
+        ".L_else:\n"
+        "        cmp     dword [ebp + 8], 10\n"  # different RHS
+        "        jne     .L_other\n"
+        "        xor     eax, eax\n"
+        ".L_other:\n"
+        "        mov     eax, 1\n"
+        ".epilogue:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_cmp_at_label", 0) == 0
+
+
+def test_redundant_cmp_at_label_skips_when_label_has_other_refs():
+    """If the label has other references (more than one Jcc), the
+    duplicate cmp can't be safely dropped because flags from one
+    Jcc's cmp may differ from another's."""
+    asm = (
+        "_f:\n"
+        "        cmp     dword [ebp + 8], 0\n"
+        "        jge     .L_else\n"
+        "        cmp     dword [ebp + 8], 5\n"  # different cmp
+        "        jne     .L_else\n"  # second ref to .L_else
+        "        mov     eax, -1\n"
+        "        jmp     .epilogue\n"
+        ".L_else:\n"
+        "        cmp     dword [ebp + 8], 0\n"
+        "        jne     .L_other\n"
+        ".L_other:\n"
+        "        mov     eax, 1\n"
+        ".epilogue:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_cmp_at_label", 0) == 0
+
+
+def test_redundant_cmp_at_label_skips_when_label_falls_through():
+    """If the label is preceded by a non-terminator (e.g. text
+    fallthrough is possible), flags may not be preserved."""
+    asm = (
+        "_f:\n"
+        "        cmp     dword [ebp + 8], 0\n"
+        "        jge     .L_else\n"
+        "        nop\n"  # falls through to .L_else
+        ".L_else:\n"
+        "        cmp     dword [ebp + 8], 0\n"
+        "        jne     .L_other\n"
+        ".L_other:\n"
+        "        mov     eax, 1\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_cmp_at_label", 0) == 0
+
+
+def test_redundant_cmp_at_label_test_form():
+    """`test` form also works."""
+    asm = (
+        "_f:\n"
+        "        test    eax, eax\n"
+        "        jz      .L_zero\n"
+        "        mov     eax, 1\n"
+        "        jmp     .epilogue\n"
+        ".L_zero:\n"
+        "        test    eax, eax\n"
+        "        js      .L_neg\n"
+        ".L_neg:\n"
+        "        xor     eax, eax\n"
+        ".epilogue:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("redundant_cmp_at_label") == 1
+    assert out.count("test    eax, eax") == 1
+
+
+def test_redundant_cmp_at_label_jne_path():
+    """The jcc can be any conditional flavor."""
+    asm = (
+        "_f:\n"
+        "        cmp     dword [ebp + 8], 5\n"
+        "        jne     .L_branch\n"
+        "        mov     eax, 0\n"
+        "        jmp     .epilogue\n"
+        ".L_branch:\n"
+        "        cmp     dword [ebp + 8], 5\n"
+        "        jl      .L_other\n"
+        ".L_other:\n"
+        "        mov     eax, 1\n"
+        ".epilogue:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("redundant_cmp_at_label") == 1
+
+
 # ── xfer_store_collapse ───────────────────────────────────────────
 
 
