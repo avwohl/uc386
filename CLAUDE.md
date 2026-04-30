@@ -1530,3 +1530,11 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Concrete win on `_classify` (4-way if-elif chain)**: drops the duplicate `cmp dword [ebp + 8], 0` at `.L2_endif:`. Saves 4 bytes per qualifying duplicate. Other labels with different operands (`.L4_endif: cmp ..., 10`) correctly retained.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests. 1010 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-29 — Phase A peephole: op_mem_to_reg_collapse**: collapse `OP reg, [m]; mov [m], reg` into `OP [m], reg` for commutative OPs (add, and, or, xor). Saves 3 bytes per match (drops the 3-byte mem-store; the merged in-place OP has the same encoded length as the original OP-with-mem-source).
+  - **Common shape**: `sum += helper()` where helper's return is in EAX, then `add eax, [sum]; mov [sum], eax`. The codegen lowers compound-assign-with-call this way because the call clobbers EAX, and only after the call does it know the value to add.
+  - **Differs from `rmw_collapse`**: that pass handles `mov reg, [m]; OP reg, X; mov [m], reg` (3 lines, with a load of [m] first). My pass handles `OP reg, [m]; mov [m], reg` (2 lines, no load — reg already has the value to add to [m]).
+  - **Restricted to commutative OPs**: sub is non-commutative (`reg - [m]` != `[m] - reg`), so the rewrite would change the value at [m]. Same exclusion for cmp (no in-place cmp form), imul (no `imul [m], reg` form), shifts (different shape).
+  - **Conditions**: 2 adjacent instructions; A's [m] textually equals B's [m] after stripping size prefixes; A's destination = B's source register; reg dead after B (since the rewrite leaves reg unchanged whereas the OP would modify it).
+  - **Concrete win on `_driver` (compound assign in for-loop body)**: `add eax, dword [ebp - 4]; mov [ebp - 4], eax` becomes `add [ebp - 4], eax`. Loop body shrinks from 7 instructions to 6 — saves 3 bytes per iteration of any compound-assign-with-call pattern.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +6 peephole tests. 1016 unit tests total. Pipeline 1734/1734 (100%).

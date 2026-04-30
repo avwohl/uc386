@@ -459,6 +459,7 @@ class PeepholeOptimizer:
             lines = self._pass_dup_load_with_intermediate(lines)
             lines = self._pass_uncollapse_cmp_when_reload(lines)
             lines = self._pass_redundant_cmp_at_label(lines)
+            lines = self._pass_op_mem_to_reg_collapse(lines)
             lines = self._pass_redundant_mem_load_via_xfer(lines)
             lines = self._pass_load_add_xfer_forward(lines)
             lines = self._pass_byte_stores_to_dword(lines)
@@ -11241,6 +11242,106 @@ class PeepholeOptimizer:
             )
             # Don't advance — re-check from current pos in case
             # cascading effects (e.g., another duplicate cmp pattern).
+        return out
+
+    def _pass_op_mem_to_reg_collapse(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse ``OP reg, [m]; mov [m], reg`` into
+        ``OP [m], reg`` for commutative OPs (add, and, or, xor).
+
+        Saves 3 bytes per match (drops the redundant store back to
+        [m]; the merged in-place OP has the same encoded length as
+        the original OP-with-mem-source).
+
+        Common shape: `sum += helper()` where helper's return is in
+        EAX, then we add [sum] and store back. The codegen emits
+        ``add eax, [sum]; mov [sum], eax`` which directly merges.
+
+        Conditions:
+        - OP ∈ {add, and, or, xor} (commutative — `reg + [m]` ==
+          `[m] + reg` so the rewrite preserves the value at [m]).
+          sub/cmp/imul/shifts don't qualify due to operand-order or
+          form differences.
+        - A's source [m] textually equals B's destination [m]
+          (after stripping optional size prefixes).
+        - reg is the same in A's destination and B's source.
+        - reg is dead after B (since the rewrite leaves reg
+          unchanged whereas the original modified it via the OP).
+        """
+        out = list(lines)
+        COMMUTATIVE_OPS = {"add", "and", "or", "xor"}
+        i = 0
+        while i + 1 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            if not (
+                a.kind == "instr" and a.op in COMMUTATIVE_OPS
+                and b.kind == "instr" and b.op == "mov"
+            ):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            bp = _operands_split(b.operands)
+            if ap is None or bp is None:
+                i += 1
+                continue
+            a_dst = ap[0].strip().lower()
+            a_src = ap[1].strip()
+            if not self._is_general_register(a_dst):
+                i += 1
+                continue
+            # Strip optional size prefix on A's source.
+            a_src_clean = a_src
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if a_src_clean.lower().startswith(prefix):
+                    a_src_clean = a_src_clean[len(prefix):].lstrip()
+                    break
+            if not (
+                a_src_clean.startswith("[")
+                and a_src_clean.endswith("]")
+            ):
+                i += 1
+                continue
+            # B: mov [m], reg
+            b_dst = bp[0].strip()
+            b_src = bp[1].strip().lower()
+            if b_src != a_dst:
+                i += 1
+                continue
+            b_dst_clean = b_dst
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if b_dst_clean.lower().startswith(prefix):
+                    b_dst_clean = b_dst_clean[len(prefix):].lstrip()
+                    break
+            if not (
+                b_dst_clean.startswith("[")
+                and b_dst_clean.endswith("]")
+            ):
+                i += 1
+                continue
+            if b_dst_clean != a_src_clean:
+                i += 1
+                continue
+            # reg must be dead after B (since the rewrite leaves
+            # reg unchanged whereas the OP would have modified it).
+            if not self._reg_dead_after(out, i + 2, a_dst):
+                i += 1
+                continue
+            # All checks passed. Rewrite to single in-place OP.
+            indent = self._extract_indent(a.raw)
+            spacer = " " * max(1, 8 - len(a.op))
+            new_raw = (
+                f"{indent}{a.op}{spacer}{a_src_clean}, {a_dst}"
+            )
+            new_line = Line(
+                raw=new_raw, kind="instr", op=a.op,
+                operands=f"{a_src_clean}, {a_dst}",
+            )
+            out = out[:i] + [new_line] + out[i + 2:]
+            self.stats["op_mem_to_reg_collapse"] = (
+                self.stats.get("op_mem_to_reg_collapse", 0) + 1
+            )
         return out
 
     def _pass_xfer_store_collapse(

@@ -6388,6 +6388,111 @@ def test_redundant_cmp_at_label_jne_path():
     assert opt.stats.get("redundant_cmp_at_label") == 1
 
 
+# ── op_mem_to_reg_collapse ────────────────────────────────────────
+
+
+def test_op_mem_to_reg_collapse_add():
+    """`add eax, [m]; mov [m], eax` → `add [m], eax`. Saves 3 bytes."""
+    asm = (
+        "_f:\n"
+        "        call    _helper\n"
+        "        add     eax, dword [ebp - 4]\n"
+        "        mov     [ebp - 4], eax\n"
+        "        xor     eax, eax\n"  # eax dead
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("op_mem_to_reg_collapse") == 1
+    assert "add     [ebp - 4], eax" in out
+    # Original load+store gone.
+    assert "add     eax, dword [ebp - 4]" not in out
+
+
+def test_op_mem_to_reg_collapse_or():
+    """`or eax, [m]; mov [m], eax` → `or [m], eax`."""
+    asm = (
+        "_f:\n"
+        "        call    _helper\n"
+        "        or      eax, [ebp - 4]\n"
+        "        mov     [ebp - 4], eax\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("op_mem_to_reg_collapse") == 1
+    assert "or      [ebp - 4], eax" in out
+
+
+def test_op_mem_to_reg_collapse_skips_sub():
+    """sub is non-commutative: `sub reg, [m]; mov [m], reg` ≠
+    `sub [m], reg`. Pass should skip."""
+    asm = (
+        "_f:\n"
+        "        call    _helper\n"
+        "        sub     eax, [ebp - 4]\n"
+        "        mov     [ebp - 4], eax\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("op_mem_to_reg_collapse", 0) == 0
+
+
+def test_op_mem_to_reg_collapse_skips_when_reg_live():
+    """If reg is read after the store, the rewrite changes its
+    value (reg keeps its pre-OP value rather than being modified
+    by the OP). Unsafe."""
+    asm = (
+        "_f:\n"
+        "        call    _helper\n"
+        "        add     eax, [ebp - 4]\n"
+        "        mov     [ebp - 4], eax\n"
+        "        add     ecx, eax\n"  # reads eax
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("op_mem_to_reg_collapse", 0) == 0
+
+
+def test_op_mem_to_reg_collapse_skips_when_mem_differs():
+    """A's [m] must equal B's [m]."""
+    asm = (
+        "_f:\n"
+        "        call    _helper\n"
+        "        add     eax, [ebp - 4]\n"
+        "        mov     [ebp - 8], eax\n"  # different slot
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("op_mem_to_reg_collapse", 0) == 0
+
+
+def test_op_mem_to_reg_collapse_and_xor():
+    """`and` and `xor` also work."""
+    asm = (
+        "_f:\n"
+        "        call    _h1\n"
+        "        and     eax, [ebp - 4]\n"
+        "        mov     [ebp - 4], eax\n"
+        "        call    _h2\n"
+        "        xor     eax, [ebp - 8]\n"
+        "        mov     [ebp - 8], eax\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("op_mem_to_reg_collapse") == 2
+    assert "and     [ebp - 4], eax" in out
+    assert "xor     [ebp - 8], eax" in out
+
+
 # ── xfer_store_collapse ───────────────────────────────────────────
 
 
