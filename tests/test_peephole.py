@@ -10029,6 +10029,159 @@ def test_index_load_collapse_label_skips_idx_reused():
     assert opt.stats.get("index_load_collapse_label", 0) == 0
 
 
+def test_mov_label_shl_add_load_to_sib_basic():
+    """`mov edx, _g; shl eax, 2; add eax, edx; mov eax, [eax]`
+    → `mov eax, [_g + eax*4]`. Drops 3 instructions / ~10 bytes.
+    Common shape: for-loop body where index is in EAX and codegen
+    materializes the global base into EDX as a scratch."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, _g\n"
+        "        shl     eax, 2\n"
+        "        add     eax, edx\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     edx, _g" not in out
+    assert "shl     eax, 2" not in out
+    assert "add     eax, edx" not in out
+    assert "mov     eax, [_g + eax*4]" in out
+    assert opt.stats.get("mov_label_shl_add_load_to_sib") == 1
+
+
+def test_mov_label_shl_add_load_to_sib_distinct_dst():
+    """DST != IDX: `mov edx, _g; shl eax, 1; add eax, edx; movzx
+    ecx, word [eax]` → `movzx ecx, word [_g + eax*2]`. Requires IDX
+    dead after (eax not read past the load)."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, _g\n"
+        "        shl     eax, 1\n"
+        "        add     eax, edx\n"
+        "        movzx   ecx, word [eax]\n"
+        "        mov     eax, ecx\n"  # eax overwritten before any read
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "movzx   ecx, word [_g + eax*2]" in out
+    assert opt.stats.get("mov_label_shl_add_load_to_sib") == 1
+
+
+def test_mov_label_shl_add_load_to_sib_skips_idx_alive():
+    """If IDX is alive after the load and DST != IDX, the rewrite
+    leaves IDX with the unscaled index value (instead of the
+    original post-add LABEL + idx*scale). Must not fire."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, _g\n"
+        "        shl     eax, 1\n"
+        "        add     eax, edx\n"
+        "        movzx   ecx, word [eax]\n"
+        "        mov     [ebp - 4], eax\n"  # eax read after — alive
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("mov_label_shl_add_load_to_sib", 0) == 0
+
+
+def test_mov_label_shl_add_load_to_sib_skips_base_alive():
+    """If BASE is alive after (read before being overwritten), the
+    rewrite would observe a different value (pre-A vs LABEL). Must
+    not fire."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, _g\n"
+        "        shl     eax, 2\n"
+        "        add     eax, edx\n"
+        "        mov     eax, [eax]\n"
+        "        mov     [ebp - 4], edx\n"  # edx read after
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("mov_label_shl_add_load_to_sib", 0) == 0
+
+
+def test_mov_label_shl_add_load_to_sib_skips_numeric_label():
+    """A's source must be a label/symbolic expression, not a numeric
+    literal (that's plain `disp_load_collapse` territory)."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, 100\n"  # numeric, not label
+        "        shl     eax, 2\n"
+        "        add     eax, edx\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("mov_label_shl_add_load_to_sib", 0) == 0
+
+
+def test_mov_label_shl_add_load_to_sib_skips_invalid_scale():
+    """Shift must be 1, 2, or 3 (scale 2/4/8). Other counts bail."""
+    asm = (
+        "_f:\n"
+        "        mov     edx, _g\n"
+        "        shl     eax, 5\n"  # scale 32 not supported
+        "        add     eax, edx\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("mov_label_shl_add_load_to_sib", 0) == 0
+
+
+def test_mov_label_shl_add_load_to_sib_skips_same_reg():
+    """BASE != IDX. If same, the pattern can't make sense (the shl
+    would already need IDX = LABEL, which is wrong for an index)."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, _g\n"
+        "        shl     eax, 2\n"  # base == idx == eax
+        "        add     eax, eax\n"
+        "        mov     eax, [eax]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("mov_label_shl_add_load_to_sib", 0) == 0
+
+
+def test_mov_label_shl_add_load_to_sib_loop_body():
+    """Realistic loop body: cmp at top with EAX = i, body derefs
+    `g[i]`. EDX is dead at function exit; .L1_for_top is a back-edge
+    target. Pass should fire and the loop body shrinks dramatically."""
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        ".L1_for_top:\n"
+        "        mov     eax, [ebp - 8]\n"
+        "        cmp     eax, [ebp + 8]\n"
+        "        jge     .L3_for_end\n"
+        "        mov     edx, _g\n"
+        "        shl     eax, 2\n"
+        "        add     eax, edx\n"
+        "        mov     eax, [eax]\n"
+        "        add     [ebp - 4], eax\n"
+        "        inc     dword [ebp - 8]\n"
+        "        jmp     .L1_for_top\n"
+        ".L3_for_end:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "mov     eax, [_g + eax*4]" in out
+    assert opt.stats.get("mov_label_shl_add_load_to_sib") == 1
+
+
 def test_same_memory_operand_reuse_add():
     """`mov reg, [m]; add reg, [m]` → `mov reg, [m]; add reg, reg`.
 

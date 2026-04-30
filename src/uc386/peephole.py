@@ -426,6 +426,7 @@ class PeepholeOptimizer:
             lines = self._pass_compound_assign_collapse(lines)
             lines = self._pass_index_load_collapse(lines)
             lines = self._pass_index_load_collapse_label(lines)
+            lines = self._pass_mov_label_shl_add_load_to_sib(lines)
             # Runs AFTER index_load_collapse_label so that pass can
             # consume the `shl + add LABEL + load` pattern entirely
             # (saves more bytes). My pass picks up the remaining cases
@@ -2442,6 +2443,7 @@ class PeepholeOptimizer:
         self, lines: list[Line], start_idx: int, reg32: str,
         visited_labels: frozenset[str] = frozenset(),
         depth: int = 0,
+        treat_as_scratch: bool = False,
     ) -> bool:
         """Forward scan from start_idx. Return True if `reg32` is
         provably dead — a pure-write happens before any read.
@@ -2455,6 +2457,14 @@ class PeepholeOptimizer:
         The codegen invariant — registers are not assumed to carry
         values across labels — means cross-label scanning is safe
         for the reg liveness question.
+
+        ``treat_as_scratch=True`` treats EAX/EDX as dead at ret.
+        Use only when the caller knows the register is being used
+        purely as scratch (e.g., a base-address holder for SIB
+        arithmetic) and not as a return-value setup. The codegen
+        explicitly emits long-long return setup via cdq + EDX:EAX
+        loads, so a stale `mov edx, _label` doesn't constitute a
+        return value.
         """
         if depth > 5:
             return False
@@ -2490,6 +2500,8 @@ class PeepholeOptimizer:
                 # leaves them at the caller's value, which is fine).
                 # ECX is caller-saved scratch.
                 if reg32 in ("eax", "edx"):
+                    if treat_as_scratch:
+                        return True
                     return False
                 return True
             # `leave` is `mov esp, ebp; pop ebp` — it READS EBP and
@@ -2524,6 +2536,7 @@ class PeepholeOptimizer:
                     lines, target_idx + 1, reg32,
                     visited_labels | frozenset({target}),
                     depth + 1,
+                    treat_as_scratch=treat_as_scratch,
                 )
             # Conditional jumps split control flow. Both successors
             # must reach a pure-write before any read. Recurse on the
@@ -2542,6 +2555,7 @@ class PeepholeOptimizer:
                     lines, target_idx + 1, reg32,
                     visited_labels | frozenset({target}),
                     depth + 1,
+                    treat_as_scratch=treat_as_scratch,
                 )
                 if not target_dead:
                     return False
@@ -6015,6 +6029,186 @@ class PeepholeOptimizer:
             self.stats["index_load_collapse_label"] = (
                 self.stats.get(
                     "index_load_collapse_label", 0
+                ) + 1
+            )
+            continue
+        return out
+
+    def _pass_mov_label_shl_add_load_to_sib(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Collapse the 4-line global-array-index pattern produced
+        when the index is in EAX (so the codegen materializes the
+        base label into a separate scratch register first).
+
+        Pattern (4 consecutive instr lines):
+            A: mov BASE, LABEL
+            B: shl IDX, N            ; N in {1, 2, 3}
+            C: add IDX, BASE
+            D: mov/movsx/movzx DST, [IDX]
+
+        Rewrite:
+            D': mov/movsx/movzx DST, [LABEL + IDX*scale]
+
+        Drops A, B, C entirely. Saves 3 instructions / ~10 bytes.
+
+        Common shape: a for-loop's body where the loop counter sits
+        in EAX (loaded for the cmp at the loop top), then the body
+        derefs `g[i]`. Codegen picks a fresh register (EDX) to hold
+        the global base because EAX is busy with the index.
+
+        Conditions:
+        - BASE, IDX, DST are 32-bit GP registers; BASE != IDX.
+        - LABEL is non-numeric, non-memory, non-register.
+        - N in {1, 2, 3} (scale 2/4/8).
+        - D's mem operand is plain `[IDX]` (no displacement).
+        - BASE dead after D (the original sequence ended with
+          BASE = LABEL; after rewrite BASE keeps its pre-A value).
+        - IDX dead after D OR DST == IDX (original ended with
+          IDX = LABEL + idx*scale; after rewrite IDX keeps its
+          pre-A unscaled value unless overwritten by D).
+        """
+        SCALE = {1: 2, 2: 4, 3: 8}
+        LOAD_OPS = {"mov", "movsx", "movzx"}
+        out = list(lines)
+        i = 0
+        while i + 3 < len(out):
+            a = out[i]
+            b = out[i + 1]
+            c = out[i + 2]
+            d = out[i + 3]
+            if not (
+                a.kind == "instr" and a.op == "mov"
+                and b.kind == "instr" and b.op == "shl"
+                and c.kind == "instr" and c.op == "add"
+                and d.kind == "instr" and d.op in LOAD_OPS
+            ):
+                i += 1
+                continue
+            # Parse A: `mov BASE, LABEL`.
+            ap = _operands_split(a.operands)
+            if ap is None:
+                i += 1
+                continue
+            base_reg = ap[0].strip().lower()
+            label = ap[1].strip()
+            if not self._is_general_register(base_reg):
+                i += 1
+                continue
+            # LABEL must be non-register, non-numeric, non-memory.
+            if self._is_general_register(label.lower()):
+                i += 1
+                continue
+            try:
+                int(label)
+                i += 1
+                continue
+            except ValueError:
+                pass
+            try:
+                int(label, 16)
+                i += 1
+                continue
+            except ValueError:
+                pass
+            if "[" in label:
+                i += 1
+                continue
+            # Parse B: `shl IDX, N`.
+            bp = _operands_split(b.operands)
+            if bp is None:
+                i += 1
+                continue
+            idx_reg = bp[0].strip().lower()
+            try:
+                n = int(bp[1].strip())
+            except ValueError:
+                i += 1
+                continue
+            if n not in SCALE:
+                i += 1
+                continue
+            if not self._is_general_register(idx_reg):
+                i += 1
+                continue
+            if idx_reg == base_reg:
+                i += 1
+                continue
+            # Parse C: `add IDX, BASE`.
+            cp = _operands_split(c.operands)
+            if cp is None:
+                i += 1
+                continue
+            c_dst = cp[0].strip().lower()
+            c_src = cp[1].strip().lower()
+            if c_dst != idx_reg or c_src != base_reg:
+                i += 1
+                continue
+            # Parse D: `mov/movsx/movzx DST, [IDX]` (plain deref).
+            dp = _operands_split(d.operands)
+            if dp is None:
+                i += 1
+                continue
+            dst_reg = dp[0].strip().lower()
+            d_src = dp[1].strip()
+            if not self._is_general_register(dst_reg):
+                i += 1
+                continue
+            size_prefix = ""
+            for prefix in ("dword ", "word ", "byte ", "qword "):
+                if d_src.lower().startswith(prefix):
+                    size_prefix = d_src[:len(prefix)]
+                    d_src = d_src[len(prefix):].lstrip()
+                    break
+            mem_re = re.match(
+                r"^\[\s*([a-zA-Z]+)\s*\]$",
+                d_src,
+            )
+            if mem_re is None:
+                i += 1
+                continue
+            mem_reg = mem_re.group(1).lower()
+            if mem_reg != idx_reg:
+                i += 1
+                continue
+            # BASE must be dead after D (the rewrite leaves BASE at
+            # its pre-A value; original ended with BASE = LABEL).
+            # treat_as_scratch=True since BASE is a scratch holding a
+            # label address, not a return-value setup.
+            if not self._reg_dead_after(
+                out, i + 4, base_reg, treat_as_scratch=True
+            ):
+                i += 1
+                continue
+            # IDX must be dead after D, unless DST == IDX (D
+            # overwrites IDX, so its pre-D value doesn't escape).
+            if dst_reg != idx_reg:
+                if not self._reg_dead_after(
+                    out, i + 4, idx_reg, treat_as_scratch=True
+                ):
+                    i += 1
+                    continue
+            # Rewrite.
+            indent = self._extract_indent(d.raw)
+            scale = SCALE[n]
+            new_src = (
+                f"{size_prefix}[{label} + {idx_reg}*{scale}]"
+            )
+            opname = d.op
+            spacer = " " * max(8 - len(opname), 1)
+            new_raw = (
+                f"{indent}{opname}{spacer}{dst_reg}, {new_src}"
+            )
+            new_line = Line(
+                raw=new_raw,
+                kind="instr",
+                op=opname,
+                operands=f"{dst_reg}, {new_src}",
+            )
+            out = out[:i] + [new_line] + out[i + 4:]
+            self.stats["mov_label_shl_add_load_to_sib"] = (
+                self.stats.get(
+                    "mov_label_shl_add_load_to_sib", 0
                 ) + 1
             )
             continue
