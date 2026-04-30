@@ -6606,6 +6606,153 @@ def test_push_pop_to_free_reg_skips_imul_with_implicit_reg():
     assert opt.stats.get("push_pop_to_free_reg", 0) == 0
 
 
+# ── redundant_recompute_after_cmp ─────────────────────────────────
+
+
+def test_redundant_recompute_after_cmp_basic():
+    """Ternary `m = arr[i] > m ? arr[i] : m` recomputes arr[i]
+    after the cmp+jcc. Drop the second compute."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        cmp     eax, [ebp - 4]\n"
+        "        jle     .L_skip\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        mov     [ebp - 4], eax\n"
+        ".L_skip:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("redundant_recompute_after_cmp") == 1
+    # Only ONE pair of `mov eax, [ebp + 8]` + SIB load remains.
+    assert out.count("mov     eax, [ebp + 8]") == 1
+    assert out.count("mov     eax, [eax + ecx*4]") == 1
+
+
+def test_redundant_recompute_after_cmp_with_disp():
+    """SIB form with displacement also handled."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + ecx*4 + 8]\n"
+        "        cmp     eax, [ebp - 4]\n"
+        "        jle     .L_skip\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + ecx*4 + 8]\n"
+        "        mov     [ebp - 4], eax\n"
+        ".L_skip:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("redundant_recompute_after_cmp") == 1
+
+
+def test_redundant_recompute_after_cmp_test_form():
+    """`test reg, reg` form also works."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        test    eax, eax\n"
+        "        jz      .L_skip\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        mov     [ebp - 4], eax\n"
+        ".L_skip:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("redundant_recompute_after_cmp") == 1
+
+
+def test_redundant_recompute_after_cmp_skips_when_a_e_differ():
+    """If A and E load from different memory, can't dedup."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        cmp     eax, [ebp - 4]\n"
+        "        jle     .L_skip\n"
+        "        mov     eax, [ebp + 12]\n"  # different m
+        "        mov     eax, [eax + ecx*4]\n"
+        "        mov     [ebp - 4], eax\n"
+        ".L_skip:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_recompute_after_cmp", 0) == 0
+
+
+def test_redundant_recompute_after_cmp_skips_when_b_f_differ():
+    """If B and F have different scale or idx, can't dedup."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        cmp     eax, [ebp - 4]\n"
+        "        jle     .L_skip\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + ecx*8]\n"  # different scale
+        "        mov     [ebp - 4], eax\n"
+        ".L_skip:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_recompute_after_cmp", 0) == 0
+
+
+def test_redundant_recompute_after_cmp_with_idx_setup():
+    """Real-world `find_max` shape: A, idx_setup (mov ecx, [...]),
+    B, cmp, jcc, E (= A), F (= B). The duplicate omits idx_setup
+    because ECX is unchanged."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp - 8]\n"  # idx_setup
+        "        mov     eax, [eax + ecx*4]\n"
+        "        cmp     eax, [ebp - 4]\n"
+        "        jle     .L_skip\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        "        mov     [ebp - 4], eax\n"
+        ".L_skip:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("redundant_recompute_after_cmp") == 1
+    # The duplicate at the end is gone.
+    assert out.count("mov     eax, [ebp + 8]") == 1
+    assert out.count("mov     eax, [eax + ecx*4]") == 1
+
+
+def test_redundant_recompute_after_cmp_skips_when_intermediate_writes_reg():
+    """If intermediate writes EAX, the SIB load uses a different
+    base than the duplicate would."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [some_other]\n"  # writes EAX
+        "        mov     eax, [eax + ecx*4]\n"
+        "        cmp     eax, [ebp - 4]\n"
+        "        jle     .L_skip\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     eax, [eax + ecx*4]\n"
+        ".L_skip:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    opt.optimize(asm)
+    assert opt.stats.get("redundant_recompute_after_cmp", 0) == 0
+
+
 # ── xfer_store_collapse ───────────────────────────────────────────
 
 

@@ -461,6 +461,7 @@ class PeepholeOptimizer:
             lines = self._pass_redundant_cmp_at_label(lines)
             lines = self._pass_op_mem_to_reg_collapse(lines)
             lines = self._pass_push_pop_to_free_reg(lines)
+            lines = self._pass_redundant_recompute_after_cmp(lines)
             lines = self._pass_redundant_mem_load_via_xfer(lines)
             lines = self._pass_load_add_xfer_forward(lines)
             lines = self._pass_byte_stores_to_dword(lines)
@@ -11594,6 +11595,234 @@ class PeepholeOptimizer:
                 dst_alias, result, flags=re.IGNORECASE,
             )
         return result
+
+    def _pass_redundant_recompute_after_cmp(
+        self, lines: list[Line]
+    ) -> list[Line]:
+        """Drop a duplicate 2-instruction load+SIB-deref sequence
+        immediately after a cmp/test+jcc that doesn't modify the
+        registers involved. Pattern:
+
+            mov reg, [m]                   ; A
+            ...intermediate (writes idx_reg, not reg)...
+            mov reg, [reg + idx_reg*scale] ; B (SIB load)
+            cmp reg, X (or test reg, reg)  ; C
+            jcc L                          ; D
+            mov reg, [m]                   ; E — duplicate of A
+            mov reg, [reg + idx_reg*scale] ; F — duplicate of B
+            [next instr uses reg = arr[idx]]
+
+        Drop E and F. Saves 6 bytes per match.
+
+        Why safe: cmp/test/jcc don't modify reg or idx_reg (just
+        flags). At the start of F, reg = M[m] (from E), idx_reg
+        unchanged. F dereferences M[M[m] + idx_reg*scale]. Same
+        address as B did, same memory unchanged → same value. So
+        at end of F, reg has the same value it had after B.
+        Dropping E+F leaves reg unchanged from after B (cmp/jcc
+        don't touch it), giving the same final reg value at the
+        next instruction.
+
+        Common shape: `if (arr[i] > m) m = arr[i];` and ternary
+        forms `cond ? arr[i] : default;` — the codegen evaluates
+        arr[i] once for the comparison, then evaluates it AGAIN
+        for the value to assign. Redundant.
+
+        Conditions:
+        - A: ``mov reg, [m]`` with m a memory operand.
+        - Up to 4 intermediate instructions between A and B that
+          don't write reg or modify [m]. (Typical: a `mov idx_reg,
+          [m_idx]` setting up the SIB index.)
+        - B: ``mov reg, [reg + idx_reg*scale]`` or with displacement.
+        - C: cmp/test that reads reg (immediately after B).
+        - D: jcc (immediately after C).
+        - E: textually identical to A (immediately after D).
+        - F: textually identical to B (immediately after E).
+        """
+        out = list(lines)
+        MAX_INTERMEDIATE = 4
+        i = 0
+        while i < len(out):
+            a = out[i]
+            if not (a.kind == "instr" and a.op == "mov"):
+                i += 1
+                continue
+            ap = _operands_split(a.operands)
+            if ap is None:
+                i += 1
+                continue
+            a_dst = ap[0].strip().lower()
+            a_src = ap[1].strip()
+            if not self._is_general_register(a_dst):
+                i += 1
+                continue
+            if not (a_src.startswith("[") and a_src.endswith("]")):
+                i += 1
+                continue
+            # Scan forward up to MAX_INTERMEDIATE instructions for B.
+            # Intermediate must not write a_dst (or modify [m]).
+            j = i + 1
+            int_count = 0
+            b_idx = None
+            scan_failed = False
+            while j < len(out) and int_count <= MAX_INTERMEDIATE:
+                ln = out[j]
+                if ln.kind in ("blank", "comment"):
+                    j += 1
+                    continue
+                if ln.kind in ("label", "directive"):
+                    scan_failed = True
+                    break
+                if ln.kind != "instr":
+                    j += 1
+                    continue
+                # Could this be B?
+                if ln.op == "mov":
+                    lp = _operands_split(ln.operands)
+                    if lp is not None:
+                        b_dst_cand = lp[0].strip().lower()
+                        b_src_cand = lp[1].strip()
+                        if b_dst_cand == a_dst:
+                            sib_match = re.match(
+                                r"^\[\s*" + re.escape(a_dst)
+                                + r"\s*\+\s*([a-z]+)\*([0-9]+)"
+                                + r"(?:\s*([+-])\s*(\d+))?\s*\]$",
+                                b_src_cand, re.IGNORECASE,
+                            )
+                            if sib_match is not None:
+                                b_idx = j
+                                break
+                # Otherwise: intermediate instruction. Must not
+                # write a_dst.
+                if self._instr_writes_reg(ln, a_dst):
+                    scan_failed = True
+                    break
+                int_count += 1
+                j += 1
+            if scan_failed or b_idx is None:
+                i += 1
+                continue
+            b = out[b_idx]
+            bp = _operands_split(b.operands)
+            b_src = bp[1].strip()
+            sib_match = re.match(
+                r"^\[\s*" + re.escape(a_dst)
+                + r"\s*\+\s*([a-z]+)\*([0-9]+)"
+                + r"(?:\s*([+-])\s*(\d+))?\s*\]$",
+                b_src, re.IGNORECASE,
+            )
+            idx_reg = sib_match.group(1).lower()
+            if not self._is_general_register(idx_reg):
+                i += 1
+                continue
+            # Now expect C, D, E, F adjacent after B.
+            if b_idx + 4 >= len(out):
+                i += 1
+                continue
+            c = out[b_idx + 1]
+            d = out[b_idx + 2]
+            e = out[b_idx + 3]
+            f = out[b_idx + 4]
+            if not all(
+                ln.kind == "instr" for ln in (c, d, e, f)
+            ):
+                i += 1
+                continue
+            if c.op not in ("cmp", "test"):
+                i += 1
+                continue
+            if not (d.op.startswith("j") and d.op != "jmp"):
+                i += 1
+                continue
+            if not (e.op == "mov" and f.op == "mov"):
+                i += 1
+                continue
+            # E identical to A.
+            ep = _operands_split(e.operands)
+            fp = _operands_split(f.operands)
+            cp = _operands_split(c.operands)
+            if ep is None or fp is None or cp is None:
+                i += 1
+                continue
+            if (
+                ep[0].strip().lower() != a_dst
+                or ep[1].strip() != a_src
+            ):
+                i += 1
+                continue
+            # F identical to B.
+            if (
+                fp[0].strip().lower() != a_dst
+                or fp[1].strip() != b_src
+            ):
+                i += 1
+                continue
+            # C reads reg.
+            if cp[0].strip().lower() != a_dst:
+                i += 1
+                continue
+            # All checks passed. Drop E and F.
+            out = out[:b_idx + 3] + out[b_idx + 5:]
+            self.stats["redundant_recompute_after_cmp"] = (
+                self.stats.get(
+                    "redundant_recompute_after_cmp", 0
+                ) + 1
+            )
+            # Don't advance — re-check from current pos.
+        return out
+
+    @staticmethod
+    def _instr_writes_reg(line: Line, reg32: str) -> bool:
+        """Does this instruction write to reg32 (or a sub-alias)?
+        Conservative: returns True for mov/lea/movsx/movzx with
+        reg as dest, single-operand RMW (inc/dec/neg/not) on reg,
+        2-operand ops (add/sub/and/or/xor/shl/shr/etc.) with reg
+        as dest, pop reg, and any implicit-write op (cdq/idiv/etc.
+        that writes EAX/EDX)."""
+        if line.kind != "instr":
+            return False
+        op = line.op
+        family = PeepholeOptimizer._REG_FAMILY.get(reg32, ())
+        ops = line.operands or ""
+        # Parse operands.
+        parts = _operands_split(ops)
+        if parts is not None:
+            dest = parts[0].strip().lower()
+            # 2-operand instructions write to dest (except cmp/test).
+            if op in {"cmp", "test"}:
+                return False
+            # mov/lea/movsx/movzx/add/sub/and/or/xor/imul/shl/shr/sar/etc.
+            if dest in family:
+                return True
+            return False
+        # Single-operand or no operands.
+        if op == "pop":
+            single = ops.strip().lower()
+            return single in family
+        if op in {"inc", "dec", "neg", "not", "shl", "shr", "sar",
+                  "rol", "ror", "rcl", "rcr"}:
+            single = ops.strip().lower()
+            # Could be mem or reg.
+            return single in family
+        # Implicit writes (cdq, mul, div, idiv, lodsd, etc.)
+        if op == "cdq" or op == "cwd":
+            return reg32 == "edx"
+        if op in {"mul", "div", "idiv"}:
+            # 1-operand form writes EDX:EAX.
+            return reg32 in ("eax", "edx")
+        if op == "imul":
+            # 1-operand: writes EDX:EAX. 2/3-op: writes the dest.
+            if "," not in ops:
+                return reg32 in ("eax", "edx")
+            return False  # already handled by the operand split above
+        if op in {"lodsd", "lodsw", "lodsb"}:
+            return reg32 in ("eax", "esi")
+        if op in {"stosd", "stosw", "stosb"}:
+            return reg32 == "edi"
+        if op in {"call"}:
+            # cdecl: EAX, ECX, EDX clobbered.
+            return reg32 in ("eax", "ecx", "edx")
+        return False
 
     def _pass_xfer_store_collapse(
         self, lines: list[Line]
