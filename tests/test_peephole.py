@@ -12843,3 +12843,172 @@ def test_dead_addr_recompute_allows_indirect_write_when_not_addr_taken():
     opt = PeepholeOptimizer()
     out = opt.optimize(asm)
     assert opt.stats.get("dead_addr_recompute", 0) == 3
+
+
+def test_redundant_movsx_after_cmp():
+    """The strncmp-style pattern: load + cmp + jcc + reload (where
+    the reload is redundant because the registers still hold their
+    loaded values on the not-taken path).
+    """
+    asm = (
+        "_f:\n"
+        "        enter   8, 0\n"
+        "        movsx   eax, byte [ebp - 4]\n"
+        "        movsx   ecx, byte [ebp - 8]\n"
+        "        cmp     eax, ecx\n"
+        "        je      .L_eq\n"
+        "        movsx   eax, byte [ebp - 4]\n"  # REDUNDANT
+        "        movsx   ecx, byte [ebp - 8]\n"  # REDUNDANT
+        "        sub     eax, ecx\n"
+        "        leave\n"
+        "        ret\n"
+        ".L_eq:\n"
+        "        xor     eax, eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Both `movsx eax, byte [ebp - 4]` collapse to one occurrence.
+    assert out.count("movsx   eax, byte [ebp - 4]") == 1
+    # Both `movsx ecx, byte [ebp - 8]` collapse to one occurrence.
+    assert out.count("movsx   ecx, byte [ebp - 8]") == 1
+
+
+def test_redundant_movsx_word():
+    """movsx with `word` size also tracked."""
+    asm = (
+        "_f:\n"
+        "        movsx   eax, word [ebp - 4]\n"
+        "        cmp     eax, 100\n"
+        "        je      .L_eq\n"
+        "        movsx   eax, word [ebp - 4]\n"  # REDUNDANT
+        "        sub     eax, 1\n"
+        "        ret\n"
+        ".L_eq:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert out.count("movsx   eax, word [ebp - 4]") == 1
+
+
+def test_redundant_movzx_byte():
+    """movzx tracked separately from movsx — different operations."""
+    asm = (
+        "_f:\n"
+        "        movzx   eax, byte [ebp - 4]\n"
+        "        test    eax, eax\n"
+        "        je      .L_zero\n"
+        "        movzx   eax, byte [ebp - 4]\n"  # REDUNDANT
+        "        ret\n"
+        ".L_zero:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert out.count("movzx   eax, byte [ebp - 4]") == 1
+
+
+def test_redundant_movsx_different_size_not_collapsed():
+    """movsx byte and movsx word on the same memory are different
+    operations — second must be preserved (not dropped as redundant).
+    """
+    asm = (
+        "_f:\n"
+        "        movsx   eax, byte [ebp - 4]\n"
+        "        movsx   ecx, byte [ebp - 5]\n"
+        "        cmp     eax, ecx\n"
+        "        je      .L_zero\n"
+        "        movsx   eax, word [ebp - 4]\n"  # NOT redundant — different size
+        "        sub     eax, 1\n"
+        "        ret\n"
+        ".L_zero:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The byte and word movsx are different ops — the word one
+    # must survive (not dropped by my pass since it's different).
+    # Other passes may modify but my pass shouldn't drop it.
+    assert "movsx   eax, word [ebp - 4]" in out
+
+
+def test_redundant_mov_then_movsx_not_collapsed():
+    """mov dword and movsx byte on the same memory are different
+    operations — second must NOT be dropped by my pass."""
+    asm = (
+        "_f:\n"
+        "        mov     eax, [ebp - 4]\n"
+        "        mov     ecx, [ebp - 8]\n"
+        "        cmp     eax, ecx\n"
+        "        je      .L_zero\n"
+        "        movsx   eax, byte [ebp - 4]\n"  # NOT redundant — different op
+        "        ret\n"
+        ".L_zero:\n"
+        "        xor     eax, eax\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # The movsx should survive — different op from the mov.
+    assert "movsx   eax, byte [ebp - 4]" in out
+
+
+def test_redundant_movsx_invalidated_by_mem_write():
+    """If the source memory is written between the two movsx loads,
+    the second is NOT redundant (different value)."""
+    asm = (
+        "_f:\n"
+        "        movsx   eax, byte [ebp - 4]\n"
+        "        mov     [ebp - 8], eax\n"        # save first value
+        "        mov     byte [ebp - 4], 99\n"     # writes the slot
+        "        movsx   eax, byte [ebp - 4]\n"   # reload — NOT redundant
+        "        add     eax, [ebp - 8]\n"         # use both
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Both movsx survive (the mem write invalidates the cached state)
+    assert out.count("movsx   eax, byte [ebp - 4]") == 2
+
+
+def test_redundant_movsx_invalidated_by_reg_write():
+    """If EAX is written to a different value between the two movsx
+    loads, the second is NOT a textual duplicate of the first
+    (the cached state was reset)."""
+    asm = (
+        "_f:\n"
+        "        movsx   eax, byte [ebp - 4]\n"
+        "        mov     [ebp - 12], eax\n"  # use first value
+        "        mov     eax, 1\n"            # EAX clobbered
+        "        mov     [ebp - 16], eax\n"
+        "        movsx   eax, byte [ebp - 4]\n"  # reload — NOT redundant
+        "        add     eax, [ebp - 16]\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert out.count("movsx   eax, byte [ebp - 4]") == 2
+
+
+def test_redundant_movzx_for_ecx():
+    """The ECX tracker also handles movzx."""
+    asm = (
+        "_f:\n"
+        "        movzx   ecx, byte [ebp - 4]\n"
+        "        cmp     ecx, 0\n"
+        "        je      .L_zero\n"
+        "        movzx   ecx, byte [ebp - 4]\n"  # REDUNDANT
+        "        sub     ecx, 1\n"
+        "        ret\n"
+        ".L_zero:\n"
+        "        xor     ecx, ecx\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert out.count("movzx   ecx, byte [ebp - 4]") == 1

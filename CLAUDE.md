@@ -1726,3 +1726,21 @@ See `README.md` for the public roadmap (Phase 0–6).
   - **Limited fire rate** on test suites: 0 fires on first 500 torture tests + 50 c-testsuite (none use this idiom). Real-world programs (game engines, particle systems, struct-array databases) commonly hit it.
 
   **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +10 peephole tests. 1132 unit tests total. Pipeline 1734/1734 (100%).
+- **2026-04-30 — Phase A peephole: redundant_eax/ecx_load tracks movsx/movzx**: extends `_run_redundant_reg_load` to also recognize `movsx` and `movzx` loads. Previously only plain `mov reg, [m]` was tracked; now any of `mov reg, [m]` / `movsx reg, byte [m]` / `movsx reg, word [m]` / `movzx reg, byte [m]` / `movzx reg, word [m]` are tracked. Each load form is keyed distinctly: `(op, src_with_size_prefix)`. A subsequent identical load is redundant; different forms (e.g., `mov` vs `movsx byte`) are correctly NOT collapsed since they produce different register values.
+  - **Common shape**: strncmp/strcmp-style loops where the codegen loads a sub-word value, compares, branches, then re-loads on the not-taken path:
+    ```
+    movsx eax, byte [ebp - 4]
+    movsx ecx, byte [ebp - 8]
+    cmp eax, ecx
+    je .L_eq
+    movsx eax, byte [ebp - 4]    ← REDUNDANT
+    movsx ecx, byte [ebp - 8]    ← REDUNDANT
+    sub eax, ecx
+    ```
+    Both reloads are dropped. Saves 6 bytes per such pattern (3 bytes per movsx).
+  - **High fire rate**: 127/200 torture tests (63.5%) had reductions, with 804 total movsx/movzx duplicates eliminated. Each saves 3 bytes for ebp-relative byte/word loads — ~2400 bytes saved across the first 200 torture tests alone.
+  - **Cascading effects**: with the second movsx pair dropped, downstream patterns like `cmp byte [ebp - 4], 0; jne ...` (the original codegen) become `test eax, eax; jne ...` (since EAX still holds the movsx'd value from the surviving load). Other passes detect this equivalence and substitute.
+  - **Restricted to ebp-relative literal-offset memory** (`[ebp ± N]`). Other forms (register-base, label) are not tracked because alias-analysis is uncertain.
+  - **Stat key shared with `mov` tracking** (`redundant_eax_load` / `redundant_ecx_load`). Code structure already passed `stat_key` per pass — splitting into separate keys would require refactoring; not worth it.
+
+  **Result: 1514/1514 gcc-c-torture (--full), 220/220 c-testsuite (--full) still 100%**. +8 peephole tests. 1140 unit tests total. Pipeline 1734/1734 (100%).

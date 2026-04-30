@@ -3145,6 +3145,45 @@ class PeepholeOptimizer:
                 continue
             op = line.op
             ops = line.operands
+            if op in ("movsx", "movzx"):
+                # Track sign/zero-extend loads as a distinct key
+                # form: f"{op} {src_norm_with_size}". A subsequent
+                # identical movsx/movzx load is redundant.
+                # Different load forms (e.g. mov vs movsx, or
+                # movsx byte vs movsx word) are textually distinct
+                # and don't match each other — correct, since they
+                # produce different register values.
+                parts = _operands_split(ops)
+                if parts is not None:
+                    dest, src = parts
+                    dest_low = dest.strip().lower()
+                    src_norm = src.strip()
+                    if dest_low == reg32:
+                        full_key = f"{op} {src_norm}"
+                        if (
+                            reg_mem is not None
+                            and self._is_ebp_offset_mem(src_norm)
+                            and reg_mem == full_key
+                        ):
+                            self.stats[stat_key] = (
+                                self.stats.get(stat_key, 0) + 1
+                            )
+                            continue
+                        if self._is_ebp_offset_mem(src_norm):
+                            reg_mem = full_key
+                        else:
+                            reg_mem = None
+                        out.append(line)
+                        continue
+                    # Fall through: unusual forms (sub-reg dest etc.)
+                    # — invalidate. movsx/movzx writing a sub-reg of
+                    # reg32 is rare (movsx writes to 32-bit dest in
+                    # x86 only — there's no `movsx al, byte [...]`
+                    # form), but be defensive.
+                    if dest_low in sub_regs:
+                        reg_mem = None
+                    out.append(line)
+                    continue
             if op == "mov":
                 parts = _operands_split(ops)
                 if parts is not None:
