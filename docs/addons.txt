@@ -1,0 +1,10 @@
+port gnu utilites to this compiler
+a full binary install should install the gnu utils
+some  gnu utils dont make sence like chroot, groups 
+also include gawk
+make scripts to download , build , test
+games from the dos DPMI period such as doom,
+duke nukem, etc. we dan't ship the built executables due to licensing
+but we can ship build scripts.
+note we think we did all sorts of watcom compatibility to be able
+to build the games.  build them to see if that worked
