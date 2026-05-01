@@ -76,6 +76,51 @@ Suspects worth checking next:
   two distinct union shapes, member access through the wrong
   variant would dereference garbage.
 
+## Update 2026-05-01 — `x = 5` works, value-print crashes elsewhere
+
+Two more fixes shipped (commits 21dc0d9 + ad0ad62):
+
+1. **QDEF1 routing**: the grep'd qstrs were all going to QDEF0
+   (static pool). `mp_qstr_const_pool` (the main, sorted pool) ended
+   up with `len = 0` BUT `is_sorted = true` — the binary search in
+   `qstr_find_strn` underflowed `pool->len - 1` to 0xFFFFFFFF and
+   walked off the end of the address space. Routing every grep'd
+   qstr to QDEF1 instead of QDEF0 made the main pool non-empty and
+   unblocked the qstr lookup path used by `x = 5` (qstr-store).
+
+2. **qstr name extraction off-by-one**: the awk that strips the
+   `MP_QSTR_` macro prefix dropped 7 chars instead of 8, leaving
+   a stray leading underscore on every qstr's string. So
+   `MP_QSTR___repl_print__` was recorded with string
+   `___repl_print__` (3 leading underscores), making
+   `mp_load_name(MP_QSTR___repl_print__)` fail at the dict lookup
+   stage. Fixed: `substr(s, 9)` instead of `substr(s, 8)`.
+
+After both fixes, `pass`, empty line, `x = 5`, Ctrl-D-only all
+exit cleanly. **Value-print** (`1`, `print('hi')`) still crashes
+with `UC_ERR_READ_UNMAPPED` — but in a *different* place than
+before:
+
+  - EIP 0xCC41, inside `mp_obj_equal_not_equal`, instruction
+    `cmp dword [eax], _mp_type_str`.
+  - lhs (the `[ebp+12]` argument, which is the second of three:
+    op, lhs, rhs) = garbage pointer (e.g. 0xd9027f24, 0xec835053).
+  - rhs = qstr-tagged value e.g. 0x027a (qstr id 79 in our table,
+    which is `__rand__`).
+  - Caller is `mp_map_lookup`, which is walking dict entries and
+    comparing each entry's key against the lookup key. The garbage
+    lhs comes from one of the dict entries.
+
+Hypothesis: a global dict (probably `mp_module_builtins.globals`
+or similar) has a corrupt entry whose key is a bad pointer. The
+qstr id 79 (`__rand__`) being the lookup key suggests this is the
+bytecode compiler probing for `__rand__` (right-AND) during
+constant folding or peephole-opt of `1`. uc386's static
+initializer for one of the registered-builtins dict tables is
+likely emitting wrong bytes for an mp_obj_t — possibly a
+struct-identity collision where two `mp_obj_t` union variants
+get the same fingerprint.
+
 ## Build
 
 ```sh
