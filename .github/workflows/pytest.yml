@@ -34,4 +34,11 @@ jobs:
         pip install "uc_core @ git+https://github.com/avwohl/uc_core@main"
         pip install -e .
     - name: Run tests
-      run: pytest tests/ -v --tb=short
+      # tests/ — uc386 unit tests (1320 cases, no external deps).
+      # addons/ — addon smoke tests (doom, micropython REPL).
+      # The addon tests skip cleanly when their .bin artifacts
+      # don't exist (binaries are derived from upstream sources via
+      # per-addon fetch.sh + build.sh, not checked in). Adding
+      # addons/ to CI guards future addon-side test additions
+      # without forcing CI to compile large upstream sources.
+      run: pytest tests/ addons/ -v --tb=short
