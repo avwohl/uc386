@@ -3,10 +3,10 @@
 Status of each item in `docs/addons.txt`. The original 8 items
 from 2026-04-30 are still done; **3 new line-items** added by the
 user on 2026-05-01 (MicroPython, ship test scripts in FOSS,
-ship build scripts everywhere) are tracked below — all three are
-done at the **infrastructure** level, with MicroPython itself
-landing as a triage skeleton (87 % of py/ core compiles) since a
-full port is multi-day work.
+ship build scripts everywhere) are all done. **MicroPython now
+runs full Python** on uc386: arithmetic, control flow, functions,
+classes, exceptions, list comprehensions, builtins — see the
+MicroPython section below.
 
 A second 2026-05-01 update added 3 more cross-cutting asks
 (mac→linux portability, ship-source-with-binary, dosiz as a
@@ -232,10 +232,11 @@ runs ~2-4× wider than uc386 across the rest of the table because
 DOS/4GW carries its own protected-mode startup; uc386 emits flat
 real-mode-32 binaries that dos_emu loads directly.
 
-## ◐ Include the latest MicroPython (2026-05-01 ask)
+## ✓ Include the latest MicroPython (2026-05-01 ask)
 
-**Runnable `micropython.bin` evaluates Python expressions.** A
-170 KB flat i386 DOS binary built end-to-end through uc386 prints:
+**Runnable `micropython.bin` is a fully-functional Python REPL.**
+A 170 KB flat i386 DOS binary built end-to-end through uc386
+prints:
 
 ```
 MicroPython uc386-triage on 2026-05-01; uc386-dos with i386
@@ -245,14 +246,20 @@ Type "help()" for more information.
 >>>
 ```
 
-…and then accepts arbitrary integer arithmetic (`1+2` → `3`,
-`2*3+4` → `10`), `pass`/`x = 5`/empty-line, **named builtins**
-(`print(2+3)` → `5`, `len("hi")` → `2`), **static qstrs**
-(`__name__` → `'__main__'`), string literals, and Ctrl-D-to-exit.
-The full lex → parse → compile → VM dispatch → NLR
-(setjmp-backed) → qstr-pool → mp_load_global → builtins-dict
-lookup → builtin-function call → print result path runs
-end-to-end.
+…and accepts essentially full Python: integer arithmetic, named
+builtins (`print(2+3)`, `len("hi")`, `sum(range(10))` → `45`,
+`sorted([3,1,2])` → `[1, 2, 3]`), string operations
+(`"-".join(["a","b","c"])` → `a-b-c`), `print()` with **real
+newlines** (not the pre-fix mangled `_0x0a_`), control flow
+(`if/else`, `for/range`, `while/break`), exception handling
+(`try/except` catching `ZeroDivisionError`), function definition
+(`def f(x): return x*2; f(7)` → `14`), classes (`class C: x=1; C.x`
+→ `1`), list/dict/tuple literals, list comprehensions
+(`[i*i for i in range(5)]` → `[0, 1, 4, 9, 16]`), static qstrs
+(`__name__` → `'__main__'`), and clean Ctrl-D exit. The full
+lex → parse → compile → VM dispatch → NLR (setjmp-backed) →
+qstr-pool → mp_load_global → builtins-dict lookup → builtin /
+user-function call → print result path runs end-to-end.
 
 Four real bug fixes unlocked Python execution:
 
@@ -301,11 +308,15 @@ Layered evidence:
   cleanly under `nasm -f bin` to a 170 KB `.bin`. Only externs
   remaining are dead libm names left in a string table (DCE
   doesn't strip those today).
-- **Boot smoke test**:
+- **REPL smoke tests** (10 cases):
   `addons/gnu/micropython/test_micropython_smoke.py` runs the bin
-  under dos_emu and asserts the REPL banner + `>>> ` prompt
-  appear in stdout. Skips cleanly when the bin doesn't exist;
-  passes in 10s on the dev Mac when it does.
+  under dos_emu and pins: banner, clean Ctrl-D exit, arithmetic
+  (`2+3` → `5`), assignment (`x = 5`), `pass`, named builtins
+  (`__name__`), `print()` with real newlines, function
+  def + call, list comprehensions, `try/except`. Skips cleanly
+  when the bin doesn't exist; passes in 11s on the dev Mac when it
+  does (~1.5s per test, dominated by the 5K-instruction VM-init
+  warmup).
 
 Triage progression as the slice unfolded:
 - 95 / 132 with empty stubs (most failures were missing-qstr

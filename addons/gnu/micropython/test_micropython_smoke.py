@@ -200,3 +200,98 @@ def test_micropython_clean_eof_exit(micropython_bin: Path) -> None:
         f"REPL prompt missing before Ctrl-D was processed: "
         f"{res.stdout!r}"
     )
+
+
+def test_micropython_print_real_newline(micropython_bin: Path) -> None:
+    """`print(2+3)\\n\\x04` exercises the qstr-payload path: the
+    builtin `print()` ends each line with `\\n`, which is qstr id
+    `MP_QSTR__0x0a_`. Until commit 2abb610 the qstrdefs generator
+    captured the *sanitized* macro tail as the qstr's payload string,
+    so `print()` emitted the literal text `_0x0a_` instead of a
+    newline. Fix: gen_qstrdefs.py reverses upstream's qstr_escape
+    (re-using upstream's codepoint2name map) so escaped qstrs ship
+    their original byte string in the QDEF1 payload."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"print(2+3)\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # Result `5` followed by a real `\n`, then the next `>>> ` prompt.
+    # The bug rendered this as `5_0x0a_>>>` (concatenated, no newline).
+    assert "5\n>>> " in res.stdout, (
+        f"expected `5` + real newline + prompt in stdout, got: "
+        f"{res.stdout!r}"
+    )
+    # Belt-and-suspenders: explicitly forbid the pre-fix mangled form.
+    assert "_0x0a_" not in res.stdout, (
+        f"found mangled `_0x0a_` (qstr_escape not reversed): "
+        f"{res.stdout!r}"
+    )
+
+
+def test_micropython_def_and_call(micropython_bin: Path) -> None:
+    """Exercise function definition + call: `def f(x): return x*2`,
+    then `f(7)` → `14`. Pins compile of FunctionDef and the
+    bytecode CALL_FUNCTION → MAKE_FUNCTION → arg binding → return
+    path."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"def f(x): return x*2\n\nprint(f(7))\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "\n14\n" in res.stdout, (
+        f"expected `f(7) = 14` in stdout, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_list_comprehension(micropython_bin: Path) -> None:
+    """`[i*i for i in range(5)]` exercises the comprehension scope
+    + generator + range iter path, then prints the list. Pins
+    objlist + objgenerator + objrange + the BUILD_LIST opcode."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"print([i*i for i in range(5)])\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "[0, 1, 4, 9, 16]" in res.stdout, (
+        f"expected list-comprehension result in stdout, got: "
+        f"{res.stdout!r}"
+    )
+
+
+def test_micropython_try_except(micropython_bin: Path) -> None:
+    """`try: 1/0 except ZeroDivisionError: print(\"caught\")`
+    exercises the NLR (non-local return) path: the VM raises
+    ZeroDivisionError, the SETUP_EXCEPT handler frame catches it,
+    matches the type, runs the handler. setjmp-backed NLR
+    (MICROPY_NLR_SETJMP=1 in mpconfigport.h) is what makes this
+    work — uc386 can't compile nlrx86.c's inline asm."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"try:\n    1/0\nexcept:\n    print('caught')\n\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "caught" in res.stdout, (
+        f"expected `caught` in stdout (try/except didn't work): "
+        f"{res.stdout!r}"
+    )
