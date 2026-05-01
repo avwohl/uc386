@@ -51,13 +51,24 @@ if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
     # parses as an identifier becomes a qstr) but keeps the mapping
     # complete enough that the enum in py/qstr.h covers every
     # reference downstream code (py/, shared/runtime, etc.) makes.
+    #
+    # The first entry (MP_QSTRnull) goes in the static pool as
+    # QDEF0; everything else goes in the main pool as QDEF1.
+    # Reason: `mp_qstr_const_pool` (the main pool) has
+    # `is_sorted = true` and the binary search in
+    # `qstr_find_strn` does `pool->len - 1` as its upper bound —
+    # which underflows to 0xFFFFFFFF when `pool->len == 0`,
+    # then loops the binary search into out-of-bounds reads.
+    # A real upstream build always has at least one QDEF1 entry,
+    # so the empty-main-pool case never happens. We avoid it by
+    # routing every grep'd qstr to QDEF1.
     {
         echo "QDEF0(MP_QSTRnull, 0, 0, \"\")"
-        echo "QDEF0(MP_QSTR_, 0, 0, \"\")"
+        echo "QDEF1(MP_QSTR_, 0, 0, \"\")"
         grep -rhoE "MP_QSTR_[A-Za-z_][A-Za-z0-9_]*" \
                 upstream/py/ upstream/shared/ \
             | sort -u \
-            | awk '{ name = substr($0, 8); print "QDEF0(" $0 ", 0, 0, \"" name "\")" }'
+            | awk '{ name = substr($0, 8); print "QDEF1(" $0 ", 0, 0, \"" name "\")" }'
     } > build/genhdr/qstrdefs.generated.h
 fi
 [ -f build/genhdr/moduledefs.h ] || cat > build/genhdr/moduledefs.h <<'EOF'
