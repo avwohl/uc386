@@ -217,27 +217,34 @@ real-mode-32 binaries that dos_emu loads directly.
 ## ◐ Include the latest MicroPython (2026-05-01 ask)
 
 **Skeleton + triage landed** under `addons/gnu/micropython/`. A
-real port is multi-day work — today this is a triage harness that
-answers the prerequisite question: how much of MicroPython core
-compiles via uc386? Answer: **115 / 132 sources from
-`upstream/py/` (87 %)** with a synthetic `int main()` and stub
-`genhdr/` headers (auto-generated `qstrdefs.generated.h` from a
-grep over `MP_QSTR_*` references; empty stubs for `moduledefs.h`,
-`mpversion.h`, `root_pointers.h`).
+runnable `micropython.bin` is still multi-day work (port shim,
+real qstr generator integration, REPL HAL), but the triage
+result is now substantial: **131 / 132 sources from
+`upstream/py/` (99 %)** compile cleanly via uc386 → NASM-ready
+.asm using a synthetic `int main()` and stub `genhdr/` headers.
 
-The 17 remaining failures break down:
-- 12 × `<obj>.sig` const-eval failures (`MP_DEFINE_CONST_FUN_OBJ_*`
-  packs flags + min/max into an Identifier-bearing init).
-- 2 × `pp->m` codegen rejections on pointer-to-pointer-to-struct
-  (real uc386 bug).
-- 1 × parser quirk on a 6-entry table given 7 inits.
-- 1 × `MICROPY_REGISTERED_MODULES` (port-specific, empty in stubs).
-- 1 × misc `.sig`.
+Triage progression as the slice unfolded:
+- 95 / 132 with empty stubs (most failures were missing-qstr
+  noise, not real codegen issues).
+- 115 / 132 once a synthetic `qstrdefs.generated.h` was built
+  by grepping `MP_QSTR_*` references out of `upstream/py/`.
+- 117 / 132 after fixing a uc_core copy-prop bug (was eagerly
+  propagating `struct *p = void_ptr_param;`, losing struct
+  type for later `p->m`).
+- 131 / 132 (current) after teaching uc386 `_const_eval` about
+  ternaries / comparisons / `&&` / `||` (lifted 12 packed-flag
+  `.sig` failures from `MP_OBJ_FUN_MAKE_SIG`-style macros) and
+  teaching `_resolved_var_type` to const-eval enum-constant
+  designators (lifted `[SCOPE_GEN_EXPR] = …`-style unsized-
+  array length-inference).
+
+The single remaining failure is `objmodule.c`'s
+`MICROPY_REGISTERED_MODULES` — a port-specific macro that's
+empty in our triage stubs; a real port supplies it.
 
 See `addons/gnu/micropython/NOTES.md` for the path to a runnable
-`micropython.bin` (`tools/makeqstrdefs.py` → real qstrdefs, fix
-the two codegen bugs, write `ports/uc386-dos/` with INT-21h-backed
-`mp_hal_stdout_tx_strn`).
+`micropython.bin` (`tools/makeqstrdefs.py` → real qstrdefs,
+write `ports/uc386-dos/` with INT-21h-backed `mp_hal_stdout_tx_strn`).
 
 ## ✓ Ship executables and test scripts in FOSS tarball (2026-05-01 ask)
 
