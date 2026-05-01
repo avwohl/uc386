@@ -40,8 +40,6 @@ through uc386 → NASM-ready .asm in one pass. The setup:
   refs resolve.
 - Synthetic `int main()` so uc386's "every TU needs `main`" check
   accepts library sources.
-- `--no-ast-optimize` to dodge the uc_core alias-propagation bug
-  (see "Bug surfaced" below).
 
 The 15 remaining failures fall into:
 
@@ -52,32 +50,35 @@ The 15 remaining failures fall into:
 | `__static_objmodule__mp_builtin_module_table.key: got Identifier MICROPY_REGISTERED_MODULES` | 1     | Port-specific `MICROPY_REGISTERED_MODULES` macro is empty in stubs; real port supplies it.                     |
 | Other                                                                              | 1     | Additional `.sig` flavour outside the dominant 12.                                                              |
 
-## Bug surfaced (and worked around)
+## Bug surfaced (and fixed)
 
-The `pp->m`-on-a-typedef case actually surfaced a real bug in the
-**uc_core AST optimizer**, not in uc386 codegen. The shape that
-trips it up:
+The `pp->m`-on-a-typedef case surfaced a real bug in the
+**uc_core AST optimizer's copy-propagation path**. The shape that
+tripped it up:
 
 ```c
 void f(void *data) {
-    struct printer *pr = data;
-    if (pr->flag) { ... }   // ← optimizer rewrites pr → data, type-of(data) is `void *`, error
+    struct printer *pr = data;     // legal C: void* → struct*
+    if (pr->flag) { ... }           // ← optimizer rewrote pr → data
 }
 ```
 
-The optimizer propagates `pr = data` and replaces later `pr`
-references with `data`. That loses the declared `struct printer *`
-type, so the codegen's `_type_of(pr)` returns `PointerType(void)`
-instead, which the `->` lowering rejects. The triage build script
-passes `--no-ast-optimize` to dodge this; a real port would want
-the bug fixed in uc_core (the optimizer must respect declared types
-of the propagation target).
+`_types_compatible_for_copy` happily propagated `pr = data` because
+both sides are PointerType. But replacing `pr` with `data` loses the
+declared `struct printer *` type — `_type_of(data)` returns
+`PointerType(void)`, which uc386's `->` lowering rejects.
 
-**Earlier baselines**:
+**Fix** (in `uc_core/src/uc_core/ast_optimizer.py`): refuse copy
+propagation between two PointerTypes when either side's pointee is
+`void`, or when the pointee kinds differ (one BasicType, one
+StructType, etc.). Equivalent pointers (e.g. `int *` to `int *`)
+still propagate.
+
+**Triage progression**:
 - 95/132 with empty qstrdefs (most failures were downstream of
   missing MP_QSTR enum entries, not separate bugs).
 - 115/132 once the synthetic qstr table was in place.
-- 117/132 (current) with `--no-ast-optimize` lifting the 2
+- 117/132 (current) with the uc_core copy-prop fix lifting the 2
   `pp->m` failures.
 
 ## Next steps for a runnable image
@@ -88,15 +89,14 @@ The triage proves the core is reachable. To land an actual
 1. **Run upstream's `tools/makeqstrdefs.py`** to emit the real
    `genhdr/qstrdefs.generated.h` (correct hash + len fields,
    minus the over-inclusion the grep heuristic ships).
-2. **Fix the remaining uc386/uc_core issues** that remain after
-   the qstr table is correct:
+2. **Fix the remaining uc386 codegen issues** after the qstr table
+   is correct:
    - `MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN`-style packed-flag
      bitfield-style init (the `.sig` family — 12 failures).
      Likely the `(MP_OBJ_FUN_FLAG_* | n_min)` shape includes
      an Identifier that needs to evaluate to a constant.
-   - **uc_core optimizer alias-propagation type bug** — see
-     "Bug surfaced" above. Currently worked around in build.sh
-     via `--no-ast-optimize`; real port should fix it upstream.
+   - The uc_core copy-prop type bug from "Bug surfaced" above is
+     **already fixed** as part of this slice.
 3. **Write `ports/uc386-dos/`** — a thin port with:
    - `mpconfigport.h` (start from `ports/minimal/`)
    - `main.c` calling `mp_init` / `pyexec_friendly_repl` with

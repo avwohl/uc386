@@ -96,12 +96,7 @@ for src in "$SRC_DIR"/*.c; do
     [ -f "$src" ] || continue
     TOTAL=$((TOTAL + 1))
     name="$(basename "$src" .c)"
-    # --no-ast-optimize works around a uc_core alias-propagation bug:
-    # `T *p = void_ptr_param;` makes the optimizer rewrite later
-    # `p->m` as `void_ptr_param->m`, which fails type-of since the
-    # parameter is `void *`. Triage is about compiler coverage, not
-    # benchmarking optimized output.
-    if "$PYTHON" -m uc386.main --no-ast-optimize "$TRIAGE_MAIN" "$src" \
+    if "$PYTHON" -m uc386.main "$TRIAGE_MAIN" "$src" \
             -o "build/${name}.asm" \
             -I "$INCLUDE" \
             -I "upstream" \
