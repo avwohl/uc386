@@ -57,3 +57,4 @@ int SDL_PollEvent(SDL_Event *event);
 int SDL_WaitEvent(SDL_Event *event);
 
 #endif /* _UC386_SDL_H */
+
