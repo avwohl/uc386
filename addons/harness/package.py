@@ -78,8 +78,39 @@ def list_addons() -> list[str]:
     return out
 
 
+def _pack_addon_sources(tar: tarfile.TarFile, addon_dir: Path) -> None:
+    """Include per-addon sources + scripts under uc386-foss/src/<name>/.
+
+    Skips derived directories (`build/`, `upstream/`, `__pycache__/`).
+    The shipped layout mirrors `addons/gnu/<name>/` so users can read
+    the source, re-run fetch.sh / build.sh, or run test_addons.py
+    against the manifests.
+    """
+    EXCLUDE = {"build", "upstream", "__pycache__"}
+    for child in addon_dir.rglob("*"):
+        if not child.is_file():
+            continue
+        rel = child.relative_to(addon_dir)
+        if any(p in EXCLUDE for p in rel.parts):
+            continue
+        tar.add(child, arcname=f"uc386-foss/src/{addon_dir.name}/{rel}")
+
+
 def package_foss(version: str) -> Path:
-    """Bundle all built FOSS addon binaries into a release tarball."""
+    """Bundle built FOSS addon binaries + sources + test runner.
+
+    Tarball layout:
+        uc386-foss/
+          README.md, LICENSE, SBASE-LICENSE, AWK-LICENSE
+          test_addons.py           — runs <name>.bin under dos_emu
+                                     against src/<name>/manifest.toml
+          <name>.bin                — built binaries (16 + awk)
+          src/<name>/manifest.toml  — argv / stdin / expected stdout
+          src/<name>/*.c            — addon source
+          src/_sbase_shim/util.{c,h}, LICENSE — shared sbase helpers
+          src/awk-bwk/{fetch,build}.sh, NOTES.md — upstream port
+          src/gawk/{fetch,build}.sh, NOTES.md   — doc-only stub
+    """
     out_dir = REPO_ROOT / "dist"
     out_dir.mkdir(exist_ok=True)
     out_path = out_dir / f"uc386-foss-addons-{version}.tar.gz"
@@ -96,8 +127,26 @@ def package_foss(version: str) -> Path:
             arcname = f"uc386-foss/{name}.bin"
             tar.add(bin_path, arcname=arcname)
             print(f"  {name}: {bin_path.stat().st_size:,} bytes")
-        # Include README + LICENSE
-        readme = REPO_ROOT / "addons" / "README.md"
+
+        # Per-addon sources, manifests, and scripts under src/.
+        # Includes every gnu/* dir (the manifest-driven 16, the
+        # _sbase_shim shared headers, awk-bwk's fetch+build scripts,
+        # and the gawk doc-only stub).
+        gnu_root = ADDONS_ROOT / "gnu"
+        for sub in sorted(gnu_root.iterdir()):
+            if not sub.is_dir():
+                continue
+            _pack_addon_sources(tar, sub)
+
+        # Test runner: ships at the top level so users can `python
+        # test_addons.py` from the unpacked tarball directory.
+        test_runner = REPO_ROOT / "addons" / "harness" / "test_addons.py"
+        if test_runner.exists():
+            tar.add(test_runner, arcname="uc386-foss/test_addons.py")
+
+        # Ship the release-tailored README (action-oriented, references
+        # test_addons.py and src/) instead of the dev-side addons/README.md.
+        readme = REPO_ROOT / "addons" / "RELEASE_README.md"
         license_ = REPO_ROOT / "LICENSE"
         if readme.exists():
             tar.add(readme, arcname="uc386-foss/README.md")
