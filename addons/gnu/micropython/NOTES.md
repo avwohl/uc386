@@ -1,4 +1,4 @@
-# MicroPython port — status: **skeleton + triage** (2026-05-01)
+# MicroPython port — status: **skeleton + triage (full)** (2026-05-01)
 
 **Upstream**: https://github.com/micropython/micropython
 **License**: MIT
@@ -22,17 +22,16 @@ uc386?" before we sink time in a real port.
 ## Triage result (latest run)
 
 ```
-== py/ triage: 131 pass / 1 fail / 132 total ==
+== py/ triage: 132 pass / 0 fail / 132 total ==
 ```
 
-That's **99 % of the platform-independent core** compiling clean
-through uc386 → NASM-ready .asm in one pass. The single remaining
-failure is `objmodule.c`'s `MICROPY_REGISTERED_MODULES` — that's
-a port-specific macro listing the modules the port wants to
-register, empty in our triage stubs. A real port (e.g.
-`ports/uc386-dos/mpconfigport.h`) supplies it as part of the
-normal build setup. **Effectively all of py/ that can compile
-without port-specific config does compile.**
+That's **100 % of the platform-independent core** compiling clean
+through uc386 → NASM-ready .asm in one pass. The remaining work to
+land an actual `micropython.bin` is the port shim
+(`ports/uc386-dos/main.c` + `mphalport.c` + `mpconfigport.h`),
+the GC heap region, and the multi-file link — none of which the
+triage exercises. **Every py/*.c that can compile without port-
+specific config now does compile.**
 
 The setup:
 
@@ -49,11 +48,14 @@ The setup:
 - Synthetic `int main()` so uc386's "every TU needs `main`" check
   accepts library sources.
 
-The single remaining failure:
-
-| Class                                                                              | Count | Cause                                                                                                          |
-|------------------------------------------------------------------------------------|-------|----------------------------------------------------------------------------------------------------------------|
-| `__static_objmodule__mp_builtin_module_table.key: got Identifier MICROPY_REGISTERED_MODULES` | 1     | Port-specific `MICROPY_REGISTERED_MODULES` macro is empty in stubs; real port supplies it.                     |
+All py/*.c sources now compile. Earlier triage runs showed one
+last failure on `objmodule.c`'s `mp_builtin_module_table[]`
+initializer expanding the undefined `MICROPY_REGISTERED_MODULES`
+macro into a literal identifier (`got Identifier
+MICROPY_REGISTERED_MODULES`); the stub `genhdr/moduledefs.h` now
+defines that macro (and `MICROPY_REGISTERED_EXTENSIBLE_MODULES`)
+as empty, matching the shape a real port-without-modules would
+emit through `py/makemoduledefs.py`.
 
 ## Bug surfaced (and fixed)
 

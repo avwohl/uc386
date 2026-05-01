@@ -237,9 +237,10 @@ real-mode-32 binaries that dos_emu loads directly.
 **Skeleton + triage landed** under `addons/gnu/micropython/`. A
 runnable `micropython.bin` is still multi-day work (port shim,
 real qstr generator integration, REPL HAL), but the triage
-result is now substantial: **131 / 132 sources from
-`upstream/py/` (99 %)** compile cleanly via uc386 → NASM-ready
-.asm using a synthetic `int main()` and stub `genhdr/` headers.
+result now covers **the entire platform-independent core**:
+**132 / 132 sources from `upstream/py/` (100 %)** compile
+cleanly via uc386 → NASM-ready .asm using a synthetic
+`int main()` and stub `genhdr/` headers.
 
 Triage progression as the slice unfolded:
 - 95 / 132 with empty stubs (most failures were missing-qstr
@@ -249,16 +250,22 @@ Triage progression as the slice unfolded:
 - 117 / 132 after fixing a uc_core copy-prop bug (was eagerly
   propagating `struct *p = void_ptr_param;`, losing struct
   type for later `p->m`).
-- 131 / 132 (current) after teaching uc386 `_const_eval` about
+- 131 / 132 after teaching uc386 `_const_eval` about
   ternaries / comparisons / `&&` / `||` (lifted 12 packed-flag
   `.sig` failures from `MP_OBJ_FUN_MAKE_SIG`-style macros) and
   teaching `_resolved_var_type` to const-eval enum-constant
   designators (lifted `[SCOPE_GEN_EXPR] = …`-style unsized-
   array length-inference).
-
-The single remaining failure is `objmodule.c`'s
-`MICROPY_REGISTERED_MODULES` — a port-specific macro that's
-empty in our triage stubs; a real port supplies it.
+- 132 / 132 (current) after defining `MICROPY_REGISTERED_MODULES`
+  (and `MICROPY_REGISTERED_EXTENSIBLE_MODULES`) as empty in
+  the triage `genhdr/moduledefs.h`. A real build runs upstream's
+  `py/makemoduledefs.py` over registered ports/<name>/main.c
+  modules to emit per-module `MP_ROM_QSTR/MP_ROM_PTR` entries
+  followed by `#define MICROPY_REGISTERED_MODULES <list>`; with
+  no registered modules in the triage config the macro reduces
+  `mp_builtin_module_table[] = { ... }` to an empty array
+  initializer — which is the same shape a real port-without-
+  modules emits.
 
 See `addons/gnu/micropython/NOTES.md` for the path to a runnable
 `micropython.bin` (`tools/makeqstrdefs.py` → real qstrdefs,

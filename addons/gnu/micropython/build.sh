@@ -59,8 +59,14 @@ if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
     } > build/genhdr/qstrdefs.generated.h
 fi
 [ -f build/genhdr/moduledefs.h ] || cat > build/genhdr/moduledefs.h <<'EOF'
-// Empty stub so py/objmodule.c can include it cleanly.
-// A real build emits MP_REGISTER_MODULE entries here.
+// Triage stub. A real build runs upstream/py/makemoduledefs.py over
+// the source tree to emit per-module MP_ROM_QSTR / MP_ROM_PTR entries
+// followed by `#define MICROPY_REGISTERED_MODULES <list>`. With no
+// registered modules in the triage config we just define the macro
+// empty so py/objmodule.c's `mp_builtin_module_table[] = { ... }`
+// reduces to an empty array initializer.
+#define MICROPY_REGISTERED_MODULES
+#define MICROPY_REGISTERED_EXTENSIBLE_MODULES
 EOF
 [ -f build/genhdr/mpversion.h ] || cat > build/genhdr/mpversion.h <<'EOF'
 // Triage stub.
