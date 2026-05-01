@@ -52,7 +52,7 @@ primitives, even though some are still placeholders without
   (SDL.h), `startgtk_editor.c` (gtk/gtk.h)
 - Bail (Windows-only): `startwin_editor.c`, `winlayer.c`
 
-**34 of 42 source files compile through uc386 today.** Surprise:
+**35 of 42 source files compile through uc386 today.** Surprise:
 much of the Build engine's "needs Phase 2" is actually fine
 without `#pragma aux` because `pragmas.c` provides plain-C
 fallbacks. The renderer (`engine.c`) compiles. The hard yards
