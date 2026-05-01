@@ -3996,8 +3996,32 @@ _stat:
 _lstat:
         mov     eax, -1
         ret
+; ---- access(path, mode) ---------------------------------------------------
+; Return 0 if path exists (mode bits ignored — dos_emu has no real
+; perms). Try to open() the path read-only; on success close + return 0,
+; on fail return -1. Lets period code that probes for files
+; (`access(wad, R_OK)`) actually find them under vfiles_init.
 _access:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        mov     edx, [ebp + 8]              ; path → DS:EDX for INT 21h
+        mov     al, 0                        ; mode = read-only
+        mov     ah, 0x3D                     ; AH = 0x3D (open)
+        int     21h
+        jc      ._fail
+        ; Got a valid fd in EAX (low 16). Close and return 0.
+        mov     ebx, eax
+        mov     ah, 0x3E
+        int     21h
+        xor     eax, eax
+        jmp     ._done
+._fail:
         mov     eax, -1
+._done:
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
         ret
 
 ; ---- time / clock: return a counter that increments per call ----------------
