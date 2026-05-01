@@ -2079,6 +2079,19 @@ class CodeGenerator:
     ) -> list[str]:
         elem_type = arr_ty.base_type
         elem_size = self._size_of(elem_type)
+        # `char arr[N] = {"string"};` and `char arr[M][N] = { {"row0"}, ... };`
+        # — the outer brace wraps a single string literal, which is the
+        # idiomatic way period code initializes char arrays from string
+        # constants. C lets you elide the braces entirely; treat them as
+        # equivalent.
+        if (
+            isinstance(elem_type, ast.BasicType)
+            and elem_type.name == "char"
+            and isinstance(init, ast.InitializerList)
+            and len(init.values) == 1
+            and isinstance(init.values[0], ast.StringLiteral)
+        ):
+            init = init.values[0]
         # Flexible array member or `int arr[] = {...};` — derive length
         # from the initializer. With designators, length is
         # max(designated_index) + 1.

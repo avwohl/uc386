@@ -3384,6 +3384,36 @@ _mprotect:
         mov     eax, -1
         ret
 
+; ---- div(numer, denom) -> div_t -------------------------------------------
+; C99 div() returns a struct by value. Under uc386's struct-return ABI
+; the caller passes a hidden retptr as the leftmost arg, the callee
+; writes {quot, rem} into *retptr, and EAX returns the same retptr so
+; chained struct-returning calls work without temps.
+;
+; Stack:  [ebp+8]  = retptr (div_t *)
+;         [ebp+12] = numer
+;         [ebp+16] = denom
+_div:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        mov     eax, [ebp + 12]             ; eax = numer
+        cdq                                  ; sign-extend into edx:eax
+        mov     ecx, [ebp + 16]             ; ecx = denom
+        idiv    ecx                          ; eax = quot, edx = rem
+        mov     esi, [ebp + 8]              ; esi = retptr
+        mov     [esi], eax                   ; *retptr = quot
+        mov     [esi + 4], edx               ; *(retptr+4) = rem
+        mov     eax, esi                     ; EAX = retptr
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ldiv: same shape, long is 32-bit on uc386. Reuse _div.
+_ldiv:
+        jmp     _div
+
 ; ---- atoi ------------------------------------------------------------------
 _atoi:
         push    ebp

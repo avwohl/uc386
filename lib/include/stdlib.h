@@ -54,9 +54,10 @@ typedef struct {
     long rem;
 } ldiv_t;
 
-/* Division functions (return pointer to static storage) */
-div_t *div(int numer, int denom);
-ldiv_t *ldiv(long numer, long denom);
+/* Division functions (C99-conformant: return by value). The libc
+ * impl uses our hidden-retptr struct-return ABI under the hood. */
+div_t  div(int numer, int denom);
+ldiv_t ldiv(long numer, long denom);
 
 /* String conversion - integers */
 int atoi(const char *nptr);

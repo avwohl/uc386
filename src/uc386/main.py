@@ -62,8 +62,14 @@ I386_DOS_PREDEFINES = {
     "__WINT_TYPE__": "int",
     "__CHAR16_TYPE__": "unsigned short",
     "__CHAR32_TYPE__": "unsigned long",
-    # GCC predefines this for sources that probe.
+    # GCC predefines these for sources that probe. Period code (Build
+    # engine, etc.) often uses both __GNUC__ and __GNUC_MINOR__ in the
+    # same expression (`sprintf("%d.%d", __GNUC__, __GNUC_MINOR__)`),
+    # so leaving __GNUC_MINOR__ undefined turns it into an unknown
+    # identifier at codegen time.
     "__GNUC__": "4",
+    "__GNUC_MINOR__": "0",
+    "__GNUC_PATCHLEVEL__": "0",
     # IEEE-754 float / double limits — used by torture tests as
     # `__FLT_MAX__` etc. Approximated as decimal literals in the
     # source so the lexer parses them back as float/double values.
