@@ -5,11 +5,18 @@ DPMI-era games, and DOS installers. The compiler itself lives in
 `../src/uc386/`; this directory is the "things you can build with it"
 shelf.
 
-**First release**: <https://github.com/avwohl/uc386/releases/tag/v0.1.0-dev>
-ships the FOSS-addons tarball (16 utilities + BWK awk), the
-games-build-scripts tarball (Doom + 5 games), and the size
-comparison vs gcc/Watcom/DJGPP across all 13 addons. See
-`STATUS.md` for the per-item completion against `docs/addons.txt`.
+**Latest release**: <https://github.com/avwohl/uc386/releases/tag/v0.1.1-dev>
+(superseding v0.1.0-dev). Ships:
+
+- `uc386-foss-addons-v0.1.1-dev.tar.gz` — 16 GNU userland binaries
+  + BWK awk (~62 KB total).
+- `uc386-games-build-scripts-v0.1.1-dev.tar.gz` — fetch.sh /
+  build.sh / NOTES.md / stubs.c / config shims for Doom + 5
+  games. 19 KB after the package.py upstream-exclude fix.
+- `results.md` — uc386 vs gcc / Watcom / DJGPP across all 13
+  FOSS addons (uc386 is 50–10,000× smaller).
+
+See `STATUS.md` for the per-item completion against `docs/addons.txt`.
 
 ## Layout
 
