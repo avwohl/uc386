@@ -83,11 +83,17 @@ from `manifest.toml`.
 | Game     | Source               | Compiles    | Boots? |
 |----------|----------------------|-------------|--------|
 | Doom     | id-Software/DOOM     | **58 / 58** | **yes** (W_InitFiles, no WAD shipped) |
-| Heretic  | chocolate-doom       | 44 / 47     | no     |
-| Hexen    | chocolate-doom       | 45 / 48     | no     |
-| Duke3D   | jfduke3d             | 34 / 42     | no     |
-| ROTT     | videogamepreservation| **52 / 52** (1 dead-code .C skipped) | no     |
+| Heretic  | chocolate-doom       | **47 / 47** | no (needs ~76 I_/TXT_/SDL_ stubs) |
+| Hexen    | chocolate-doom       | **48 / 48** | no (needs same chocolate-doom stubs) |
+| Duke3D   | jfduke3d             | **35 / 35** (16 game + 19 engine; 7 platform-only excluded) | no (needs `#pragma aux` codegen) |
+| ROTT     | videogamepreservation| **52 / 52** (1 dead-code .C skipped) | no (needs `#pragma aux` codegen) |
 | Descent  | dxx-rebirth          | n/a (C++)   | no     |
+
+**All five C games now triage 100% clean** at the per-file level —
+240 period DOS sources compile through uc386 → NASM. The remaining
+gap to a runnable .bin is per-game stubs/linkage (chocolate-doom
+platform layer for Heretic/Hexen, `#pragma aux` codegen in uc_core
+Phase 2 for the Watcom-era inline-asm helpers in Duke3D/ROTT).
 
 Today's Doom blockers are NOT `#pragma aux` (we use `linuxdoom-1.10`,
 not the DOS tree). Compile-time blockers cleared 2026-04-30:

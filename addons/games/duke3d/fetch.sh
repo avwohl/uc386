@@ -35,5 +35,21 @@ echo "duke3d: patching menues.c block-scope shadow …"
 sed -i '' 's|static const char \*s\[\] = { "Off", "New"|static const char *weaponswitch_names[] = { "Off", "New"|' upstream/src/menues.c
 sed -i '' 's|gametextpal(d,yy, s\[ud.weaponswitch\]|gametextpal(d,yy, weaponswitch_names[ud.weaponswitch]|' upstream/src/menues.c
 
+# Patch: kplib.c expects __int64 + _lrotl as Watcom intrinsics under
+# __DOS__ (uc386 predefines __DOS__=1, so the in-file
+# `#if !defined(_WIN32) && !defined(__DOS__)` typedef branch is
+# inactive). Inject the typedef + a portable _lrotl fallback right
+# after `#include <stdint.h>`.
+echo "duke3d: patching kplib.c __int64 / _lrotl shim for __DOS__ …"
+python3 -c '
+src = open("upstream/jfbuild/src/kplib.c").read()
+shim = ("#include <stdint.h>\n"
+        "typedef long long __int64;\n"
+        "static int _lrotl(int i, int sh) "
+        "{ return (int)(((unsigned)i << sh) | ((unsigned)i >> (32 - sh))); }")
+src = src.replace("#include <stdint.h>", shim, 1)
+open("upstream/jfbuild/src/kplib.c", "w").write(src)
+'
+
 echo "duke3d: upstream tree at addons/games/duke3d/upstream/"
 echo "duke3d: src/ is game logic; jfbuild/ is the Build engine."

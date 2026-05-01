@@ -71,9 +71,15 @@ triage() {
 
 triage "Game-side (upstream/src)" "$GAME_SOURCES"
 
-# Build engine — exclude GL/GTK/Win32/SDL files; we want the core C
-# that has any chance of compiling on a non-host target.
-ENGINE_EXCLUDE='/(gl|polymost|gtkbits|sdlayer|startgtk|startwin|winbits|defs)\.c$|polymosttex|mdsprite'
+# Build engine — exclude files that are platform-specific to OSes
+# we don't target. None of these are reachable on DOS:
+#   gl/polymost*       — OpenGL (jfduke3d's hardware renderer)
+#   gtkbits/startgtk*  — GTK Linux editor frontends
+#   startwin*/winlayer/winbits — Win32 editor + DDraw layer
+#   sdlayer*           — SDL backend (we have no SDL on flat-DOS)
+#   mmulti             — BSD sockets (netinet/in.h)
+#   defs               — defs.c is a stub that #error-s without DDB
+ENGINE_EXCLUDE='/(gl[^/]*|polymost[^/]*|gtkbits|sdlayer[^/]*|startgtk[^/]*|startwin[^/]*|winbits|winlayer|mmulti|defs)\.c$|polymosttex|mdsprite'
 ENGINE_SOURCES="$(find upstream/jfbuild/src -maxdepth 1 -name '*.c' | grep -Ev "$ENGINE_EXCLUDE" | sort)"
 triage "Build engine (jfbuild/src)" "$ENGINE_SOURCES"
 
