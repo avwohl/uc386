@@ -28,6 +28,26 @@
 // 6-byte declaration would have caused setjmp to buffer-overflow.
 #define MICROPY_NLR_SETJMP                (1)
 
+// MINIMUM today; bumping to CORE_FEATURES (upstream's default; adds
+// min/max/reversed + slicing) hits a uc_core preprocessor bug. The
+// `mp_seq_replace_slice_grow_inplace` macro in obj.h has parameter
+// list `(dest, dest_len, beg, end, slice, slice_len, len_adj, ...)`
+// — the 5th param name `slice` collides with the user's local
+// `mp_bound_slice_t slice;` in objlist.c's call site:
+//
+//   mp_seq_replace_slice_grow_inplace(self->items, self->len,
+//       slice.start, slice.stop, value_items, value_len, ...)
+//
+// Param `beg = slice.start`. The C standard says parameter
+// substitution is simultaneous (one pass) — `slice` in `slice.start`
+// (which came from the `beg` arg) is the user's identifier and must
+// not be re-substituted. uc_core appears to do iterative substitution
+// instead, turning `slice.start` into `value_items.start` (because
+// the param `slice = value_items` also fires). uc386 codegen then
+// correctly errors `.` on PointerType. Tracked as a uc_core
+// preprocessor fix; staying at MINIMUM until that lands. The
+// MINIMUM build already covers def, class, list comp, try/except,
+// range, sum, sorted, zip, divmod, and most arithmetic.
 #define MICROPY_CONFIG_ROM_LEVEL          (MICROPY_CONFIG_ROM_LEVEL_MINIMUM)
 
 #define MICROPY_ENABLE_COMPILER           (1)
