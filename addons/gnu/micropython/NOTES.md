@@ -22,33 +22,57 @@ uc386?" before we sink time in a real port.
 ## Triage result (latest run)
 
 ```
-== py/ triage: 95 pass / 37 fail / 132 total ==
+== py/ triage: 115 pass / 17 fail / 132 total ==
 ```
 
-That's **72 % of the platform-independent core** compiling clean
-through uc386 → NASM-ready .asm in one pass — using empty stubs
-for the four upstream-generated headers (`qstrdefs.generated.h`,
-`moduledefs.h`, `mpversion.h`, `root_pointers.h`) and a synthetic
-`int main()` so uc386's "every TU needs main" check accepts library
-sources. The 37 failures bucket two ways:
+That's **87 % of the platform-independent core** compiling clean
+through uc386 → NASM-ready .asm in one pass. The setup:
 
-| Class                                                          | Count | Cause                                                                                                |
-|----------------------------------------------------------------|-------|------------------------------------------------------------------------------------------------------|
-| `unknown identifier MP_QSTR_*`                                 | 16    | Real qstrdefs needs `tools/makeqstrdefs.py` over the source tree first; stub is empty.               |
-| `global mp_type_X.name: float init must be a constant expression (got Identifier)` | 21    | uc386 const-eval bug — `mp_type_X.name = MP_QSTR_X` (integer ID) routes through the float-init path. |
+- Stub `genhdr/moduledefs.h`, `genhdr/mpversion.h`,
+  `genhdr/root_pointers.h` (empty headers — real builds emit these
+  from the source tree).
+- Auto-generate a triage `genhdr/qstrdefs.generated.h` by grepping
+  `MP_QSTR_*` references out of `upstream/py/` and emitting the
+  matching `QDEF0(...)` macro invocations. Approximates upstream's
+  `tools/makeqstrdefs.py` over-inclusively (any MP_QSTR_x pattern
+  becomes a qstr, even if it's only a comment in real source) but
+  keeps the enum in `py/qstr.h` complete enough that downstream
+  refs resolve.
+- Synthetic `int main()` so uc386's "every TU needs `main`" check
+  accepts library sources.
+
+The 17 remaining failures fall into:
+
+| Class                                                                              | Count | Cause                                                                                                          |
+|------------------------------------------------------------------------------------|-------|----------------------------------------------------------------------------------------------------------------|
+| `global <obj>.sig: float init must be a constant expression`                       | 12    | `MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN` packs flags+min+max into an Identifier-bearing init that const-eval rejects. |
+| `__static_scope__scope_simple_name_table: initializer index 6 out of range`        | 1     | Array of 6 `const char *` initialized with 7 entries — likely a parser quirk in our upstream version.           |
+| `__static_objmodule__mp_builtin_module_table.key: got Identifier MICROPY_REGISTERED_MODULES` | 1     | Port-specific `MICROPY_REGISTERED_MODULES` macro is empty in stubs; real port supplies it.                     |
+| `-> requires a pointer to struct (got PointerType)`                                | 2     | uc386 codegen rejects `pp->m` where pp is `(struct *)*p`. File as a real bug — this is wrong.                  |
+| Other                                                                              | 1     | Additional `.sig` flavour outside the dominant 12.                                                              |
+
+**Earlier baseline** (before the synthetic qstrdefs step): 95/132.
+The 20-source jump came purely from generating a triage qstr table
+— the previous 21 `mp_type_X.name` errors were all downstream of
+empty qstrdefs, not separate codegen bugs as initially supposed.
 
 ## Next steps for a runnable image
 
 The triage proves the core is reachable. To land an actual
 `micropython.bin`:
 
-1. **Run upstream's qstr generator** to emit a real
-   `genhdr/qstrdefs.generated.h` from the source tree. This
-   resolves the 16 `MP_QSTR_*` identifier failures.
-2. **Fix the const-eval Identifier-as-int regression in uc386
-   codegen** (or, as a workaround, dynamically initialise the
-   `mp_type_X` struct fields in module-init rather than at
-   global scope). This resolves the remaining 21.
+1. **Run upstream's `tools/makeqstrdefs.py`** to emit the real
+   `genhdr/qstrdefs.generated.h` (correct hash + len fields,
+   minus the over-inclusion the grep heuristic ships).
+2. **Fix the two real uc386 codegen issues** that remain after
+   the qstr table is correct:
+   - `MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN`-style packed-flag
+     bitfield-style init (the `.sig` family — 12 failures).
+     Likely the `(MP_OBJ_FUN_FLAG_* | n_min)` shape includes
+     an Identifier that needs to evaluate to a constant.
+   - `pp->member` rejected when `pp` is itself `*p` of
+     `struct **`. The 2 `->` failures look like a real codegen
+     bug.
 3. **Write `ports/uc386-dos/`** — a thin port with:
    - `mpconfigport.h` (start from `ports/minimal/`)
    - `main.c` calling `mp_init` / `pyexec_friendly_repl` with

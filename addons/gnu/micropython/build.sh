@@ -42,10 +42,22 @@ mkdir -p build build/genhdr
 # emit these from the source tree; for triage we ship empty stubs
 # so the preprocessor finds them and we see compile-class failures
 # (uc386 limitations) instead of a wall of missing-header errors.
-[ -f build/genhdr/qstrdefs.generated.h ] || cat > build/genhdr/qstrdefs.generated.h <<'EOF'
-// Empty stub so py/qstr.c and py/qstr.h can include it cleanly.
-// A real build emits Q(name) entries here from collected qstr usage.
-EOF
+if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
+    # Emit a triage qstr table by grep over upstream/py/. Real builds
+    # use upstream's tools/makeqstrdefs.py which preprocesses each TU
+    # to find MP_QSTR_x macro uses; for triage we approximate with a
+    # grep over the source tree, which over-includes (any string that
+    # parses as an identifier becomes a qstr) but keeps the mapping
+    # complete enough that the enum in py/qstr.h covers every
+    # reference downstream code makes.
+    {
+        echo "QDEF0(MP_QSTRnull, 0, 0, \"\")"
+        echo "QDEF0(MP_QSTR_, 0, 0, \"\")"
+        grep -rhoE "MP_QSTR_[A-Za-z_][A-Za-z0-9_]*" upstream/py/*.c upstream/py/*.h \
+            | sort -u \
+            | awk '{ name = substr($0, 8); print "QDEF0(" $0 ", 0, 0, \"" name "\")" }'
+    } > build/genhdr/qstrdefs.generated.h
+fi
 [ -f build/genhdr/moduledefs.h ] || cat > build/genhdr/moduledefs.h <<'EOF'
 // Empty stub so py/objmodule.c can include it cleanly.
 // A real build emits MP_REGISTER_MODULE entries here.
