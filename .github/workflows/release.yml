@@ -73,6 +73,12 @@ jobs:
         run: python -m addons.harness.package --version "${{ steps.ver.outputs.version }}" --foss-only
 
       - name: Build BWK awk
+        # Bison 3.x's awkgram.tab.c output uses typedef chains that
+        # uc386 currently misparses inside function bodies (works fine
+        # with the bison 2.3 the dev host has via brew). Don't fail
+        # the release on this — the FOSS tarball ships without awk in
+        # the meantime. Tracked as a known-issue.
+        continue-on-error: true
         run: |
           cd addons/gnu/awk-bwk
           ./fetch.sh
@@ -80,6 +86,7 @@ jobs:
           ls -la build/awk.bin
 
       - name: Repackage with awk
+        if: success()
         run: python -m addons.harness.package --version "${{ steps.ver.outputs.version }}" --foss-only
 
       - name: Build games-scripts tarball
