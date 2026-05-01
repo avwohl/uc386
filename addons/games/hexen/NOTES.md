@@ -10,26 +10,16 @@ Hexen — Raven's id-Tech-1-derived engine, separate from Heretic's.
 `fetch.sh` works (shares chocolate-doom upstream with Heretic).
 `uc386_config` is a symlink to `../heretic/uc386_config` so the
 generated `config.h` and `SDL_endian.h` shims are shared.
+`build.sh` is a per-file triage harness like the other games'.
 
-Triage: every `src/hexen/*.c` we tried bails at the same spot —
-chocolate-doom's `PACKED_STRUCT(...)` macro spans multiple lines
-with a brace-block argument:
+**44 of 48 hexen sources compile cleanly** through uc386 after the
+uc_core preprocessor improvements (uc_core@63912fd):
+- multi-line macro merge in _preprocess_included
+- comment-aware paren tracking in _has_unclosed_macro_call
+- comment-first scan in _expand_macros_once and _parse_macro_args
+- trailing-comment strip in _process_define
 
-```c
-typedef PACKED_STRUCT (
-{
-    short width; short height; ...
-}) patch_t;
-```
-
-uc_core's preprocessor doesn't merge subsequent lines when a
-function-like macro invocation has unclosed parentheses spanning
-several lines AND the inner content has braces. PACKED_STRUCT
-stays unexpanded, then the parser hits `typedef PACKED_STRUCT (`
-and bails with "Expected type specifier".
-
-`_has_unclosed_macro_call` exists in the preprocessor and *does*
-merge subsequent lines for unclosed parens — but it's not robust
-to brace-content arguments (or maybe a different fault). Worth a
-uc_core ticket. Once that's fixed, Hexen should build through
-the same `doom_stubs.c` family Doom uses.
+Remaining 4 fails are SDL.h missing (chocolate-doom uses SDL2
+directly for input). To build Hexen end-to-end we'd need an SDL.h
+shim (similar to the SDL_endian.h we already have) plus the
+matching doom_stubs.c-style I_* implementations.
