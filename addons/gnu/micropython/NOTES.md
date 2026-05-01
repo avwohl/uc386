@@ -118,12 +118,46 @@ on the linear-search loop in `mp_map_lookup`:
 
 uc386's bitfield read + write generated code looks correct in
 isolated tests (verified with focused `_compile` snippets — read
-shifts and masks the right ranges; write does proper RMW). So
-the bug is more subtle: maybe the order of mp_map_init's
-assignments interacts badly with codegen, or the static init
-of `mp_state_ctx` / `dict_main` at the BSS level has a layout
-mismatch. Further bisection needs more debugging time than
-fits in a /loop iteration.
+shifts and masks the right ranges; write does proper RMW).
+
+**Further narrowing (final state of the session)**: hooked the
+3 `mp_map_lookup` entry points and dumped `(map_ptr, index, kind,
+return_addr)` for each. Result for input `1\n\x04`:
+
+  - Call 1: ret=0xECD5, map=0x69360, index=0x21A (`__name__`),
+    kind=1 (ADD_IF_NOT_FOUND). This is `mp_init`'s store of
+    `__name__` into `dict_main`. dict_main lives in mp_state_ctx
+    BSS; its `&dict_main.map` runtime address is 0x69360.
+  - Call 2: ret=0x1C73F, map=0x69360, kind=0. This is
+    `mp_load_name`'s `mp_locals_get()->map` lookup. Same dict_main —
+    locals == globals at module scope, so this is correct.
+  - Call 3: ret=0x1C773, map=**0x2A354**, kind=0. This is
+    `mp_load_global`'s `mp_globals_get()->map` lookup *immediately
+    after* the locals miss. **The map address differs from
+    dict_main** (0x69360) — `mp_globals_get()` returned a different
+    dict than `mp_locals_get()` despite mp_init's
+    `mp_locals_set(&dict_main); mp_globals_set(&dict_main)`.
+
+The map at 0x2A354 lives in the GC heap and is corrupted:
+`bitfield = 0x6935C` (is_ordered=1, used=0xD26B), `alloc=121`,
+`table=NULL`. The linear-search loop entered (because is_ordered=1)
+walks from address 0 (`table`) for `used*8` bytes, immediately
+hits boot-instruction bytes interpreted as mp_obj_t key/value
+pairs, and trips the unmapped read at the first qstr-shaped
+garbage value with high bit set.
+
+**Hypothesis**: `mp_compile` (called during `parse_compile_execute`
+in the REPL loop) creates a module function whose context's
+`globals` is a *fresh* dict instead of inheriting the existing
+dict_main. uc386's emission of mp_compile's context init is the
+suspect. The bug doesn't reproduce on `pass` because that compiles
+to bytecode that doesn't do `LOAD_GLOBAL` (no `__repl_print__`
+call); it doesn't reproduce on `x = 5` because STORE_NAME goes to
+the locals dict (= dict_main, which is fine), not globals.
+
+Further root-cause debugging needs source-level inspection of
+mp_compile's context setup and the difference between locals_set
+and globals_set behaviors — outside what fits in /loop iterations.
 
   - EIP 0xCC41, inside `mp_obj_equal_not_equal`, instruction
     `cmp dword [eax], _mp_type_str`.
