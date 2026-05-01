@@ -71,6 +71,36 @@ def test_micropython_repl_banner(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_pass_statement(micropython_bin: Path) -> None:
+    """Sending `pass\\n\\x04` exercises the full lex → parse → compile
+    → exec path: `pass` is a no-op statement, so the REPL shouldn't
+    print anything but the next `>>> ` prompt before EOF exits.
+
+    This pins the parser + compiler + VM + NLR (exception machinery)
+    after the REPL banner. Expression statements that produce a value
+    (`1`, `print(2+3)`) currently fail in the value-print path —
+    that's a separate gap, tracked in NOTES.md."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"pass\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0, (
+        f"unexpected exit code: {res.exit_code} "
+        f"(expected 0 for `pass\\n\\x04` clean exit)"
+    )
+    # After `pass` executes (no output), REPL prints `>>> ` again,
+    # then Ctrl-D exits. Two prompts is the diagnostic.
+    assert res.stdout.count(">>> ") >= 2, (
+        f"expected two `>>> ` prompts in stdout (one before `pass`, "
+        f"one after), got: {res.stdout!r}"
+    )
+
+
 def test_micropython_clean_eof_exit(micropython_bin: Path) -> None:
     """Sending only Ctrl-D (EOF) at the prompt should exit the REPL
     cleanly with exit code 0 — exercises the readline → pyexec EOF

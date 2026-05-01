@@ -234,8 +234,9 @@ real-mode-32 binaries that dos_emu loads directly.
 
 ## ◐ Include the latest MicroPython (2026-05-01 ask)
 
-**Runnable `micropython.bin` boots to the REPL.** A 170 KB flat
-i386 DOS binary built end-to-end through uc386 prints:
+**Runnable `micropython.bin` boots to the REPL and runs simple
+Python statements.** A 170 KB flat i386 DOS binary built
+end-to-end through uc386 prints:
 
 ```
 MicroPython uc386-triage on 2026-05-01; uc386-dos with i386
@@ -243,11 +244,16 @@ Type "help()" for more information.
 >>>
 ```
 
-…then waits on stdin under `uc386.dos_emu.run`. Boots cleanly
-through `gc_init`, `mp_init`, `pyexec_friendly_repl`. Executing
-arbitrary Python expressions is the remaining work — the parser
-hits an unmapped read on first input — but the boot path,
-multi-file link, and HAL plumbing are all healthy.
+…and then accepts `pass`, empty lines, and Ctrl-D-to-exit. The
+parser / compiler / VM / NLR (setjmp-backed) path is exercised
+end-to-end; statements that don't allocate or print run cleanly.
+Statements that allocate (`x = 5` — qstr + dict store) or
+produce a value to print (`1`, `print('hi')`) still crash with
+`UC_ERR_READ_UNMAPPED` somewhere downstream of the bytecode
+dispatch — likely a libm shim returning to dead code, an
+ast-optimizer copy-prop interacting badly with a function-pointer
+table, or something in the qstr-pool growth path. Investigation
+continues.
 
 Layered evidence:
 

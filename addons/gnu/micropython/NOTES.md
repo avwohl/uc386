@@ -15,12 +15,35 @@ Type "help()" for more information.
 ```
 
 The boot path — `gc_init` → `mp_init` → `pyexec_friendly_repl` —
-runs cleanly through 143 multi-TU-compiled sources. Executing
-arbitrary input is the remaining gap: the first input character
-arrives and is echoed, but the parser/compile path hits an
-unmapped memory read. Likely needs more libc surface area
-(setjmp/longjmp's NLR machinery is the prime suspect — the parser
-exception path goes through `nlr_jump`) or a larger heap.
+runs cleanly through 143 multi-TU-compiled sources. Simple
+statements that don't allocate or produce a printable value (`pass`,
+empty line, Ctrl-D-to-exit) execute end-to-end through lex →
+parse → compile → VM dispatch.
+
+Remaining gap: statements that **allocate** (`x = 5` allocates a
+qstr "x" + dict-stores 5) or **produce a value to print** (`1`,
+`print('hi')`) crash with `UC_ERR_READ_UNMAPPED` somewhere
+downstream of bytecode dispatch. Suspects worth checking next:
+
+- **dead libm externs**: 18 libm symbols (acos, sin, cosh, trunc,
+  …) appear as externs but only as string-table debug names;
+  they're listed because the asm DCE can't prove they're unused.
+  An indirect call through a function pointer that resolves to one
+  of these `extern _xxx` symbols would jump to the import-stub
+  address instead of real code.
+- **ast-optimizer copy-prop on a function pointer**: similar to
+  the `void *data → struct *p` bug fixed earlier in this slice,
+  but for function pointers — uc_core might be copy-propagating
+  a function-table indirection that loses the call target.
+- **Qstr-pool growth path**: `qstr_add` allocates via
+  `m_malloc` from the GC heap. If GC's free-list traversal trips
+  on something (unaligned heap base, off-by-one in the heap end
+  sentinel), the allocation returns garbage.
+- **Struct identity for nested unions**: `mp_obj_t` is a union
+  of pointers and small-int-tagged ints; if the structural
+  fingerprinting that resolves anonymous structs is collapsing
+  two distinct union shapes, member access through the wrong
+  variant would dereference garbage.
 
 ## Build
 
