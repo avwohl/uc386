@@ -12,23 +12,22 @@ codebase). Public source releases:
 Build prospects track Doom's — same engine, same blockers. Once Doom
 builds, these are mostly recompiles + per-game asset paths.
 
-## Status (2026-04-30)
+## Status (2026-05-01)
 
 `fetch.sh` works (pulls chocolate-doom which carries both Heretic and
-Hexen). `uc386_config/config.h` is a hand-written stand-in for the
-autotools-generated config.h chocolate-doom expects — claims
-HAVE_DECL_STRCASECMP/STRNCASECMP, leaves all the optional features
-(fluidsynth, libsamplerate, libpng, ALSA) undefined.
+Hexen). `build.sh` is a per-file triage harness like the other games'.
 
-First-pass triage: `info.c` (the giant frame-state table) gets past
-doomtype.h's `#include "config.h"` and starts parsing the
-`state_t states[NUMSTATES]` literal but bails ~500 entries in with
-"Expected type specifier" — likely uc386 closing the array literal
-early. Worth a uc_core ticket.
+`uc386_config/` carries three hand-written shims:
+- `config.h` — autotools stand-in (PACKAGE_NAME, HAVE_DECL_*, etc.)
+- `SDL_endian.h` — identity LE byte-swaps (uc386 is little-endian)
+- `SDL.h` — minimal opaque types so SDL_Event*-typed APIs parse
 
-Underlying engine is Doom's, so all the `doom_stubs.c` work applies
-unchanged — `I_*` functions, `lseek`, `fstat`, the libc additions.
-The remaining work after the parser fix: patch chocolate-doom's
-autotools-driven Makefile-isms out of the source list, and decide
-whether to share or fork doom_stubs.c for heretic's slightly
-different sound/midi calls.
+**44 of 47 src/heretic/*.c sources compile cleanly** through uc386
+after the uc_core preprocessor improvements (uc_core@63912fd) and
+the SDL.h shim. Remaining 3 fails are deeper SDL2 API references.
+
+The same engine + libc work as Doom carries through — `doom_stubs.c`
+is the next deliverable to actually link a bin. The remaining work:
+1. Expand SDL.h shim or make it pointer-only opaque
+2. Add a heretic-flavored stubs.c (or share doom's with #ifdef)
+3. Verify multi-file linkage works end-to-end
