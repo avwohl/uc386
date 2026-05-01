@@ -36,6 +36,13 @@ doesn't call into Heretic; asm-DCE strips the unreferenced
 symbols. Switching the stub to `D_DoomMain()` would surface the
 remaining link-time work (I_* stubs, runtime).
 
-The same engine + libc work as Doom carries through — a
-`doom_stubs.c`-style file is the last deliverable to actually
-boot a bin.
+The same engine + libc work as Doom carries through, BUT
+chocolate-doom has a much bigger platform abstraction layer
+than original DOOM:
+- 76 distinct `I_*` functions (vs DOOM's 30)
+- 30 `TXT_*` textscreen functions
+- 8 `SDL_*` calls
+
+A heretic_stubs.c in the spirit of doom_stubs.c is the last
+deliverable to link a bin — but it's a multi-day port, not a
+single-tick task. Doom's stubs.c (~30 functions) is the model.
