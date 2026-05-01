@@ -962,6 +962,33 @@ class CodeGenerator:
             if label_diff is not None:
                 directive = self._DATA_DIRECTIVE[self._size_of(ty)]
                 return [f"        {directive}      {label_diff}"]
+            # `(int)"string"` / `(int)&global` — period code (DOOM
+            # m_misc.c chatmacro defaults) stores pointer-typed values
+            # in int fields by explicit cast. On i386 with `int` and
+            # pointer both 4-wide, lay down the string/symbol label as
+            # the integer value. Width-mismatch (sub-int slot) falls
+            # through to the const_eval path which raises.
+            if self._size_of(ty) == 4:
+                stripped = init
+                while isinstance(stripped, ast.Cast):
+                    stripped = stripped.expr
+                if isinstance(stripped, ast.StringLiteral):
+                    label = self._intern_string(stripped.value)
+                    return [f"        dd      {label}"]
+                if (
+                    isinstance(stripped, ast.UnaryOp)
+                    and stripped.op == "&"
+                    and isinstance(stripped.operand, ast.Identifier)
+                ):
+                    inner_name = self._resolve_static_init_name(
+                        stripped.operand.name
+                    )
+                    if (
+                        inner_name in self._globals
+                        or inner_name in self._func_return_types
+                        or inner_name in self._extern_vars
+                    ):
+                        return [f"        dd      _{inner_name}"]
             # `_Bool` globals can initialize from any compile-time
             # constant including floats — fall back to the float
             # const-eval when the integer one fails. Per C 6.3.1.2
@@ -974,7 +1001,16 @@ class CodeGenerator:
                 value = 1 if value != 0 else 0
                 directive = self._DATA_DIRECTIVE[self._size_of(ty)]
                 return [f"        {directive}      {value}"]
-            value = self._const_eval(init, name)
+            try:
+                value = self._const_eval(init, name)
+            except CodegenError:
+                # Period code (DOOM, Watcom-era games) often initializes
+                # `static fixed_t x = .2 * FRACUNIT;` style. The int
+                # const-eval gives up on FloatLiteral; fall back to
+                # the float evaluator and truncate toward zero, mirroring
+                # what an explicit `(int)` cast would do.
+                f_value = self._const_eval_float(init, name)
+                value = int(f_value) if f_value >= 0 else -int(-f_value)
             # __int128 globals: lay down two 64-bit halves (low, high)
             # honoring the value's signedness.
             if self._is_int128(ty):
@@ -2418,6 +2454,14 @@ class CodeGenerator:
         from the actual 32-bit FLT_MIN.
         """
         import struct
+        # Integer-only subexpression? Period code mixes float and int
+        # subexpressions freely (`-.5 * FRACUNIT` where FRACUNIT is
+        # `1<<16`); _const_eval handles bit ops we don't replicate
+        # here. Try it first — on success, lift to float.
+        try:
+            return float(self._const_eval(expr, name))
+        except CodegenError:
+            pass
         while isinstance(expr, ast.Cast):
             target = expr.target_type
             inner = self._const_eval_float(expr.expr, name)
@@ -4825,7 +4869,11 @@ class CodeGenerator:
                         return after
                     if t.name in self._structs:
                         return t.name
-            key = f"__inline_{id(t)}"
+            # Structural key (not id-based) so that two textually-identical
+            # anonymous structs from the same header included in different
+            # TUs collapse to one registered layout. id(t) would split them
+            # and break struct assignment between the two TUs.
+            key = f"__inline_{self._struct_shape_hash(t)}"
             if key not in self._structs:
                 from types import SimpleNamespace
                 self._register_struct(SimpleNamespace(
@@ -4853,11 +4901,60 @@ class CodeGenerator:
         # Empty struct (`typedef struct {} empty_s;` → StructType
         # with name=None, members=[]). GCC permits these; register a
         # zero-sized layout so it can be a struct member or a local.
-        key = f"__empty_struct_{id(t)}"
+        # All empty anonymous structs are layout-compatible — collapse
+        # into one key so cross-TU usage doesn't fragment.
+        key = "__empty_struct__"
         if key not in self._structs:
             self._structs[key] = []
             self._struct_sizes[key] = 0
         return key
+
+    def _struct_shape_hash(self, t: ast.StructType) -> str:
+        """Stable structural fingerprint of an anonymous struct.
+
+        Used as the registry key for `typedef struct { ... } X;` so that
+        identical inline shapes from the same header land on the same
+        key across TUs (otherwise multi-TU mode treats each include as
+        a fresh type and struct-copy assignment fails).
+
+        Uses an MD5 of the textual shape — the prefix of the digest is
+        plenty for collision resistance among the few-thousand-struct
+        codebases we care about.
+        """
+        import hashlib
+
+        def type_repr(ty) -> str:
+            if ty is None:
+                return "?"
+            if isinstance(ty, ast.StructType):
+                if ty.name and not ty.members:
+                    # Tag-only — same name, same identity.
+                    return f"S<{'union' if ty.is_union else 'struct'}:{ty.name}>"
+                # Recurse into the nested anon shape.
+                return f"S<{self._struct_shape_hash(ty)}>"
+            if isinstance(ty, ast.PointerType):
+                return f"P<{type_repr(ty.base_type)}>"
+            if isinstance(ty, ast.ArrayType):
+                # ArrayType.size may be an Expression; stringify naively.
+                sz = repr(getattr(ty, "size", None))
+                return f"A[{sz}]<{type_repr(ty.base_type)}>"
+            if isinstance(ty, ast.BasicType):
+                return f"B<{ty.name},sgn={getattr(ty, 'is_signed', None)}>"
+            if isinstance(ty, ast.EnumType):
+                return f"E<{getattr(ty, 'name', None)}>"
+            if isinstance(ty, ast.FunctionType):
+                rt = type_repr(getattr(ty, "return_type", None))
+                params = ",".join(type_repr(p) for p in getattr(ty, "param_types", []))
+                return f"F<{rt}({params})>"
+            return f"X<{type(ty).__name__}>"
+
+        parts = ["union" if t.is_union else "struct",
+                 "packed" if getattr(t, "is_packed", False) else "unpacked"]
+        for m in t.members:
+            mname = m.name if m.name is not None else ""
+            parts.append(f"{mname}:{type_repr(m.member_type)}")
+        sig = "|".join(parts)
+        return hashlib.md5(sig.encode("utf-8")).hexdigest()[:16]
 
     def _anon_member_layout_key(self, t: ast.StructType) -> str:
         """Resolve `t` (a StructType used as an anonymous member) to a

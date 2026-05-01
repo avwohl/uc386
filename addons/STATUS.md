@@ -85,21 +85,32 @@ pull upstream sources cleanly) and `build.sh` (Doom now drives
 58 sources through preprocess → parse → codegen).
 
 Today's Doom blockers are NOT `#pragma aux` (we use `linuxdoom-1.10`,
-not the DOS tree), but rather:
+not the DOS tree). Compile-time blockers cleared 2026-04-30:
+
 1. ~~Several missing libc headers — `values.h`, `alloca.h`, `malloc.h`,
-   `R_OK` in `unistd.h`~~ Added 2026-04-30.
-2. ~~File-scope `static` name collisions in multi-TU mode~~ Fixed
-   2026-04-30 via per-file static name mangling in `main.py`.
-3. **Anonymous-struct type identity across TUs.** A typedef'd struct
-   in a shared header gets a distinct identity in each including TU,
-   so struct assignment across the merged AST fails. Needs uc_core
-   type-system change (structural equality OR pre-merge unification
-   of named typedefs).
-4. (Future tickets — won't be visible until #3 unblocks.)
+   `R_OK` in `unistd.h`~~ Added.
+2. ~~File-scope `static` name collisions in multi-TU mode~~ Fixed via
+   per-file static name mangling in `main.py`.
+3. ~~Anonymous-struct type identity across TUs~~ Fixed: `_resolve_struct_name`
+   now uses a structural fingerprint, not `id(t)`.
+4. ~~Float-init for integer globals (`.2 * FRACUNIT`)~~ Fallback to
+   float-eval + truncate.
+5. ~~Bit ops in float const-eval~~ Delegate to int-eval when shape allows.
+6. ~~`(int)"string"` / `(int)&global` in int slots~~ Lay down label as `dd`.
+7. ~~Strength-reduction `x * 2^n -> x << n` mis-firing on float operands
+   inside UnaryOp~~ uc_core optimizer now avoids any subtree with a
+   FloatLiteral / float-Cast.
+
+**All 58 doom sources now lower to a single 76 K-line .asm.** What's
+left is *runtime glue*, not compiler work: stubs for ~30 `_I_*`
+platform functions (`I_GetTime`, `I_Error`, `I_InitGraphics`, …) plus
+a couple of libc additions (`fstat`, `mkdir`, `sscanf` variadic).
+Documented in `addons/games/doom/NOTES.md`.
 
 **Spirit of the request preserved**: every blocker we close benefits
-ALL period-code ports, not just Doom — `static`-name-mangling
-unblocks any multi-TU C codebase, the libc additions are reusable.
+ALL period-code ports, not just Doom — these are six general compiler
+improvements (structural struct identity, float-aware strength
+reduction, etc.) that shipped in this slice.
 
 ## ✓ Two installers (FOSS + abandonware)
 

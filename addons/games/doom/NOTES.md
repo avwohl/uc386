@@ -40,22 +40,35 @@ DOOM linuxdoom-1.10 is mostly straight C with these dependencies:
 upstream compile) and gets 58 sources into the compiler.
 
 Blockers cleared so far:
-- `<values.h>` — added libc shim forwarding to `<limits.h>` / `<float.h>`
-- `<alloca.h>` — added (alloca → malloc, leaks bounded by use-pattern)
-- `<malloc.h>` — added (forwards to `<stdlib.h>`)
-- `R_OK`/`access()` — added to `<unistd.h>`
+- `<values.h>`, `<alloca.h>`, `<malloc.h>`, `R_OK`/`access()` — libc
 - File-scope `static` name collisions (every .c has `static const char
   rcsid[]`) — fixed via per-file mangling pass in main.py before TU merge
+- Anonymous-struct type identity across TUs — `_resolve_struct_name`
+  now uses a structural fingerprint (MD5 of member shape) instead of
+  Python `id(t)`, so the same `typedef struct {...}` in a header
+  collapses to one registered layout across all including TUs.
+- Float-typed initializers in integer globals (`(.2 * FRACUNIT)` style
+  fixed-point constants) — `_emit_global_init` falls back to the float
+  evaluator when the int evaluator gives up; truncates toward zero.
+- Bit-shift subexpressions in float const-eval — `_const_eval_float`
+  delegates to `_const_eval` when its early integer try succeeds,
+  picking up `<<`, `>>`, `&`, `|`, `^` for free.
+- `(int)"string"` and `(int)&global` in int-typed global init slots —
+  recognized as a label diff, lays down `dd <label>`. DOOM uses this
+  in m_misc.c chatmacro defaults.
+- Strength reduction `x * 2^n -> x << n` was firing on float operands
+  (when `other` was a `UnaryOp(-, FloatLiteral)`, not a top-level
+  FloatLiteral). uc_core ast_optimizer now bails on any subtree
+  containing a FloatLiteral / float-Cast.
 
-Current first remaining blocker:
-- Anonymous-struct type identity across TUs. When `typedef struct {...}`
-  in a header is included by two .c files, the merged AST has two
-  distinct struct-type nodes for the same logical type, so struct
-  assignment fails ("got `__inline_X` and `__inline_Y`"). Fix path:
-  unify named typedef'd structs at TU-merge time, OR teach codegen to
-  compare struct types structurally instead of by identity. uc_core
-  type-system change.
+Status: all 58 sources compile end-to-end through uc386 to a single
+76 K-line .asm file. Remaining work to actually run is a
+**doom_stubs.c** file providing definitions for the 30+ `_I_*`
+externs (the platform-specific functions we excluded:
+`I_StartFrame`, `I_GetTime`, `I_Error`, `I_InitGraphics`, etc.) plus
+a couple of libc additions (`fstat`, `mkdir`, `sscanf`,
+`sndserver_filename`/`mb_used` variable stubs).
 
-After that there will be more — but the work is now incremental
-ticket-by-ticket rather than uniformly blocked. ETA-to-first-build is
-no longer "weeks" — it's "however many of these tickets we close."
+Once that exists, NASM produces a single flat `.bin` and the question
+becomes "does it run under dos_emu" — likely a fresh batch of runtime
+issues, but qualitatively different (no longer a compile-time wall).
