@@ -27,6 +27,12 @@ struct stat {
 #define S_IFBLK  0060000
 #define S_IFIFO  0010000
 
+/* Watcom-style aliases for the POSIX S_I*USR bits — period DOS code
+ * uses the unprefixed forms when calling open() with permissions. */
+#define S_IREAD  0400
+#define S_IWRITE 0200
+#define S_IEXEC  0100
+
 #define S_IRUSR 0400
 #define S_IWUSR 0200
 #define S_IXUSR 0100
