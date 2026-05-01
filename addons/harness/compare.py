@@ -109,6 +109,13 @@ def build_watcom(addon: Path) -> int | None:
     wcc = _which_first(WATCOM_CANDIDATES)
     if wcc is None:
         return None
+    # wcc386 needs WATCOM env (for h/, lib386/) and INCLUDE for stdio.h
+    # etc. If WATCOM isn't already set, default it from the wcc386 path.
+    env = os.environ.copy()
+    if "WATCOM" not in env:
+        env["WATCOM"] = str(Path(wcc).parent.parent)
+    if "INCLUDE" not in env:
+        env["INCLUDE"] = str(Path(env["WATCOM"]) / "h")
     out = REPO_ROOT / "build" / "compare" / addon.name
     out.mkdir(parents=True, exist_ok=True)
     obj_path = out / "wcc386.o"
@@ -116,18 +123,33 @@ def build_watcom(addon: Path) -> int | None:
     # wcc386 wants /fo=obj, the linker is wlink.
     proc = subprocess.run(
         [wcc, "-bt=dos", "-q", "-fo=" + str(obj_path), str(addon / "main.c")],
-        capture_output=True, text=True, cwd=out,
+        capture_output=True, text=True, cwd=out, env=env,
     )
     if proc.returncode != 0:
+        # Surface the error to the workflow log so we can debug.
+        sys.stderr.write(
+            f"watcom {addon.name}: wcc386 rc={proc.returncode}\n"
+            f"  stdout: {proc.stdout[:400]}\n"
+            f"  stderr: {proc.stderr[:400]}\n"
+        )
         return None
-    wlink = _which_first(["wlink"] + ([str(Path(wcc).parent / "wlink")] if "/" in wcc else []))
+    wlink_candidates = ["wlink"]
+    if "/" in wcc:
+        wlink_candidates.insert(0, str(Path(wcc).parent / "wlink"))
+    wlink = _which_first(wlink_candidates)
     if wlink is None:
+        sys.stderr.write(f"watcom {addon.name}: wlink not found in PATH or {Path(wcc).parent}\n")
         return None
     proc = subprocess.run(
         [wlink, "system", "dos4g", "name", str(exe_path), "file", str(obj_path)],
-        capture_output=True, text=True, cwd=out,
+        capture_output=True, text=True, cwd=out, env=env,
     )
     if proc.returncode != 0 or not exe_path.exists():
+        sys.stderr.write(
+            f"watcom {addon.name}: wlink rc={proc.returncode} exists={exe_path.exists()}\n"
+            f"  stdout: {proc.stdout[:400]}\n"
+            f"  stderr: {proc.stderr[:400]}\n"
+        )
         return None
     return exe_path.stat().st_size
 
