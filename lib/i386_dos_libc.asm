@@ -4009,7 +4009,10 @@ _access:
         mov     al, 0                        ; mode = read-only
         mov     ah, 0x3D                     ; AH = 0x3D (open)
         int     21h
-        jc      ._fail
+        ; dos_emu doesn't set CF on open-failure; check EAX directly
+        ; (it returns -1 = 0xFFFFFFFF when the vfile isn't found).
+        cmp     eax, -1
+        je      ._fail
         ; Got a valid fd in EAX (low 16). Close and return 0.
         mov     ebx, eax
         mov     ah, 0x3E
