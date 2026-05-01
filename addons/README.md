@@ -5,6 +5,12 @@ DPMI-era games, and DOS installers. The compiler itself lives in
 `../src/uc386/`; this directory is the "things you can build with it"
 shelf.
 
+**First release**: <https://github.com/avwohl/uc386/releases/tag/v0.1.0-dev>
+ships the FOSS-addons tarball (16 utilities + BWK awk), the
+games-build-scripts tarball (Doom + 5 games), and the size
+comparison vs gcc/Watcom/DJGPP across all 13 addons. See
+`STATUS.md` for the per-item completion against `docs/addons.txt`.
+
 ## Layout
 
 ```
