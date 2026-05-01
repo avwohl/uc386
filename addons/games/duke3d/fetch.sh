@@ -25,5 +25,15 @@ fi
 
 echo "duke3d: cloning $URL with submodules …"
 git clone --depth=1 --recurse-submodules --shallow-submodules "$URL" upstream
+
+# Patch: menues.c uses a block-scope `static const char *s[]` in
+# `case 8` that uc386's flat function-scope can't disambiguate from
+# an `int s` reused as a counter in `case 9`. Rename the inner array
+# to `weaponswitch_names` so the two `s` references are no longer
+# the same identifier.
+echo "duke3d: patching menues.c block-scope shadow …"
+sed -i '' 's|static const char \*s\[\] = { "Off", "New"|static const char *weaponswitch_names[] = { "Off", "New"|' upstream/src/menues.c
+sed -i '' 's|gametextpal(d,yy, s\[ud.weaponswitch\]|gametextpal(d,yy, weaponswitch_names[ud.weaponswitch]|' upstream/src/menues.c
+
 echo "duke3d: upstream tree at addons/games/duke3d/upstream/"
 echo "duke3d: src/ is game logic; jfbuild/ is the Build engine."

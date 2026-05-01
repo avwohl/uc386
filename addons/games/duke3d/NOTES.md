@@ -36,12 +36,11 @@ buildable — the engine framework compiles, the math primitives don't.
 After several rounds of compiler + libc fixes (see commits this
 session), per-file triage stands at:
 
-**Game-side (`upstream/src/`):** 15 of 16 clean.
-- Bail: `menues.c` — assigns to a `char *s[]` after a same-name
-  `static const char *s[]` from a sibling `case` block. uc386 has
-  flat function scope, so it doesn't see the inner `s` as
-  block-local. uc_core scope-fix is the right answer; for now
-  exclude this file from the linked build.
+**Game-side (`upstream/src/`):** ALL 16 of 16 clean.
+- Previous menues.c block-scope-shadow bail resolved by patching
+  upstream at fetch time: rename inner `static const char *s[]`
+  to `weaponswitch_names` so uc386's flat function scope no
+  longer conflates it with the `int s` from a sibling case.
 
 **Build engine (`upstream/jfbuild/src/`):** 19 of 26 clean —
 includes `engine.c` (the renderer!) and `pragmas.c` (the math
@@ -52,7 +51,7 @@ primitives, even though some are still placeholders without
   (SDL.h), `startgtk_editor.c` (gtk/gtk.h)
 - Bail (Windows-only): `startwin_editor.c`, `winlayer.c`
 
-**35 of 42 source files compile through uc386 today.** Surprise:
+**36 of 42 source files compile through uc386 today.** Surprise:
 much of the Build engine's "needs Phase 2" is actually fine
 without `#pragma aux` because `pragmas.c` provides plain-C
 fallbacks. The renderer (`engine.c`) compiles. The hard yards

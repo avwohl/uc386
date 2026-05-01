@@ -34,7 +34,7 @@ Status today (2026-05-01):
 | Doom     | yes (id Software)   | **58 / 58**     | **yes** | Boots end-to-end through dos_emu — exits at WAD-not-found (no WAD shipped) |
 | Heretic  | yes (chocolate-doom)| **47 / 47**     | no     | All sources compile; needs heretic_stubs.c to actually link a bin          |
 | Hexen    | yes (chocolate-doom)| **48 / 48**     | no     | All sources compile; same stubs.c story as Heretic                         |
-| Duke3D   | yes (jfduke3d)      | **35 / 42**     | no     | game-side 15/16 + Build engine 20/26 — engine.c renderer compiles!         |
+| Duke3D   | yes (jfduke3d)      | **36 / 42**     | no     | game-side 16/16 (ALL) + Build engine 20/26 — engine.c renderer compiles!   |
 | ROTT     | yes (Apogee)        | **51 / 53**     | no     | Watcom DOS source — needed 9 new period libc headers                       |
 | Descent  | yes (dxx-rebirth)   | n/a (C++)       | no     | dxx-rebirth is C++, uc386 is C-only; would need 1998 source release        |
 
