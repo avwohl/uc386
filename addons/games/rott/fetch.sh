@@ -27,5 +27,25 @@ echo "rott: patching upstream filename typos …"
 sed -i '' 's|"_rt_build\.h"|"_rt_buil.h"|g' upstream/rott/RT_BUILD.C
 sed -i '' 's|"rt_spball\.h"|"rt_spbal.h"|g' upstream/rott/RT_IN.C
 
+# RT_TEXT.C declares `char word[WORDLIMIT]` as a local in HandleWord
+# but RT_DEF.H typedefs `word` as `unsigned short int`. uc386's parser
+# doesn't handle local-variable shadowing of a typedef; rename the
+# local to `wordbuf` for lines 395-435 of HandleWord.
+echo "rott: patching RT_TEXT.C HandleWord local-typedef shadow …"
+python3 -c '
+import re
+src = open("upstream/rott/RT_TEXT.C").read()
+lines = src.split("\n")
+for i in range(394, 435):
+    if i < len(lines):
+        lines[i] = re.sub(r"\bword\b", "wordbuf", lines[i])
+open("upstream/rott/RT_TEXT.C", "w").write("\n".join(lines))
+'
+
+# RT_TEXT.C also uses `pic_t` (defined in lumpy.h, not transitively
+# pulled in). Add the include.
+sed -i '' 's|#include "memcheck.h"|#include "lumpy.h"\
+#include "memcheck.h"|' upstream/rott/RT_TEXT.C
+
 echo "rott: upstream tree at addons/games/rott/upstream/"
 echo "rott: ROTT-source/ holds the original DOS C; ROTT-Audio/ has audio/data tools."
