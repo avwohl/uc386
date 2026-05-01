@@ -132,6 +132,11 @@ def package_games_scripts(version: str) -> Path:
     games_root = ADDONS_ROOT / "games"
     print(f"Bundling game build scripts from {games_root} …")
 
+    # Only ship the scaffolding (fetch.sh / build.sh / NOTES.md /
+    # stubs.c / uc386_config/ / *.py). Users fetch upstream sources
+    # themselves via fetch.sh, and `build/` is ignored as derived.
+    EXCLUDE_DIRS = {"upstream", "build", "__pycache__"}
+
     with tarfile.open(out_path, "w:gz") as tar:
         for sub in sorted(games_root.iterdir()):
             if not sub.is_dir():
@@ -139,12 +144,13 @@ def package_games_scripts(version: str) -> Path:
             for child in sub.rglob("*"):
                 if not child.is_file():
                     continue
+                # Skip anything inside an excluded directory at any depth.
+                if any(p in EXCLUDE_DIRS for p in child.relative_to(sub).parts):
+                    continue
                 rel = child.relative_to(games_root)
                 tar.add(child, arcname=f"uc386-games/{rel}")
-        readme = games_root / "README.md"
-        if readme.exists():
-            # already covered by the loop, but ensure top-level
-            pass
+        # Top-level README.md is already covered by the per-game loop;
+        # nothing more to add here.
 
     print(f"\nWrote {out_path} ({out_path.stat().st_size:,} bytes)")
     return out_path
