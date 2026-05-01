@@ -15,4 +15,19 @@ is the demonstration vehicle for Watcom flat-32 in 1995. Phase 2's
 `__watcall` and `#pragma aux` are required; we'll likely also need
 real interrupt-service-routine support that we currently parse-and-drop.
 
-Status: longest-horizon target. Documented here for completeness.
+## Status (2026-05-01)
+
+`fetch.sh` clones dxx-rebirth (modernized fork, builds today) but
+that tree is **C++** end-to-end — 112 `.cpp` files plus 7 plain `.c`
+support utilities. uc386 is C-only, so even with the new period-DOS
+header shims, the game body never reaches the parser.
+
+Two paths to revive this target:
+1. Switch fetch.sh to the **1998 Parallax DOS source release**
+   (plain C with Watcom `#pragma aux`). Hosted in mirrors like
+   archive.org's "Descent source code release"; no clean GitHub
+   home that we know of. Needs uc_core Phase 2 (`#pragma aux`).
+2. Add C++ frontend to uc_core. Out of scope; uc386 is C-only.
+
+Status: longest-horizon target. Other DPMI-era games are
+prioritized first.
