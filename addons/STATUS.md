@@ -156,11 +156,20 @@ DJGPP cross-compiler installed locally at `~/.local/opt/djgpp` from
 detects it via the `DJGPP_CANDIDATES` list — works on both macOS
 arm64 and the Linux CI runner.
 
-Open Watcom V2 has no macOS build, but the upstream Linux x64
-self-extractor works on the CI runner. The release workflow installs
-both toolchains (`.github/workflows/release.yml`) so the Watcom
-column populates on `v*` tag releases. Local dev host shows `—`
-gracefully via `_which_first` detection.
+Open Watcom V2 has no macOS build. The upstream Linux x64
+"installer" is actually an ELF stub appended to a regular ZIP
+archive — the release workflow `unzip -d`s it directly, avoiding
+the FPE the installer otherwise triggers under unattended install.
+Watcom column populates on every release run for 6 of 13 addons
+(echo / false / true / yes / wc / open_test) — sample row:
+
+```
+| true | 14 | 15,776 | 5,494 | 147,898 |
+```
+
+The remaining 7 addons trip Watcom-specific compile errors
+(E1063 etc.) — fixable with source-side adjustments but not
+required for the comparison-table demonstration.
 
 ## Summary (2026-04-30, end of session)
 
