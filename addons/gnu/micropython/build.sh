@@ -157,10 +157,11 @@ for src in "$SRC_DIR"/*.c; do
     triage_one "$src" py ""
 done
 
-# shared/{libc,readline,runtime}/ — extra sources the minimal port
-# (and a future ports/uc386-dos/) pulls in alongside py/. Keeping
-# them in the same triage answers "how close is the full minimal
-# port to compiling cleanly" not just "how clean is py/".
+# shared/{libc,readline,runtime,timeutils,netutils}/ — extra sources
+# real ports pull in alongside py/. The minimal port uses the first
+# three; richer ports (esp32, rp2, etc.) also pull in timeutils +
+# netutils. Keeping them in the same triage answers "how close is a
+# full port to compiling cleanly" not just "how clean is py/".
 for shared_src in \
         upstream/shared/libc/printf.c \
         upstream/shared/libc/string0.c \
@@ -170,7 +171,11 @@ for shared_src in \
         upstream/shared/runtime/pyexec.c \
         upstream/shared/runtime/stdout_helpers.c \
         upstream/shared/runtime/interrupt_char.c \
-        upstream/shared/runtime/sys_stdio_mphal.c; do
+        upstream/shared/runtime/sys_stdio_mphal.c \
+        upstream/shared/timeutils/timeutils.c \
+        upstream/shared/netutils/netutils.c \
+        upstream/shared/netutils/trace.c \
+        upstream/shared/netutils/dhcpserver.c; do
     [ -f "$shared_src" ] || continue
     # name_prefix=shared_ so e.g. shared/libc/printf.c doesn't collide
     # with py/ — there is no collision today, but the prefix keeps
@@ -180,8 +185,8 @@ done
 
 echo
 echo "== triage: $PASS pass / $FAIL fail / $TOTAL total =="
-echo "    py/                $PY_PASS / $PY_TOTAL"
-echo "    shared/{libc,readline,runtime}/  $SH_PASS / $SH_TOTAL"
+echo "    py/                                          $PY_PASS / $PY_TOTAL"
+echo "    shared/{libc,readline,runtime,timeutils,netutils}/  $SH_PASS / $SH_TOTAL"
 echo
 echo "Top error classes (count × class):"
 sort "$ERR_HIST" | uniq -c | sort -rn | head -15

@@ -238,11 +238,11 @@ real-mode-32 binaries that dos_emu loads directly.
 runnable `micropython.bin` is still multi-day work (port shim,
 real qstr generator integration, REPL HAL), but the triage
 result now covers **the entire platform-independent core +
-the shared support sources the minimal port builds alongside
-py/**: **141 / 141 sources (132 from `upstream/py/` + 9 from
-`upstream/shared/{libc,readline,runtime}/`, 100 %)** compile
-cleanly via uc386 → NASM-ready .asm using a synthetic
-`int main()` and stub `genhdr/` headers.
+every shared support source a real port pulls in**:
+**145 / 145 sources (132 from `upstream/py/` + 13 from
+`upstream/shared/{libc,readline,runtime,timeutils,netutils}/`,
+100 %)** compile cleanly via uc386 → NASM-ready .asm using a
+synthetic `int main()` and stub `genhdr/` headers.
 
 Triage progression as the slice unfolded:
 - 95 / 132 with empty stubs (most failures were missing-qstr

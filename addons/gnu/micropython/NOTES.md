@@ -23,28 +23,31 @@ uc386?" before we sink time in a real port.
 ## Triage result (latest run)
 
 ```
-== triage: 141 pass / 0 fail / 141 total ==
-    py/                132 / 132
-    shared/{libc,readline,runtime}/  9 / 9
+== triage: 145 pass / 0 fail / 145 total ==
+    py/                                          132 / 132
+    shared/{libc,readline,runtime,timeutils,netutils}/  13 / 13
 ```
 
-That's **100 % of the platform-independent core + the shared
-support sources the minimal port pulls in** compiling clean
-through uc386 → NASM-ready .asm in one pass. The remaining work
-to land an actual `micropython.bin` is the port shim
+That's **100 % of the platform-independent core + every shared
+support source a real port pulls in** compiling clean through
+uc386 → NASM-ready .asm in one pass. The remaining work to land
+an actual `micropython.bin` is the port shim
 (`ports/uc386-dos/main.c` + `mphalport.c` + `mpconfigport.h`),
 the GC heap region, and the multi-file link — none of which the
 triage exercises.
 
-The shared/ sources covered are the exact set the minimal port
-(see `upstream/ports/minimal/Makefile`) builds alongside py/:
+The shared/ sources covered are:
 
 - `shared/libc/printf.c`, `string0.c`, `__errno.c`, `abort_.c`
-- `shared/readline/readline.c`
-- `shared/runtime/pyexec.c` (the REPL driver)
-- `shared/runtime/stdout_helpers.c`
-- `shared/runtime/interrupt_char.c`
-- `shared/runtime/sys_stdio_mphal.c`
+  (the minimal-port libc)
+- `shared/readline/readline.c` (REPL line editor)
+- `shared/runtime/pyexec.c` (REPL driver), `stdout_helpers.c`,
+  `interrupt_char.c`, `sys_stdio_mphal.c`
+- `shared/timeutils/timeutils.c` (date/time helpers used by most
+  ports)
+- `shared/netutils/netutils.c`, `trace.c`, `dhcpserver.c`
+  (network + DHCP server helpers used by richer ports —
+  rp2/esp32 pull these in)
 
 The setup:
 
