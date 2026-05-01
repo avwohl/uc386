@@ -34,12 +34,13 @@ Status today (2026-05-01):
 | Doom     | yes (id Software)   | **58 / 58**     | **yes** | Boots end-to-end through dos_emu — exits at WAD-not-found (no WAD shipped) |
 | Heretic  | yes (chocolate-doom)| **47 / 47**     | no     | All sources compile; needs heretic_stubs.c to actually link a bin          |
 | Hexen    | yes (chocolate-doom)| **48 / 48**     | no     | All sources compile; same stubs.c story as Heretic                         |
-| Duke3D   | yes (jfduke3d)      | **36 / 42**     | no     | game-side 16/16 (ALL) + Build engine 20/26 — engine.c renderer compiles!   |
-| ROTT     | yes (Apogee)        | **51 / 53**     | no     | Watcom DOS source — needed 9 new period libc headers                       |
+| Duke3D   | yes (jfduke3d)      | **35 / 35**     | no     | game-side 16/16 + Build engine 19/19 — 7 platform-only files excluded       |
+| ROTT     | yes (Apogee)        | **52 / 52**     | no     | Watcom DOS source — TEXTURE.C is dead in upstream MAKEFILE (skipped)        |
 | Descent  | yes (dxx-rebirth)   | n/a (C++)       | no     | dxx-rebirth is C++, uc386 is C-only; would need 1998 source release        |
 
-**~239 source files** from period DOS games compile cleanly through
-uc386 today. The "build scripts" no longer just document what's
+**240 source files** from period DOS games compile cleanly through
+uc386 today — every C game in the table triages 100% on every
+in-scope file. The "build scripts" no longer just document what's
 missing — they're per-file triage harnesses that produce a
 histogram of remaining errors. Each error is a concrete ticket;
 many turn out to be small (2-line predefines, header shims).
