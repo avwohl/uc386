@@ -22,11 +22,19 @@ uc386?" before we sink time in a real port.
 ## Triage result (latest run)
 
 ```
-== py/ triage: 117 pass / 15 fail / 132 total ==
+== py/ triage: 131 pass / 1 fail / 132 total ==
 ```
 
-That's **89 % of the platform-independent core** compiling clean
-through uc386 → NASM-ready .asm in one pass. The setup:
+That's **99 % of the platform-independent core** compiling clean
+through uc386 → NASM-ready .asm in one pass. The single remaining
+failure is `objmodule.c`'s `MICROPY_REGISTERED_MODULES` — that's
+a port-specific macro listing the modules the port wants to
+register, empty in our triage stubs. A real port (e.g.
+`ports/uc386-dos/mpconfigport.h`) supplies it as part of the
+normal build setup. **Effectively all of py/ that can compile
+without port-specific config does compile.**
+
+The setup:
 
 - Stub `genhdr/moduledefs.h`, `genhdr/mpversion.h`,
   `genhdr/root_pointers.h` (empty headers — real builds emit these
@@ -41,14 +49,11 @@ through uc386 → NASM-ready .asm in one pass. The setup:
 - Synthetic `int main()` so uc386's "every TU needs `main`" check
   accepts library sources.
 
-The 15 remaining failures fall into:
+The single remaining failure:
 
 | Class                                                                              | Count | Cause                                                                                                          |
 |------------------------------------------------------------------------------------|-------|----------------------------------------------------------------------------------------------------------------|
-| `global <obj>.sig: float init must be a constant expression`                       | 12    | `MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN` packs flags+min+max into an Identifier-bearing init that const-eval rejects. |
-| `__static_scope__scope_simple_name_table: initializer index 6 out of range`        | 1     | Array of 6 `const char *` initialized with 7 entries — likely a parser quirk in our upstream version.           |
 | `__static_objmodule__mp_builtin_module_table.key: got Identifier MICROPY_REGISTERED_MODULES` | 1     | Port-specific `MICROPY_REGISTERED_MODULES` macro is empty in stubs; real port supplies it.                     |
-| Other                                                                              | 1     | Additional `.sig` flavour outside the dominant 12.                                                              |
 
 ## Bug surfaced (and fixed)
 
@@ -78,8 +83,14 @@ still propagate.
 - 95/132 with empty qstrdefs (most failures were downstream of
   missing MP_QSTR enum entries, not separate bugs).
 - 115/132 once the synthetic qstr table was in place.
-- 117/132 (current) with the uc_core copy-prop fix lifting the 2
-  `pp->m` failures.
+- 117/132 with the uc_core copy-prop fix lifting the 2 `pp->m`
+  failures.
+- 130/132 once `_const_eval` learned `TernaryOp` (lifted the 12
+  packed-flag `.sig` failures from `MP_OBJ_FUN_MAKE_SIG`'s
+  `(takes_kw) ? 1 : 0` ternary).
+- 131/132 (current) once `_resolved_var_type` learned to const-
+  eval enum-constant designators (lifted the
+  `[SCOPE_GEN_EXPR] = ...`-style array-size mis-inference).
 
 ## Next steps for a runnable image
 
@@ -89,14 +100,18 @@ The triage proves the core is reachable. To land an actual
 1. **Run upstream's `tools/makeqstrdefs.py`** to emit the real
    `genhdr/qstrdefs.generated.h` (correct hash + len fields,
    minus the over-inclusion the grep heuristic ships).
-2. **Fix the remaining uc386 codegen issues** after the qstr table
-   is correct:
-   - `MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN`-style packed-flag
-     bitfield-style init (the `.sig` family — 12 failures).
-     Likely the `(MP_OBJ_FUN_FLAG_* | n_min)` shape includes
-     an Identifier that needs to evaluate to a constant.
-   - The uc_core copy-prop type bug from "Bug surfaced" above is
-     **already fixed** as part of this slice.
+2. **Compiler fixes for MicroPython idioms** — all already shipped
+   as part of this slice:
+   - **uc_core**: copy-propagation refuses propagation across
+     `void *` and across pointee-kind boundaries (was rewriting
+     `void *data → struct *p` propagations and losing struct
+     type for later `p->m`).
+   - **uc386 const-eval**: `TernaryOp` + comparison + `&&`/`||`
+     now fold (lifted the `MP_OBJ_FUN_MAKE_SIG`'s `.sig` family).
+   - **uc386 array sizing**: `_resolved_var_type` const-evals
+     enum-constant designators when inferring an unsized array's
+     length (lifted the `static const T arr[] = { [ENUM] = … }`
+     class).
 3. **Write `ports/uc386-dos/`** — a thin port with:
    - `mpconfigport.h` (start from `ports/minimal/`)
    - `main.c` calling `mp_init` / `pyexec_friendly_repl` with

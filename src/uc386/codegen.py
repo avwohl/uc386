@@ -2644,6 +2644,18 @@ class CodeGenerator:
             if expr.op == "!":
                 return 0 if inner else 1
         if isinstance(expr, ast.BinaryOp):
+            # Short-circuit ops: only evaluate the side actually used,
+            # so `0 && undefined` and `1 || undefined` const-fold.
+            if expr.op == "&&":
+                l = self._const_eval(expr.left, name)
+                if l == 0:
+                    return 0
+                return 1 if self._const_eval(expr.right, name) != 0 else 0
+            if expr.op == "||":
+                l = self._const_eval(expr.left, name)
+                if l != 0:
+                    return 1
+                return 1 if self._const_eval(expr.right, name) != 0 else 0
             l = self._const_eval(expr.left, name)
             r = self._const_eval(expr.right, name)
             if expr.op == "+":   return l + r
@@ -2657,6 +2669,22 @@ class CodeGenerator:
             if expr.op == "^":   return l ^ r
             if expr.op == "<<":  return l << r
             if expr.op == ">>":  return l >> r
+            # Comparison operators: useful inside macros that pack
+            # `cond ? FLAG_A : FLAG_B` style constants.
+            if expr.op == "==":  return 1 if l == r else 0
+            if expr.op == "!=":  return 1 if l != r else 0
+            if expr.op == "<":   return 1 if l < r else 0
+            if expr.op == ">":   return 1 if l > r else 0
+            if expr.op == "<=":  return 1 if l <= r else 0
+            if expr.op == ">=":  return 1 if l >= r else 0
+        if isinstance(expr, ast.TernaryOp):
+            # `c ? a : b` is constant if c, a, b all are. Only evaluate
+            # the chosen arm — the unchosen side may legitimately not
+            # be a constant in this context (e.g. the false-branch is
+            # a runtime expression that's pruned when c folds to true).
+            cond = self._const_eval(expr.condition, name)
+            chosen = expr.true_expr if cond else expr.false_expr
+            return self._const_eval(chosen, name)
         raise CodegenError(
             f"global `{name}`: initializer must be a constant expression "
             f"(got {type(expr).__name__})"
@@ -4666,6 +4694,19 @@ class CodeGenerator:
                                     max_idx = end
                                 cursor = end + 1
                                 continue
+                            except CodegenError:
+                                pass
+                        else:
+                            # Const-evaluable designator (enum constant,
+                            # `sizeof`, macro-folded expression, etc.).
+                            # Without this branch, `[ENUM_VAL] = ...`
+                            # leaves cursor at the previous position and
+                            # the array shrinks to fewer slots than the
+                            # max designator implies.
+                            try:
+                                cursor = self._const_eval(
+                                    d0, f"`{decl.name}` array index",
+                                )
                             except CodegenError:
                                 pass
                     if cursor > max_idx:
