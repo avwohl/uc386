@@ -95,8 +95,17 @@ Linux:
 
 macOS:
 
-	brew install --cask djgpp
-	# or build from source via build-djgpp; see https://github.com/andrewwutw/build-djgpp
+	# No Homebrew formula for DJGPP. Use the prebuilt tarball from
+	# andrewwutw/build-djgpp (same release as Linux, different artifact):
+	mkdir -p ~/.local/opt
+	curl -sL -o /tmp/djgpp.tar.bz2 \
+	  https://github.com/andrewwutw/build-djgpp/releases/download/v3.4/djgpp-osx-gcc1220.tar.bz2
+	tar xjf /tmp/djgpp.tar.bz2 -C ~/.local/opt
+	export PATH="$HOME/.local/opt/djgpp/bin:$PATH"
+
+	# `addons/harness/compare.py` already searches ~/.local/opt/djgpp/bin
+	# so the export is only needed if you want to call
+	# `i586-pc-msdosdjgpp-gcc` directly from a shell.
 
 ### OpenWatcom V2 (the period reference compiler)
 
@@ -110,10 +119,14 @@ Linux:
 	export INCLUDE=$WATCOM/h
 	export PATH="$WATCOM/binl64:$PATH"
 
-macOS: download `open-watcom-2_0-c-macos` from the same
-release page and unzip it; set `WATCOM`, `INCLUDE`, and add
-`$WATCOM/binmac` (or `binl64` on Apple Silicon w/ Rosetta) to
-`PATH`.
+macOS: **no native build.** The Open Watcom V2 Current-build
+release ships dos/linux-x86/linux-x64/win/win16/os2 — but no
+macOS binary, and the linux-x64 build won't run on Darwin even
+under Rosetta (Rosetta translates x86_64 → arm64 user-space; it
+doesn't bridge the linux ABI). Either skip Watcom on the dev
+host (`compare.py` will leave the column empty) or run the
+size comparison through CI on a Linux runner. See
+`addons/harness/compare.py` for the candidate paths it walks.
 
 The Linux installer is an ELF wrapper around a regular ZIP; running it
 under `-i=u` floating-point-faults on some hosts. Unzipping the
