@@ -81,12 +81,16 @@ def list_addons() -> list[str]:
 def _pack_addon_sources(tar: tarfile.TarFile, addon_dir: Path) -> None:
     """Include per-addon sources + scripts under uc386-foss/src/<name>/.
 
-    Skips derived directories (`build/`, `upstream/`, `__pycache__/`).
-    The shipped layout mirrors `addons/gnu/<name>/` so users can read
-    the source, re-run fetch.sh / build.sh, or run test_addons.py
-    against the manifests.
+    Skips derived directories (`build/`, `__pycache__/`). The shipped
+    layout mirrors `addons/gnu/<name>/` so users can read the source,
+    re-run fetch.sh / build.sh, or run test_addons.py against the
+    manifests. **Includes `upstream/` when it exists** so the FOSS
+    tarball ships the exact upstream source corresponding to any
+    shipped binary (GPL §3 / sbase MIT / one-true-awk Lucent license
+    all require source-with-binary). For addons whose upstream is not
+    yet fetched, the fetch.sh + build.sh scripts ship instead.
     """
-    EXCLUDE = {"build", "upstream", "__pycache__"}
+    EXCLUDE = {"build", "__pycache__"}
     for child in addon_dir.rglob("*"):
         if not child.is_file():
             continue
@@ -186,10 +190,13 @@ def package_games_scripts(version: str) -> Path:
     games_root = ADDONS_ROOT / "games"
     print(f"Bundling game build scripts from {games_root} …")
 
-    # Only ship the scaffolding (fetch.sh / build.sh / NOTES.md /
-    # stubs.c / uc386_config/ / *.py). Users fetch upstream sources
-    # themselves via fetch.sh, and `build/` is ignored as derived.
-    EXCLUDE_DIRS = {"upstream", "build", "__pycache__"}
+    # Skip derived `build/` and `__pycache__/`. `upstream/` is shipped
+    # when present — every game we host is GPL or otherwise requires
+    # source-with-binary, so when we ship a binary the source has to
+    # ride along. For games where upstream/ is empty (developer hasn't
+    # run fetch.sh, or CI didn't fetch this game), only the
+    # scaffolding ships.
+    EXCLUDE_DIRS = {"build", "__pycache__"}
 
     # Games whose .bin we DO ship when it exists in build/. Listed
     # explicitly so a stale per-game build/ doesn't silently leak

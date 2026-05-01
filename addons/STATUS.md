@@ -8,6 +8,18 @@ done at the **infrastructure** level, with MicroPython itself
 landing as a triage skeleton (87 % of py/ core compiles) since a
 full port is multi-day work.
 
+A second 2026-05-01 update added 3 more cross-cutting asks
+(mac→linux portability, ship-source-with-binary, dosiz as a
+test runner). Status:
+- **Mac→Linux install** ✓ — `docs/INSTALL.md` covers apt / brew /
+  dnf, `pyproject.toml` accepts Python ≥ 3.11, 1320 tests pass on
+  this Linux box.
+- **Ship source with binary** ✓ — `addons/harness/package.py`
+  no longer excludes `upstream/` from either tarball, so when the
+  CI fetches + builds awk-bwk or doom, the matching upstream
+  source tree ships alongside the binary.
+- **dosiz integration** ◐ — pending (sibling at `../dosiz`).
+
 ## ✓ Port GNU utilities to this compiler
 
 **Done.** 16 addons under `addons/gnu/` ship working binaries:

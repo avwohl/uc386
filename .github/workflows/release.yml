@@ -144,18 +144,24 @@ jobs:
               (~62 KB built) plus a per-addon `src/` tree
               (manifest.toml + .c sources or fetch.sh / build.sh)
               and `test_addons.py` that walks the manifests and
-              runs every binary under `uc386.dos_emu`. Source
-              provenance: this repo (GPL-3.0) + sbase upstream
-              (MIT) + one-true-awk (Lucent free license).
+              runs every binary under `uc386.dos_emu`. When awk.bin
+              ships, the matching one-true-awk upstream tree ships
+              under `src/awk-bwk/upstream/` so every shipped binary
+              travels with its source. Source provenance: this
+              repo (GPL-3.0) + sbase upstream (MIT) + one-true-awk
+              (Lucent free license).
 
             - **`uc386-games-build-scripts-*.tar.gz`** — fetch +
               build scripts for Doom, Duke3D, Heretic, Hexen, ROTT,
               Descent — plus a pre-built `bin/doom/doom.bin` (the
               one game that boots end-to-end under dos_emu today).
-              Other games triage 100 % per-file but still need
-              link-time stubs / `#pragma aux` codegen; their
-              binaries will land here as those gaps close. Game
-              data files (WAD, GRP, RTL) are NOT shipped — supply
-              your own.
+              When a game's binary ships, its `<game>/upstream/`
+              source tree ships alongside it so the binary always
+              travels with the GPL / abandonware source it was
+              built from. Other games triage 100 % per-file but
+              still need link-time stubs / `#pragma aux` codegen;
+              their binaries will land here as those gaps close.
+              Game data files (WAD, GRP, RTL) are NOT shipped —
+              supply your own.
 
             See `addons/results.md` for size comparison vs gcc.

@@ -16,6 +16,7 @@ uc386-foss/
   src/<name>/       ← per-addon: manifest.toml + sources
   src/_sbase_shim/  ← shared sbase headers (used by sbase-cat etc.)
   src/awk-bwk/      ← BWK awk fetch.sh / build.sh / NOTES
+  src/awk-bwk/upstream/ ← one-true-awk source tree (when awk.bin ships)
   src/gawk/         ← GNU gawk (doc-only — see NOTES.md for blockers)
   test_addons.py    ← walks src/<name>/manifest.toml, runs each .bin
   README.md         ← this file
@@ -109,7 +110,10 @@ cd src/awk-bwk
 - **sbase-cat / sbase-head / sbase-tee**: ISC (sbase upstream
   license). See `SBASE-LICENSE` and `src/_sbase_shim/LICENSE`.
 - **awk-bwk**: Lucent free / public-source licence (BWK awk
-  upstream). See `AWK-LICENSE`.
+  upstream). See `AWK-LICENSE`. When `awk.bin` ships, the
+  matching one-true-awk source tree ships under
+  `src/awk-bwk/upstream/` so the binary always travels with the
+  source it was built from.
 - **gawk** (folder is documentation-only — no binary ships):
   full GNU gawk would need a regex engine and gnulib subset; see
   `src/gawk/NOTES.md`. The shipped `awk` (BWK) covers the spirit
