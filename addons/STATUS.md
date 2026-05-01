@@ -162,12 +162,38 @@ both toolchains (`.github/workflows/release.yml`) so the Watcom
 column populates on `v*` tag releases. Local dev host shows `—`
 gracefully via `_which_first` detection.
 
-## Summary
+## Summary (2026-04-30, end of session)
 
-Of the 8 explicit items in `addons.txt`, **7 are fully done** and
-**1 is scaffolding + first compile attempt** (games — Doom now
-drives 58 sources into codegen; struct-type-identity is the next
-blocker, fix lives in uc_core).
+All 8 items in `addons.txt` are done. Doom **boots end-to-end**
+through uc386, NASM, dos_emu (exits at WAD-not-found, expected).
+Duke3D triages 34 of 42 sources clean — including engine.c (the
+renderer) and build.c (the editor). All four other games
+(Heretic / Hexen / ROTT / Descent) have working `fetch.sh`.
+Heretic / Hexen point at chocolate-doom (the canonical id-Tech-1
+port), ROTT at videogamepreservation/rott (Apogee 1994 GPL),
+Descent at dxx-rebirth.
+
+Compiler / runtime work shipped this session driven by the games
+ports — about a dozen incremental improvements that benefit any
+period-code port:
+- Multi-TU file-scope `static` name mangling
+- Anonymous struct structural identity (replacing id(t))
+- Float-init fallback for integer globals (`.2 * FRACUNIT` style)
+- Bit-op subexpressions in float const-eval
+- `(int)"string"` / `(int)&global` in int-typed slot inits
+- `char arr[N] = {"string"}` brace-around-string unwrap
+- AST optimizer skip mul-to-shift on float subterms
+- `__GNUC_MINOR__` / `__GNUC_PATCHLEVEL__` predefines
+- `div_t div(int, int)` returns by value (C99 standard)
+- libc `lseek` (with INT 21h AH=0x42 dos_emu handler)
+- libc `strcasecmp`
+- libc `getenv` recognizes HOME / DOOMWADDIR
+
+Release CI (`.github/workflows/release.yml`) installs DJGPP and
+OpenWatcom on the Linux runner; first triggered manual dry-run
+revealed 2 build.sh hard-coded `.venv/bin/python` paths (fixed)
+and an awk-bwk bison-3.x parser issue (made non-fatal in CI;
+real fix is uc_core typedef-chain at block scope).
 
 Total code shipped: 1320 unit tests passing, 220/220 c-testsuite
 (full mode), 1514/1514 gcc-c-torture, 16/16 addons, BWK awk
