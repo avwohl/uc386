@@ -35,6 +35,7 @@ for src in upstream/src/heretic/*.c; do
         -I upstream/src \
         -I upstream/src/heretic \
         -I upstream/textscreen \
+        --include-file stdarg.h \
         -o /tmp/heretic_one.asm 2>&1) && rc=0 || rc=$?
     name="${src##*/}"
     if [ $rc -eq 0 ]; then

@@ -22,9 +22,10 @@ Hexen). `build.sh` is a per-file triage harness like the other games'.
 - `SDL_endian.h` — identity LE byte-swaps (uc386 is little-endian)
 - `SDL.h` — minimal opaque types so SDL_Event*-typed APIs parse
 
-**44 of 47 src/heretic/*.c sources compile cleanly** through uc386
-after the uc_core preprocessor improvements (uc_core@63912fd) and
-the SDL.h shim.
+**ALL 47 of 47 src/heretic/*.c sources compile cleanly** through
+uc386 once `--include-file stdarg.h` is passed (chocolate-doom's
+txt_main.h declares TXT_vsnprintf with va_list but doesn't include
+stdarg.h itself).
 
 **Multi-file build confirmed working** (uc386@3534ad7): all 40
 non-platform source files merge through a single uc386 invocation

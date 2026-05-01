@@ -33,6 +33,8 @@ for src in upstream/src/hexen/*.c; do
         -I uc386_config \
         -I upstream/src \
         -I upstream/src/hexen \
+        -I upstream/textscreen \
+        --include-file stdarg.h \
         -o /tmp/hexen_one.asm 2>&1) && rc=0 || rc=$?
     name="${src##*/}"
     if [ $rc -eq 0 ]; then
