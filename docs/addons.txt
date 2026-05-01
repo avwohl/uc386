@@ -3,6 +3,10 @@ Port gnu utilites to this compiler
 Set a dos installer in the github release area of this project
 some  gnu utils dont make sence like chroot, groups 
 also include gawk
+also include the latest micro python
+ship (to the github release area) executables and test scripts for packages
+with good open source licenses.  That should be all non games ship and some games ship
+Do ship the download and build scripts for everything.
 make scripts to download , build , test
 games from the dos DPMI period such as doom,
 duke nukem, etc. we dan't ship the built executables due to licensing
