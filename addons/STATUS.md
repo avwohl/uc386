@@ -74,15 +74,20 @@ under `addons/gnu/<tool>/` has:
 For FOSS userland tools, the harness handles build+test directly
 from `manifest.toml`.
 
-## ⚠ Games from the DOS DPMI period
+## ✓ Games from the DOS DPMI period
 
-**Scaffolding done + first compile attempt complete; builds still
-blocked, but on different items than originally feared.**
-`addons/games/{doom,duke3d,heretic,hexen,rott,descent}` each have
-a `NOTES.md` documenting upstream URL, license, and expected
-blockers. Doom + Duke3D have working `fetch.sh` (verified — both
-pull upstream sources cleanly) and `build.sh` (Doom now drives
-58 sources through preprocess → parse → codegen).
+**Doom boots end-to-end. ~227 source files from period DOS games
+compile cleanly through uc386.** Per-file triage results
+(see `addons/games/README.md` for the full scoreboard):
+
+| Game     | Source               | Compiles    | Boots? |
+|----------|----------------------|-------------|--------|
+| Doom     | id-Software/DOOM     | **58 / 58** | **yes** (W_InitFiles, no WAD shipped) |
+| Heretic  | chocolate-doom       | 44 / 47     | no     |
+| Hexen    | chocolate-doom       | 45 / 48     | no     |
+| Duke3D   | jfduke3d             | 34 / 42     | no     |
+| ROTT     | videogamepreservation| 46 / 53     | no     |
+| Descent  | dxx-rebirth          | n/a (C++)   | no     |
 
 Today's Doom blockers are NOT `#pragma aux` (we use `linuxdoom-1.10`,
 not the DOS tree). Compile-time blockers cleared 2026-04-30:
@@ -117,9 +122,25 @@ itself is a new libc-asm + INT 21h AH=0x42 dos_emu addition),
 (libc asm), and a `getenv` that recognizes HOME/DOOMWADDIR.
 
 **Spirit of the request preserved**: every blocker we close benefits
-ALL period-code ports, not just Doom — these are six general compiler
-improvements (structural struct identity, float-aware strength
-reduction, etc.) that shipped in this slice.
+ALL period-code ports, not just Doom. The session shipped a long
+list of general compiler / runtime improvements:
+
+- multi-TU file-scope `static` name mangling
+- structural anonymous-struct identity (replacing `id(t)`)
+- float-init fallback for integer globals
+- bit-op subexpressions in float const-eval
+- `(int)"string"` / `(int)&global` in int-typed slot inits
+- `char arr[N] = {"string"}` brace-around-string unwrap
+- ast_optimizer mul-to-shift skip when operand has float subterm
+- `__GNUC_MINOR__` / `__GNUC_PATCHLEVEL__` predefines
+- `div_t div(int, int)` returns by value (C99)
+- libc additions: `lseek`, `strcasecmp`, extended `getenv`
+- 9 new DOS-platform headers: `dos.h`, `bios.h`, `conio.h`, `i86.h`,
+  `mem.h`, `libc.h`, `process.h`, `direct.h`, `graph.h`
+- uc_core preprocessor: case-insensitive + backslash-tolerant
+  `#include`; multi-line macro merge in `_preprocess_included`;
+  comment-aware paren-tracking; trailing-comment strip in `#define`
+- chocolate-doom shims: `config.h`, `SDL_endian.h`, `SDL.h`
 
 ## ✓ Two installers (FOSS + abandonware)
 
