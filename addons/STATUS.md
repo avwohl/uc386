@@ -237,8 +237,10 @@ real-mode-32 binaries that dos_emu loads directly.
 **Skeleton + triage landed** under `addons/gnu/micropython/`. A
 runnable `micropython.bin` is still multi-day work (port shim,
 real qstr generator integration, REPL HAL), but the triage
-result now covers **the entire platform-independent core**:
-**132 / 132 sources from `upstream/py/` (100 %)** compile
+result now covers **the entire platform-independent core +
+the shared support sources the minimal port builds alongside
+py/**: **141 / 141 sources (132 from `upstream/py/` + 9 from
+`upstream/shared/{libc,readline,runtime}/`, 100 %)** compile
 cleanly via uc386 → NASM-ready .asm using a synthetic
 `int main()` and stub `genhdr/` headers.
 

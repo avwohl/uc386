@@ -43,17 +43,19 @@ mkdir -p build build/genhdr
 # so the preprocessor finds them and we see compile-class failures
 # (uc386 limitations) instead of a wall of missing-header errors.
 if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
-    # Emit a triage qstr table by grep over upstream/py/. Real builds
-    # use upstream's tools/makeqstrdefs.py which preprocesses each TU
-    # to find MP_QSTR_x macro uses; for triage we approximate with a
-    # grep over the source tree, which over-includes (any string that
+    # Emit a triage qstr table by grep over upstream/py/ +
+    # upstream/shared/. Real builds use upstream's
+    # tools/makeqstrdefs.py which preprocesses each TU to find
+    # MP_QSTR_x macro uses; for triage we approximate with a grep
+    # over the source tree, which over-includes (any string that
     # parses as an identifier becomes a qstr) but keeps the mapping
     # complete enough that the enum in py/qstr.h covers every
-    # reference downstream code makes.
+    # reference downstream code (py/, shared/runtime, etc.) makes.
     {
         echo "QDEF0(MP_QSTRnull, 0, 0, \"\")"
         echo "QDEF0(MP_QSTR_, 0, 0, \"\")"
-        grep -rhoE "MP_QSTR_[A-Za-z_][A-Za-z0-9_]*" upstream/py/*.c upstream/py/*.h \
+        grep -rhoE "MP_QSTR_[A-Za-z_][A-Za-z0-9_]*" \
+                upstream/py/ upstream/shared/ \
             | sort -u \
             | awk '{ name = substr($0, 8); print "QDEF0(" $0 ", 0, 0, \"" name "\")" }'
     } > build/genhdr/qstrdefs.generated.h
@@ -74,9 +76,22 @@ EOF
 #define MICROPY_GIT_HASH "0000000"
 #define MICROPY_BUILD_DATE "2026-05-01"
 EOF
-[ -f build/genhdr/root_pointers.h ] || cat > build/genhdr/root_pointers.h <<'EOF'
-// Empty stub. Real build emits MP_REGISTER_ROOT_POINTER entries here.
-EOF
+if [ ! -f build/genhdr/root_pointers.h ]; then
+    # Real builds run upstream/py/makeqstrdefs.py with mode=root_pointer
+    # to scan all C sources for `MP_REGISTER_ROOT_POINTER(<decl>);`
+    # declarations and emit them as struct fields of `_mp_state_vm_t`
+    # (via py/mpstate.h's `#include "genhdr/root_pointers.h"`). For
+    # triage we approximate with grep — the macro pattern is regular,
+    # we just take everything between the parens and emit it as a
+    # struct member terminated with a semicolon.
+    {
+        echo "// Triage stub. Real build emits MP_REGISTER_ROOT_POINTER entries here."
+        grep -rhE "^MP_REGISTER_ROOT_POINTER\(.*\);" \
+                upstream/py/ upstream/shared/ \
+            | sed -E 's#^MP_REGISTER_ROOT_POINTER\((.*)\);#    \1;#' \
+            | sort -u
+    } > build/genhdr/root_pointers.h
+fi
 
 # Triage stub: a one-line main() so uc386 (which requires a main
 # function in every translation unit it compiles) accepts library
@@ -98,10 +113,18 @@ ERR_HIST="build/errors.txt"
 PASS=0
 FAIL=0
 TOTAL=0
-for src in "$SRC_DIR"/*.c; do
-    [ -f "$src" ] || continue
+
+# Section accounting so the per-section pass/fail is visible.
+PY_PASS=0; PY_FAIL=0; PY_TOTAL=0
+SH_PASS=0; SH_FAIL=0; SH_TOTAL=0
+
+triage_one() {
+    src="$1"
+    section="$2"        # used only for the section-count update
+    name_prefix="$3"    # disambiguates basenames between sections
+    [ -f "$src" ] || return 0
     TOTAL=$((TOTAL + 1))
-    name="$(basename "$src" .c)"
+    name="${name_prefix}$(basename "$src" .c)"
     if "$PYTHON" -m uc386.main "$TRIAGE_MAIN" "$src" \
             -o "build/${name}.asm" \
             -I "$INCLUDE" \
@@ -110,10 +133,14 @@ for src in "$SRC_DIR"/*.c; do
             -I "build" \
             > "build/${name}.out" 2> "build/${name}.err"; then
         PASS=$((PASS + 1))
+        if [ "$section" = py ]; then PY_PASS=$((PY_PASS + 1)); PY_TOTAL=$((PY_TOTAL + 1)); fi
+        if [ "$section" = sh ]; then SH_PASS=$((SH_PASS + 1)); SH_TOTAL=$((SH_TOTAL + 1)); fi
         echo "$name: OK" >> "$TRIAGE"
         rm -f "build/${name}.err" "build/${name}.out"
     else
         FAIL=$((FAIL + 1))
+        if [ "$section" = py ]; then PY_FAIL=$((PY_FAIL + 1)); PY_TOTAL=$((PY_TOTAL + 1)); fi
+        if [ "$section" = sh ]; then SH_FAIL=$((SH_FAIL + 1)); SH_TOTAL=$((SH_TOTAL + 1)); fi
         first_line="$(head -1 "build/${name}.err" 2>/dev/null || echo unknown)"
         echo "$name: FAIL  $first_line" >> "$TRIAGE"
         # Strip filename + line numbers from the leading error so
@@ -123,10 +150,38 @@ for src in "$SRC_DIR"/*.c; do
             | sed -E 's#  +# #g; s#^ +##' \
             >> "$ERR_HIST"
     fi
+}
+
+# py/ — the platform-independent core (132 sources today).
+for src in "$SRC_DIR"/*.c; do
+    triage_one "$src" py ""
+done
+
+# shared/{libc,readline,runtime}/ — extra sources the minimal port
+# (and a future ports/uc386-dos/) pulls in alongside py/. Keeping
+# them in the same triage answers "how close is the full minimal
+# port to compiling cleanly" not just "how clean is py/".
+for shared_src in \
+        upstream/shared/libc/printf.c \
+        upstream/shared/libc/string0.c \
+        upstream/shared/libc/__errno.c \
+        upstream/shared/libc/abort_.c \
+        upstream/shared/readline/readline.c \
+        upstream/shared/runtime/pyexec.c \
+        upstream/shared/runtime/stdout_helpers.c \
+        upstream/shared/runtime/interrupt_char.c \
+        upstream/shared/runtime/sys_stdio_mphal.c; do
+    [ -f "$shared_src" ] || continue
+    # name_prefix=shared_ so e.g. shared/libc/printf.c doesn't collide
+    # with py/ — there is no collision today, but the prefix keeps
+    # the name space clean and makes the section visible in triage.txt.
+    triage_one "$shared_src" sh "shared_"
 done
 
 echo
-echo "== py/ triage: $PASS pass / $FAIL fail / $TOTAL total =="
+echo "== triage: $PASS pass / $FAIL fail / $TOTAL total =="
+echo "    py/                $PY_PASS / $PY_TOTAL"
+echo "    shared/{libc,readline,runtime}/  $SH_PASS / $SH_TOTAL"
 echo
 echo "Top error classes (count × class):"
 sort "$ERR_HIST" | uniq -c | sort -rn | head -15

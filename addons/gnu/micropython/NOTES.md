@@ -13,38 +13,59 @@ uc386?" before we sink time in a real port.
 
 ```sh
 ./fetch.sh    # clones micropython upstream into upstream/
-./build.sh    # per-file triage of upstream/py/*.c through uc386
-              # writes build/<name>.asm on PASS, build/<name>.err
-              # on FAIL; build/triage.txt is the per-source ledger,
-              # build/errors.txt the histogram.
+./build.sh    # per-file triage of upstream/py/*.c +
+              # upstream/shared/{libc,readline,runtime}/ through
+              # uc386. Writes build/<name>.asm on PASS,
+              # build/<name>.err on FAIL; build/triage.txt is the
+              # per-source ledger, build/errors.txt the histogram.
 ```
 
 ## Triage result (latest run)
 
 ```
-== py/ triage: 132 pass / 0 fail / 132 total ==
+== triage: 141 pass / 0 fail / 141 total ==
+    py/                132 / 132
+    shared/{libc,readline,runtime}/  9 / 9
 ```
 
-That's **100 % of the platform-independent core** compiling clean
-through uc386 → NASM-ready .asm in one pass. The remaining work to
-land an actual `micropython.bin` is the port shim
+That's **100 % of the platform-independent core + the shared
+support sources the minimal port pulls in** compiling clean
+through uc386 → NASM-ready .asm in one pass. The remaining work
+to land an actual `micropython.bin` is the port shim
 (`ports/uc386-dos/main.c` + `mphalport.c` + `mpconfigport.h`),
 the GC heap region, and the multi-file link — none of which the
-triage exercises. **Every py/*.c that can compile without port-
-specific config now does compile.**
+triage exercises.
+
+The shared/ sources covered are the exact set the minimal port
+(see `upstream/ports/minimal/Makefile`) builds alongside py/:
+
+- `shared/libc/printf.c`, `string0.c`, `__errno.c`, `abort_.c`
+- `shared/readline/readline.c`
+- `shared/runtime/pyexec.c` (the REPL driver)
+- `shared/runtime/stdout_helpers.c`
+- `shared/runtime/interrupt_char.c`
+- `shared/runtime/sys_stdio_mphal.c`
 
 The setup:
 
-- Stub `genhdr/moduledefs.h`, `genhdr/mpversion.h`,
-  `genhdr/root_pointers.h` (empty headers — real builds emit these
-  from the source tree).
-- Auto-generate a triage `genhdr/qstrdefs.generated.h` by grepping
-  `MP_QSTR_*` references out of `upstream/py/` and emitting the
-  matching `QDEF0(...)` macro invocations. Approximates upstream's
-  `tools/makeqstrdefs.py` over-inclusively (any MP_QSTR_x pattern
-  becomes a qstr, even if it's only a comment in real source) but
-  keeps the enum in `py/qstr.h` complete enough that downstream
-  refs resolve.
+- Stub `genhdr/moduledefs.h` (defines
+  `MICROPY_REGISTERED_MODULES` and
+  `MICROPY_REGISTERED_EXTENSIBLE_MODULES` empty), `genhdr/mpversion.h`
+  (placeholder strings).
+- Auto-generate `genhdr/qstrdefs.generated.h` by grepping
+  `MP_QSTR_*` references out of `upstream/py/` and
+  `upstream/shared/`, emitting the matching `QDEF0(...)` macro
+  invocations. Approximates upstream's `tools/makeqstrdefs.py`
+  over-inclusively (any MP_QSTR_x pattern becomes a qstr, even
+  if it's only a comment in real source) but keeps the enum in
+  `py/qstr.h` complete enough that downstream refs resolve.
+- Auto-generate `genhdr/root_pointers.h` by grepping
+  `MP_REGISTER_ROOT_POINTER(<decl>);` declarations out of py/ +
+  shared/ and emitting them as struct fields. Approximates
+  upstream's `makeqstrdefs.py mode=root_pointer` — needed because
+  `py/mpstate.h` `#include`s this header inside `_mp_state_vm_t`
+  to grow per-module root-pointer fields (e.g. `readline_hist`,
+  `mp_sys_argv_obj`).
 - Synthetic `int main()` so uc386's "every TU needs `main`" check
   accepts library sources.
 
