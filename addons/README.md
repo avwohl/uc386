@@ -37,7 +37,7 @@ addons/
 
 ## Phases (this is what /loop docs/addons.txt is iterating over)
 
-The work splits into eight tracked tasks (`TaskList` in the harness).
+The work splits into nine tracked tasks (`TaskList` in the harness).
 Order reflects dependency, not priority — the foundation has to land
 first or none of the rest is testable.
 
@@ -68,7 +68,10 @@ first or none of the rest is testable.
 8. **DOS installers** — two separate installers shipped via GitHub
    releases:
    - **FOSS installer**: built GNU userland binaries (clear GPL
-     provenance, OK to redistribute).
+     provenance, OK to redistribute). The release tarball also
+     ships per-addon source + `manifest.toml` + a top-level
+     `test_addons.py` that exercises each binary under
+     `uc386.dos_emu` and asserts stdout/exit against the manifest.
    - **Abandonware installer**: built game binaries from each game's
      public-source release. Original source releases (Doom, Duke3D,
      Heretic, Hexen, ROTT) ship under GPL or similar; the resulting
@@ -76,7 +79,17 @@ first or none of the rest is testable.
      ship the binaries — but **never the data files** (WAD, GRP,
      etc.), which remain proprietary. Users supply their own.
      Build scripts also ride along so users can rebuild from source
-     if they don't trust our binaries.
+     if they don't trust our binaries. Today's tarball ships
+     `bin/doom/doom.bin` (the only game that boots end-to-end);
+     the rest will join as their link-time gaps close.
+
+9. **MicroPython port** — `addons/gnu/micropython/`. Today a
+   triage skeleton: 115 / 132 (87 %) of `upstream/py/` core
+   compiles via uc386 with a synthetic main + stub generated
+   headers. Real port needs `tools/makeqstrdefs.py` driving real
+   qstrs, two uc386 codegen fixes (`pp->m` chain + packed-flag
+   const-eval), and a `ports/uc386-dos/` with INT-21h-backed
+   `mp_hal_*` HAL. See `addons/gnu/micropython/NOTES.md`.
 
 ## Running the harness
 

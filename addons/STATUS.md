@@ -1,6 +1,12 @@
-# addons.txt — completion status (2026-04-30)
+# addons.txt — completion status (2026-05-01)
 
-Status of each item in `docs/addons.txt`:
+Status of each item in `docs/addons.txt`. The original 8 items
+from 2026-04-30 are still done; **3 new line-items** added by the
+user on 2026-05-01 (MicroPython, ship test scripts in FOSS,
+ship build scripts everywhere) are tracked below — all three are
+done at the **infrastructure** level, with MicroPython itself
+landing as a triage skeleton (87 % of py/ core compiles) since a
+full port is multi-day work.
 
 ## ✓ Port GNU utilities to this compiler
 
@@ -36,11 +42,18 @@ See `addons/gnu/awk-bwk/NOTES.md`.
 **Done.** `.github/workflows/release.yml` triggers on `v*` tags and
 attaches two tarballs to the release:
 
-- `uc386-foss-addons-<ver>.tar.gz` (~62 KB) — built FOSS binaries
-- `uc386-games-build-scripts-<ver>.tar.gz` (~5 KB) — game fetch/build scripts
+- `uc386-foss-addons-<ver>.tar.gz` (~80 KB) — built FOSS binaries
+  + per-addon `src/<name>/` tree (manifest.toml + .c sources or
+  fetch.sh / build.sh) + `test_addons.py` runner.
+- `uc386-games-build-scripts-<ver>.tar.gz` (~155 KB) — game
+  fetch/build scripts + pre-built `bin/doom/doom.bin` (the only
+  game that boots end-to-end today).
 
 The packaging logic is in `addons/harness/package.py` (runnable
 locally too: `python -m addons.harness.package --version dev`).
+Layout details and the new test-runner / src-tree shipping are
+documented under the corresponding 2026-05-01 items at the bottom
+of this file.
 
 ## ✓ Skip irrelevant utilities
 
@@ -201,7 +214,65 @@ runs ~2-4× wider than uc386 across the rest of the table because
 DOS/4GW carries its own protected-mode startup; uc386 emits flat
 real-mode-32 binaries that dos_emu loads directly.
 
-## Summary (2026-04-30, end of session)
+## ◐ Include the latest MicroPython (2026-05-01 ask)
+
+**Skeleton + triage landed** under `addons/gnu/micropython/`. A
+real port is multi-day work — today this is a triage harness that
+answers the prerequisite question: how much of MicroPython core
+compiles via uc386? Answer: **115 / 132 sources from
+`upstream/py/` (87 %)** with a synthetic `int main()` and stub
+`genhdr/` headers (auto-generated `qstrdefs.generated.h` from a
+grep over `MP_QSTR_*` references; empty stubs for `moduledefs.h`,
+`mpversion.h`, `root_pointers.h`).
+
+The 17 remaining failures break down:
+- 12 × `<obj>.sig` const-eval failures (`MP_DEFINE_CONST_FUN_OBJ_*`
+  packs flags + min/max into an Identifier-bearing init).
+- 2 × `pp->m` codegen rejections on pointer-to-pointer-to-struct
+  (real uc386 bug).
+- 1 × parser quirk on a 6-entry table given 7 inits.
+- 1 × `MICROPY_REGISTERED_MODULES` (port-specific, empty in stubs).
+- 1 × misc `.sig`.
+
+See `addons/gnu/micropython/NOTES.md` for the path to a runnable
+`micropython.bin` (`tools/makeqstrdefs.py` → real qstrdefs, fix
+the two codegen bugs, write `ports/uc386-dos/` with INT-21h-backed
+`mp_hal_stdout_tx_strn`).
+
+## ✓ Ship executables and test scripts in FOSS tarball (2026-05-01 ask)
+
+**Done.** `uc386-foss-addons-*.tar.gz` now ships:
+- 16 in-tree GNU utility binaries + BWK awk binary (already
+  shipped before).
+- A `src/<name>/` tree with each addon's `manifest.toml` + .c
+  sources, plus `_sbase_shim/` (shared sbase headers) and the
+  `awk-bwk/` / `gawk/` upstream scripts.
+- `test_addons.py` at the top level — walks
+  `src/<name>/manifest.toml`, runs each `<name>.bin` under
+  `uc386.dos_emu.run` with the manifest's argv / stdin / vfiles,
+  asserts stdout + exit code match the expected values.
+
+End-to-end verified: extract the tarball, `python test_addons.py`
+prints `16/16 passed (0 skipped)` against the shipped manifests
++ binaries.
+
+For the games tarball, "some games ship" is **just Doom today** —
+the only game that boots end-to-end. `addons/games/doom/build/doom.bin`
+ships under `uc386-games/bin/doom/doom.bin` when present. The
+`SHIP_BIN` allow-list in `addons/harness/package.py` gates which
+games' binaries leak into the tarball, so a stale build artefact
+on a workstation can't accidentally publish.
+
+## ✓ Ship download + build scripts for everything (2026-05-01 ask)
+
+**Done.** Already done for the games tarball before today (every
+game ships `fetch.sh` + `build.sh` + `NOTES.md` + per-game shims).
+The FOSS tarball now matches: per-addon `manifest.toml` + sources
+(in-tree addons) and `fetch.sh` / `build.sh` / `NOTES.md` (upstream
+addons like awk-bwk + the new micropython skeleton). The release
+README inside the tarball describes the rebuild path.
+
+## Summary (2026-04-30, end of original 8-item session)
 
 All 8 items in `addons.txt` are done. Doom **boots end-to-end**
 through uc386, NASM, dos_emu (exits at WAD-not-found, expected).
