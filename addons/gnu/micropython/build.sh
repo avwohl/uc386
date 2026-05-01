@@ -65,10 +65,15 @@ if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
     {
         echo "QDEF0(MP_QSTRnull, 0, 0, \"\")"
         echo "QDEF1(MP_QSTR_, 0, 0, \"\")"
+        # `MP_QSTR_<name>` — skip the 8-char `MP_QSTR_` prefix (M-P-_-Q-S-T-R-_)
+        # to recover the actual qstr string. Earlier the prefix-strip used 7
+        # chars and left a stray leading underscore (`__repl_print__` came
+        # out as `___repl_print__`), making LOAD_NAME for builtins fail and
+        # value-print compile crash inside mp_obj_equal_not_equal.
         grep -rhoE "MP_QSTR_[A-Za-z_][A-Za-z0-9_]*" \
                 upstream/py/ upstream/shared/ \
             | sort -u \
-            | awk '{ name = substr($0, 8); print "QDEF1(" $0 ", 0, 0, \"" name "\")" }'
+            | awk '{ name = substr($0, 9); print "QDEF1(" $0 ", 0, 0, \"" name "\")" }'
     } > build/genhdr/qstrdefs.generated.h
 fi
 [ -f build/genhdr/moduledefs.h ] || cat > build/genhdr/moduledefs.h <<'EOF'
