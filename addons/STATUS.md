@@ -244,16 +244,18 @@ Type "help()" for more information.
 >>>
 ```
 
-…and then accepts `pass`, empty lines, and Ctrl-D-to-exit. The
-parser / compiler / VM / NLR (setjmp-backed) path is exercised
-end-to-end; statements that don't allocate or print run cleanly.
-Statements that allocate (`x = 5` — qstr + dict store) or
-produce a value to print (`1`, `print('hi')`) still crash with
-`UC_ERR_READ_UNMAPPED` somewhere downstream of the bytecode
-dispatch — likely a libm shim returning to dead code, an
-ast-optimizer copy-prop interacting badly with a function-pointer
-table, or something in the qstr-pool growth path. Investigation
-continues.
+…and then accepts `pass`, empty lines, **`x = 5` (qstr-store)**,
+and other allocating-but-not-printing statements; exits cleanly
+on Ctrl-D. The full lex → parse → compile → VM dispatch → NLR
+(setjmp-backed) → qstr-pool → name-store path runs end-to-end.
+
+Statements that produce a value to **print** (`1`, `print('hi')`)
+still trip an `UC_ERR_READ_UNMAPPED` in `_mp_obj_equal_not_equal`
+(EIP 0xCC41 — `cmp dword [eax], _mp_type_str` with a garbage
+`eax`). Likely another invariant-relying bug similar to the
+QDEF1-empty-pool one we just fixed (where mp_qstr_const_pool with
+zero QDEF1 entries had `is_sorted=true` but `len=0`, hitting a
+size_t underflow in the binary search).
 
 Layered evidence:
 

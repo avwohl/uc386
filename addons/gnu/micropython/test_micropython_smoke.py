@@ -71,6 +71,33 @@ def test_micropython_repl_banner(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_assign_statement(micropython_bin: Path) -> None:
+    """`x = 5\\n\\x04` exercises the qstr-store path that the
+    QDEF1 fix unblocked: lexes the identifier, allocates an
+    interned qstr, dict-stores 5 against it, then EOF exits.
+
+    Different from `pass` — that one didn't allocate any qstrs.
+    Until commit 21dc0d9 this trapped in `qstr_find_strn`'s
+    binary search because the empty-main-pool corner case
+    underflowed the high-bound."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"x = 5\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0, (
+        f"unexpected exit code: {res.exit_code} "
+        f"(expected 0 for `x = 5\\n\\x04` clean exit)"
+    )
+    assert res.stdout.count(">>> ") >= 2, (
+        f"expected two `>>> ` prompts in stdout, got: {res.stdout!r}"
+    )
+
+
 def test_micropython_pass_statement(micropython_bin: Path) -> None:
     """Sending `pass\\n\\x04` exercises the full lex → parse → compile
     → exec path: `pass` is a no-op statement, so the REPL shouldn't
