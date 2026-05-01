@@ -7,3 +7,6 @@ dist/
 .coverage
 .venv/
 .claude/scheduled_tasks.lock
+
+# Addons: upstream sources are fetched by fetch.sh, never checked in.
+addons/**/upstream/

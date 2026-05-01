@@ -1,0 +1,16 @@
+name = "strtol_test"
+description = "smoke test for minimal strtol/strdup/getenv/strerror/fflush"
+sources = ["main.c"]
+expect_stdout = """\
+dec=42 end=0
+neg=-1234 rem=
+dec99=99
+env=(null)
+dup=hello
+err=error
+fflush=0
+"""
+# Note: minimal strtol sets *endptr to end-of-string (not "after the
+# parsed digits" as C99 specifies). So `rem=` is empty string. A
+# richer strtol that walks past digits → endptr is a future slice.
+expect_exit = 0

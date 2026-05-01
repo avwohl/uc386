@@ -1,0 +1,8 @@
+cat.c is from suckless's sbase (https://git.suckless.org/sbase/),
+ported to uc386 verbatim. The util.h / util.c shim in this directory
+is a uc386-specific minimal compatibility layer (not from sbase).
+Both are MIT-licensed.
+
+Sbase's full author list lives at https://git.suckless.org/sbase/plain/LICENSE.
+The same MIT statement reproduced in addons/gnu/sbase-tee/LICENSE
+applies here.

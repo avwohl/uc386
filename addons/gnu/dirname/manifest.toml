@@ -1,0 +1,6 @@
+name = "dirname"
+description = "POSIX `dirname PATH`"
+sources = ["main.c"]
+argv = ["dirname", "/usr/local/bin/uc386"]
+expect_stdout = "/usr/local/bin\n"
+expect_exit = 0

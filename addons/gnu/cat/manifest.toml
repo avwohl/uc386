@@ -1,0 +1,11 @@
+name = "cat"
+description = "POSIX `cat`: stdin or argv files → stdout"
+sources = ["main.c"]
+argv = ["cat", "greeting.txt", "-", "tail.txt"]
+stdin = "[stdin]\n"
+expect_stdout = "hello from a file\n[stdin]\nfinal line\n"
+expect_exit = 0
+
+[vfiles]
+"greeting.txt" = "hello from a file\n"
+"tail.txt" = "final line\n"

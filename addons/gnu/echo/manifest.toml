@@ -1,0 +1,6 @@
+name = "echo"
+description = "POSIX `echo`: print argv[1..] separated by spaces"
+sources = ["main.c"]
+argv = ["echo", "hello", "world", "from", "uc386"]
+expect_stdout = "hello world from uc386\n"
+expect_exit = 0

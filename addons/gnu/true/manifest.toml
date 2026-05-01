@@ -1,0 +1,5 @@
+name = "true"
+description = "POSIX `true` — always exit 0"
+sources = ["main.c"]
+expect_stdout = ""
+expect_exit = 0

@@ -1,0 +1,8 @@
+name = "sbase-head"
+description = "sbase head.c (lightly adapted: drops fshut/estrtonum sbase helpers, uses atoi+EARGF) ported to uc386"
+sources = ["../_sbase_shim/util.c", "head.c"]
+extra_cflags = ["-I", "addons/gnu/_sbase_shim"]
+argv = ["head", "-n", "2"]
+stdin = "alpha\nbeta\ngamma\ndelta\n"
+expect_stdout = "alpha\nbeta\n"
+expect_exit = 0

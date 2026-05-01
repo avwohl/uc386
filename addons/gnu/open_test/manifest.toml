@@ -1,0 +1,5 @@
+name = "open_test"
+description = "smoke test for _open POSIX flags + append mode"
+sources = ["main.c"]
+expect_stdout = "got: first second\n"
+expect_exit = 0

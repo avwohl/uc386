@@ -1,0 +1,7 @@
+name = "tail"
+description = "POSIX `tail -n N` over stdin"
+sources = ["main.c"]
+argv = ["tail", "-n", "2"]
+stdin = "one\ntwo\nthree\nfour\nfive\n"
+expect_stdout = "four\nfive\n"
+expect_exit = 0

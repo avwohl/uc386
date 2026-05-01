@@ -1,0 +1,7 @@
+name = "head"
+description = "POSIX `head -n N` over stdin"
+sources = ["main.c"]
+argv = ["head", "-n", "3"]
+stdin = "one\ntwo\nthree\nfour\nfive\nsix\n"
+expect_stdout = "one\ntwo\nthree\n"
+expect_exit = 0

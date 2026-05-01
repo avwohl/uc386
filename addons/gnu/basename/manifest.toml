@@ -1,0 +1,6 @@
+name = "basename"
+description = "POSIX `basename PATH [SUFFIX]`"
+sources = ["main.c"]
+argv = ["basename", "/usr/local/bin/uc386.exe", ".exe"]
+expect_stdout = "uc386\n"
+expect_exit = 0

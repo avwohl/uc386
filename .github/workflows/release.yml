@@ -1,0 +1,101 @@
+name: Release
+
+# Builds the FOSS-addons + games-build-scripts tarballs and attaches
+# them to a GitHub release whenever a tag matching v* is pushed.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag for dev builds (e.g. dev-2026-04-30)'
+        required: false
+        default: 'dev'
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm bison
+          python -m pip install --upgrade pip
+          pip install pytest unicorn
+          pip install "uc_core @ git+https://github.com/avwohl/uc_core@main"
+          pip install -e .
+
+      - name: Run tests
+        run: pytest tests/ -q
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build addon binaries (FOSS tarball)
+        run: python -m addons.harness.package --version "${{ steps.ver.outputs.version }}" --foss-only
+
+      - name: Build BWK awk
+        run: |
+          cd addons/gnu/awk-bwk
+          ./fetch.sh
+          ./build.sh
+          ls -la build/awk.bin
+
+      - name: Repackage with awk
+        run: python -m addons.harness.package --version "${{ steps.ver.outputs.version }}" --foss-only
+
+      - name: Build games-scripts tarball
+        run: python -m addons.harness.package --version "${{ steps.ver.outputs.version }}" --games-only
+
+      - name: Generate comparison table
+        run: python -m addons.harness.compare --write
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: uc386-release-${{ steps.ver.outputs.version }}
+          path: |
+            dist/*.tar.gz
+            addons/results.md
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            addons/results.md
+          body: |
+            ## uc386 ${{ steps.ver.outputs.version }}
+
+            Two release artifacts:
+
+            - **`uc386-foss-addons-*.tar.gz`** — built FOSS binaries
+              (16 utilities + BWK awk = ~62 KB total). Source: this
+              repo (GPL-3.0) + sbase upstream (MIT) + one-true-awk
+              (Lucent free license). Drop into a uc386-aware host
+              and run via `dos_emu.run()`.
+
+            - **`uc386-games-build-scripts-*.tar.gz`** — fetch + build
+              scripts for Doom, Duke3D, Heretic, Hexen, ROTT,
+              Descent. Run on your host: each script downloads the
+              upstream public-source release and (when the build
+              works) produces a uc386-format binary. Game data files
+              (WAD, GRP, RTL) are NOT shipped — supply your own.
+
+            See `addons/results.md` for size comparison vs gcc.

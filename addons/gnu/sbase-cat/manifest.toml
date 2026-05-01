@@ -1,0 +1,12 @@
+name = "sbase-cat"
+description = "sbase cat.c (verbatim) ported to uc386 via the shared sbase shim"
+sources = ["../_sbase_shim/util.c", "cat.c"]
+extra_cflags = ["-I", "addons/gnu/_sbase_shim"]
+argv = ["cat", "alpha.txt", "-", "beta.txt"]
+stdin = "[stdin slice]\n"
+expect_stdout = "alpha contents\n[stdin slice]\nbeta contents\n"
+expect_exit = 0
+
+[vfiles]
+"alpha.txt" = "alpha contents\n"
+"beta.txt" = "beta contents\n"

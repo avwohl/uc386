@@ -1,0 +1,8 @@
+name = "sbase-tee"
+description = "sbase tee.c (verbatim) ported to uc386 via the shared sbase shim"
+sources = ["../_sbase_shim/util.c", "tee.c"]
+extra_cflags = ["-I", "addons/gnu/_sbase_shim"]
+argv = ["tee", "out1.txt", "out2.txt"]
+stdin = "line one\nline two\n"
+expect_stdout = "line one\nline two\n"
+expect_exit = 0
