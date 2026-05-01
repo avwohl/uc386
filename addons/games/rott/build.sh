@@ -27,7 +27,7 @@ INCLUDE="$REPO/lib/include"
 # We claim Watcom-compatibility so memcheck.h's `#elif defined(__WATCOMC__)`
 # branch lights up rather than the `#error Unknown compiler` fallback.
 # 1100 is Watcom 11.0; ROTT's tests treat anything ≥1000 the same.
-CFLAGS="-D __WATCOMC__=1100 -D __386__"
+CFLAGS="-D __WATCOMC__=1100 -D __386__ -D int32=int -D byte=uchar -D fixed=int"
 
 cat > /tmp/rott_stub_main.c << 'EOF'
 int main(void) { return 0; }
@@ -42,6 +42,7 @@ for src in upstream/rott/*.C; do
         -I upstream/rott \
         -I upstream/rottcom/ROTTSER \
         -I upstream/rottcom/ROTTIPX \
+        --include-file dos.h \
         $CFLAGS \
         -o /tmp/rott_one.asm 2>&1) && rc=0 || rc=$?
     if [ $rc -eq 0 ]; then

@@ -18,7 +18,7 @@ Blockers:
 `fetch.sh` works (videogamepreservation/rott mirror).
 `build.sh` is a per-file triage harness like Duke3D's.
 
-Triage result: **46 of 53** game-side .C files compile cleanly via
+Triage result: **50 of 53** game-side .C files compile cleanly via
 uc386. Driven by:
 - 9 new DOS-platform libc headers: `dos.h`, `bios.h`, `conio.h`,
   `i86.h`, `mem.h`, `libc.h`, `process.h`, `direct.h`, `graph.h`.
@@ -35,15 +35,20 @@ uc386. Driven by:
   (`<sys\stat.h>`) + case-insensitive include lookup
   (period DOS code freely mixes case).
 
-Remaining 7 fails:
-- `_rt_build.h` / `rt_spball.h` — upstream typos (the actual
-  files are `_RT_BUIL.H` / `RT_SPBAL.H`, no double-l). Fixable
-  with symlinks at fetch time, or patching the .C sources.
-- `RT_TEXT.C:1360` and `TEXTURE.C:21` — real syntax errors.
-- `RT_SOUND.C` — bails silently (need to dig in).
-- `RT_TED.C` — `errno` unknown (file doesn't include errno.h
-  but uses errno through a transitive chain).
-- 1 more around `RT_CFG.C` `S_IREAD` macro chain.
+Remaining 3 fails:
+- `RT_TEXT.C:1471` — uc_core parser corner case (file is large).
+- `TEXTURE.C` — `scan_t` typedef missing (used without
+  `#include`; likely a Watcom-builtin or similar).
+- `RT_SOUND.C` — bails silently; needs investigation.
+
+Earlier fails resolved this session:
+- `_rt_build.h` / `rt_spball.h` upstream typos: fetch.sh now
+  patches the `#include` lines after extraction.
+- `S_IREAD` and `errno` unknown: `<io.h>` shim now pulls in
+  `<sys/stat.h>` and `<errno.h>`, matching DOS-era expectations.
+- `byte` / `int32` / `fixed` undefined: build.sh predefines
+  via `-D` flags, plus `--include-file dos.h` brings in the
+  `uchar` typedef chain.
 
 The deeper engine blocker (`#pragma aux` for `mulscale<n>` etc.)
 isn't surfacing here because most of the affected files compile

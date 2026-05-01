@@ -9,6 +9,13 @@
 
 #include <stddef.h>
 
+/* Watcom-era typedefs that period code uses without including
+ * a typedef header — the compiler had them as keywords / built-ins.
+ * Provide as plain typedefs so source that does `byte b;` compiles. */
+typedef unsigned char  uchar;
+typedef unsigned short ushort;
+typedef unsigned int   uint;
+
 /* Watcom-flavored register pack — three views of the same storage:
  *   .x  full 32-bit (eax/ebx/...)
  *   .w  16-bit halves (ax/bx/...)

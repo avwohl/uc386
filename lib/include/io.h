@@ -8,7 +8,9 @@
 
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <sys/types.h>
+#include <sys/stat.h>  /* S_IREAD / S_IWRITE / S_IEXEC */
 
 /* Watcom-specific helpers: file size by fd / by name. */
 long filelength(int fd);
