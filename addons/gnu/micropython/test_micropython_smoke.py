@@ -71,6 +71,28 @@ def test_micropython_repl_banner(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_named_builtin(micropython_bin: Path) -> None:
+    """`__name__\\n\\x04` exercises the static-qstr LOAD_GLOBAL path:
+    mp_init's dict_main store of `__name__` (qstr id 67) had to
+    survive the qstr_find_strn binary search through all 878
+    main-pool entries. Required: LC_ALL=C ASCII collation in the
+    qstrdefs sort + real strlen in the QDEF length field. Result
+    should print the module name `'__main__'`."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"__name__\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "'__main__'" in res.stdout, (
+        f"expected `'__main__'` in stdout, got: {res.stdout!r}"
+    )
+
+
 def test_micropython_arithmetic(micropython_bin: Path) -> None:
     """`2+3\\n\\x04` exercises the value-print path: lex → parse →
     compile → VM dispatch (LOAD_CONST 2; LOAD_CONST 3; BINARY_OP +;

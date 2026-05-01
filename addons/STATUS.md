@@ -245,28 +245,43 @@ Type "help()" for more information.
 >>>
 ```
 
-…and then accepts `pass`, empty lines, `x = 5`, **value-print
-of integer expressions (`1` → `1`, `2+3` → `5`, `42` → `42`,
-`1+2` → `3`)**, and Ctrl-D-to-exit. The full lex → parse →
-compile → VM dispatch → NLR (setjmp-backed) → qstr-pool →
-mp_load_global → builtins-dict lookup → __repl_print__ → print
-result path runs end-to-end.
+…and then accepts arbitrary integer arithmetic (`1+2` → `3`,
+`2*3+4` → `10`), `pass`/`x = 5`/empty-line, **named builtins**
+(`print(2+3)` → `5`, `len("hi")` → `2`), **static qstrs**
+(`__name__` → `'__main__'`), string literals, and Ctrl-D-to-exit.
+The full lex → parse → compile → VM dispatch → NLR
+(setjmp-backed) → qstr-pool → mp_load_global → builtins-dict
+lookup → builtin-function call → print result path runs
+end-to-end.
 
-The fix that unlocked this was a **uc386 peephole bug**:
-`_pass_push_memory_to_push_reg` was incorrectly merging chained
-pointer dereferences (`mov eax, [eax+4]; push [eax+4]` →
-`push eax`) when the memory expression referenced the destination
-register. That dropped the second deref of
-`self->context->module.globals` in objfun.c's fun_bc_call and
-let MicroPython's mp_globals_set store the *context pointer*
-itself instead of the dict pointer. See commit `19ae598` for the
-fix and `addons/gnu/micropython/NOTES.md` for the full diagnostic
-trail.
+Three real bug fixes unlocked Python execution:
 
-Calls to *named builtins* (`print('hi')`) still raise NameError
-because of an unrelated qstr-id mismatch between the builtins
-dict's static-init keys and the bytecode's lookup keys. That's
-the next investigation.
+- **uc386 peephole** (commit `19ae598`):
+  `_pass_push_memory_to_push_reg` was incorrectly merging chained
+  pointer dereferences (`mov eax, [eax+4]; push [eax+4]` →
+  `push eax`) when the memory expression referenced the
+  destination register. That dropped the second deref of
+  `self->context->module.globals` and broke
+  `mp_globals_set(...)`. Fix: skip the cache when the source
+  expression references the destination register.
+- **qstr length** (commit `17c3191`): the grep heuristic emitted
+  every QDEF1 with `len=0`, but `qstr_find_strn`'s post-binary-
+  search linear sweep filters by `lengths[at] == str_len` before
+  memcmp. The filter rejected every entry. Fix: emit
+  `length(name)` in the third QDEF1 field.
+- **qstr collation** (commit `ab61a86`): macOS `sort` uses
+  locale-aware ordering (`__name__` before `BUILD_LIST`), but
+  `strncmp` uses ASCII (the opposite). The pool's
+  `is_sorted=true` invariant requires ASCII order, so binary
+  search missed every static qstr starting with `_`. Fix:
+  `LC_ALL=C sort -u` in the pipeline.
+
+Some qstrs containing non-identifier chars (e.g. `\n` →
+`MP_QSTR__0x0a_`, `<stdin>` → `MP_QSTR__lt_stdin_gt_`) still
+ship with the *mangled* string instead of the original — the
+grep heuristic captures the macro name, not the un-sanitized
+source string. So `print(...)`'s trailing newline renders as
+the literal text `_0x0a_`. Cosmetic but visible.
 
 Layered evidence:
 
