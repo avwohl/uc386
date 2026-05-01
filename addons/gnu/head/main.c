@@ -14,6 +14,8 @@
 int main(int argc, char **argv) {
     int n = 10;
     int i;
+    int lines = 0;
+    int c;
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             n = atoi(argv[++i]);
@@ -21,8 +23,6 @@ int main(int argc, char **argv) {
             n = atoi(argv[i] + 1);
         }
     }
-    int lines = 0;
-    int c;
     while (lines < n && (c = getchar()) != EOF) {
         putchar(c);
         if (c == '\n') {

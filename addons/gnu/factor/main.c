@@ -12,6 +12,7 @@
 #include <string.h>
 
 static void factor_one(unsigned long n) {
+    unsigned long d;
     printf("%lu:", n);
     if (n < 2) {
         putchar('\n');
@@ -21,7 +22,7 @@ static void factor_one(unsigned long n) {
         printf(" 2");
         n >>= 1;
     }
-    unsigned long d = 3;
+    d = 3;
     while (d <= n / d) {
         while (n % d == 0UL) {
             printf(" %lu", d);
@@ -37,12 +38,13 @@ static void factor_one(unsigned long n) {
 
 int main(int argc, char **argv) {
     int i;
+    unsigned long n;
     if (argc < 2) {
         fputs("factor: missing operand\n", stderr);
         return 1;
     }
     for (i = 1; i < argc; i++) {
-        unsigned long n = strtoul(argv[i], NULL, 10);
+        n = strtoul(argv[i], NULL, 10);
         factor_one(n);
     }
     return 0;

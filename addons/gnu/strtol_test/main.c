@@ -15,25 +15,29 @@
 
 int main(void) {
     char *end;
+    long a, b, f;
+    char *p;
+    char *dup;
+    int rc;
 
     /* Basic decimal */
-    long a = strtol("42", &end, 10);
+    a = strtol("42", &end, 10);
     printf("dec=%ld end=%c\n", a, *end ? *end : '0');
 
     /* Negative with leading whitespace */
-    long b = strtol("  -1234abc", &end, 10);
+    b = strtol("  -1234abc", &end, 10);
     printf("neg=%ld rem=%s\n", b, end);
 
     /* Plain decimal */
-    long f = strtol("99", NULL, 10);
+    f = strtol("99", NULL, 10);
     printf("dec99=%ld\n", f);
 
     /* getenv: empty environment under dos_emu */
-    char *p = getenv("PATH");
+    p = getenv("PATH");
     printf("env=%s\n", p ? p : "(null)");
 
     /* strdup */
-    char *dup = strdup("hello");
+    dup = strdup("hello");
     printf("dup=%s\n", dup);
     free(dup);
 
@@ -41,7 +45,7 @@ int main(void) {
     printf("err=%s\n", strerror(2));
 
     /* fflush — should return 0 */
-    int rc = fflush(stdout);
+    rc = fflush(stdout);
     printf("fflush=%d\n", rc);
 
     return 0;

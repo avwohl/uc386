@@ -13,6 +13,13 @@
 int main(int argc, char **argv) {
     int n = 10;
     int i;
+    char **buf;
+    char line[MAX_LINE];
+    int head = 0;
+    int count = 0;
+    int start, idx;
+    size_t len;
+
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             n = atoi(argv[++i]);
@@ -24,15 +31,12 @@ int main(int argc, char **argv) {
         return 0;
     }
     /* Ring buffer of n line slots. */
-    char **buf = (char **)calloc((size_t)n, sizeof(char *));
+    buf = (char **)calloc((size_t)n, sizeof(char *));
     if (!buf) {
         return 1;
     }
-    char line[MAX_LINE];
-    int head = 0;
-    int count = 0;
     while (fgets(line, MAX_LINE, stdin)) {
-        size_t len = strlen(line);
+        len = strlen(line);
         if (buf[head]) {
             free(buf[head]);
         }
@@ -46,9 +50,9 @@ int main(int argc, char **argv) {
             count++;
         }
     }
-    int start = (count < n) ? 0 : head;
+    start = (count < n) ? 0 : head;
     for (i = 0; i < count; i++) {
-        int idx = (start + i) % n;
+        idx = (start + i) % n;
         fputs(buf[idx], stdout);
     }
     return 0;

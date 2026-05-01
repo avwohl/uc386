@@ -25,6 +25,7 @@ static int copy_stream(FILE *in) {
 int main(int argc, char **argv) {
     int i;
     int rc = 0;
+    FILE *fp;
     if (argc <= 1) {
         return copy_stream(stdin);
     }
@@ -35,7 +36,7 @@ int main(int argc, char **argv) {
             }
             continue;
         }
-        FILE *fp = fopen(argv[i], "r");
+        fp = fopen(argv[i], "r");
         if (!fp) {
             fputs("cat: cannot open ", stderr);
             fputs(argv[i], stderr);
