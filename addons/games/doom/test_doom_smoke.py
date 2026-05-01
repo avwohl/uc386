@@ -29,12 +29,17 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
-# Two locations: the dev-tree path and the games-tarball path. The
-# tarball lays out as uc386-games/bin/doom/doom.bin while the dev tree
-# uses addons/games/doom/build/doom.bin.
+# Two locations: the dev-tree path and the games-tarball path.
+#
+# Dev tree:  addons/games/doom/test_doom_smoke.py → build/doom.bin
+#   = parent / build / doom.bin
+# Tarball:   uc386-games/doom/test_doom_smoke.py → bin/doom/doom.bin
+#            (sibling to the doom/ dir under uc386-games/)
+#   = parent.parent / bin / doom / doom.bin
+_HERE = Path(__file__).resolve().parent
 _BIN_CANDIDATES = [
-    Path(__file__).resolve().parent / "build" / "doom.bin",
-    Path(__file__).resolve().parent.parent.parent / "bin" / "doom" / "doom.bin",
+    _HERE / "build" / "doom.bin",
+    _HERE.parent / "bin" / "doom" / "doom.bin",
 ]
 
 
