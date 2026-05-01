@@ -23,7 +23,38 @@ parse → compile → VM dispatch.
 Remaining gap: statements that **allocate** (`x = 5` allocates a
 qstr "x" + dict-stores 5) or **produce a value to print** (`1`,
 `print('hi')`) crash with `UC_ERR_READ_UNMAPPED` somewhere
-downstream of bytecode dispatch. Suspects worth checking next:
+downstream of bytecode dispatch.
+
+**Crash narrowed to `qstr_find_strn`'s binary search.** Diagnostic
+hook at the dos_emu level pinpoints the failing instruction:
+`push [eax + ecx*4]` at EIP 0x0001b8b9 inside `_qstr_find_strn`
+(NASM listing line 44389; function starts at 0x0001b84d, line
+44352). The crash address is `0x80024fc4`; `eax = 0x00024fc8`
+(= `&pool->qstrs[0]`, so `pool` lives at `0x24fb4` — inside the
+GC heap, i.e. a dynamically-allocated pool, not one of the const
+pools at `0x13A4` / `0x13B8`). `ecx = 0x1fffffff`, the binary-
+search midpoint `(high + low) / 2` from
+`(pool->len - 1 + 0) / 2`, which means `pool->len` was read as
+`0x40000000` — clearly garbage; a freshly-allocated dynamic
+pool's `len` should start at 0.
+
+The constant pools have correct layout in the assembled image
+(verified from the NASM listing: prev / bitfield-word / alloc=10
+/ len / lengths / qstrs[]; the bitfield word for
+`mp_qstr_const_pool` reads `0x8000036F` = `is_sorted=1` packed
+with `total_prev_len=879`). Reads from `pool->len` at offset 12
+match the layout. So either:
+
+- the dynamic pool's `len` is being clobbered by something between
+  allocation and read (heap layout overlap, double-free, GC
+  metadata trampling), or
+- uc386's `sizeof(qstr_pool_t)` differs from the access offset
+  uc_core uses — a few bytes of padding mismatch on the FAM
+  (`const char *qstrs[]`) would shift fields, or
+- a struct-identity collision is making two distinct structs look
+  the same to uc_core's structural fingerprinting.
+
+Suspects worth checking next:
 
 - **dead libm externs**: 18 libm symbols (acos, sin, cosh, trunc,
   …) appear as externs but only as string-table debug names;
