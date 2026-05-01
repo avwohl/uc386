@@ -10,6 +10,13 @@
 #ifndef _UC386_CHOCO_CONFIG_H
 #define _UC386_CHOCO_CONFIG_H
 
+/* chocolate-doom's textscreen headers declare TXT_vsnprintf with a
+ * `va_list` parameter but don't `#include <stdarg.h>` themselves —
+ * upstream relies on the consumer having pulled it in via something
+ * else. Pre-include here so any TU that picks up this config gets
+ * va_list before it's referenced. */
+#include <stdarg.h>
+
 /* Project metadata. PACKAGE_TARNAME drives the data-file lookup
  * directory name; we leave it as "heretic" so any DOS data files
  * under that name still resolve. */
@@ -18,6 +25,10 @@
 #define PACKAGE_VERSION "1.3-uc386"
 #define PACKAGE_STRING  "heretic 1.3-uc386"
 #define PACKAGE_BUGREPORT "uc386@local"
+
+/* PROGRAM_PREFIX — autoconf-defined string prefix for config files /
+ * data dirs. Empty under uc386 (we keep filenames un-prefixed). */
+#define PROGRAM_PREFIX ""
 
 /* Standard libc decls we have. */
 #define HAVE_DECL_STRCASECMP  1

@@ -186,6 +186,10 @@ def main() -> int:
     ap.add_argument("-o", "--output", help="Output assembly file (default: input.asm)")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("-I", "--include", action="append", default=[], metavar="DIR")
+    ap.add_argument("--include-file", action="append", default=[], metavar="FILE",
+                    help="Force-include FILE at the start of every source. "
+                         "Useful for headers that period code expects to be "
+                         "always available (gcc -include equivalent).")
     ap.add_argument("-D", "--define", action="append", default=[], metavar="NAME[=VALUE]")
     ap.add_argument("-E", "--preprocess-only", action="store_true")
     ap.add_argument("-P", "--no-preprocess", action="store_true")
@@ -247,6 +251,14 @@ def main() -> int:
                         pp.macros[name] = pp.macros.get(name) or Macro(name, body=value)
                     else:
                         pp.macros[define] = Macro(define, body="1")
+                # `--include-file` (gcc -include semantics): prepend
+                # `#include "..."` directives to the source so the named
+                # files get processed before anything else. Lets us pull
+                # in headers that period code expects to "always be in
+                # scope" even when upstream forgot to #include them.
+                if args.include_file:
+                    prefix = "".join(f'#include "{f}"\n' for f in args.include_file)
+                    source = prefix + source
                 source = pp.preprocess(source, str(p))
                 if args.preprocess_only:
                     print(source)
