@@ -32,13 +32,13 @@ Status today (2026-05-01):
 | Game     | Source available    | Per-file triage | Boots? | Notes                                                                     |
 |----------|---------------------|-----------------|--------|---------------------------------------------------------------------------|
 | Doom     | yes (id Software)   | **58 / 58**     | **yes** | Boots end-to-end through dos_emu — exits at WAD-not-found (no WAD shipped) |
-| Heretic  | yes (chocolate-doom)| **44 / 47**     | no     | Remaining 3 want richer SDL2 API; same engine as Doom, can share stubs.c    |
-| Hexen    | yes (chocolate-doom)| **45 / 48**     | no     | Same SDL.h gap as Heretic                                                  |
-| Duke3D   | yes (jfduke3d)      | **34 / 42**     | no     | game-side 15/16 + Build engine 19/26 — engine.c renderer compiles!         |
-| ROTT     | yes (Apogee)        | **46 / 53**     | no     | Watcom DOS source — needed 9 new period libc headers                       |
+| Heretic  | yes (chocolate-doom)| **47 / 47**     | no     | All sources compile; needs heretic_stubs.c to actually link a bin          |
+| Hexen    | yes (chocolate-doom)| **48 / 48**     | no     | All sources compile; same stubs.c story as Heretic                         |
+| Duke3D   | yes (jfduke3d)      | **35 / 42**     | no     | game-side 15/16 + Build engine 20/26 — engine.c renderer compiles!         |
+| ROTT     | yes (Apogee)        | **51 / 53**     | no     | Watcom DOS source — needed 9 new period libc headers                       |
 | Descent  | yes (dxx-rebirth)   | n/a (C++)       | no     | dxx-rebirth is C++, uc386 is C-only; would need 1998 source release        |
 
-**~227 source files** from period DOS games compile cleanly through
+**~239 source files** from period DOS games compile cleanly through
 uc386 today. The "build scripts" no longer just document what's
 missing — they're per-file triage harnesses that produce a
 histogram of remaining errors. Each error is a concrete ticket;
