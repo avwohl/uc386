@@ -8,9 +8,15 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Exercise both supported host platforms — addons.txt 2026-05-01
+    # asks the install requirements work on linux (apt) and macOS
+    # (brew). The macOS leg validates that pip install -e . + tests
+    # still run after the dev workstation moved off macOS.
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest]
         python-version: ['3.11', '3.12', '3.13']
     steps:
     - uses: actions/checkout@v6
