@@ -146,18 +146,52 @@ hits boot-instruction bytes interpreted as mp_obj_t key/value
 pairs, and trips the unmapped read at the first qstr-shaped
 garbage value with high bit set.
 
-**Hypothesis**: `mp_compile` (called during `parse_compile_execute`
-in the REPL loop) creates a module function whose context's
-`globals` is a *fresh* dict instead of inheriting the existing
-dict_main. uc386's emission of mp_compile's context init is the
-suspect. The bug doesn't reproduce on `pass` because that compiles
-to bytecode that doesn't do `LOAD_GLOBAL` (no `__repl_print__`
-call); it doesn't reproduce on `x = 5` because STORE_NAME goes to
-the locals dict (= dict_main, which is fine), not globals.
+**Root cause identified (in upstream-side codegen, not the
+runtime)**: looking at the asm uc386 emits for `objfun.c`'s
+`fun_bc_call`:
 
-Further root-cause debugging needs source-level inspection of
-mp_compile's context setup and the difference between locals_set
-and globals_set behaviors — outside what fits in /loop iterations.
+```c
+mp_globals_set(self->context->module.globals);
+```
+
+uc386 emits:
+```
+mov eax, [ebp - 4]   ; eax = self
+push [eax + 4]        ; push self->context (the pointer VALUE)
+call mp_globals_set
+```
+
+This has **only one dereference** — it pushes the *value of the
+context pointer field* (`self->context`), NOT the result of
+`self->context->module.globals` (which is two derefs deep).
+The CORRECT asm would be:
+
+```
+mov eax, [ebp - 4]    ; self
+mov eax, [eax + 4]    ; eax = self->context  (deref 1)
+push [eax + 4]        ; push self->context->module.globals  (deref 2)
+```
+
+So `mp_globals_set(...)` ends up storing the *context pointer
+itself* as the new globals dict. mp_globals_get later returns
+that context pointer. The runtime treats it as a `mp_obj_dict_t *`,
+and `&dict.map = context+4 = 0x2A354` (the corrupt-looking dict
+we saw in our hooks).
+
+Isolated `_compile`-driven reproductions of the same access
+pattern (struct base; pointer member; embedded struct; pointer
+field) all generate the correct two-deref asm. The bug only
+triggers in the actual MicroPython multi-TU build — likely a
+struct-identity collision in uc_core's anonymous-struct
+fingerprinting that loses track of `mp_obj_module_t` vs
+`mp_module_context_t` across the relevant TUs (objfun.c sees
+slightly different types than runtime.c does), so the
+`->module.globals` traversal stops one deref short.
+
+Fix is in **uc_core**, not uc386 — needs source-level investigation
+of how multi-TU struct fingerprinting interacts with embedded
+structs whose first field is itself a struct (`mp_obj_base_t base`).
+Outside the scope of this repo.
 
   - EIP 0xCC41, inside `mp_obj_equal_not_equal`, instruction
     `cmp dword [eax], _mp_type_str`.
