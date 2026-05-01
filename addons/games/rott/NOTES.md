@@ -18,7 +18,7 @@ Blockers:
 `fetch.sh` works (videogamepreservation/rott mirror).
 `build.sh` is a per-file triage harness like Duke3D's.
 
-Triage result: **50 of 53** game-side .C files compile cleanly via
+Triage result: **51 of 53** game-side .C files compile cleanly via
 uc386. Driven by:
 - 9 new DOS-platform libc headers: `dos.h`, `bios.h`, `conio.h`,
   `i86.h`, `mem.h`, `libc.h`, `process.h`, `direct.h`, `graph.h`.
@@ -35,11 +35,10 @@ uc386. Driven by:
   (`<sys\stat.h>`) + case-insensitive include lookup
   (period DOS code freely mixes case).
 
-Remaining 3 fails:
+Remaining 2 fails:
 - `RT_TEXT.C:1471` — uc_core parser corner case (file is large).
 - `TEXTURE.C` — `scan_t` typedef missing (used without
   `#include`; likely a Watcom-builtin or similar).
-- `RT_SOUND.C` — bails silently; needs investigation.
 
 Earlier fails resolved this session:
 - `_rt_build.h` / `rt_spball.h` upstream typos: fetch.sh now
