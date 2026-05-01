@@ -120,9 +120,13 @@ def build_watcom(addon: Path) -> int | None:
     out.mkdir(parents=True, exist_ok=True)
     obj_path = out / "wcc386.o"
     exe_path = out / "wcc386.exe"
-    # wcc386 wants /fo=obj, the linker is wlink.
+    # wcc386 wants /fo=obj, the linker is wlink. -ze enables Watcom
+    # language extensions including "declarations anywhere in a block",
+    # which most of our addons use (period code did this too once C99
+    # was available). Without it the C89 default rejects mid-block
+    # decls with E1063.
     proc = subprocess.run(
-        [wcc, "-bt=dos", "-q", "-fo=" + str(obj_path), str(addon / "main.c")],
+        [wcc, "-bt=dos", "-q", "-ze", "-fo=" + str(obj_path), str(addon / "main.c")],
         capture_output=True, text=True, cwd=out, env=env,
     )
     if proc.returncode != 0:
