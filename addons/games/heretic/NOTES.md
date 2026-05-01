@@ -24,10 +24,17 @@ Hexen). `build.sh` is a per-file triage harness like the other games'.
 
 **44 of 47 src/heretic/*.c sources compile cleanly** through uc386
 after the uc_core preprocessor improvements (uc_core@63912fd) and
-the SDL.h shim. Remaining 3 fails are deeper SDL2 API references.
+the SDL.h shim.
 
-The same engine + libc work as Doom carries through — `doom_stubs.c`
-is the next deliverable to actually link a bin. The remaining work:
-1. Expand SDL.h shim or make it pointer-only opaque
-2. Add a heretic-flavored stubs.c (or share doom's with #ifdef)
-3. Verify multi-file linkage works end-to-end
+**Multi-file build confirmed working** (uc386@3534ad7): all 40
+non-platform source files merge through a single uc386 invocation
+with `--include-file stdarg.h` (chocolate-doom's txt_main.h
+forgets to include stdarg.h itself) and `PROGRAM_PREFIX=""` in
+config.h. Output asm is small only because our stub `main()`
+doesn't call into Heretic; asm-DCE strips the unreferenced
+symbols. Switching the stub to `D_DoomMain()` would surface the
+remaining link-time work (I_* stubs, runtime).
+
+The same engine + libc work as Doom carries through — a
+`doom_stubs.c`-style file is the last deliverable to actually
+boot a bin.
