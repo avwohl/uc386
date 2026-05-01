@@ -44,17 +44,22 @@ jobs:
 
       - name: Install OpenWatcom V2
         run: |
+          # The Linux x64 "installer" is an ELF wrapper around a regular
+          # ZIP archive. Running it via -i=u FPEs on the runner; unzip
+          # the embedded archive directly instead — gives us the same
+          # binl64/binl/lib386/h tree without invoking the installer at
+          # all. Fast and reliable.
           mkdir -p ~/.local/opt/watcom
           curl -sL -o /tmp/watcom.bin \
             https://github.com/open-watcom/open-watcom-v2/releases/download/Current-build/open-watcom-2_0-c-linux-x64
-          chmod +x /tmp/watcom.bin
-          # The Linux self-extractor wants an interactive license accept; -i=u
-          # = unattended user-mode install into the path we point to.
-          /tmp/watcom.bin -dDstDir=$HOME/.local/opt/watcom -i=u || true
-          ls $HOME/.local/opt/watcom/binl64/wcc386 || \
-            (echo "watcom installer layout unexpected; listing:" && \
-             find $HOME/.local/opt/watcom -name wcc386 -type f)
+          unzip -q /tmp/watcom.bin -d ~/.local/opt/watcom
+          chmod +x ~/.local/opt/watcom/binl64/wcc386 \
+                   ~/.local/opt/watcom/binl64/wlink \
+                   ~/.local/opt/watcom/binl64/wcl386 || true
+          ~/.local/opt/watcom/binl64/wcc386 -? 2>&1 | head -1 || \
+            echo "wcc386 banner check failed (continuing — compare.py will skip)"
           echo "WATCOM=$HOME/.local/opt/watcom" >> $GITHUB_ENV
+          echo "INCLUDE=$HOME/.local/opt/watcom/h" >> $GITHUB_ENV
           echo "$HOME/.local/opt/watcom/binl64" >> $GITHUB_PATH
 
       - name: Run tests
