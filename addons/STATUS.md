@@ -18,7 +18,13 @@ test runner). Status:
   no longer excludes `upstream/` from either tarball, so when the
   CI fetches + builds awk-bwk or doom, the matching upstream
   source tree ships alongside the binary.
-- **dosiz integration** ◐ — pending (sibling at `../dosiz`).
+- **dosiz integration** ◐ — gap analysed in
+  `docs/dosiz-integration.md`. dosiz today loads MZ / MZ+LE /
+  bare LE; uc386 emits flat .bin via `nasm -f bin`. Smallest
+  bridge is a `--flat-bin` loader on the dosiz side (reuses its
+  existing PM / LDT plumbing); the larger payoff is uc386
+  emitting MZ+LE so the binaries run on real DOS too. Path-B
+  first; tracked there.
 
 ## ✓ Port GNU utilities to this compiler
 
