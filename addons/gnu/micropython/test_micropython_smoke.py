@@ -69,3 +69,26 @@ def test_micropython_repl_banner(micropython_bin: Path) -> None:
     assert ">>> " in res.stdout, (
         f"REPL prompt ('>>> ') missing: {res.stdout!r}"
     )
+
+
+def test_micropython_clean_eof_exit(micropython_bin: Path) -> None:
+    """Sending only Ctrl-D (EOF) at the prompt should exit the REPL
+    cleanly with exit code 0 — exercises the readline → pyexec EOF
+    path that runs after the boot banner."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"\x04",
+              timeout_seconds=15.0,
+              instruction_limit=2_000_000_000)
+    assert not res.timed_out, "REPL didn't exit on Ctrl-D"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0, (
+        f"unexpected exit code: {res.exit_code} "
+        f"(expected 0 for clean Ctrl-D exit)"
+    )
+    assert ">>> " in res.stdout, (
+        f"REPL prompt missing before Ctrl-D was processed: "
+        f"{res.stdout!r}"
+    )
