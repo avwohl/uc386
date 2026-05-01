@@ -16,6 +16,18 @@
 
 #include <stdint.h>
 
+// Use the setjmp/longjmp-backed NLR (non-local return) machinery.
+// The default x86 NLR (`upstream/py/nlrx86.c`) is GCC inline asm,
+// which uc_core / uc386 doesn't compile — `nlr_push`/`nlr_jump`
+// would silently expand to no-ops, leaving uninitialized garbage in
+// the nlr_buf and crashing the parser at the first exception. The
+// setjmp path goes through uc386's libc `_setjmp`/`_longjmp`
+// (lib/i386_dos_libc.asm), which is real i386 asm (saves 6 dwords:
+// ebx/esi/edi/ebp/esp/eip). Pair this with the fix in
+// `lib/include/setjmp.h` that widens jmp_buf to 24 bytes — the old
+// 6-byte declaration would have caused setjmp to buffer-overflow.
+#define MICROPY_NLR_SETJMP                (1)
+
 #define MICROPY_CONFIG_ROM_LEVEL          (MICROPY_CONFIG_ROM_LEVEL_MINIMUM)
 
 #define MICROPY_ENABLE_COMPILER           (1)
@@ -40,6 +52,11 @@ typedef long mp_off_t;
 // Use the same STDOUT path the minimal port uses on linux/darwin —
 // uc386's libc turns read(STDIN)/write(STDOUT) into INT 21h DOS calls.
 #define MICROPY_MIN_USE_STDOUT (1)
-#define MICROPY_HEAP_SIZE      (65536) // 64 KB GC heap, fits a tiny REPL session
+// 256 KB GC heap. Bumped from 64 KB after the first runnable port:
+// arbitrary input echoes back but the parser/compile path hits an
+// UC_ERR_READ_UNMAPPED — heap exhaustion during parse-tree allocation
+// is one likely cause. dos_emu maps a much wider data region than
+// 64 KB so the additional fixed-region heap is fine.
+#define MICROPY_HEAP_SIZE      (262144)
 
 #define MP_STATE_PORT MP_STATE_VM
