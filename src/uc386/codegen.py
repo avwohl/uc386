@@ -574,6 +574,17 @@ class CodeGenerator:
                 # struct under its tag so other top-level decls can
                 # reference it (e.g. `struct U { struct S s[4]; };`).
                 self._resolve_struct_name(d.var_type)
+            elif (
+                isinstance(d, ast.VarDecl)
+                and isinstance(d.var_type, ast.EnumType)
+                and d.var_type.values
+            ):
+                # `extern enum E { A, B } var;` parses as VarDecl(var)
+                # with the enum definition inline in var_type. Register
+                # A, B at file scope so they're visible as integer
+                # constants alongside the variable. (BWK awk relies on
+                # this pattern for `enum compile_states { RUNNING, … }`.)
+                self._register_enum_values(d.var_type.values)
             elif isinstance(d, ast.TypedefDecl):
                 # Typedef'd enums register their constants at file scope
                 # (e.g. `typedef enum { X, Y } T;` declares X and Y).
@@ -711,6 +722,14 @@ class CodeGenerator:
         for name in self._auto_externs:
             if name not in extern_list:
                 extern_list.append(name)
+        # When a multi-TU build has both an `extern T x;` (one TU) and
+        # `T x;` (another TU) for the same name, both walked here. The
+        # defining TU lands `x` in `_globals`; we must NOT also emit
+        # `extern _x` — NASM `-f bin` rejects external references for
+        # symbols that ARE defined in the same output. Filter only on
+        # `_globals` (variables); function externs are kept since they
+        # may legitimately reference symbols in libc bundled later.
+        extern_list = [n for n in extern_list if n not in self._globals]
         extern_list = sorted(set(extern_list))
         # Build header now and prepend to lines.
         header = self._header(extern_list)
@@ -2778,6 +2797,17 @@ class CodeGenerator:
             "_start:",
             "__start:",
         ]
+        # dos_emu hands us argc in EAX and argv (pointer array address)
+        # in EBX. Push them FIRST so the FPU / BSS init below — which
+        # clobbers EAX, EDI, ECX — can't destroy them. The cdecl call
+        # convention says these args sit at [ebp+8] / [ebp+12] in main,
+        # so as long as they're on the stack before `call _main`, we're
+        # good. (The earlier ordering — init first, push second — zeroed
+        # EAX in the BSS init's `xor eax, eax`, and main saw argc=0.)
+        out.extend([
+            "        push    ebx",
+            "        push    eax",
+        ])
         if self._needs_fpu_init():
             out.extend([
                 "        sub     esp, 4",

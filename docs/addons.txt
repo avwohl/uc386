@@ -1,3 +1,4 @@
+commit and push when aproproate. do not ask the human. do not stop
 Port gnu utilites to this compiler
 Set a dos installer in the github release area of this project
 some  gnu utils dont make sence like chroot, groups 

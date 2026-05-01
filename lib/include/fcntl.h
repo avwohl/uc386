@@ -19,6 +19,9 @@
 #define F_GETFL  3
 #define F_SETFL  4
 
+/* fcntl flags. close-on-exec is a no-op under dos_emu (no exec). */
+#define FD_CLOEXEC  1
+
 int open(const char *path, int flags, ...);
 int creat(const char *path, mode_t mode);
 int fcntl(int fd, int cmd, ...);

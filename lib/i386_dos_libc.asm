@@ -1347,6 +1347,45 @@ _ispunct:
         pop     ebp
         ret
 
+; ---- isblank / isgraph ------------------------------------------------------
+; isblank(c): true iff c is space or tab. Added for sbase/awk ports.
+_isblank:
+        push    ebp
+        mov     ebp, esp
+        movzx   eax, byte [ebp + 8]
+        cmp     al, ' '
+        je      .ib_yes
+        cmp     al, 9
+        je      .ib_yes
+        xor     eax, eax
+        mov     esp, ebp
+        pop     ebp
+        ret
+.ib_yes:
+        mov     eax, 1
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; isgraph(c): printable AND not space. ASCII '!' through '~'.
+_isgraph:
+        push    ebp
+        mov     ebp, esp
+        movzx   eax, byte [ebp + 8]
+        cmp     al, 0x21
+        jb      .ig_no
+        cmp     al, 0x7E
+        ja      .ig_no
+        mov     eax, 1
+        mov     esp, ebp
+        pop     ebp
+        ret
+.ig_no:
+        xor     eax, eax
+        mov     esp, ebp
+        pop     ebp
+        ret
+
 _toupper:
         push    ebp
         mov     ebp, esp
@@ -3060,9 +3099,16 @@ _tmpnam_internal_buf:  resb 32
 _signal_handlers: resd 32
 section .data
 __heap_ptr:     dd __heap
-_stdin:         dd 0
-_stdout:        dd 1
-_stderr:        dd 2
+; Stdin/stdout/stderr use sentinel "magic" fd values (0xF0/0xF1/0xF2)
+; instead of the raw 0/1/2. Why: code like `fp == NULL` (NULL == 0)
+; was matching stdin when stdin was fd 0 — awk's getrec then looped
+; forever after EOF because `infile == stdin` stayed true once
+; `infile = NULL`. With stdin = 0xF0, `NULL != stdin`. The dos_emu
+; INT 21h handlers (AH=0x3F read, AH=0x40 write, AH=0x3E close)
+; translate the magic values back to fd 0/1/2 before doing real I/O.
+_stdin:         dd 0xF0
+_stdout:        dd 0xF1
+_stderr:        dd 0xF2
 _perror_suffix: db ': error', 10
 section .text
 
@@ -3283,16 +3329,43 @@ _raise:
         pop     ebp
         ret
 
-; ---- open / mmap / munmap / mprotect (stubs returning -1) ------------------
-; uc386 runs in a flat-32 DOS environment with no real fs/mmap support.
-; Tests guarded by `if (mmap(...) == MAP_FAILED) skip;` exit cleanly when
-; these stubs return -1.
+; ---- open / mmap / munmap / mprotect ---------------------------------------
+; uc386 runs in a flat-32 DOS environment. mmap/mprotect/munmap remain
+; -1 stubs (no protection model under unicorn). open() and creat()
+; route through dos_emu's AH=0xA0 (POSIX open) handler so they back
+; into the virtual file system.
 _open:
+        push    ebp
+        mov     ebp, esp
+        mov     edx, [ebp + 8]              ; path
+        mov     ecx, [ebp + 12]             ; flags (POSIX)
+        mov     ah, 0xA0
+        int     21h
+        movzx   eax, ax
+        cmp     ax, 0xFFFF
+        jne     .ok
         mov     eax, -1
+.ok:
+        mov     esp, ebp
+        pop     ebp
         ret
 
 _creat:
+        ; creat(path, mode) ≡ open(path, O_WRONLY|O_CREAT|O_TRUNC).
+        ; flags = 1 | 0o100 | 0o1000 = 0x441
+        push    ebp
+        mov     ebp, esp
+        mov     edx, [ebp + 8]
+        mov     ecx, 0x441
+        mov     ah, 0xA0
+        int     21h
+        movzx   eax, ax
+        cmp     ax, 0xFFFF
+        jne     .ok
         mov     eax, -1
+.ok:
+        mov     esp, ebp
+        pop     ebp
         ret
 
 _fcntl:
@@ -3545,3 +3618,947 @@ ___uc386_umod128:
         mov     esp, ebp
         pop     ebp
         ret
+
+; ============================================================================
+; Userland-port helpers: getenv, errno, strerror, strtol, fflush, strdup, atol
+; Added 2026-04-30 to unblock real upstream GNU coreutil ports.
+; ============================================================================
+
+        section .data
+_errno:         dd 0
+_strerror_msg:  db "error", 0
+
+        section .text
+
+; ---- getenv(name) ----------------------------------------------------------
+; dos_emu has no environment table; always return NULL. Programs that
+; treat getenv as "optional override" still work; programs that REQUIRE
+; an env var must be patched.
+_getenv:
+        xor     eax, eax
+        ret
+
+; ---- __errno_location() ----------------------------------------------------
+; Glibc-style accessor. Headers declare `extern int errno;` so direct
+; reads work too — both forms reach _errno.
+___errno_location:
+        mov     eax, _errno
+        ret
+
+; ---- strerror(errnum) ------------------------------------------------------
+; Return a static "error" string. Differentiating per-errno is a future
+; refinement — most callers just print the message and exit.
+_strerror:
+        mov     eax, _strerror_msg
+        ret
+
+; ---- fflush(stream) --------------------------------------------------------
+; dos_emu writes immediately on each putchar / fputc / write — no buffer
+; to flush. Return 0 (success) for any argument.
+_fflush:
+        xor     eax, eax
+        ret
+
+; ---- atol(s) ---------------------------------------------------------------
+; long is 32-bit on i386 flat-32; same parser as atoi.
+_atol:
+        jmp     _atoi
+
+; ---- strtol(nptr, endptr, base) — atoi wrapper -----------------------------
+; Minimal version: calls _atoi (sign + decimal). When endptr is
+; non-null, sets *endptr to nptr + strlen(nptr) (i.e. end-of-string).
+; That's not what C99 specifies (should point past the parsed digits)
+; but it's "consistent garbage" — programs that don't dereference what
+; *endptr points at, just compare *endptr to nptr to detect "no digits
+; consumed", get a wrong but non-crashy answer.
+;
+; Full C99 strtol with base/endptr-after-digits is a future slice;
+; an earlier handwritten version triggered NASM phase-error flap when
+; bundled into BWK awk's ~12K-line asm. The fix is likely "rewrite in
+; C, compile through uc386" — pending.
+_strtol:
+        push    ebp
+        mov     ebp, esp
+        push    edi                         ; preserve EDI (used for endptr)
+        mov     edi, [ebp + 12]             ; edi = endptr
+        push    dword [ebp + 8]
+        call    _atoi
+        add     esp, 4
+        ; If endptr is null, just return.
+        test    edi, edi
+        jz      .ret
+        ; Set *endptr = nptr + strlen(nptr).
+        push    eax                         ; preserve atoi result
+        push    dword [ebp + 8]
+        call    _strlen
+        add     esp, 4
+        mov     edx, [ebp + 8]
+        add     edx, eax
+        mov     [edi], edx
+        pop     eax                         ; restore atoi result
+.ret:
+        pop     edi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- strtoul(nptr, endptr, base) -------------------------------------------
+; Same parser as strtol; signedness only matters at the C type level.
+_strtoul:
+        jmp     _strtol
+
+; ---- strtoll(nptr, endptr, base) -------------------------------------------
+; long long is 64-bit; this implementation truncates to 32 bits. OK for
+; small values (which is the common case in coreutils-style argv parsing).
+; Programs that genuinely need 64-bit parsing must patch around it.
+_strtoll:
+        jmp     _strtol
+
+; ---- strtoull(nptr, endptr, base) ------------------------------------------
+_strtoull:
+        jmp     _strtol
+
+; ---- close(fd) -------------------------------------------------------------
+; close(2) — INT 21h AH=0x3E. Backed by dos_emu's vfile close.
+_close:
+        push    ebp
+        mov     ebp, esp
+        mov     ebx, [ebp + 8]
+        mov     ah, 0x3E
+        int     21h
+        movzx   eax, ax
+        cmp     ax, 0xFFFF
+        jne     .ok
+        mov     eax, -1
+.ok:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- fseek / ftell / rewind / clearerr / feof / ferror (no-op stubs) -------
+; Our FILE* backing isn't seekable — stdin is byte-stream-only and
+; vfiles maintain their own position via fopen mode. Real seekable
+; semantics is a future slice; for now these stubs let programs
+; including <stdio.h> link cleanly.
+_fseek:
+        ; Returns 0 for "success" — many programs use it for non-essential
+        ; seeks (e.g., rewinding before re-reading a config file). The
+        ; actual data-position is unaffected.
+        xor     eax, eax
+        ret
+_ftell:
+        ; Always 0 — programs that depend on this return value are
+        ; broken under our model and would need real seek.
+        xor     eax, eax
+        ret
+_rewind:
+        ret
+_clearerr:
+        ret
+_feof:
+        ; Always 0 (not at EOF) — programs check feof after read; better
+        ; signal is read returning 0 / EOF directly.
+        xor     eax, eax
+        ret
+_ferror:
+        xor     eax, eax
+        ret
+_setbuf:
+        ; setbuf(FILE*, char*) — buffering is a no-op (we write through).
+        ret
+_setvbuf:
+        ; setvbuf(FILE*, char*, int, size_t) — same as above; return 0.
+        xor     eax, eax
+        ret
+
+; ---- strdup(s) -------------------------------------------------------------
+; malloc(strlen(s) + 1) + memcpy. Returns NULL if malloc fails.
+_strdup:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    dword [ebp + 8]
+        call    _strlen
+        add     esp, 4
+        inc     eax                         ; +1 for null terminator
+        mov     ebx, eax
+        push    ebx
+        call    _malloc
+        add     esp, 4
+        test    eax, eax
+        jz      .end
+        push    ebx
+        push    dword [ebp + 8]
+        push    eax
+        call    _memcpy                     ; memcpy returns dst (eax)
+        add     esp, 12
+.end:
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ============================================================================
+; Userland-port helpers part 2: stubs for 24 symbols BWK awk references but
+; doesn't need to fully work (no shell, no real time, no UTF-8 under dos_emu).
+; Added 2026-04-30.
+; ============================================================================
+
+        section .data
+_environ_array: dd 0                        ; empty environment (NULL terminator)
+_locale_C:      db "C", 0
+_environ:       dd _environ_array
+_strerror_buf:  times 32 db 0
+
+        section .text
+
+; ---- shell-related: popen / pclose / system — all stubbed -------------------
+; dos_emu has no fork/exec. popen returns NULL; pclose / system return -1.
+_popen:
+        xor     eax, eax
+        ret
+_pclose:
+        mov     eax, -1
+        ret
+_system:
+        mov     eax, -1
+        ret
+
+; ---- setlocale(category, locale): always return "C" -------------------------
+_setlocale:
+        mov     eax, _locale_C
+        ret
+
+; ---- stat / lstat / access: filesystem queries — return -1 (not found) ------
+_stat:
+        mov     eax, -1
+        ret
+_lstat:
+        mov     eax, -1
+        ret
+_access:
+        mov     eax, -1
+        ret
+
+; ---- time / clock: return a counter that increments per call ----------------
+        section .data
+_time_counter:  dd 0
+        section .text
+_time:
+        mov     eax, [_time_counter]
+        inc     dword [_time_counter]
+        ; If t is non-null, write counter there.
+        mov     ecx, [esp + 4]
+        test    ecx, ecx
+        jz      .skip
+        mov     [ecx], eax
+.skip:
+        ret
+_clock:
+        mov     eax, [_time_counter]
+        inc     dword [_time_counter]
+        ret
+
+; ---- ungetc(c, stream): simple one-byte unget --------------------------------
+        section .bss
+_ungetc_buf:    resd 1                      ; -1 = empty, else the byte
+        section .text
+_ungetc:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        mov     [_ungetc_buf], eax
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- mbtowc / wctomb: 1-byte-per-char passthrough (no UTF-8) -----------------
+_mbtowc:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]              ; pwc
+        test    eax, eax
+        jz      .ret_one                    ; pwc==NULL → just probe
+        mov     ecx, [ebp + 12]             ; src
+        test    ecx, ecx
+        jz      .ret_zero                   ; src==NULL → no shift state
+        movzx   edx, byte [ecx]
+        mov     [eax], edx
+        test    edx, edx
+        jz      .ret_zero                   ; null byte → return 0
+        mov     eax, 1
+        mov     esp, ebp
+        pop     ebp
+        ret
+.ret_one:
+        mov     eax, 1
+        mov     esp, ebp
+        pop     ebp
+        ret
+.ret_zero:
+        xor     eax, eax
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+_wctomb:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]              ; s
+        test    eax, eax
+        jz      .ret_zero
+        mov     ecx, [ebp + 12]             ; wc (low byte = char)
+        mov     [eax], cl
+        mov     eax, 1
+        mov     esp, ebp
+        pop     ebp
+        ret
+.ret_zero:
+        xor     eax, eax
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- towlower / towupper: ASCII-only wide-char case mapping ------------------
+_towlower:
+        push    dword [esp + 4]
+        call    _tolower
+        add     esp, 4
+        ret
+_towupper:
+        push    dword [esp + 4]
+        call    _toupper
+        add     esp, 4
+        ret
+
+; ---- strncasecmp: case-insensitive strncmp -----------------------------------
+_strncasecmp:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        push    edi
+        push    ebx
+        mov     esi, [ebp + 8]
+        mov     edi, [ebp + 12]
+        mov     ecx, [ebp + 16]
+.loop:
+        test    ecx, ecx
+        jz      .equal
+        movzx   eax, byte [esi]
+        movzx   ebx, byte [edi]
+        ; Lower-case both (ASCII): if 'A'..'Z' → +0x20
+        cmp     al, 'A'
+        jb      .a_done
+        cmp     al, 'Z'
+        ja      .a_done
+        add     al, 0x20
+.a_done:
+        cmp     bl, 'A'
+        jb      .b_done
+        cmp     bl, 'Z'
+        ja      .b_done
+        add     bl, 0x20
+.b_done:
+        cmp     al, bl
+        jne     .diff
+        test    al, al
+        jz      .equal
+        inc     esi
+        inc     edi
+        dec     ecx
+        jmp     .loop
+.diff:
+        movzx   eax, al
+        movzx   ebx, bl
+        sub     eax, ebx
+        jmp     .ret
+.equal:
+        xor     eax, eax
+.ret:
+        pop     ebx
+        pop     edi
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- realloc(ptr, size): bump-allocator-friendly version ---------------------
+; If ptr is NULL → malloc(size).
+; Else: malloc a new block of `size`, copy `size` bytes from old (we don't
+; know the old size; copy as much as fits, treating source as opaque).
+; The old block leaks since our free is a no-op; on a 1MB heap this is fine
+; for short-running programs.
+_realloc:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        push    edi
+        push    ebx
+        mov     esi, [ebp + 8]              ; old ptr
+        mov     ebx, [ebp + 12]             ; new size
+        ; If new size is 0, free old and return NULL.
+        test    ebx, ebx
+        jnz     .alloc
+        xor     eax, eax
+        jmp     .ret
+.alloc:
+        push    ebx
+        call    _malloc
+        add     esp, 4
+        test    eax, eax
+        jz      .ret
+        ; If old ptr is NULL, return malloc result directly.
+        test    esi, esi
+        jz      .ret
+        ; Copy at most ebx bytes from esi to eax.
+        ; (We don't know the old size, so this may copy uninitialized
+        ; bytes past the old allocation. Caller's responsibility to
+        ; avoid using uninitialized data.)
+        mov     edi, eax
+        push    eax                         ; preserve return value
+        mov     ecx, ebx
+        cld
+        rep movsb
+        pop     eax
+.ret:
+        pop     ebx
+        pop     edi
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- bsearch(key, base, nmemb, size, compar): linear-search fallback ---------
+; A real bsearch logs(n) using the sorted property. This linear walk is
+; correct (returns the first match) but not asymptotically optimal.
+_bsearch:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        push    edi
+        push    ebx
+        mov     edi, [ebp + 8]              ; key
+        mov     esi, [ebp + 12]             ; base
+        mov     ecx, [ebp + 16]             ; nmemb
+        mov     ebx, [ebp + 20]             ; size
+.loop:
+        test    ecx, ecx
+        jz      .miss
+        ; Call compar(key, current).
+        push    ecx                         ; preserve nmemb
+        push    esi                         ; element ptr (also passed as arg)
+        push    edi                         ; key
+        mov     eax, [ebp + 24]             ; compar
+        call    eax
+        add     esp, 8
+        pop     ecx
+        test    eax, eax
+        jz      .hit
+        add     esi, ebx
+        dec     ecx
+        jmp     .loop
+.hit:
+        mov     eax, esi
+        jmp     .ret
+.miss:
+        xor     eax, eax
+.ret:
+        pop     ebx
+        pop     edi
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- atof / strtod: minimal float parsers ------------------------------------
+; atof(s) ≈ strtod(s, NULL). Both: skip whitespace, optional sign, parse
+; integer + fractional digits, ignore exponent. Result returned in st(0)
+; per cdecl float-return ABI on i386.
+_atof:
+        push    ebp
+        mov     ebp, esp
+        push    dword [ebp + 8]
+        push    0
+        push    dword [ebp + 8]
+        ; stack: nptr (for strtod), endptr (NULL), nptr (for cleanup)
+        ; Actually let me reorganize: just call strtod with endptr=NULL.
+        mov     esp, ebp
+        ; Re-do: cleaner direct call
+        sub     esp, 8
+        mov     eax, [ebp + 8]
+        mov     [esp], eax                  ; nptr
+        mov     dword [esp + 4], 0          ; endptr = NULL
+        call    _strtod
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+_strtod:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        push    ebx
+        mov     esi, [ebp + 8]              ; nptr
+        ; Skip whitespace.
+.ws:
+        movzx   eax, byte [esi]
+        cmp     al, ' '
+        je      .ws_step
+        cmp     al, 9
+        jne     .sign
+.ws_step:
+        inc     esi
+        jmp     .ws
+.sign:
+        xor     ebx, ebx                    ; sign flag
+        cmp     al, '-'
+        jne     .checkpos
+        mov     ebx, 1
+        inc     esi
+        jmp     .integer
+.checkpos:
+        cmp     al, '+'
+        jne     .integer
+        inc     esi
+.integer:
+        ; fpu push 0.0, accumulator on st(0)
+        fldz
+        ; Parse integer digits.
+.intloop:
+        movzx   eax, byte [esi]
+        cmp     al, '0'
+        jb      .frac_check
+        cmp     al, '9'
+        ja      .frac_check
+        sub     al, '0'
+        push    eax
+        fild    dword [esp]                 ; load digit
+        add     esp, 4
+        ; st(0) = digit, st(1) = acc
+        ; acc = acc * 10 + digit
+        fxch    st1
+        push    dword 10
+        fimul   dword [esp]
+        add     esp, 4
+        faddp   st1, st0
+        inc     esi
+        jmp     .intloop
+.frac_check:
+        cmp     al, '.'
+        jne     .done_frac
+        inc     esi
+        ; Parse fractional digits.
+        push    dword 10
+        fild    dword [esp]                 ; divisor accumulator = 10.0
+        add     esp, 4
+.fracloop:
+        movzx   eax, byte [esi]
+        cmp     al, '0'
+        jb      .pop_div
+        cmp     al, '9'
+        ja      .pop_div
+        sub     al, '0'
+        push    eax
+        fild    dword [esp]
+        add     esp, 4
+        ; st(0) = digit, st(1) = divisor, st(2) = acc
+        fdiv    st0, st1
+        ; st(0) = digit/divisor
+        ; acc += digit/divisor
+        faddp   st2, st0
+        ; divisor *= 10
+        push    dword 10
+        fimul   dword [esp]
+        add     esp, 4
+        inc     esi
+        jmp     .fracloop
+.pop_div:
+        ; pop the divisor, leave acc on st(0)
+        fstp    st0
+.done_frac:
+        ; Skip exponent if present (we don't support, but consume so endptr
+        ; — and APPLIES it numerically: build exp_value as int10, set a
+        ; sign flag, then multiply / divide st(0) by 10^|exp| at the end.
+        cmp     byte [esi], 'e'
+        je      .read_exp
+        cmp     byte [esi], 'E'
+        jne     .applysign
+.read_exp:
+        inc     esi
+        push    dword 0                     ; [esp]   = exp_value
+        push    dword 0                     ; [esp+4] = exp_neg flag
+        cmp     byte [esi], '+'
+        je      .read_exp_pos
+        cmp     byte [esi], '-'
+        jne     .read_exp_digits
+        mov     dword [esp + 4], 1
+        inc     esi
+        jmp     .read_exp_digits
+.read_exp_pos:
+        inc     esi
+.read_exp_digits:
+        movzx   eax, byte [esi]
+        cmp     al, '0'
+        jb      .apply_exp
+        cmp     al, '9'
+        ja      .apply_exp
+        sub     al, '0'
+        movzx   eax, al
+        ; exp_value = exp_value * 10 + digit
+        mov     ecx, [esp]
+        imul    ecx, ecx, 10
+        add     ecx, eax
+        mov     [esp], ecx
+        inc     esi
+        jmp     .read_exp_digits
+.apply_exp:
+        ; If exp_value is 0, no scaling needed.
+        mov     ecx, [esp]
+        test    ecx, ecx
+        jz      .pop_exp
+        ; Build 10^exp_value on the FPU. We compute 10.0 ** ecx via
+        ; repeated multiplication (small absolute exponents in real
+        ; awk-style numeric data — bigger ones lose precision either
+        ; way without a proper pow10 table).
+        push    dword 10
+        fild    dword [esp]                 ; st(0) = 10.0
+        add     esp, 4
+        fld1                                ; st(0) = 1.0, st(1) = 10.0
+.exp_loop:
+        test    ecx, ecx
+        jz      .exp_done
+        fmul    st0, st1                    ; result *= 10
+        dec     ecx
+        jmp     .exp_loop
+.exp_done:
+        ; st(0) = 10^|exp|, st(1) = 10.0, st(2) = mantissa
+        fstp    st1                         ; drop the 10.0, keep result
+        ; If exp_neg, divide; else multiply.
+        cmp     dword [esp + 4], 0
+        je      .exp_mul
+        fdivp   st1, st0                    ; mantissa /= 10^|exp|
+        jmp     .pop_exp
+.exp_mul:
+        fmulp   st1, st0                    ; mantissa *= 10^|exp|
+.pop_exp:
+        add     esp, 8                      ; drop exp_value + exp_neg
+.applysign:
+        test    ebx, ebx
+        jz      .endptr
+        fchs
+.endptr:
+        mov     ecx, [ebp + 12]
+        test    ecx, ecx
+        jz      .done
+        mov     [ecx], esi
+.done:
+        pop     ebx
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- atan2 / exp / log / modf / isinf / isnan / signbit ----------------------
+; FPU-backed math functions. atan2 / log / exp use 80387 instructions.
+_atan2:
+        push    ebp
+        mov     ebp, esp
+        fld     qword [ebp + 8]             ; y
+        fld     qword [ebp + 16]            ; x
+        fpatan                              ; st(0) = atan2(y, x); st(1) was y
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+_exp:
+        push    ebp
+        mov     ebp, esp
+        fld     qword [ebp + 8]             ; x
+        ; e^x = 2^(x * log2(e))
+        fldl2e                              ; st(0) = log2(e), st(1) = x
+        fmulp   st1, st0                    ; st(0) = x * log2(e)
+        fld     st0                         ; duplicate
+        frndint
+        fxch    st1
+        fsub    st0, st1                    ; fractional part
+        f2xm1                               ; 2^frac - 1
+        fld1
+        faddp   st1, st0                    ; 2^frac
+        fscale                              ; multiply by 2^int
+        fstp    st1                         ; pop the integer-part copy
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+_log:
+        push    ebp
+        mov     ebp, esp
+        fldln2                              ; ln(2)
+        fld     qword [ebp + 8]             ; x
+        fyl2x                               ; ln(2) * log2(x) = ln(x)
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+_modf:
+        push    ebp
+        mov     ebp, esp
+        fld     qword [ebp + 8]             ; x
+        fld     st0                         ; duplicate
+        ; Round toward zero (truncate)
+        sub     esp, 4
+        fnstcw  [ebp - 2]
+        mov     ax, [ebp - 2]
+        and     ax, 0xF3FF
+        or      ax, 0x0C00                  ; truncate
+        mov     [ebp - 4], ax
+        fldcw   [ebp - 4]
+        frndint
+        fldcw   [ebp - 2]
+        add     esp, 4
+        ; st(0) = trunc(x), st(1) = x
+        ; *iptr = trunc(x)
+        mov     ecx, [ebp + 16]
+        fst     qword [ecx]
+        ; Result = x - trunc(x)
+        fsubp   st1, st0
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; isinf(x): 1 if +inf, -1 if -inf, 0 otherwise.
+_isinf:
+        push    ebp
+        mov     ebp, esp
+        ; Read raw double bytes
+        mov     eax, [ebp + 8]              ; lo
+        mov     edx, [ebp + 12]             ; hi
+        ; Inf: exponent = all 1s, mantissa = 0
+        mov     ecx, edx
+        and     ecx, 0x7FF00000             ; mask exponent
+        cmp     ecx, 0x7FF00000
+        jne     .not_inf
+        mov     ecx, edx
+        and     ecx, 0x000FFFFF
+        or      ecx, eax
+        jnz     .not_inf
+        ; It's inf — sign in high bit of edx
+        test    edx, edx
+        js      .neg_inf
+        mov     eax, 1
+        mov     esp, ebp
+        pop     ebp
+        ret
+.neg_inf:
+        mov     eax, -1
+        mov     esp, ebp
+        pop     ebp
+        ret
+.not_inf:
+        xor     eax, eax
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; isnan(x): 1 if NaN, else 0.
+_isnan:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]              ; lo
+        mov     edx, [ebp + 12]             ; hi
+        ; NaN: exponent = all 1s, mantissa != 0
+        mov     ecx, edx
+        and     ecx, 0x7FF00000
+        cmp     ecx, 0x7FF00000
+        jne     .not_nan
+        mov     ecx, edx
+        and     ecx, 0x000FFFFF
+        or      ecx, eax
+        jz      .not_nan
+        mov     eax, 1
+        mov     esp, ebp
+        pop     ebp
+        ret
+.not_nan:
+        xor     eax, eax
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; signbit(x): 1 if negative, else 0.
+_signbit:
+        mov     eax, [esp + 8]              ; high dword
+        shr     eax, 31
+        ret
+
+; ---- random / srandom: linear congruential RNG -------------------------------
+; awk uses these for `rand` / `srand`. We don't need cryptographic strength;
+; a simple LCG suffices.
+        section .data
+_random_seed:   dd 1
+        section .text
+_srandom:
+        mov     eax, [esp + 4]
+        mov     [_random_seed], eax
+        ret
+_random:
+        ; LCG: x = x * 1103515245 + 12345 (the classic glibc parameters)
+        mov     eax, [_random_seed]
+        imul    eax, eax, 1103515245
+        add     eax, 12345
+        mov     [_random_seed], eax
+        ; Mask top bit so result fits in signed 32-bit positive range.
+        and     eax, 0x7FFFFFFF
+        ret
+_rand:                                      ; alias
+        jmp     _random
+_srand:                                     ; alias
+        jmp     _srandom
+
+; ---- fileno(stream): given FILE*, return underlying fd ----------------------
+; FILE* in our libc is just an int handle stored as the pointer value.
+; The standard FILE struct has the fd at a known offset. For our minimal
+; stdio (where stdin=0, stdout=1, stderr=2 as plain FILE* values), the
+; fileno is the FILE* value cast to int.
+_fileno:
+        mov     eax, [esp + 4]              ; stream
+        ret
+
+; ---- getline(lineptr, n, stream) — POSIX dynamic-buffer line read -----------
+; lineptr / n point at caller-managed buffer pointer + size. If *lineptr
+; is NULL or *n is 0, allocate. Read until '\n' or EOF, growing the
+; buffer (doubling) as needed. Returns the number of bytes read
+; (including the '\n') or -1 on EOF/error.
+;
+; This is a hot path for ported text utilities (sbase head/tail, awk
+; alternatives). Implemented to keep the buffer growable across calls.
+        section .data
+_getline_initial: dd 128
+        section .text
+_getline:
+        push    ebp
+        mov     ebp, esp
+        push    esi                         ; lineptr
+        push    edi                         ; n
+        push    ebx                         ; stream
+        mov     esi, [ebp + 8]
+        mov     edi, [ebp + 12]
+        mov     ebx, [ebp + 16]
+        ; If *lineptr is NULL OR *n is 0, allocate initial buffer.
+        mov     ecx, [esi]
+        test    ecx, ecx
+        jnz     .check_n
+        push    dword [_getline_initial]
+        call    _malloc
+        add     esp, 4
+        test    eax, eax
+        jz      .err
+        mov     [esi], eax
+        mov     ecx, [_getline_initial]
+        mov     [edi], ecx
+        jmp     .read_loop
+.check_n:
+        mov     ecx, [edi]
+        test    ecx, ecx
+        jnz     .read_loop
+        push    dword [_getline_initial]
+        call    _malloc
+        add     esp, 4
+        test    eax, eax
+        jz      .err
+        mov     [esi], eax
+        mov     ecx, [_getline_initial]
+        mov     [edi], ecx
+.read_loop:
+        ; Loop: read a byte from stream, store in buffer, grow if needed,
+        ; stop on '\n' or EOF.
+        sub     esp, 4                      ; bytes_read counter on stack
+        mov     dword [esp], 0
+.loop:
+        push    ebx
+        call    _fgetc
+        add     esp, 4
+        cmp     eax, -1
+        je      .check_eof
+        ; Got a byte. Ensure buffer has room for it + null terminator.
+        mov     ecx, [esp]                  ; bytes_read
+        mov     edx, [edi]                  ; buffer size
+        ; If bytes_read + 1 >= bufsize, double the buffer.
+        lea     edx, [ecx + 2]              ; need bytes + null
+        cmp     edx, [edi]
+        jbe     .store
+        ; Realloc to 2x current size.
+        mov     edx, [edi]
+        shl     edx, 1
+        push    edx
+        push    dword [esi]
+        call    _realloc
+        add     esp, 8
+        test    eax, eax
+        jz      .err_pop
+        mov     [esi], eax
+        mov     edx, [edi]
+        shl     edx, 1
+        mov     [edi], edx
+.store:
+        mov     ecx, [esp]
+        mov     edx, [esi]
+        mov     [edx + ecx], al
+        inc     ecx
+        mov     [esp], ecx
+        cmp     al, 10                      ; '\n'
+        je      .end
+        jmp     .loop
+.check_eof:
+        ; EOF. If we read nothing, return -1; else terminate and return.
+        mov     ecx, [esp]
+        test    ecx, ecx
+        jz      .err_pop
+.end:
+        ; Null-terminate.
+        mov     ecx, [esp]
+        mov     edx, [esi]
+        mov     byte [edx + ecx], 0
+        ; Return bytes_read.
+        mov     eax, ecx
+        add     esp, 4
+        pop     ebx
+        pop     edi
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+.err_pop:
+        add     esp, 4
+.err:
+        mov     eax, -1
+        pop     ebx
+        pop     edi
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- atan / atanh / acos / asin / sinh / cosh / tanh / log10 / log2 ---------
+; A handful of math functions awk's math header pulls in via `<math.h>`.
+; All FPU-backed.
+_atan:
+        push    ebp
+        mov     ebp, esp
+        fld1
+        fld     qword [ebp + 8]
+        fpatan
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+_log10:
+        push    ebp
+        mov     ebp, esp
+        fldlg2                              ; log10(2)
+        fld     qword [ebp + 8]
+        fyl2x                               ; log10(2) * log2(x) = log10(x)
+        mov     esp, ebp
+        pop     ebp
+        ret
+

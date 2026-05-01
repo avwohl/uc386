@@ -52,11 +52,14 @@ except ImportError:
 # Memory layout
 #   0x00000000 .. 0x00800000   code/data (8 MB) — the loaded binary lives here
 #   0x00800000 .. 0x01000000   heap (8 MB, growable in principle)
+#   0x00F00000 .. 0x00F01000   argv area (4 KB)
 #   0x01000000 .. 0x01100000   stack (1 MB, top at 0x010FFFF0)
 CODE_BASE = 0x00000000
 CODE_SIZE = 0x00800000
 HEAP_BASE = 0x00800000
 HEAP_SIZE = 0x00800000
+ARGV_BASE = 0x00F00000
+ARGV_SIZE = 0x00001000
 STACK_BASE = 0x01000000
 STACK_SIZE = 0x00100000
 STACK_TOP = STACK_BASE + STACK_SIZE - 16
@@ -92,8 +95,14 @@ def run(
     instruction_limit: int = 50_000_000,
     stdin_bytes: bytes = b"",
     argv: list[str] | None = None,
+    vfiles_init: dict[bytes, bytes] | None = None,
 ) -> Result:
-    """Emulate a flat-binary i386 program; return its stdout + exit code."""
+    """Emulate a flat-binary i386 program; return its stdout + exit code.
+
+    `vfiles_init` seeds the virtual file system with named files
+    visible to fopen("name", "r"). Pass `{b"data.txt": b"hello\n"}`
+    so a program can open and read `data.txt`.
+    """
     if not _UNICORN_AVAILABLE:
         raise RuntimeError(
             "dos_emu.run() requires the `unicorn` package. "
@@ -104,10 +113,33 @@ def run(
 
     mu = Uc(UC_ARCH_X86, UC_MODE_32)
     mu.mem_map(CODE_BASE, CODE_SIZE)
+    mu.mem_map(ARGV_BASE, ARGV_SIZE)
     mu.mem_map(STACK_BASE, STACK_SIZE)
 
     # Load the program at address 0 (matches NASM `-f bin` default org 0).
     mu.mem_write(CODE_BASE, binary)
+
+    # Build argv: a contiguous region with [argc+1 dwords of pointers]
+    # followed by the null-terminated argv strings. argc lands in EAX
+    # and the address of the pointer array lands in EBX before _start
+    # runs; codegen's _start_stub pushes both onto the stack before
+    # calling _main so cdecl `int main(int argc, char **argv)` sees
+    # them at [ebp+8] / [ebp+12].
+    if argv is None:
+        argv = ["program"]
+    argc = len(argv)
+    ptr_array_bytes = 4 * (argc + 1)
+    abuf = bytearray(ARGV_SIZE)
+    cursor = ptr_array_bytes
+    for i, arg in enumerate(argv):
+        s = arg.encode("utf-8") + b"\x00"
+        abuf[i * 4:(i + 1) * 4] = struct.pack("<I", ARGV_BASE + cursor)
+        abuf[cursor:cursor + len(s)] = s
+        cursor += len(s)
+    # Final null pointer terminator already 0 from bytearray init.
+    if cursor > ARGV_SIZE:
+        return Result(error=f"argv too large: {cursor} > {ARGV_SIZE}")
+    mu.mem_write(ARGV_BASE, bytes(abuf))
 
     # Initialize stack near the top of the stack region. Push a fake return
     # address (0xFFFFFFFF) so `ret` from the entry function ends up at an
@@ -117,6 +149,8 @@ def run(
     esp = STACK_TOP
     mu.reg_write(UC_X86_REG_ESP, esp)
     mu.reg_write(UC_X86_REG_EBP, esp)
+    mu.reg_write(UC_X86_REG_EAX, argc)
+    mu.reg_write(UC_X86_REG_EBX, ARGV_BASE)
 
     res = Result()
     stdin_pos = [0]
@@ -127,8 +161,12 @@ def run(
     signal_handlers: dict[int, int] = {}
     # Virtual file system: name → bytearray. Persists for the lifetime
     # of the run, so a `fopen` for read after a `fopen`+`fclose` for
-    # write returns the previously-written bytes.
+    # write returns the previously-written bytes. Caller can seed the
+    # vfs via `vfiles_init` so the program can fopen pre-existing files.
     vfiles: dict[bytes, bytearray] = {}
+    if vfiles_init:
+        for name, content in vfiles_init.items():
+            vfiles[name] = bytearray(content)
     # Open-file table: fd → {"name": bytes, "pos": int, "mode": str}.
     # Modes: "r" (read), "w" (write/truncate), "a" (append).
     vfd_table: dict[int, dict] = {}
@@ -587,6 +625,10 @@ def run(
             fmt = _read_cstr_local(ecx)
             formatted = _printf_format(fmt, edx)
             fd = ebx & 0xFFFFFFFF
+            # Translate stdin/stdout/stderr magic FILE* sentinels.
+            if fd == 0xF0: fd = 0
+            elif fd == 0xF1: fd = 1
+            elif fd == 0xF2: fd = 2
             if fd == 2:
                 _write_stderr(formatted)
             elif fd == 1:
@@ -652,6 +694,11 @@ def run(
             edx = uc.reg_read(UC_X86_REG_EDX)
             count = ecx & 0xFFFF  # spec is 16-bit count, but tolerate larger
             fd = ebx & 0xFFFF
+            # Translate stdin/stdout/stderr magic FILE* sentinels (libc
+            # uses 0xF0 / 0xF1 / 0xF2 so they don't compare-equal to NULL).
+            if fd == 0xF0: fd = 0
+            elif fd == 0xF1: fd = 1
+            elif fd == 0xF2: fd = 2
             if fd == 1:
                 data = bytes(uc.mem_read(edx, count))
                 _write_stdout(data)
@@ -677,6 +724,10 @@ def run(
             edx = uc.reg_read(UC_X86_REG_EDX)
             count = ecx & 0xFFFF
             fd = ebx & 0xFFFF
+            # Translate stdin/stdout/stderr magic FILE* sentinels.
+            if fd == 0xF0: fd = 0
+            elif fd == 0xF1: fd = 1
+            elif fd == 0xF2: fd = 2
             if fd == 0:
                 start = stdin_pos[0]
                 end = min(start + count, len(stdin_bytes))
@@ -721,6 +772,11 @@ def run(
             # close(fd): BX=fd. Returns 0 on success.
             ebx = uc.reg_read(UC_X86_REG_EBX)
             fd = ebx & 0xFFFFFFFF
+            # Standard streams: closing them is a no-op (success).
+            if fd in (0xF0, 0xF1, 0xF2, 0, 1, 2):
+                new_eax = (eax & ~0xFFFFFFFF) | 0
+                uc.reg_write(UC_X86_REG_EAX, new_eax)
+                return
             rc = _vfile_close(fd)
             new_eax = (eax & ~0xFFFFFFFF) | (rc & 0xFFFFFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
@@ -752,6 +808,38 @@ def run(
             prev = signal_handlers.get(signum, 0)
             signal_handlers[signum] = ebx
             new_eax = (eax & ~0xFFFFFFFF) | (prev & 0xFFFFFFFF)
+            uc.reg_write(UC_X86_REG_EAX, new_eax)
+            return
+        if ah == 0xA0:
+            # uc386 extension: POSIX open(path, flags). DS:EDX=name,
+            # ECX=POSIX flags. Returns fd in AX, -1 on error.
+            #
+            # The DOS-flavored AH=0x3D handler only takes a 0/1/2 mode
+            # byte (read/write/rdwr) — too restrictive for sbase-style
+            # `open(name, O_WRONLY|O_CREAT|O_APPEND, 0666)`. This handler
+            # consumes the full POSIX flag word and dispatches to the
+            # right vfile mode.
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            ecx = uc.reg_read(UC_X86_REG_ECX)
+            name = bytes(_read_cstr_local(edx))
+            flags = ecx & 0xFFFFFFFF
+            O_WRONLY = 1
+            O_RDWR = 2
+            O_CREAT = 0o100
+            O_TRUNC = 0o1000
+            O_APPEND = 0o2000
+            if flags & O_TRUNC:
+                mode = "w"
+            elif flags & O_APPEND:
+                mode = "a"
+            elif flags & (O_WRONLY | O_RDWR):
+                # Open-for-write without trunc/append: treat as truncate
+                # (real DOS would fail; the simpler semantics is fine).
+                mode = "w"
+            else:
+                mode = "r"
+            fd = _vfile_open(name, mode)
+            new_eax = (eax & ~0xFFFFFFFF) | (fd & 0xFFFFFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
             return
         # Unimplemented — record and exit.
@@ -1034,6 +1122,9 @@ def assemble_and_run(
     instruction_limit: int = 50_000_000,
     bundle_libc: bool = True,
     keep_intermediate: bool = False,
+    stdin_bytes: bytes = b"",
+    argv: list[str] | None = None,
+    vfiles_init: dict[bytes, bytes] | None = None,
 ) -> Result:
     """Convenience: optionally bundle libc, nasm-assemble (-f bin), and run.
 
@@ -1055,11 +1146,19 @@ def assemble_and_run(
         bin_path,
         timeout_seconds=timeout_seconds,
         instruction_limit=instruction_limit,
+        stdin_bytes=stdin_bytes,
+        argv=argv,
+        vfiles_init=vfiles_init,
     )
     if not keep_intermediate:
         try:
             bin_path.unlink()
-            if bundle_libc:
+            # Only delete the bundled asm if we created it (i.e.,
+            # it's distinct from the caller's input). When the input
+            # is already-bundled, `bundle_user_asm` returns the input
+            # path unchanged — deleting that would clobber the caller's
+            # source-of-truth asm file.
+            if bundle_libc and asm_to_assemble != asm_path:
                 asm_to_assemble.unlink()
         except FileNotFoundError:
             pass

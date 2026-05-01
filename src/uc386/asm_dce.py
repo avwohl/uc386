@@ -130,8 +130,31 @@ class ParsedAsm:
     def emit(self, reachable: set[str]) -> str:
         """Produce asm text containing only reachable functions and
         data labels."""
+        # Names referenced from anything we're emitting — used to
+        # decide which `extern _name` declarations to keep. Includes
+        # `reachable` itself (a fn may be both defined and self-ref'd
+        # in deps) plus the union of deps of every reachable item.
+        referenced: set[str] = set(reachable)
+        for name in reachable:
+            if name in self.functions:
+                referenced.update(self.functions[name].deps)
+            elif name in self.data_labels:
+                referenced.update(self.data_labels[name].deps)
+
         out: list[str] = []
-        out.extend(self.header)
+        # Filter `extern _name` lines: keep only those referenced from
+        # something we're actually emitting. Without this, declarations
+        # pulled in by header transitive includes (math.h declares
+        # ~150 extern functions; awk uses 4) bloat the asm and trip
+        # nasm's `-f bin` "binary output format does not support external
+        # references" because the bundled libc doesn't define them.
+        for line in self.header:
+            stripped = line.strip()
+            if stripped.startswith("extern "):
+                name = stripped[7:].strip().rstrip(",")
+                if name not in referenced:
+                    continue
+            out.append(line)
         for name, fn in self.functions.items():
             if name in reachable:
                 out.extend(fn.source)
