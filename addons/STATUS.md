@@ -160,16 +160,19 @@ Open Watcom V2 has no macOS build. The upstream Linux x64
 "installer" is actually an ELF stub appended to a regular ZIP
 archive — the release workflow `unzip -d`s it directly, avoiding
 the FPE the installer otherwise triggers under unattended install.
-Watcom column populates on every release run for 6 of 13 addons
-(echo / false / true / yes / wc / open_test) — sample row:
+Watcom column populates on every release run for **all 13 addons**
+(once we converted period sources to C89-compat decl placement and
+added `-ze` to wcc386). Full comparison row sample:
 
 ```
 | true | 14 | 15,776 | 5,494 | 147,898 |
 ```
 
-The remaining 7 addons trip Watcom-specific compile errors
-(E1063 etc.) — fixable with source-side adjustments but not
-required for the comparison-table demonstration.
+uc386 is **390× smaller than Watcom** for `true`, **1,127×
+smaller than gcc**, and **10,564× smaller than DJGPP**. Watcom
+runs ~2-4× wider than uc386 across the rest of the table because
+DOS/4GW carries its own protected-mode startup; uc386 emits flat
+real-mode-32 binaries that dos_emu loads directly.
 
 ## Summary (2026-04-30, end of session)
 
