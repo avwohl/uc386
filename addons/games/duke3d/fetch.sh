@@ -17,14 +17,22 @@ if [ -d upstream/jfbuild/include ]; then
 fi
 
 URL="https://github.com/jonof/jfduke3d.git"
+# Pinned upstream commit (parent jfduke3d only — submodules pin via
+# whatever they're recorded at on this commit). Bump with
+# `git ls-remote https://github.com/jonof/jfduke3d HEAD`.
+SHA="55c5f9592d2a78e427a2bbdb13ce3c4c9ccf6f04"  # 2026-01-02
 
 if [ -d upstream ]; then
     echo "duke3d: upstream/ exists but submodules empty; re-cloning."
     rm -rf upstream
 fi
 
-echo "duke3d: cloning $URL with submodules …"
-git clone --depth=1 --recurse-submodules --shallow-submodules "$URL" upstream
+echo "duke3d: cloning $URL @ $SHA with submodules …"
+# --depth=1 only fetches HEAD, so we can't checkout an older SHA from
+# a depth-1 clone. Use a full clone here; jfduke3d is small (a few MB).
+git clone --recurse-submodules "$URL" upstream
+( cd upstream && git checkout "$SHA" && \
+  git submodule update --init --recursive )
 
 # Patch: menues.c uses a block-scope `static const char *s[]` in
 # `case 8` that uc386's flat function-scope can't disambiguate from

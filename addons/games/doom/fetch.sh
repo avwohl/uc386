@@ -11,7 +11,12 @@ if [ -d upstream ]; then
     exit 0
 fi
 
-URL="https://github.com/id-Software/DOOM/archive/refs/heads/master.tar.gz"
+# Pinned to a specific upstream commit so the source we ship in the
+# games tarball alongside doom.bin always matches the binary. id's
+# repo is essentially frozen (last commit 2024-01) so this pin will
+# rarely move. Bump with `git ls-remote https://github.com/id-Software/DOOM HEAD`.
+SHA="a77dfb96cb91780ca334d0d4cfd86957558007e0"  # 2024-01-16
+URL="https://github.com/id-Software/DOOM/archive/${SHA}.tar.gz"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

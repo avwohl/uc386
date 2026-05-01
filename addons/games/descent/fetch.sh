@@ -15,7 +15,10 @@ if [ -d upstream ]; then
     exit 0
 fi
 
-URL="https://github.com/dxx-rebirth/dxx-rebirth/archive/refs/heads/master.tar.gz"
+# Pinned upstream commit. Bump with
+# `git ls-remote https://github.com/dxx-rebirth/dxx-rebirth HEAD`.
+SHA="b749eadb4080f596ce90ef7b2be97d7c1213567f"  # 2026-04-12
+URL="https://github.com/dxx-rebirth/dxx-rebirth/archive/${SHA}.tar.gz"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

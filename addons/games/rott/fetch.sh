@@ -10,7 +10,11 @@ if [ -d upstream ]; then
     exit 0
 fi
 
-URL="https://github.com/videogamepreservation/rott/archive/refs/heads/master.tar.gz"
+# Pinned upstream commit. The rott repo is essentially frozen
+# (last commit 2018-10) so this pin will rarely move. Bump with
+# `git ls-remote https://github.com/videogamepreservation/rott HEAD`.
+SHA="6ab87f2e96d7b57ce81fe0ccfcae2c2ad48ff7e4"  # 2018-10-13
+URL="https://github.com/videogamepreservation/rott/archive/${SHA}.tar.gz"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

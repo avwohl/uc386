@@ -12,7 +12,10 @@ if [ -d upstream ]; then
     exit 0
 fi
 
-URL="https://github.com/chocolate-doom/chocolate-doom/archive/refs/heads/master.tar.gz"
+# Pinned upstream commit. Bump by replacing the SHA below with
+# `git ls-remote https://github.com/chocolate-doom/chocolate-doom HEAD`.
+SHA="9e731e2b2b03d361a477f4c0ce4da830c1a71312"  # 2026-04-29
+URL="https://github.com/chocolate-doom/chocolate-doom/archive/${SHA}.tar.gz"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
