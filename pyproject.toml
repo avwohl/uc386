@@ -46,3 +46,13 @@ dev = [
     "pytest>=7.0",
     "pytest-cov",
 ]
+
+[tool.pytest.ini_options]
+# Avoid pytest descending into upstream/ trees of fetched addons —
+# they're not our code and they routinely import differently than
+# pytest expects (e.g. `raise SystemExit` at module top level for
+# unsupported targets). Our own test files all live outside upstream/.
+norecursedirs = [
+    "*/upstream/*", "upstream", "*/upstream", ".venv", "build", "dist",
+    "__pycache__", ".git", ".pytest_cache",
+]

@@ -13,6 +13,14 @@ optimization) lives in [uc_core](https://github.com/avwohl/uc_core);
 this repo owns the driver, the x86-32 NASM emitter, and the DOS
 runtime bindings. See `CLAUDE.md` for the per-slice development log.
 
+**Highlights**: DOOM boots end-to-end through uc386 → NASM → dos_emu
+(hits W_InitFiles, exits at WAD-not-found as expected; smoke-tested
+via `addons/games/doom/test_doom_smoke.py`). MicroPython REPL boots
+to its prompt — `addons/gnu/micropython/build_port.sh` produces a
+170 KB i386 DOS binary that runs `pass`, empty lines, and Ctrl-D
+exit cleanly under dos_emu (`addons/gnu/micropython/test_micropython_smoke.py`).
+See `addons/STATUS.md` for the full per-addon report.
+
 ## Goal
 
 Compile representative public-source DOS games **unmodified**:
