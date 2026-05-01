@@ -17,6 +17,10 @@ on:
 jobs:
   build-release:
     runs-on: ubuntu-latest
+    # softprops/action-gh-release needs `contents: write` to create
+    # the release; default GITHUB_TOKEN is read-only since 2023.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v6
 
