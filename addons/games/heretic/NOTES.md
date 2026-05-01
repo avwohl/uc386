@@ -17,10 +17,13 @@ builds, these are mostly recompiles + per-game asset paths.
 `fetch.sh` works (pulls chocolate-doom which carries both Heretic and
 Hexen). `build.sh` is a per-file triage harness like the other games'.
 
-`uc386_config/` carries three hand-written shims:
-- `config.h` — autotools stand-in (PACKAGE_NAME, HAVE_DECL_*, etc.)
+`uc386_config/` carries four hand-written shims:
+- `config.h` — autotools stand-in (PACKAGE_NAME, HAVE_DECL_*,
+  PROGRAM_PREFIX, etc.)
 - `SDL_endian.h` — identity LE byte-swaps (uc386 is little-endian)
-- `SDL.h` — minimal opaque types so SDL_Event*-typed APIs parse
+- `SDL.h` — opaque SDL_Event/Window/Renderer/Surface types + a
+  subset of constants
+- `SDL_gamecontroller.h` — opaque controller / joystick types
 
 **ALL 47 of 47 src/heretic/*.c sources compile cleanly** through
 uc386 once `--include-file stdarg.h` is passed (chocolate-doom's
