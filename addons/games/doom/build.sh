@@ -23,7 +23,7 @@ INCLUDE="$REPO/lib/include"
 # level shims (i_video / i_sound replacement), but the upstream files
 # themselves don't compile under uc386.
 EXCLUDE_RX='/(i_net|i_sound|i_video|i_system)\.c$'
-SOURCES="$(find upstream/linuxdoom-1.10 -name '*.c' | grep -Ev "$EXCLUDE_RX" | sort)"
+SOURCES="$(find upstream/linuxdoom-1.10 -name '*.c' | grep -Ev "$EXCLUDE_RX" | sort) stubs.c"
 OUT="$(pwd)/build/doom.asm"
 mkdir -p "$(dirname "$OUT")"
 
@@ -39,5 +39,11 @@ echo "doom: compiling $(echo "$SOURCES" | wc -l) sources …"
 
 echo "doom: wrote $OUT"
 echo "doom: assembling via nasm …"
-nasm -f bin "$OUT" -o "${OUT%.asm}.bin"
+# `-w-error=label-redef-late`: large programs (DOOM is 60K+ lines of
+# generated asm) hit NASM's multi-pass convergence corner cases —
+# short-vs-long jump promotion can shift labels between passes. NASM
+# 3.x makes this an error by default; we want the warning, not the
+# fail. The binary's still correct after convergence.
+nasm -f bin -w-error=label-redef-late "$OUT" -o "${OUT%.asm}.bin"
 echo "doom: built ${OUT%.asm}.bin"
+ls -lh "${OUT%.asm}.bin"

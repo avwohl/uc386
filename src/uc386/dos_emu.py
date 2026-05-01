@@ -197,6 +197,25 @@ def run(
             return 0
         return -1
 
+    def _vfile_seek(fd: int, off: int, whence: int) -> int:
+        """lseek(2) — backs INT 21h AH=0x42. Returns new pos or -1."""
+        e = vfd_table.get(fd)
+        if e is None:
+            return -1
+        buf = vfiles.get(e["name"], bytearray())
+        if whence == 0:
+            new = off
+        elif whence == 1:
+            new = e["pos"] + off
+        elif whence == 2:
+            new = len(buf) + off
+        else:
+            return -1
+        if new < 0:
+            return -1
+        e["pos"] = new
+        return new
+
     def _vfile_read(fd: int, addr: int, count: int) -> int:
         e = vfd_table.get(fd)
         if e is None or e["mode"] not in ("r",):
@@ -788,6 +807,37 @@ def run(
             rc = _vfile_delete(name)
             new_eax = (eax & ~0xFFFFFFFF) | (rc & 0xFFFFFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
+            return
+        if ah == 0x42:
+            # lseek(fd, off, whence): BX=fd, CX:DX=offset, AL=whence.
+            # Real DOS returns DX:AX=new pos / CF on error. The libc
+            # asm packs DX:AX -> EAX so we only need to put the new
+            # position in EAX (split into AX-low + DX-high). On error
+            # we leave CF set and AX=-1.
+            ebx = uc.reg_read(UC_X86_REG_EBX)
+            ecx = uc.reg_read(UC_X86_REG_ECX)
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            fd = ebx & 0xFFFF
+            off = ((ecx & 0xFFFF) << 16) | (edx & 0xFFFF)
+            # Sign-extend 32-bit offset.
+            if off & 0x80000000:
+                off -= 0x100000000
+            whence = al
+            new_pos = _vfile_seek(fd, off, whence)
+            if new_pos < 0:
+                # Error: set CF in EFLAGS, AX=-1.
+                eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
+                new_eax = (eax & ~0xFFFF) | 0xFFFF
+                uc.reg_write(UC_X86_REG_EAX, new_eax)
+                return
+            # Clear CF, return DX:AX = new_pos.
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
+            new_eax = (eax & ~0xFFFF) | (new_pos & 0xFFFF)
+            uc.reg_write(UC_X86_REG_EAX, new_eax)
+            new_edx = (edx & ~0xFFFF) | ((new_pos >> 16) & 0xFFFF)
+            uc.reg_write(UC_X86_REG_EDX, new_edx)
             return
         if ah == 0x5A:
             # tmpnam: DS:EDX=buf (output). Writes a unique name. Returns

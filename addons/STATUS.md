@@ -101,11 +101,20 @@ not the DOS tree). Compile-time blockers cleared 2026-04-30:
    inside UnaryOp~~ uc_core optimizer now avoids any subtree with a
    FloatLiteral / float-Cast.
 
-**All 58 doom sources now lower to a single 76 K-line .asm.** What's
-left is *runtime glue*, not compiler work: stubs for ~30 `_I_*`
-platform functions (`I_GetTime`, `I_Error`, `I_InitGraphics`, …) plus
-a couple of libc additions (`fstat`, `mkdir`, `sscanf` variadic).
-Documented in `addons/games/doom/NOTES.md`.
+**DOOM boots under dos_emu** (as of 2026-04-30):
+
+- 58 doom sources + `stubs.c` → 2 MB .asm → 301 KB flat .bin
+- Boot reaches `W_InitFiles` (one INT past `Z_Init`); exits with
+  "no files found" because we don't ship a WAD
+- Provide a WAD via `vfiles_init` and DOOM should proceed into
+  `R_Init` and the title-screen tic loop (subject to: video framebuffer
+  capture in `I_FinishUpdate`, input pump in `I_StartTic`)
+
+`addons/games/doom/stubs.c` provides the ~30 `_I_*` platform
+functions, plus `fstat` (via `lseek` to SEEK_END/SET — `lseek`
+itself is a new libc-asm + INT 21h AH=0x42 dos_emu addition),
+`mkdir`, `sscanf` (handles `%d %i %x %c`), `strcasecmp`
+(libc asm), and a `getenv` that recognizes HOME/DOOMWADDIR.
 
 **Spirit of the request preserved**: every blocker we close benefits
 ALL period-code ports, not just Doom — these are six general compiler

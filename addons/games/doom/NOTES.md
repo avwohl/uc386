@@ -61,14 +61,34 @@ Blockers cleared so far:
   FloatLiteral). uc_core ast_optimizer now bails on any subtree
   containing a FloatLiteral / float-Cast.
 
-Status: all 58 sources compile end-to-end through uc386 to a single
-76 K-line .asm file. Remaining work to actually run is a
-**doom_stubs.c** file providing definitions for the 30+ `_I_*`
-externs (the platform-specific functions we excluded:
-`I_StartFrame`, `I_GetTime`, `I_Error`, `I_InitGraphics`, etc.) plus
-a couple of libc additions (`fstat`, `mkdir`, `sscanf`,
-`sndserver_filename`/`mb_used` variable stubs).
+Status: **DOOM boots end-to-end under dos_emu.**
 
-Once that exists, NASM produces a single flat `.bin` and the question
-becomes "does it run under dos_emu" — likely a fresh batch of runtime
-issues, but qualitatively different (no longer a compile-time wall).
+Build pipeline (`./build.sh`):
+1. uc386 compiles 58 doom sources + `stubs.c` into a 2 MB .asm
+2. NASM assembles to a 301 KB flat .bin
+3. dos_emu loads + runs the .bin
+
+Boot output as of 2026-04-30:
+
+```
+Game mode indeterminate.
+                 Public DOOM - v1.10
+V_Init: allocate screens.
+M_LoadDefaults: Load system defaults.
+Z_Init: Init zone memory allocation daemon.
+W_Init: Init WADfiles.
+I_Error: W_InitFiles: no files found
+```
+
+Exit point is `W_InitFiles` (not a uc386 limitation — we just don't
+ship a WAD; we can't, license-wise). With a user-supplied WAD via
+`vfiles_init`, DOOM would proceed into `R_Init` (rendering), then
+`P_Init` (gameplay), then the title-screen tic loop. Reaching the
+title screen requires a video stub that captures the 320x200x8
+framebuffer (currently `I_FinishUpdate` is no-op); reaching gameplay
+also requires the input pump (`I_StartTic` → produce ticcmds).
+
+Compiler-side blockers cleared this session: 6 codegen / optimizer
+fixes (above), 4 new libc headers, `lseek` + `strcasecmp` in libc
+asm + dos_emu INT 21h AH=0x42 handler, and `getenv` recognizing
+HOME / DOOMWADDIR.

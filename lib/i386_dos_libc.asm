@@ -3631,12 +3631,67 @@ _strerror_msg:  db "error", 0
         section .text
 
 ; ---- getenv(name) ----------------------------------------------------------
-; dos_emu has no environment table; always return NULL. Programs that
-; treat getenv as "optional override" still work; programs that REQUIRE
-; an env var must be patched.
+; dos_emu doesn't keep a real environment table — but a handful of
+; period programs (DOOM, Watcom-era games) hard-fail when HOME or
+; DOOMWADDIR aren't set, even if the underlying lookup is just for
+; locating optional config files. We answer those specific lookups
+; with stable string constants pointing at the dos_emu working dir.
+; Anything else still returns NULL.
 _getenv:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        push    edi
+        mov     esi, [ebp + 8]              ; esi = name
+        ; Try each well-known name; fall through to NULL if no match.
+        mov     edi, .name_HOME
+        call    .strcmp
+        test    eax, eax
+        jne     .ret_HOME
+        mov     edi, .name_DOOMWADDIR
+        call    .strcmp
+        test    eax, eax
+        jne     .ret_DOOMWADDIR
         xor     eax, eax
+        jmp     .ret
+.ret_HOME:
+        mov     eax, .val_HOME
+        jmp     .ret
+.ret_DOOMWADDIR:
+        mov     eax, .val_DOOMWADDIR
+.ret:
+        pop     edi
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
         ret
+.strcmp:
+        ; cmp name@esi to literal@edi. EAX = 1 if equal, 0 otherwise.
+        push    esi
+        push    edi
+.strcmp_loop:
+        mov     al, [esi]
+        cmp     al, [edi]
+        jne     .strcmp_diff
+        test    al, al
+        je      .strcmp_eq
+        inc     esi
+        inc     edi
+        jmp     .strcmp_loop
+.strcmp_eq:
+        mov     eax, 1
+        pop     edi
+        pop     esi
+        ret
+.strcmp_diff:
+        xor     eax, eax
+        pop     edi
+        pop     esi
+        ret
+.name_HOME:        db 'HOME', 0
+.name_DOOMWADDIR:  db 'DOOMWADDIR', 0
+.val_HOME:         db '/', 0
+.val_DOOMWADDIR:   db '/', 0
 
 ; ---- __errno_location() ----------------------------------------------------
 ; Glibc-style accessor. Headers declare `extern int errno;` so direct
@@ -3731,6 +3786,81 @@ _close:
         jne     .ok
         mov     eax, -1
 .ok:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- lseek(fd, off, whence) -----------------------------------------------
+; INT 21h AH=0x42 — set file pointer. CX:DX = offset, AL = whence
+; (0=SET / 1=CUR / 2=END). Returns DX:AX = new offset on success, or
+; CF set + AX=error. We pack DX:AX into a single 32-bit EAX result.
+;
+; The dos_emu vfile model represents file position with a 32-bit cursor;
+; the upper 16 bits of the offset (CX) are usually zero for in-tree files
+; but we still pass them through to be honest.
+_lseek:
+        push    ebp
+        mov     ebp, esp
+        mov     ebx, [ebp + 8]              ; fd
+        mov     edx, [ebp + 12]             ; offset (low half)
+        mov     ecx, [ebp + 12]
+        shr     ecx, 16                     ; offset (high half) into CX
+        mov     al,  [ebp + 16]             ; whence (assumes 0/1/2)
+        mov     ah,  0x42
+        int     21h
+        jc      ._err
+        ; Pack DX:AX -> EAX. AX is already low; shift DX into high.
+        and     eax, 0xFFFF
+        shl     edx, 16
+        or      eax, edx
+        jmp     ._done
+._err:
+        mov     eax, -1
+._done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- strcasecmp / strncasecmp ---------------------------------------------
+; Lowercase-fold ASCII A-Z, then compare. Returns 0 / <0 / >0.
+_strcasecmp:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        push    edi
+        mov     esi, [ebp + 8]
+        mov     edi, [ebp + 12]
+.casecmp_loop:
+        movzx   eax, byte [esi]
+        movzx   ecx, byte [edi]
+        ; lowercase eax if 'A'<=al<='Z'
+        cmp     al, 'A'
+        jb      .a_done
+        cmp     al, 'Z'
+        ja      .a_done
+        add     al, 0x20
+.a_done:
+        cmp     cl, 'A'
+        jb      .b_done
+        cmp     cl, 'Z'
+        ja      .b_done
+        add     cl, 0x20
+.b_done:
+        cmp     al, cl
+        jne     .diff
+        test    al, al
+        je      .equal
+        inc     esi
+        inc     edi
+        jmp     .casecmp_loop
+.diff:
+        sub     eax, ecx
+        jmp     .ret
+.equal:
+        xor     eax, eax
+.ret:
+        pop     edi
+        pop     esi
         mov     esp, ebp
         pop     ebp
         ret

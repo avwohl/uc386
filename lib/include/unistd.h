@@ -24,6 +24,13 @@ int close(int fd);
 int unlink(const char *path);
 int access(const char *path, int mode);
 
+/* lseek(2): set file position. Backed by INT 21h AH=0x42 (real,
+ * not stub). off_t is 32-bit on uc386's i386 ABI. */
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+long lseek(int fd, long offset, int whence);
+
 /* No process model under dos_emu — these are stubs. */
 int isatty(int fd);
 char *getcwd(char *buf, size_t size);
