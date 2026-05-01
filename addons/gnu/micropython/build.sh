@@ -80,22 +80,26 @@ if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
         # invented a fresh dynamic qstr for every identifier and
         # LOAD_NAME against the static-init dict_main key (whose qstr
         # id is the static 67) would never match.
-        # `LC_ALL=C sort` — force ASCII collation, NOT locale-aware.
-        # The runtime binary search in qstr_find_strn uses strncmp
-        # (raw byte comparison), so the qstr pool must be sorted by
-        # ASCII byte values. Default `sort` on macOS uses
-        # locale-aware collation that puts `_*` BEFORE uppercase
-        # letters (the opposite of ASCII order, where `_` = 0x5F
-        # comes AFTER `Z` = 0x5A but BEFORE `a` = 0x61). Without
-        # LC_ALL=C, the pool's `is_sorted=true` invariant breaks
-        # and binary search misses every static qstr — the bytecode
-        # compiler then mints a fresh dynamic qstr for each
-        # identifier and LOAD_NAME against the static-init dict
-        # entries (`__name__` etc.) always misses.
+        # gen_qstrdefs.py reverse-mangles each `MP_QSTR_<sanitized>`
+        # macro back to its source string (e.g. `MP_QSTR__0x0a_` →
+        # `"\n"`, `MP_QSTR__lt_stdin_gt_` → `"<stdin>"`) using
+        # upstream's own codepoint2name table for fidelity, then emits
+        # QDEF1 lines sorted by the *original* string in ASCII order.
+        #
+        # Sort key matters: qstr_find_strn does
+        # `strncmp(probe, pool->qstrs[mid], n)` against the 4th QDEF1
+        # field (the un-escaped string). The pool's `is_sorted=true`
+        # invariant therefore requires sort-by-original. Earlier we
+        # used `LC_ALL=C sort -u` over macro names, which coincided
+        # for pure-identifier qstrs (`print`, `__name__`) but broke
+        # for escaped ones — `MP_QSTR__0x0a_` lex-orders near `_`,
+        # while its actual byte (0x0A) would sort first. With the
+        # macro-name-as-payload heuristic, escaped qstrs also rendered
+        # the *macro tail* as their string content, so `print()`'s
+        # trailing `\n` showed up as the literal text `_0x0a_`.
         grep -rhoE "MP_QSTR_[A-Za-z_][A-Za-z0-9_]*" \
                 upstream/py/ upstream/shared/ \
-            | LC_ALL=C sort -u \
-            | awk '{ name = substr($0, 9); print "QDEF1(" $0 ", 0, " length(name) ", \"" name "\")" }'
+            | "$PYTHON" gen_qstrdefs.py
     } > build/genhdr/qstrdefs.generated.h
 fi
 [ -f build/genhdr/moduledefs.h ] || cat > build/genhdr/moduledefs.h <<'EOF'

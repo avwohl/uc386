@@ -254,7 +254,7 @@ The full lex → parse → compile → VM dispatch → NLR
 lookup → builtin-function call → print result path runs
 end-to-end.
 
-Three real bug fixes unlocked Python execution:
+Four real bug fixes unlocked Python execution:
 
 - **uc386 peephole** (commit `19ae598`):
   `_pass_push_memory_to_push_reg` was incorrectly merging chained
@@ -275,13 +275,17 @@ Three real bug fixes unlocked Python execution:
   `is_sorted=true` invariant requires ASCII order, so binary
   search missed every static qstr starting with `_`. Fix:
   `LC_ALL=C sort -u` in the pipeline.
-
-Some qstrs containing non-identifier chars (e.g. `\n` →
-`MP_QSTR__0x0a_`, `<stdin>` → `MP_QSTR__lt_stdin_gt_`) still
-ship with the *mangled* string instead of the original — the
-grep heuristic captures the macro name, not the un-sanitized
-source string. So `print(...)`'s trailing newline renders as
-the literal text `_0x0a_`. Cosmetic but visible.
+- **qstr escape reversal** (`gen_qstrdefs.py`): the grep
+  captured the *sanitized* `MP_QSTR_<x>` macro name and used the
+  tail as the qstr's payload string. For non-identifier qstrs
+  the macro tail is escaped (`\n` → `_0x0a_`, `<stdin>` →
+  `_lt_stdin_gt_`) so the pool stored the escaped form as the
+  string. `print()`'s trailing newline rendered as the literal
+  text `_0x0a_`. Fix: a Python preprocessor reverses upstream's
+  `qstr_escape` (re-using upstream's own `codepoint2name` map),
+  emitting the original byte string as the QDEF1 payload AND
+  sorting the pool by that original byte string (the binary
+  search compares against the payload, not the macro name).
 
 Layered evidence:
 
