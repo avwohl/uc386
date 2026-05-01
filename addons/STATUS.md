@@ -76,8 +76,8 @@ from `manifest.toml`.
 
 ## ✓ Games from the DOS DPMI period
 
-**Doom boots end-to-end. ~227 source files from period DOS games
-compile cleanly through uc386.** Per-file triage results
+**Doom boots end-to-end and reaches R_Init with a fake WAD.
+240 source files compile across 5 chocolate-doom-era games.** Per-file triage results
 (see `addons/games/README.md` for the full scoreboard):
 
 | Game     | Source               | Compiles    | Boots? |
