@@ -1,4 +1,12 @@
 commit and push when aproproate. do not ask the human. do not stop
+we just moved to a x86 linux from a mac. you may need to adjust
+ if you do so make things work on both mac and linux.
+ check the install our requirements to make sure they work with
+ brew, apt, rpm.  you have sudo access to use as needed.
+for everything below when we import sources, be sure to export them
+ to our release area.  Some downstream users are of the free open source
+ means if you ship a binary you must ship the source.  Even if it is
+ unchanged and noone wants it.  
 Port gnu utilites to this compiler
 Set a dos installer in the github release area of this project
 some  gnu utils dont make sence like chroot, groups 
@@ -9,13 +17,12 @@ with good open source licenses.  That should be all non games ship and some game
 Do ship the download and build scripts for everything.
 make scripts to download , build , test
 games from the dos DPMI period such as doom,
-duke nukem, etc. we dan't ship the built executables due to licensing
-but we can ship build scripts.
 note we think we did all sorts of watcom compatibility to be able
 to build the games.  build them to see if that worked
 Make two installers, one for free open source with clear provenances like gnu utils.
 Other installer for things like doom? duke nukem? which may have bizzare or
 abandonware licenses.
+../dosiz may be of use for you in testing 386 dos executables
 
 Build all of the above with this compiler and competitive compilers
  (gcc, watcom, djcpp?) and show the sizes with each build for comparison

@@ -46,9 +46,19 @@ automatically.
 
 ## Install
 
+Quick start (Linux, Debian/Ubuntu):
+
 ```
-pip install -e .
+sudo apt-get install -y python3 python3-venv nasm
+python3 -m venv .venv && . .venv/bin/activate
+pip install pytest unicorn "uc_core @ git+https://github.com/avwohl/uc_core@main" -e .
+pytest tests/
 ```
+
+macOS (Homebrew) and Fedora/RHEL (dnf) instructions, plus the
+optional toolchains for addon builds (bison/flex) and the
+DJGPP / OpenWatcom comparison columns, are documented in
+[`docs/INSTALL.md`](docs/INSTALL.md).
 
 ## Roadmap
 

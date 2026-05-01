@@ -16,12 +16,16 @@ See `README.md` for the public roadmap (Phase 0–6).
 
 ## Toolchain
 
-- Python 3.12 (system Python 3.9 is too old — uc_core uses `dataclass(kw_only=True)`).
-- Working venv at `.venv/` with `uc_core` and `uc386` installed editable.
-  - Create: `python3.12 -m venv .venv && .venv/bin/pip install pytest -e ../uc_core -e .`
-- Run tests: `.venv/bin/pytest tests/`
+- Python ≥ 3.11 (uc_core uses `dataclass(kw_only=True)`, added in 3.10).
+  Linux ships 3.11+ in current LTSes; on macOS install via
+  `brew install python@3.12` (Apple's system 3.9 is too old).
+- Working venv at `.venv/` with `uc_core`, `uc386`, `unicorn` installed.
+  - Create: `python3 -m venv .venv && .venv/bin/pip install pytest unicorn -e ../uc_core -e .`
+- Run tests: `.venv/bin/pytest tests/` (expect 1320 passed).
 - Run driver: `.venv/bin/python -m uc386.main examples/hello.c -o /tmp/hello.asm`
 - Assembler target: NASM Intel syntax (`bits 32`, `section .text`).
+- Full per-platform install (brew / apt / dnf), incl. optional bison +
+  DJGPP + OpenWatcom for addons and size comparison: see `docs/INSTALL.md`.
 
 ## Codegen contract (current)
 
