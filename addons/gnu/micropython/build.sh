@@ -70,10 +70,20 @@ if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
         # chars and left a stray leading underscore (`__repl_print__` came
         # out as `___repl_print__`), making LOAD_NAME for builtins fail and
         # value-print compile crash inside mp_obj_equal_not_equal.
+        #
+        # Emit `length(name)` as the third QDEF1 field. qstr_find_strn's
+        # post-binary-search linear sweep checks lengths[at] == str_len
+        # before doing memcmp. Length 0 (the previous heuristic) made
+        # every static qstr fail the length check, causing
+        # `qstr_find_strn("__name__")` to return MP_QSTRnull even
+        # though the qstr was in the pool — so the bytecode compiler
+        # invented a fresh dynamic qstr for every identifier and
+        # LOAD_NAME against the static-init dict_main key (whose qstr
+        # id is the static 67) would never match.
         grep -rhoE "MP_QSTR_[A-Za-z_][A-Za-z0-9_]*" \
                 upstream/py/ upstream/shared/ \
             | sort -u \
-            | awk '{ name = substr($0, 9); print "QDEF1(" $0 ", 0, 0, \"" name "\")" }'
+            | awk '{ name = substr($0, 9); print "QDEF1(" $0 ", 0, " length(name) ", \"" name "\")" }'
     } > build/genhdr/qstrdefs.generated.h
 fi
 [ -f build/genhdr/moduledefs.h ] || cat > build/genhdr/moduledefs.h <<'EOF'
