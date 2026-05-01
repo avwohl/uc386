@@ -23,9 +23,10 @@ mv "$TMP"/rott-* upstream
 # reference filenames that don't exist in any case (the actual files
 # are 8.3 truncated like _RT_BUIL.H from the DOS-era FAT layout).
 # Rewrite to the names that actually exist.
+# (sed -i.bak works on both GNU sed and BSD/macOS sed; bare -i differs.)
 echo "rott: patching upstream filename typos …"
-sed -i '' 's|"_rt_build\.h"|"_rt_buil.h"|g' upstream/rott/RT_BUILD.C
-sed -i '' 's|"rt_spball\.h"|"rt_spbal.h"|g' upstream/rott/RT_IN.C
+sed -i.bak 's|"_rt_build\.h"|"_rt_buil.h"|g' upstream/rott/RT_BUILD.C
+sed -i.bak 's|"rt_spball\.h"|"rt_spbal.h"|g' upstream/rott/RT_IN.C
 
 # RT_TEXT.C declares `char word[WORDLIMIT]` as a local in HandleWord
 # but RT_DEF.H typedefs `word` as `unsigned short int`. uc386's parser
@@ -48,13 +49,18 @@ open("upstream/rott/RT_TEXT.C", "w").write("\n".join(lines))
 # uses: pic_t (lumpy.h), ticcount (isr.h), PU_CACHE/zone (z_zone.h),
 # px/py/rowon/leftmargin (rt_menu.h), VW_UpdateScreen (rt_view.h),
 # VWB_DrawPic (rt_draw.h).
-sed -i '' 's|#include "memcheck.h"|#include "lumpy.h"\
+sed -i.bak 's|#include "memcheck.h"|#include "lumpy.h"\
 #include "isr.h"\
 #include "z_zone.h"\
 #include "rt_menu.h"\
 #include "rt_view.h"\
 #include "rt_draw.h"\
 #include "memcheck.h"|' upstream/rott/RT_TEXT.C
+
+# Drop the .bak files sed left behind so the upstream/ tree we ship
+# in the games tarball doesn't carry confusing duplicates.
+rm -f upstream/rott/RT_BUILD.C.bak upstream/rott/RT_IN.C.bak \
+      upstream/rott/RT_TEXT.C.bak
 
 echo "rott: upstream tree at addons/games/rott/upstream/"
 echo "rott: ROTT-source/ holds the original DOS C; ROTT-Audio/ has audio/data tools."

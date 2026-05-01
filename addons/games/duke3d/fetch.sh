@@ -31,9 +31,11 @@ git clone --depth=1 --recurse-submodules --shallow-submodules "$URL" upstream
 # an `int s` reused as a counter in `case 9`. Rename the inner array
 # to `weaponswitch_names` so the two `s` references are no longer
 # the same identifier.
+# (sed -i.bak works on both GNU sed and BSD/macOS sed; bare -i differs.)
 echo "duke3d: patching menues.c block-scope shadow …"
-sed -i '' 's|static const char \*s\[\] = { "Off", "New"|static const char *weaponswitch_names[] = { "Off", "New"|' upstream/src/menues.c
-sed -i '' 's|gametextpal(d,yy, s\[ud.weaponswitch\]|gametextpal(d,yy, weaponswitch_names[ud.weaponswitch]|' upstream/src/menues.c
+sed -i.bak 's|static const char \*s\[\] = { "Off", "New"|static const char *weaponswitch_names[] = { "Off", "New"|' upstream/src/menues.c
+sed -i.bak 's|gametextpal(d,yy, s\[ud.weaponswitch\]|gametextpal(d,yy, weaponswitch_names[ud.weaponswitch]|' upstream/src/menues.c
+rm -f upstream/src/menues.c.bak
 
 # Patch: kplib.c expects __int64 + _lrotl as Watcom intrinsics under
 # __DOS__ (uc386 predefines __DOS__=1, so the in-file
