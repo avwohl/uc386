@@ -101,6 +101,21 @@ jobs:
       - name: Build games-scripts tarball
         run: python -m addons.harness.package --version "${{ steps.ver.outputs.version }}" --games-only
 
+      - name: Build Doom binary (boots end-to-end under dos_emu)
+        # Best-effort: if the upstream URL flakes or a uc386 regression
+        # lands, the games tarball still ships scripts. The repackage
+        # step below picks up the binary if it built.
+        continue-on-error: true
+        run: |
+          cd addons/games/doom
+          ./fetch.sh
+          ./build.sh
+          ls -la build/doom.bin
+
+      - name: Repackage games with doom.bin
+        if: success()
+        run: python -m addons.harness.package --version "${{ steps.ver.outputs.version }}" --games-only
+
       - name: Generate comparison table
         run: python -m addons.harness.compare --write
 
@@ -125,16 +140,22 @@ jobs:
             Two release artifacts:
 
             - **`uc386-foss-addons-*.tar.gz`** — built FOSS binaries
-              (16 utilities + BWK awk = ~62 KB total). Source: this
-              repo (GPL-3.0) + sbase upstream (MIT) + one-true-awk
-              (Lucent free license). Drop into a uc386-aware host
-              and run via `dos_emu.run()`.
+              + sources + a test runner. 16 utilities + BWK awk
+              (~62 KB built) plus a per-addon `src/` tree
+              (manifest.toml + .c sources or fetch.sh / build.sh)
+              and `test_addons.py` that walks the manifests and
+              runs every binary under `uc386.dos_emu`. Source
+              provenance: this repo (GPL-3.0) + sbase upstream
+              (MIT) + one-true-awk (Lucent free license).
 
-            - **`uc386-games-build-scripts-*.tar.gz`** — fetch + build
-              scripts for Doom, Duke3D, Heretic, Hexen, ROTT,
-              Descent. Run on your host: each script downloads the
-              upstream public-source release and (when the build
-              works) produces a uc386-format binary. Game data files
-              (WAD, GRP, RTL) are NOT shipped — supply your own.
+            - **`uc386-games-build-scripts-*.tar.gz`** — fetch +
+              build scripts for Doom, Duke3D, Heretic, Hexen, ROTT,
+              Descent — plus a pre-built `bin/doom/doom.bin` (the
+              one game that boots end-to-end under dos_emu today).
+              Other games triage 100 % per-file but still need
+              link-time stubs / `#pragma aux` codegen; their
+              binaries will land here as those gaps close. Game
+              data files (WAD, GRP, RTL) are NOT shipped — supply
+              your own.
 
             See `addons/results.md` for size comparison vs gcc.

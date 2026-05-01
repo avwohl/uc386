@@ -12,6 +12,19 @@ them is fine. What we still **don't** ship: the data files (WAD,
 GRP, RTL, etc.), which remain proprietary to the original
 publisher. Users supply their own.
 
+**What ships today** (release tarball
+`uc386-games-build-scripts-*.tar.gz`):
+- Scripts (fetch.sh / build.sh / NOTES.md / stubs.c /
+  uc386_config/ shims) for every game listed below.
+- `bin/doom/doom.bin` — the only game whose binary boots
+  end-to-end under `uc386.dos_emu` today.
+
+The other games triage 100 % per-file but still need link-time
+work (chocolate-doom platform stubs for Heretic/Hexen, `#pragma
+aux` codegen for Duke3D/ROTT). When those land, their binaries
+will join `bin/<game>/<game>.bin` here — the package script's
+`SHIP_BIN` set in `addons/harness/package.py` is the gating list.
+
 Each game directory contains:
 
 - `fetch.sh` — downloads the upstream source archive into `upstream/`.

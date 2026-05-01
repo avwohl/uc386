@@ -171,9 +171,14 @@ def package_foss(version: str) -> Path:
 
 
 def package_games_scripts(version: str) -> Path:
-    """Bundle game fetch+build scripts (no binaries, just sources of
-    instructions). Users run them locally to fetch each game's
-    public-source release and build."""
+    """Bundle game fetch+build scripts and any built binaries.
+
+    Today only Doom boots end-to-end (under dos_emu, exits at WAD-
+    not-found because we don't ship WADs). Its binary, if present at
+    addons/games/doom/build/doom.bin, ships in the tarball alongside
+    its scaffolding. Other games triage clean per-file but don't yet
+    link/boot — they ship as scripts only until they do.
+    """
     out_dir = REPO_ROOT / "dist"
     out_dir.mkdir(exist_ok=True)
     out_path = out_dir / f"uc386-games-build-scripts-{version}.tar.gz"
@@ -185,6 +190,11 @@ def package_games_scripts(version: str) -> Path:
     # stubs.c / uc386_config/ / *.py). Users fetch upstream sources
     # themselves via fetch.sh, and `build/` is ignored as derived.
     EXCLUDE_DIRS = {"upstream", "build", "__pycache__"}
+
+    # Games whose .bin we DO ship when it exists in build/. Listed
+    # explicitly so a stale per-game build/ doesn't silently leak
+    # in once a different game starts producing one.
+    SHIP_BIN = {"doom"}
 
     with tarfile.open(out_path, "w:gz") as tar:
         for sub in sorted(games_root.iterdir()):
@@ -207,8 +217,18 @@ def package_games_scripts(version: str) -> Path:
                     continue
                 rel = child.relative_to(games_root)
                 tar.add(child, arcname=f"uc386-games/{rel}")
-        # Top-level README.md is already covered by the per-game loop;
-        # nothing more to add here.
+            # Second pass: explicitly ship the built binary if this
+            # game is on the SHIP_BIN list and the build artifact
+            # exists. Lives under bin/<game>/ to keep it separate
+            # from the scaffolding so users see at a glance which
+            # games come pre-built.
+            if sub.name in SHIP_BIN:
+                game_bin = sub / "build" / f"{sub.name}.bin"
+                if game_bin.exists():
+                    arc = f"uc386-games/bin/{sub.name}/{sub.name}.bin"
+                    tar.add(game_bin, arcname=arc)
+                    print(f"  {sub.name}.bin: "
+                          f"{game_bin.stat().st_size:,} bytes")
 
     print(f"\nWrote {out_path} ({out_path.stat().st_size:,} bytes)")
     return out_path
