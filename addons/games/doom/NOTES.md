@@ -68,7 +68,7 @@ Build pipeline (`./build.sh`):
 2. NASM assembles to a 301 KB flat .bin
 3. dos_emu loads + runs the .bin
 
-Boot output as of 2026-04-30:
+Boot output with NO WAD provided:
 
 ```
 Game mode indeterminate.
@@ -80,13 +80,33 @@ W_Init: Init WADfiles.
 I_Error: W_InitFiles: no files found
 ```
 
-Exit point is `W_InitFiles` (not a uc386 limitation — we just don't
-ship a WAD; we can't, license-wise). With a user-supplied WAD via
-`vfiles_init`, DOOM would proceed into `R_Init` (rendering), then
-`P_Init` (gameplay), then the title-screen tic loop. Reaching the
-title screen requires a video stub that captures the 320x200x8
-framebuffer (currently `I_FinishUpdate` is no-op); reaching gameplay
-also requires the input pump (`I_StartTic` → produce ticcmds).
+Boot output with a 28-byte fake `doom1.wad` (1 dummy lump) via
+`vfiles_init={b'/doom1.wad': ...}` — works after the access()
+INT 21h fix in libc:
+
+```
+                       DOOM Shareware Startup v1.10
+V_Init: allocate screens.
+M_LoadDefaults: Load system defaults.
+Z_Init: Init zone memory allocation daemon.
+W_Init: Init WADfiles.
+ adding //doom1.wad
+===========================================================================
+                                Shareware!
+===========================================================================
+M_Init: Init miscellaneous info.
+R_Init: Init DOOM refresh daemon -
+I_Error: W_GetNumForName: PNAMES not found!
+```
+
+DOOM now correctly identifies game mode, loads the fake WAD,
+reaches `R_Init` (renderer setup), and fails only on a missing
+specific lump (PNAMES). Going further requires either a real
+shareware WAD or a fake WAD with 300+ named lumps — both out of
+scope for the addons port. Reaching the actual title screen also
+needs a video stub that captures the 320x200x8 framebuffer
+(currently `I_FinishUpdate` is no-op) and an input pump
+(`I_StartTic` → ticcmds).
 
 Compiler-side blockers cleared this session: 6 codegen / optimizer
 fixes (above), 4 new libc headers, `lseek` + `strcasecmp` in libc
