@@ -80,9 +80,21 @@ if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
         # invented a fresh dynamic qstr for every identifier and
         # LOAD_NAME against the static-init dict_main key (whose qstr
         # id is the static 67) would never match.
+        # `LC_ALL=C sort` — force ASCII collation, NOT locale-aware.
+        # The runtime binary search in qstr_find_strn uses strncmp
+        # (raw byte comparison), so the qstr pool must be sorted by
+        # ASCII byte values. Default `sort` on macOS uses
+        # locale-aware collation that puts `_*` BEFORE uppercase
+        # letters (the opposite of ASCII order, where `_` = 0x5F
+        # comes AFTER `Z` = 0x5A but BEFORE `a` = 0x61). Without
+        # LC_ALL=C, the pool's `is_sorted=true` invariant breaks
+        # and binary search misses every static qstr — the bytecode
+        # compiler then mints a fresh dynamic qstr for each
+        # identifier and LOAD_NAME against the static-init dict
+        # entries (`__name__` etc.) always misses.
         grep -rhoE "MP_QSTR_[A-Za-z_][A-Za-z0-9_]*" \
                 upstream/py/ upstream/shared/ \
-            | sort -u \
+            | LC_ALL=C sort -u \
             | awk '{ name = substr($0, 9); print "QDEF1(" $0 ", 0, " length(name) ", \"" name "\")" }'
     } > build/genhdr/qstrdefs.generated.h
 fi
