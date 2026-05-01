@@ -1,3 +1,6 @@
+For /loop work as long you can on one session, hours are fine.
+For scheduling the next /loop start time use 1min (to start) but still think for as long as possible (hours)
+ till next stop.
 commit and push when aproproate. do not ask the human. do not stop
 we just moved to a x86 linux from a mac. you may need to adjust
  if you do so make things work on both mac and linux.
