@@ -64,6 +64,82 @@ def find_addons() -> list[Path]:
     return out
 
 
+def find_upstream_addons() -> list[Path]:
+    """Upstream-fetched addons that ship a self-contained .c source set
+    suitable for cross-compiler size comparison. Today: awk-bwk (one
+    .c set in upstream/, no port-specific shims). Skipped: micropython
+    (143 sources need a real per-compiler port config; the comparison
+    isn't meaningful), gawk (autoconf-driven, not a flat .c set)."""
+    out: list[Path] = []
+    awk_bwk = ADDONS_ROOT / "gnu" / "awk-bwk"
+    if (awk_bwk / "upstream").is_dir() and (awk_bwk / "build" / "awk.bin").exists():
+        out.append(awk_bwk)
+    return out
+
+
+def _awk_bwk_sources(addon: Path) -> list[str]:
+    """Return the list of .c sources gcc/djgpp should compile for the
+    BWK awk size comparison. Excludes `maketab.c` (a host-side helper
+    that emits the proctab.c table — already pre-generated under the
+    upstream tree by the uc386 build, so all four compilers consume
+    the same set of inputs)."""
+    src_dir = addon / "upstream"
+    return [
+        str(p)
+        for p in sorted(src_dir.glob("*.c"))
+        if p.name != "maketab.c"
+    ]
+
+
+def build_gcc_upstream(addon: Path) -> int | None:
+    """Compile a self-contained upstream .c set with host gcc."""
+    if not shutil.which("gcc"):
+        return None
+    out = REPO_ROOT / "build" / "compare" / addon.name
+    out.mkdir(parents=True, exist_ok=True)
+    bin_path = out / "gcc.bin"
+    proc = subprocess.run(
+        ["gcc", "-O2", "-w", *_awk_bwk_sources(addon),
+         "-o", str(bin_path)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    return bin_path.stat().st_size
+
+
+def build_djgpp_upstream(addon: Path) -> int | None:
+    """Cross-compile a self-contained upstream .c set with DJGPP."""
+    djgcc = _which_first(DJGPP_CANDIDATES)
+    if djgcc is None:
+        return None
+    out = REPO_ROOT / "build" / "compare" / addon.name
+    out.mkdir(parents=True, exist_ok=True)
+    exe_path = out / "djgpp.exe"
+    proc = subprocess.run(
+        [djgcc, "-O2", "-w", *_awk_bwk_sources(addon),
+         "-o", str(exe_path)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    return exe_path.stat().st_size
+
+
+def uc386_upstream_size(addon: Path) -> int | None:
+    """Read the pre-built uc386 binary size from `<addon>/build/`. We
+    don't re-invoke uc386 here — these builds take minutes (awk-bwk:
+    ~30s; the existing build.sh already produced the .bin we ship)."""
+    candidates = [
+        addon / "build" / "awk.bin",
+        addon / "build" / f"{addon.name}.bin",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c.stat().st_size
+    return None
+
+
 def build_gcc(addon: Path) -> int | None:
     """Build addon/main.c with host gcc; return ELF size or None on fail."""
     if not shutil.which("gcc"):
@@ -190,6 +266,17 @@ def main() -> int:
         wcc_sz = build_watcom(addon)
         djgpp_sz = build_djgpp(addon)
         rows.append((addon.name, uc_sz, gcc_sz, wcc_sz, djgpp_sz))
+
+    # Upstream addons (awk-bwk today) — same four columns, but the
+    # uc386 size comes from the pre-built .bin under build/ instead of
+    # being re-built per invocation. Watcom isn't wired up for the
+    # upstream path yet (period BWK awk used K&R declarations that
+    # need extra `wcc386` flags) — column shows `—`.
+    for addon in find_upstream_addons():
+        uc_sz = uc386_upstream_size(addon)
+        gcc_sz = build_gcc_upstream(addon)
+        djgpp_sz = build_djgpp_upstream(addon)
+        rows.append((addon.name, uc_sz, gcc_sz, None, djgpp_sz))
 
     def cell(n: int | None) -> str:
         return f"{n:,}" if n is not None else "—"
