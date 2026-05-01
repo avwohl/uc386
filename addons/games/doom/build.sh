@@ -11,7 +11,13 @@ if [ ! -d upstream/linuxdoom-1.10 ]; then
 fi
 
 REPO="$(cd ../../.. && pwd)"
-PYTHON="${PYTHON:-$REPO/.venv/bin/python}"
+if [ -n "${PYTHON:-}" ]; then
+    :
+elif [ -x "$REPO/.venv/bin/python" ]; then
+    PYTHON="$REPO/.venv/bin/python"
+else
+    PYTHON="$(command -v python3.12 || command -v python3 || command -v python)"
+fi
 INCLUDE="$REPO/lib/include"
 
 # DOOM compiles N source files, links to one executable. We invoke

@@ -11,7 +11,15 @@ if [ ! -d upstream ]; then
 fi
 
 REPO="$(cd ../../.. && pwd)"
-PYTHON="${PYTHON:-$REPO/.venv/bin/python}"
+# In CI we don't have .venv; fall back to whatever python is on PATH
+# (the workflow installs the right packages globally).
+if [ -n "${PYTHON:-}" ]; then
+    :  # explicit override wins
+elif [ -x "$REPO/.venv/bin/python" ]; then
+    PYTHON="$REPO/.venv/bin/python"
+else
+    PYTHON="$(command -v python3.12 || command -v python3 || command -v python)"
+fi
 INCLUDE="$REPO/lib/include"
 SHIM="$REPO/addons/gnu/_sbase_shim"
 SRC="$(pwd)/upstream"

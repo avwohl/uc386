@@ -14,7 +14,13 @@ if [ ! -d upstream/jfbuild/include ]; then
 fi
 
 REPO="$(cd ../../.. && pwd)"
-PYTHON="${PYTHON:-$REPO/.venv/bin/python}"
+if [ -n "${PYTHON:-}" ]; then
+    :
+elif [ -x "$REPO/.venv/bin/python" ]; then
+    PYTHON="$REPO/.venv/bin/python"
+else
+    PYTHON="$(command -v python3.12 || command -v python3 || command -v python)"
+fi
 INCLUDE="$REPO/lib/include"
 
 # Game-side sources (upstream/src/) plus a minimal main shim. Excludes
