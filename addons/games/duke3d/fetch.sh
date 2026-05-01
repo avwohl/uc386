@@ -1,24 +1,29 @@
 #!/bin/sh
 # Fetch Duke Nukem 3D source. 3D Realms released the Duke3D + Build
 # engine source under GPL in 2003; the modern caretaker is the
-# eduke32 community fork.
+# jonof/jfduke3d community fork.
+#
+# jfduke3d depends on three sibling submodules — jfbuild (engine),
+# jfaudiolib (sound), jfmact (input) — that the GitHub tarball
+# doesn't include. Use `git clone --recursive` so they actually
+# resolve, otherwise the duke3d compile bails on `Cannot find
+# include file: build.h` immediately.
 set -eu
 
 cd "$(dirname "$0")"
-if [ -d upstream ]; then
+if [ -d upstream/jfbuild/include ]; then
     echo "duke3d: upstream/ already populated; skip fetch."
     exit 0
 fi
 
-# Original 3D Realms release (preferred — minimum modifications).
-URL="https://github.com/jonof/jfduke3d/archive/refs/heads/master.tar.gz"
+URL="https://github.com/jonof/jfduke3d.git"
 
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+if [ -d upstream ]; then
+    echo "duke3d: upstream/ exists but submodules empty; re-cloning."
+    rm -rf upstream
+fi
 
-echo "duke3d: fetching $URL …"
-curl -fsSL "$URL" -o "$TMP/duke3d.tar.gz"
-tar -xzf "$TMP/duke3d.tar.gz" -C "$TMP"
-mv "$TMP"/jfduke3d-* upstream
+echo "duke3d: cloning $URL with submodules …"
+git clone --depth=1 --recurse-submodules --shallow-submodules "$URL" upstream
 echo "duke3d: upstream tree at addons/games/duke3d/upstream/"
-echo "duke3d: build/ subdir is the Build engine; source/ is game logic."
+echo "duke3d: src/ is game logic; jfbuild/ is the Build engine."
