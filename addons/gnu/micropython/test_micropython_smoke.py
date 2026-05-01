@@ -71,6 +71,35 @@ def test_micropython_repl_banner(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_arithmetic(micropython_bin: Path) -> None:
+    """`2+3\\n\\x04` exercises the value-print path: lex → parse →
+    compile → VM dispatch (LOAD_CONST 2; LOAD_CONST 3; BINARY_OP +;
+    __repl_print__ wrap) → mp_load_global → builtins dict lookup →
+    print result. Until commit 19ae598 this trapped in
+    `_pass_push_memory_to_push_reg`, which was incorrectly merging
+    chained pointer dereferences (`mov eax, [eax+4]; push [eax+4]`
+    → `push eax`)."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"2+3\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0, (
+        f"unexpected exit code: {res.exit_code} "
+        f"(expected 0 for `2+3\\n\\x04` clean exit)"
+    )
+    # Result `5` should appear on its own line between the two
+    # `>>> ` prompts. Use a substring check so prompt-formatting
+    # tweaks don't break the test.
+    assert "\n5\n" in res.stdout, (
+        f"expected arithmetic result `5` in stdout, got: {res.stdout!r}"
+    )
+
+
 def test_micropython_assign_statement(micropython_bin: Path) -> None:
     """`x = 5\\n\\x04` exercises the qstr-store path that the
     QDEF1 fix unblocked: lexes the identifier, allocates an

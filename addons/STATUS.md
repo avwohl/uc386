@@ -234,28 +234,39 @@ real-mode-32 binaries that dos_emu loads directly.
 
 ## ◐ Include the latest MicroPython (2026-05-01 ask)
 
-**Runnable `micropython.bin` boots to the REPL and runs simple
-Python statements.** A 170 KB flat i386 DOS binary built
-end-to-end through uc386 prints:
+**Runnable `micropython.bin` evaluates Python expressions.** A
+170 KB flat i386 DOS binary built end-to-end through uc386 prints:
 
 ```
 MicroPython uc386-triage on 2026-05-01; uc386-dos with i386
 Type "help()" for more information.
+>>> 2+3
+5
 >>>
 ```
 
-…and then accepts `pass`, empty lines, **`x = 5` (qstr-store)**,
-and other allocating-but-not-printing statements; exits cleanly
-on Ctrl-D. The full lex → parse → compile → VM dispatch → NLR
-(setjmp-backed) → qstr-pool → name-store path runs end-to-end.
+…and then accepts `pass`, empty lines, `x = 5`, **value-print
+of integer expressions (`1` → `1`, `2+3` → `5`, `42` → `42`,
+`1+2` → `3`)**, and Ctrl-D-to-exit. The full lex → parse →
+compile → VM dispatch → NLR (setjmp-backed) → qstr-pool →
+mp_load_global → builtins-dict lookup → __repl_print__ → print
+result path runs end-to-end.
 
-Statements that produce a value to **print** (`1`, `print('hi')`)
-still trip an `UC_ERR_READ_UNMAPPED` in `_mp_obj_equal_not_equal`
-(EIP 0xCC41 — `cmp dword [eax], _mp_type_str` with a garbage
-`eax`). Likely another invariant-relying bug similar to the
-QDEF1-empty-pool one we just fixed (where mp_qstr_const_pool with
-zero QDEF1 entries had `is_sorted=true` but `len=0`, hitting a
-size_t underflow in the binary search).
+The fix that unlocked this was a **uc386 peephole bug**:
+`_pass_push_memory_to_push_reg` was incorrectly merging chained
+pointer dereferences (`mov eax, [eax+4]; push [eax+4]` →
+`push eax`) when the memory expression referenced the destination
+register. That dropped the second deref of
+`self->context->module.globals` in objfun.c's fun_bc_call and
+let MicroPython's mp_globals_set store the *context pointer*
+itself instead of the dict pointer. See commit `19ae598` for the
+fix and `addons/gnu/micropython/NOTES.md` for the full diagnostic
+trail.
+
+Calls to *named builtins* (`print('hi')`) still raise NameError
+because of an unrelated qstr-id mismatch between the builtins
+dict's static-init keys and the bytecode's lookup keys. That's
+the next investigation.
 
 Layered evidence:
 
