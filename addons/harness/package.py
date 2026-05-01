@@ -141,6 +141,15 @@ def package_games_scripts(version: str) -> Path:
         for sub in sorted(games_root.iterdir()):
             if not sub.is_dir():
                 continue
+            # First pass: pick up any symlinks at the top of each game
+            # dir (hexen/uc386_config -> ../heretic/uc386_config). The
+            # default rglob doesn't follow symlinked directories, so
+            # without this the link gets dropped entirely.
+            for child in sub.iterdir():
+                if child.is_symlink():
+                    rel = child.relative_to(games_root)
+                    tar.add(child, arcname=f"uc386-games/{rel}",
+                            recursive=False)  # preserve the link itself
             for child in sub.rglob("*"):
                 if not child.is_file():
                     continue
