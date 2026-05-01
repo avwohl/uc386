@@ -1645,7 +1645,28 @@ class PeepholeOptimizer:
                                 r: rm for r, rm in reg_mem.items()
                                 if rm != m
                             }
-                            reg_mem[dst] = m
+                            # Don't track if the memory expression
+                            # references the destination register
+                            # itself: the value of `dst` just
+                            # changed, so the cached `[dst+N]`
+                            # textual key now points to a different
+                            # location than it did before this
+                            # instruction. A later
+                            # `push [dst+N]` reads the NEW location;
+                            # collapsing it to `push dst` would push
+                            # the value just loaded (the old location's
+                            # contents), not the new location's
+                            # contents — corrupts a chained pointer
+                            # dereference like
+                            # `self->context->module.globals`.
+                            inner = m[1:-1]  # strip "[" "]"
+                            if not _references_register(inner, dst):
+                                reg_mem[dst] = m
+                            else:
+                                # Drop any prior tracker for dst —
+                                # the register was overwritten and
+                                # we have nothing safe to track.
+                                reg_mem.pop(dst, None)
                             out.append(ln)
                             prev_unconditional = False
                             continue
