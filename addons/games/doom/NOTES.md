@@ -32,8 +32,30 @@ DOOM linuxdoom-1.10 is mostly straight C with these dependencies:
 5. The DOS-only `dmx.c` (sound) is NOT in `linuxdoom-1.10`; use the
    Linux subset to avoid DPMI sound entirely.
 
-## Status
+## Status (2026-04-30)
 
-`build.sh` produces compile errors today — see error log for the
-specific blockers. Each cycle: pick one error, fix in uc_core /
-codegen / libc, retry. ETA-to-first-build: weeks of work.
+`fetch.sh` works (~66 C files pulled from id-Software/DOOM master).
+`build.sh` excludes `i_net.c` / `i_sound.c` / `i_video.c` / `i_system.c`
+(BSD sockets / Linux DSP / X11 — need stub replacements rather than
+upstream compile) and gets 58 sources into the compiler.
+
+Blockers cleared so far:
+- `<values.h>` — added libc shim forwarding to `<limits.h>` / `<float.h>`
+- `<alloca.h>` — added (alloca → malloc, leaks bounded by use-pattern)
+- `<malloc.h>` — added (forwards to `<stdlib.h>`)
+- `R_OK`/`access()` — added to `<unistd.h>`
+- File-scope `static` name collisions (every .c has `static const char
+  rcsid[]`) — fixed via per-file mangling pass in main.py before TU merge
+
+Current first remaining blocker:
+- Anonymous-struct type identity across TUs. When `typedef struct {...}`
+  in a header is included by two .c files, the merged AST has two
+  distinct struct-type nodes for the same logical type, so struct
+  assignment fails ("got `__inline_X` and `__inline_Y`"). Fix path:
+  unify named typedef'd structs at TU-merge time, OR teach codegen to
+  compare struct types structurally instead of by identity. uc_core
+  type-system change.
+
+After that there will be more — but the work is now incremental
+ticket-by-ticket rather than uniformly blocked. ETA-to-first-build is
+no longer "weeks" — it's "however many of these tickets we close."

@@ -16,7 +16,14 @@ INCLUDE="$REPO/lib/include"
 
 # DOOM compiles N source files, links to one executable. We invoke
 # uc386 in multi-file mode (it merges TUs in main.py).
-SOURCES="$(find upstream/linuxdoom-1.10 -name '*.c' | sort)"
+#
+# EXCLUDE_RX skips sources that need platform-specific subsystems we
+# stub out at higher level instead of trying to compile (BSD sockets,
+# Linux sound DSP, X11). We still need a couple of these as object-
+# level shims (i_video / i_sound replacement), but the upstream files
+# themselves don't compile under uc386.
+EXCLUDE_RX='/(i_net|i_sound|i_video|i_system)\.c$'
+SOURCES="$(find upstream/linuxdoom-1.10 -name '*.c' | grep -Ev "$EXCLUDE_RX" | sort)"
 OUT="$(pwd)/build/doom.asm"
 mkdir -p "$(dirname "$OUT")"
 

@@ -118,6 +118,62 @@ I386_DOS_PREDEFINES = {
 }
 
 
+def _mangling_prefix(path: Path) -> str:
+    """Stable per-file prefix used to mangle file-scope statics.
+    Hash collision risk is low; only the basename's stem is used so
+    builds are reproducible regardless of build directory layout."""
+    stem = "".join(c if (c.isalnum() or c == "_") else "_" for c in path.stem)
+    return f"__static_{stem}__"
+
+
+def _mangle_static_globals(unit, prefix: str) -> None:
+    """Rename file-scope `static` decls in `unit` to `<prefix><name>`,
+    and rewrite intra-TU references to match. Walks the AST generically
+    via dataclasses.fields to avoid maintaining a per-node-type table.
+
+    Lexical (no scope analysis): a nested local that shadows a static
+    global will get rewritten too. In practice this is rare in the
+    period codebases we care about (Doom, Duke3D, BWK awk) and the
+    rewrite is still semantics-preserving — the local just keeps the
+    same shadowing relationship to the renamed global. The scenario
+    that would break is a nested local with the static's name being
+    referenced elsewhere as a different symbol — not a thing in C."""
+    import dataclasses
+
+    statics: set[str] = set()
+    for d in unit.declarations:
+        if isinstance(d, (ast_module.VarDecl, ast_module.FunctionDecl)):
+            if getattr(d, "storage_class", None) == "static" and d.name:
+                statics.add(d.name)
+    if not statics:
+        return
+
+    def rename(name: str) -> str:
+        return prefix + name if name in statics else name
+
+    def walk(node):
+        if node is None:
+            return
+        if isinstance(node, list):
+            for child in node:
+                walk(child)
+            return
+        if not dataclasses.is_dataclass(node):
+            return
+        # Identifier nodes: rewrite the .name field.
+        if isinstance(node, ast_module.Identifier):
+            node.name = rename(node.name)
+        # Top-level decls: rewrite their .name (Identifiers inside
+        # their bodies are handled by the generic recursion below).
+        if isinstance(node, (ast_module.VarDecl, ast_module.FunctionDecl)):
+            node.name = rename(node.name)
+        for f in dataclasses.fields(node):
+            walk(getattr(node, f.name, None))
+
+    for d in unit.declarations:
+        walk(d)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="uc386", description="C23 compiler for i386/MS-DOS")
     ap.add_argument("input", nargs="+", help="Input C source file(s)")
@@ -198,6 +254,14 @@ def main() -> int:
         if len(asts) == 1:
             unit = asts[0]
         else:
+            # Multi-TU mode: file-scope `static` decls have internal
+            # linkage in C, so identical names from different TUs are
+            # legitimate. We naive-merge into one TranslationUnit, so
+            # mangle each TU's static names with a per-file prefix to
+            # keep them distinct (and rewrite intra-TU references to
+            # match).
+            for path, u in zip(input_paths, asts):
+                _mangle_static_globals(u, _mangling_prefix(path))
             unit = ast_module.TranslationUnit(declarations=[])
             for u in asts:
                 unit.declarations.extend(u.declarations)

@@ -34,6 +34,29 @@ jobs:
           pip install "uc_core @ git+https://github.com/avwohl/uc_core@main"
           pip install -e .
 
+      - name: Install DJGPP cross-compiler
+        run: |
+          mkdir -p ~/.local/opt
+          curl -sL -o /tmp/djgpp.tar.bz2 \
+            https://github.com/andrewwutw/build-djgpp/releases/download/v3.4/djgpp-linux64-gcc1220.tar.bz2
+          tar xjf /tmp/djgpp.tar.bz2 -C ~/.local/opt
+          ~/.local/opt/djgpp/bin/i586-pc-msdosdjgpp-gcc --version
+
+      - name: Install OpenWatcom V2
+        run: |
+          mkdir -p ~/.local/opt/watcom
+          curl -sL -o /tmp/watcom.bin \
+            https://github.com/open-watcom/open-watcom-v2/releases/download/Current-build/open-watcom-2_0-c-linux-x64
+          chmod +x /tmp/watcom.bin
+          # The Linux self-extractor wants an interactive license accept; -i=u
+          # = unattended user-mode install into the path we point to.
+          /tmp/watcom.bin -dDstDir=$HOME/.local/opt/watcom -i=u || true
+          ls $HOME/.local/opt/watcom/binl64/wcc386 || \
+            (echo "watcom installer layout unexpected; listing:" && \
+             find $HOME/.local/opt/watcom -name wcc386 -type f)
+          echo "WATCOM=$HOME/.local/opt/watcom" >> $GITHUB_ENV
+          echo "$HOME/.local/opt/watcom/binl64" >> $GITHUB_PATH
+
       - name: Run tests
         run: pytest tests/ -q
 

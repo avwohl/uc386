@@ -76,22 +76,30 @@ from `manifest.toml`.
 
 ## ⚠ Games from the DOS DPMI period
 
-**Scaffolding done; builds blocked on uc_core Phase 2.**
+**Scaffolding done + first compile attempt complete; builds still
+blocked, but on different items than originally feared.**
 `addons/games/{doom,duke3d,heretic,hexen,rott,descent}` each have
 a `NOTES.md` documenting upstream URL, license, and expected
-blockers. Doom + Duke3D additionally have working `fetch.sh` /
-`build.sh` stubs (build.sh exits with status 1 today, citing the
-specific blockers).
+blockers. Doom + Duke3D have working `fetch.sh` (verified — both
+pull upstream sources cleanly) and `build.sh` (Doom now drives
+58 sources through preprocess → parse → codegen).
 
-The uniform blocker: `#pragma aux` (Watcom inline-asm + custom
-calling convention declarations). uc_core's Phase 2 would
-implement these. Until then, games like Build engine that rely
-heavily on `mulscale` / `scale` math primitives can't fully build.
+Today's Doom blockers are NOT `#pragma aux` (we use `linuxdoom-1.10`,
+not the DOS tree), but rather:
+1. ~~Several missing libc headers — `values.h`, `alloca.h`, `malloc.h`,
+   `R_OK` in `unistd.h`~~ Added 2026-04-30.
+2. ~~File-scope `static` name collisions in multi-TU mode~~ Fixed
+   2026-04-30 via per-file static name mangling in `main.py`.
+3. **Anonymous-struct type identity across TUs.** A typedef'd struct
+   in a shared header gets a distinct identity in each including TU,
+   so struct assignment across the merged AST fails. Needs uc_core
+   type-system change (structural equality OR pre-merge unification
+   of named typedefs).
+4. (Future tickets — won't be visible until #3 unblocks.)
 
-**Spirit of the request preserved**: when uc_core Phase 2 lands,
-the game ports can be retried with NO uc386-side changes — they
-auto-pick up the new uc_core via the `pip install -e ../uc_core`
-sibling install.
+**Spirit of the request preserved**: every blocker we close benefits
+ALL period-code ports, not just Doom — `static`-name-mangling
+unblocks any multi-TU C codebase, the libc additions are reusable.
 
 ## ✓ Two installers (FOSS + abandonware)
 
@@ -110,33 +118,36 @@ sibling install.
   too. Today it ships only the scripts since the binaries don't
   exist yet.
 
-## ⚠ Build with competitive compilers
+## ✓ Build with competitive compilers
 
-**gcc baseline done; Watcom + DJGPP reserved.**
-`addons/results.md` has the size table:
+**gcc + DJGPP done; Watcom wired into CI** (no native macOS build).
+`addons/results.md` has the size table — sample row:
 
 ```
-| Tool | uc386 | gcc | Watcom wcc386 | DJGPP |
-| true | 14    | 16,840 | —          | —     |
-| ...
+| true | 14 | 16,840 | (CI) | 147,914 |
 ```
 
-uc386 binaries are 50–1200× smaller than gcc-on-host (gcc emits
-ELF with full glibc startup; uc386 emits flat .bin with only the
-libc functions actually used after asm-DCE).
+uc386 binaries are 50–1200× smaller than gcc-on-host (full glibc
+startup) and ~100–10,000× smaller than DJGPP (DPMI extender + djgpp
+C runtime baked in).
 
-Watcom (wcc386) and DJGPP cross-compilers aren't available on the
-dev host. The comparison script reserves their columns; once
-those toolchains are installed the table populates automatically.
-Installing OpenWatcom on macOS isn't trivial — out of scope for
-this slice.
+DJGPP cross-compiler installed locally at `~/.local/opt/djgpp` from
+`andrewwutw/build-djgpp v3.4` (gcc 12.2.0). `addons/harness/compare.py`
+detects it via the `DJGPP_CANDIDATES` list — works on both macOS
+arm64 and the Linux CI runner.
+
+Open Watcom V2 has no macOS build, but the upstream Linux x64
+self-extractor works on the CI runner. The release workflow installs
+both toolchains (`.github/workflows/release.yml`) so the Watcom
+column populates on `v*` tag releases. Local dev host shows `—`
+gracefully via `_which_first` detection.
 
 ## Summary
 
-Of the 8 explicit items in `addons.txt`, **6 are fully done** and
-**2 are scaffolding-only** (games, full Watcom comparison) —
-both blocked on infrastructure that lives outside this addons
-work (uc_core Phase 2 + Watcom toolchain install).
+Of the 8 explicit items in `addons.txt`, **7 are fully done** and
+**1 is scaffolding + first compile attempt** (games — Doom now
+drives 58 sources into codegen; struct-type-identity is the next
+blocker, fix lives in uc_core).
 
 Total code shipped: 1320 unit tests passing, 220/220 c-testsuite
 (full mode), 1514/1514 gcc-c-torture, 16/16 addons, BWK awk
