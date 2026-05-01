@@ -56,5 +56,22 @@ void SDL_Delay(uint32_t ms);
 int SDL_PollEvent(SDL_Event *event);
 int SDL_WaitEvent(SDL_Event *event);
 
+/* Opaque pointer types — chocolate-doom code holds these as
+ * (typically extern) pointers and never dereferences them when
+ * we're running headless. */
+typedef struct SDL_Window SDL_Window;
+typedef struct SDL_Renderer SDL_Renderer;
+typedef struct SDL_Texture SDL_Texture;
+typedef struct SDL_Surface SDL_Surface;
+typedef struct SDL_RWops SDL_RWops;
+typedef struct SDL_Thread SDL_Thread;
+typedef struct SDL_mutex SDL_mutex;
+typedef struct SDL_cond SDL_cond;
+
+/* Color / Rect / Point — period code keeps them as values. */
+typedef struct SDL_Color { uint8_t r, g, b, a; } SDL_Color;
+typedef struct SDL_Rect  { int x, y, w, h; } SDL_Rect;
+typedef struct SDL_Point { int x, y; } SDL_Point;
+
 #endif /* _UC386_SDL_H */
 
