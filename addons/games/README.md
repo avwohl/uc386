@@ -27,21 +27,28 @@ inline asm, and assumptions about flat-32 `__watcall` calling
 conventions that uc386 still parses-and-flattens (Phase 1) but
 hasn't fully implemented (Phase 2).
 
-Status today (2026-04-30):
+Status today (2026-05-01):
 
-| Game            | Source available  | Compiles? | Runs? | Notes |
-|-----------------|-------------------|-----------|-------|-------|
-| Doom            | yes (id Software) | not yet   | no    | Linux source compiles, DOS-source via dmx.c needs DPMI int handling |
-| Duke3D          | yes (3D Realms)   | not yet   | no    | Build engine + game.c — heavy `#pragma aux`, blocked on Phase 2 |
-| Heretic         | yes (Raven)       | not yet   | no    | Same Doom-derived engine; likely tracks Doom progress |
-| Hexen           | yes (Raven)       | not yet   | no    | Same |
-| ROTT            | yes (Apogee)      | not yet   | no    | Watcom-specific extensions |
-| Descent         | yes (Parallax)    | not yet   | no    | Source release covers DOS only — heavy DPMI |
+| Game     | Source available    | Per-file triage | Boots? | Notes                                                                     |
+|----------|---------------------|-----------------|--------|---------------------------------------------------------------------------|
+| Doom     | yes (id Software)   | **58 / 58**     | **yes** | Boots end-to-end through dos_emu — exits at WAD-not-found (no WAD shipped) |
+| Heretic  | yes (chocolate-doom)| **44 / 47**     | no     | Remaining 3 want richer SDL2 API; same engine as Doom, can share stubs.c    |
+| Hexen    | yes (chocolate-doom)| **45 / 48**     | no     | Same SDL.h gap as Heretic                                                  |
+| Duke3D   | yes (jfduke3d)      | **34 / 42**     | no     | game-side 15/16 + Build engine 19/26 — engine.c renderer compiles!         |
+| ROTT     | yes (Apogee)        | **46 / 53**     | no     | Watcom DOS source — needed 9 new period libc headers                       |
+| Descent  | yes (dxx-rebirth)   | n/a (C++)       | no     | dxx-rebirth is C++, uc386 is C-only; would need 1998 source release        |
 
-The "build scripts" exist as scaffolding; running them today produces
-compile errors that document what's missing. Each error becomes a
-ticket against uc_core (Phase 2 `#pragma aux`) or this repo (libc
-extensions, codegen for specific patterns).
+**~227 source files** from period DOS games compile cleanly through
+uc386 today. The "build scripts" no longer just document what's
+missing — they're per-file triage harnesses that produce a
+histogram of remaining errors. Each error is a concrete ticket;
+many turn out to be small (2-line predefines, header shims).
+
+The biggest remaining lever is **multi-file linkage**: each game's
+files compile in isolation but haven't been linked together yet.
+That'll surface cross-TU issues (struct identity already fixed for
+Doom; others may follow). After that, runtime stubs to actually
+boot — `doom_stubs.c` is the existing template.
 
 ## License
 
