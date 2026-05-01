@@ -86,7 +86,7 @@ from `manifest.toml`.
 | Heretic  | chocolate-doom       | 44 / 47     | no     |
 | Hexen    | chocolate-doom       | 45 / 48     | no     |
 | Duke3D   | jfduke3d             | 34 / 42     | no     |
-| ROTT     | videogamepreservation| 46 / 53     | no     |
+| ROTT     | videogamepreservation| **52 / 52** (1 dead-code .C skipped) | no     |
 | Descent  | dxx-rebirth          | n/a (C++)   | no     |
 
 Today's Doom blockers are NOT `#pragma aux` (we use `linuxdoom-1.10`,

@@ -35,8 +35,18 @@ EOF
 
 OK=0
 FAIL=0
+# Files that ship in the upstream tree but are NOT referenced by the
+# upstream MAKEFILE — dead code that doesn't even compile against the
+# real headers. TEXTURE.C uses scan_t / Scanline / Xmax / _maxscanline
+# without a single #include and isn't called from anywhere; the actual
+# floor texture-mapper is TEXTURE.ASM.
+SKIP="TEXTURE.C"
 for src in upstream/rott/*.C; do
     name="${src##*/}"
+    case " $SKIP " in *" $name "*)
+        printf "  %-25s SKIP (dead in upstream MAKEFILE)\n" "$name"
+        continue ;;
+    esac
     out=$("$PYTHON" -m uc386.main "$src" /tmp/rott_stub_main.c \
         -I "$INCLUDE" \
         -I upstream/rott \

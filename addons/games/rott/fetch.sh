@@ -42,9 +42,18 @@ for i in range(394, 435):
 open("upstream/rott/RT_TEXT.C", "w").write("\n".join(lines))
 '
 
-# RT_TEXT.C also uses `pic_t` (defined in lumpy.h, not transitively
-# pulled in). Add the include.
+# RT_TEXT.C is missing a pile of transitive includes. Upstream relied
+# on Watcom's order-of-definitions across the per-TU compile; uc386
+# parses each TU strict-header-resolved. Add what RT_TEXT.C actually
+# uses: pic_t (lumpy.h), ticcount (isr.h), PU_CACHE/zone (z_zone.h),
+# px/py/rowon/leftmargin (rt_menu.h), VW_UpdateScreen (rt_view.h),
+# VWB_DrawPic (rt_draw.h).
 sed -i '' 's|#include "memcheck.h"|#include "lumpy.h"\
+#include "isr.h"\
+#include "z_zone.h"\
+#include "rt_menu.h"\
+#include "rt_view.h"\
+#include "rt_draw.h"\
 #include "memcheck.h"|' upstream/rott/RT_TEXT.C
 
 echo "rott: upstream tree at addons/games/rott/upstream/"
