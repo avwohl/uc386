@@ -98,8 +98,32 @@ Two more fixes shipped (commits 21dc0d9 + ad0ad62):
 
 After both fixes, `pass`, empty line, `x = 5`, Ctrl-D-only all
 exit cleanly. **Value-print** (`1`, `print('hi')`) still crashes
-with `UC_ERR_READ_UNMAPPED` — but in a *different* place than
-before:
+with `UC_ERR_READ_UNMAPPED`. Further narrowing via dos_emu hooks
+on the linear-search loop in `mp_map_lookup`:
+
+- The crashing dict has `table = 0` (NULL pointer) and a
+  `top = 0x69358` value, implying `used*8 = 0x69358`, i.e.
+  `used ≈ 53867`. The bitfield word at offset 0 of map is reading
+  as some large garbage value (with bit 2 = is_ordered = 1, since
+  the linear path was entered).
+- This isn't `mp_module_builtins.globals` (its static layout is
+  clean: bitfield = 0x267, alloc = 76, table = valid address).
+- Likely `dict_main` (the `__main__` module's globals) — created
+  at runtime by `mp_obj_dict_init(&dict, 1)` → `mp_map_init`.
+  If uc386 emits the body of mp_map_init in a way that doesn't
+  initialize the bitfield word cleanly, the existing memory at
+  &dict_main.map (in BSS, so zero-initialized at boot) might be
+  fine, but writing `used = 0` followed by `all_keys_are_qstrs = 1`
+  could clobber bits in unexpected ways.
+
+uc386's bitfield read + write generated code looks correct in
+isolated tests (verified with focused `_compile` snippets — read
+shifts and masks the right ranges; write does proper RMW). So
+the bug is more subtle: maybe the order of mp_map_init's
+assignments interacts badly with codegen, or the static init
+of `mp_state_ctx` / `dict_main` at the BSS level has a layout
+mismatch. Further bisection needs more debugging time than
+fits in a /loop iteration.
 
   - EIP 0xCC41, inside `mp_obj_equal_not_equal`, instruction
     `cmp dword [eax], _mp_type_str`.
