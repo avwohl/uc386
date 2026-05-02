@@ -76,6 +76,18 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    # uc386.dos_emu imports lazily; the actual unicorn import happens
+    # inside run(). Probe early so the user gets a clean message
+    # instead of finding out per-addon.
+    try:
+        import unicorn  # noqa: F401
+    except ImportError:
+        print(
+            "test_addons.py: the `unicorn` engine isn't installed.\n"
+            "Install with `pip install unicorn`, then re-run.",
+            file=sys.stderr,
+        )
+        return 2
 
     here = Path(args.root).resolve() if args.root else Path(__file__).resolve().parent
     src_root = here / "src"
