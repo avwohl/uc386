@@ -13,7 +13,6 @@ on:
     branches: [main]
     paths:
       - 'addons/harness/exe.py'
-      - 'addons/harness/exe_regs_probe.c'
       - 'addons/gnu/**'
       - 'src/uc386/**'
       - 'lib/**'
@@ -22,7 +21,6 @@ on:
     branches: [main]
     paths:
       - 'addons/harness/exe.py'
-      - 'addons/harness/exe_regs_probe.c'
       - 'addons/gnu/**'
       - 'src/uc386/**'
       - 'lib/**'
@@ -228,41 +226,6 @@ jobs:
             echo "FAIL: see diagnostic dumps above"
             exit 1
           fi
-
-      - name: Phase 7 regs probe — exe_regs_probe.exe under DOSBox
-        # Builds the CI-only register-state probe (not a manifest
-        # addon because it references `_pmodew_*_at_entry` globals
-        # that only exist on the .exe build path). Reveals what
-        # PMODE/W actually puts in EAX/EBX/etc. at entry — the real
-        # input the argv bridge will need to consume.
-        continue-on-error: true
-        run: |
-          set +e
-          python -m addons.harness.exe addons/harness/exe_regs_probe.c \
-            -o /tmp/regsprobe.exe
-          mkdir -p /tmp/dosbox-regs
-          chmod 777 /tmp/dosbox-regs
-          cp /tmp/regsprobe.exe /tmp/dosbox-regs/regs.exe
-          cat > /tmp/dosbox-regs.conf <<'EOF'
-          [sdl]
-          fullscreen=false
-
-          [cpu]
-          core=normal
-
-          [autoexec]
-          mount c /tmp/dosbox-regs
-          c:
-          regs.exe foo bar > regs.txt
-          exit
-          EOF
-          export SDL_VIDEODRIVER=dummy
-          timeout 30 dosbox -conf /tmp/dosbox-regs.conf -exit \
-            > /tmp/dosbox-regs.log 2>&1
-          echo "dosbox exit: $?"
-          REGS="/tmp/dosbox-regs/REGS.TXT"
-          echo '== REGS.TXT =='
-          cat "$REGS" 2>&1
 
       - name: Phase 7 probe — argv_probe.exe under DOSBox
         # Diagnostic for the .exe argv-bridge work. echo.exe outputs

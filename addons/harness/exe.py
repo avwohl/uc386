@@ -51,22 +51,16 @@ LIB_INCLUDE = REPO_ROOT / "lib" / "include"
 # The PMODE/W bridge stub. Linked into every .exe build; provides:
 #   - Real DOS handles (0/1/2) for stdin/stdout/stderr (libc's
 #     0xF0/F1/F2 dos_emu sentinels are stripped by the asm rewriter).
-#   - Captured-at-entry register snapshot for diagnostic programs.
-#   - DPMI INT 31h-driven argv parsing: get PSP selector (AX=0x51),
-#     translate to linear address (AX=0x06), copy command tail from
-#     PSP+0x80 into a flat buffer, tokenize on whitespace into an
-#     argv[] of pointers, set EAX=argc and EBX=&argv[0] so the
-#     codegen-emitted _start (which `push ebx; push eax`) hands main
-#     the right cdecl args.
+#     Without this, fputs/fwrite/printf via INT 21h AH=0x40 silently
+#     drop output (BX=0xF1 is an invalid DOS handle).
+#   - argv setup: argc=1 + argv[0]="program" placeholder. PMODE/W
+#     doesn't pass argc/argv in any register and its protected-mode
+#     PSP doesn't carry the cmdline tail at PSP+0x80. Reading the
+#     real cmdline requires Watcom CRT internals — see Phase 7
+#     section of docs/path-a-mz-le.md for the full failure log.
 #
-# Empirical PMODE/W contract (from exe_regs_probe.c output):
-#   EAX = 0x300 (768)   — opaque, possibly stack/PSP related
-#   EBX = 0x21 (33)     — opaque
-#   ECX = 0
-#   EDX = 0xF159        — looks like a real-mode segment value
-#   ESI = 0xD2 / EDI = 0x2CC6 / EBP = 0x2CC6 / ESP = 0x2D00
-# None of these are argc/argv. PMODE/W expects the program to parse
-# the cmdline itself, same as the Watcom CRT does.
+# Programs that don't read argv work cleanly. Programs that do see
+# argc=1 + a placeholder argv[0].
 BRIDGE_ASM = """
         section _DATA use32 class=DATA
         global _stdin
@@ -76,226 +70,28 @@ _stdin:  dd 0
 _stdout: dd 1
 _stderr: dd 2
 
-        global _pmodew_eax_at_entry
-        global _pmodew_ebx_at_entry
-        global _pmodew_ecx_at_entry
-        global _pmodew_edx_at_entry
-        global _pmodew_esi_at_entry
-        global _pmodew_edi_at_entry
-        global _pmodew_ebp_at_entry
-        global _pmodew_esp_at_entry
-_pmodew_eax_at_entry: dd 0
-_pmodew_ebx_at_entry: dd 0
-_pmodew_ecx_at_entry: dd 0
-_pmodew_edx_at_entry: dd 0
-_pmodew_esi_at_entry: dd 0
-_pmodew_edi_at_entry: dd 0
-_pmodew_ebp_at_entry: dd 0
-_pmodew_esp_at_entry: dd 0
-
-        ; Diagnostic globals for the DPMI argv parser. Exported so a
-        ; probe can verify each step worked (selector valid, linear
-        ; base computed, cmdline length read, etc.).
-        global _pmodew_psp_selector
-        global _pmodew_psp_linear
-        global _pmodew_cmdline_len
         global _pmodew_argc
         global _pmodew_argv
-        global _pmodew_dpmi_alloc_sel
-        global _pmodew_dpmi_alloc_cy
-_pmodew_psp_selector: dd 0
-_pmodew_psp_linear:   dd 0
-_pmodew_cmdline_len:  dd 0
 _pmodew_argc:         dd 0
 _pmodew_argv:         dd _pmodew_argv_array
-_pmodew_dpmi_alloc_sel: dd 0
-_pmodew_dpmi_alloc_cy:  dd 0
-        global _pmodew_int21h_psp
-_pmodew_int21h_psp:     dd 0
 
-        ; argv array: up to 32 args, NULL-terminated. argv[0] is the
-        ; program-name placeholder (DOS PSP doesn't include argv[0];
-        ; the real program path requires DPMI 0x60h env-block walk).
-_pmodew_argv_array: times 33 dd 0
-
-        ; Flat buffer holding the parsed/tokenized command tail.
-        ; PSP cmdline tail max is 127 bytes; double for safety.
-_pmodew_argv_buffer: times 256 db 0
-
-        ; Placeholder for argv[0] — real DOS doesn't put the program
-        ; name in PSP+0x80, so we fake it with a neutral string. Real
-        ; argv[0] needs DPMI 0x60h to walk the environment block,
-        ; which lands as a follow-up if needed.
+_pmodew_argv_array: times 2 dd 0      ; argv[0] + NULL terminator
 _pmodew_argv0_placeholder: db "program", 0
-
-        ; Diagnostic: 32 bytes copied from PSP_linear to PSP_linear+32
-        ; via flat DS view, exposed for hex inspection by a probe.
-        global _pmodew_psp_dump
-_pmodew_psp_dump: times 32 db 0
 
         section _TEXT use32 class=CODE
         global _pmodew_start
         extern _start
 
 _pmodew_start:
-        ; Capture entry state for diagnostics
-        mov     [_pmodew_eax_at_entry], eax
-        mov     [_pmodew_ebx_at_entry], ebx
-        mov     [_pmodew_ecx_at_entry], ecx
-        mov     [_pmodew_edx_at_entry], edx
-        mov     [_pmodew_esi_at_entry], esi
-        mov     [_pmodew_edi_at_entry], edi
-        mov     [_pmodew_ebp_at_entry], ebp
-        mov     [_pmodew_esp_at_entry], esp
+        ; argv[0] = placeholder, argv[1] = NULL. argc=1.
+        mov     dword [_pmodew_argv_array], _pmodew_argv0_placeholder
+        mov     dword [_pmodew_argv_array + 4], 0
+        mov     dword [_pmodew_argc], 1
 
-        ; --- argv parsing ---
-        ; PMODE/W passes the PSP real-mode segment in EDX at entry.
-        ; (Empirically verified: EDX=0xF1B3 matched the actual PSP
-        ; segment.) Convert that to a linear address inside our flat
-        ; DS — DS covers the full 4 GB starting at 0, so linear =
-        ; segment*16 IS the offset for `mov al, [linear]`.
-        ;
-        ; We tried DPMI INT 31h AX=0x51 (get PSP selector → 0x21,
-        ; matches EBX at entry) + AX=0x06 (translate to linear base
-        ; → returned 0) — the AX=0x06 path didn't yield a usable
-        ; address under PMODE/W. The EDX-at-entry shortcut sidesteps
-        ; both calls. Selector trick is left as a diagnostic.
-        mov     eax, [_pmodew_ebx_at_entry]
-        mov     [_pmodew_psp_selector], eax
-
-        ; Ask DOS for the real-mode PSP segment via INT 21h AH=0x62.
-        ; PMODE/W reflects to real DOS, returns segment in BX.
-        ; This is authoritative — EDX_at_entry was a misread (random
-        ; PMODE/W internal value, not the PSP).
-        mov     ah, 0x62
-        int     0x21
-        movzx   eax, bx
-        mov     [_pmodew_int21h_psp], eax
-
-        ; Compute PSP linear from the real PSP segment.
-        and     eax, 0xFFFF
-        shl     eax, 4
-        mov     [_pmodew_psp_linear], eax
-        mov     ecx, eax          ; ECX = PSP linear base
-
-        ; Diagnostic: try DPMI 0x0002 (Segment to Descriptor) to
-        ; allocate a fresh selector for the PSP real-mode segment.
-        ; This is the standard DPMI way to access real-mode memory
-        ; without touching pre-existing selectors. Just diagnostic
-        ; — record the result but don't load it (mov es/fs hung
-        ; the program last attempts).
-        push    eax
-        push    ebx
-        mov     bx, [_pmodew_edx_at_entry]   ; PSP segment
-        mov     ax, 0x0002
-        int     0x31
-        pushfd
-        pop     edx
-        and     edx, 1                       ; CF only
-        mov     [_pmodew_dpmi_alloc_cy], edx
-        movzx   eax, ax
-        mov     [_pmodew_dpmi_alloc_sel], eax
-        pop     ebx
-        pop     eax
-
-        ; Diagnostic: dump 32 bytes from PSP_linear+0x80 (via flat DS)
-        ; into a global so a probe can inspect what's there. If all
-        ; zero, flat DS doesn't map real-mode memory. If non-zero but
-        ; not the cmdline format, PSP layout differs from expected.
-        push    ecx
-        push    esi
-        push    edi
-        lea     esi, [ecx + 0x80]
-        mov     edi, _pmodew_psp_dump
-        mov     ecx, 32
-        cld
-        rep     movsb
-        pop     edi
-        pop     esi
-        pop     ecx
-
-        ; 3. Read command tail length at PSP+0x80
-        movzx   eax, byte [ecx + 0x80]
-        mov     [_pmodew_cmdline_len], eax
-
-        ; 4. Copy command tail from PSP+0x81 into our flat buffer
-        ;    so we can null-terminate tokens in-place.
-        push    eax               ; save length
-        lea     esi, [ecx + 0x81]
-        mov     edi, _pmodew_argv_buffer
-        mov     ecx, eax
-        test    ecx, ecx
-        jz      .copy_done
-        cmp     ecx, 255          ; clamp to buffer size
-        jbe     .copy_ok
-        mov     ecx, 255
-.copy_ok:
-        cld
-        rep     movsb
-.copy_done:
-        mov     byte [edi], 0     ; null-terminator
-        pop     eax
-
-        ; 5. Tokenize. argv[0] = placeholder. Then walk buffer
-        ;    splitting on space/tab into argv[1..argc-1].
-        mov     edi, _pmodew_argv_array
-        mov     dword [edi], _pmodew_argv0_placeholder
-        add     edi, 4
-        mov     ecx, 1            ; argc starts at 1 (placeholder argv[0])
-        mov     esi, _pmodew_argv_buffer
-
-.skip_ws:
-        cmp     ecx, 32           ; argv array has 33 slots; leave 1 for NULL
-        jge     .tokenize_done
-        mov     al, [esi]
-        test    al, al
-        jz      .tokenize_done
-        cmp     al, ' '
-        je      .skip_one
-        cmp     al, 9
-        je      .skip_one
-        cmp     al, 13            ; CR — PSP cmdline terminator
-        je      .tokenize_done
-        ; start of token: record pointer
-        mov     [edi], esi
-        add     edi, 4
-        inc     ecx
-
-.in_token:
-        inc     esi
-        mov     al, [esi]
-        test    al, al
-        jz      .tokenize_done
-        cmp     al, ' '
-        je      .end_token
-        cmp     al, 9
-        je      .end_token
-        cmp     al, 13
-        je      .end_token_cr
-        jmp     .in_token
-
-.end_token:
-        mov     byte [esi], 0     ; null-terminate this token
-        inc     esi
-        jmp     .skip_ws
-
-.end_token_cr:
-        mov     byte [esi], 0
-        jmp     .tokenize_done
-
-.skip_one:
-        inc     esi
-        jmp     .skip_ws
-
-.tokenize_done:
-        mov     dword [edi], 0    ; argv[argc] = NULL
-        mov     [_pmodew_argc], ecx
-
-        ; 6. Hand off to the codegen-emitted _start. Set up the
-        ;    dos_emu register-passing convention: EAX=argc,
-        ;    EBX=&argv[0]. _start does `push ebx; push eax`, then
-        ;    `call _main` — main reads [ebp+8]=argc, [ebp+12]=argv.
-        mov     eax, [_pmodew_argc]
+        ; Hand off to the codegen-emitted _start. dos_emu convention:
+        ; EAX=argc, EBX=&argv[0]. _start does `push ebx; push eax`,
+        ; then `call _main` — main reads [ebp+8]=argc, [ebp+12]=argv.
+        mov     eax, 1
         mov     ebx, _pmodew_argv_array
         jmp     _start
 """
