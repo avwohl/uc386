@@ -55,13 +55,21 @@ a `.exe` that runs on FreeDOS. Remaining polish:
       - **`mov fs, 0x21` + `[fs:0x80]`**: produced "JMP Illegal
         descriptor type 0" fault — corrupted segment-register
         state somewhere in the libc → INT 21h path.
-    Plausible next steps (not attempted in this session):
-      - DPMI INT 31h AX=0x0002 (Segment to Descriptor) to
-        allocate a brand-new selector for the PSP segment.
-      - DPMI INT 31h AX=0x0007 to query the existing 0x21
-        selector's limit (might be < 0x80 → fault on access).
-      - Switch to Watcom's `_cstart_` and let its CRT do the
-        cmdline parsing (would mean linking `clib3r.lib`).
+    Further attempts in this session:
+      - **INT 21h AH=0x62** (reflects to real DOS, returns PSP
+        segment in BX) returned 0x68. EDX_at_entry was 0xF232 —
+        a PMODE/W internal value, NOT the PSP. Confirmed via
+        diagnostic globals: `int21h_psp=0x68`, `psp_linear=0x680`.
+      - **DPMI INT 31h AX=0x0002** (Segment to Descriptor) with
+        BX=0x68 returned a fresh selector (0x70, CY=0). FS load
+        of that selector + read at `[fs:0x80]` did NOT crash,
+        but read returned 0. Bytes nearby were sparse and didn't
+        match the cmdline format.
+      - **Conclusion**: PMODE/W's protected-mode PSP at segment
+        0x68 doesn't carry the cmdline tail at PSP+0x80 in the
+        real-mode layout. The original cmdline lives elsewhere —
+        accessible only via extender-specific structures or by
+        linking Watcom's `_cstart_` (`clib3r.lib`).
     Programs that don't read argv work cleanly under PMODE/W;
     argv-dependent programs see argc=1 with a placeholder argv[0].
 
