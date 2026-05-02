@@ -326,7 +326,7 @@ Layered evidence:
   links cleanly under `nasm -f bin` to a ~169 KB `.bin`. Only
   externs remaining are dead libm names left in a string table
   (DCE doesn't strip those today).
-- **REPL smoke tests** (24 cases):
+- **REPL smoke tests** (26 cases):
   `addons/gnu/micropython/test_micropython_smoke.py` runs the bin
   under dos_emu and pins: banner, clean Ctrl-D exit, arithmetic
   (`2+3` → `5`), assignment (`x = 5`), `pass`, named builtins
@@ -342,7 +342,8 @@ Layered evidence:
   `bytes.decode`, generator expressions, `'%' %` formatting,
   detailed-NameError-with-qstr-name, `import sys` / `gc` /
   `micropython` / `collections` (OrderedDict + namedtuple) /
-  `struct` / `array` / `errno`.
+  `struct` / `array` / `errno` / `math` (floats lowered via the
+  x87 FPU; `math.sqrt(2.0)` → `1.41421...`).
 
 - **Module imports** (2026-05-02): hand-rolled equivalent of
   upstream's `tools/makemoduledefs.py` output written into

@@ -640,6 +640,67 @@ def test_micropython_import_errno(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_import_math(micropython_bin: Path) -> None:
+    """`import math; math.sqrt(2.0)` exercises the math module —
+    requires `MICROPY_FLOAT_IMPL=DOUBLE` (so MicroPython's mp_float_t
+    is a real double, lowered through uc386's x87 FPU path) plus
+    libc-side implementations of the math functions modmath.c
+    references at CORE_FEATURES (sin/cos/tan/asin/acos/atan/atan2/
+    exp/log/pow/sqrt/floor/ceil/trunc/fmod/copysign/fabs/ldexp/
+    nearbyint, plus modf for repr).
+
+    Also pin the constant pi (gated on MICROPY_PY_MATH_CONSTANTS at
+    EXTRA_FEATURES — we don't have it, so this test only checks
+    sqrt). Result `1.414...` proves the FPU path works end-to-end."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"import math\nprint(math.sqrt(2.0))\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "1.41421" in res.stdout, (
+        f"expected sqrt(2) ≈ 1.41421..., got: {res.stdout!r}"
+    )
+
+
+def test_micropython_float_arithmetic(micropython_bin: Path) -> None:
+    """`1.5 + 2.5` exercises the FPU path end-to-end inside the REPL:
+    lex → parse FloatLiteral → BINARY_OP + → mp_float_t add → repr
+    → print. Without MICROPY_PY_BUILTINS_FLOAT (i.e. before the
+    FLOAT_IMPL=DOUBLE bump) this raised SyntaxError on the dot.
+
+    Tolerates upstream's APPROX float formatter quirk: at
+    MICROPY_FLOAT_IMPL=DOUBLE without a wider-than-double
+    `mp_large_float_t`, the formatter accumulates rounding error
+    across digit-extraction multiplies and `4.0` repr-prints as
+    `3.999999999999997` instead. We assert the parsed value is
+    close to 4.0, not the exact literal."""
+    import re
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"print(1.5 + 2.5)\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # Match the printed numeric line between the two `>>> ` prompts.
+    m = re.search(r"\n([0-9.]+)\n", res.stdout)
+    assert m is not None, (
+        f"expected a numeric result line, got: {res.stdout!r}"
+    )
+    val = float(m.group(1))
+    assert abs(val - 4.0) < 1e-6, (
+        f"expected ≈ 4.0, got {val!r} from stdout {res.stdout!r}"
+    )
+
+
 def test_micropython_import_array(micropython_bin: Path) -> None:
     """`import array; array.array('i', ...)` — gated on
     `MICROPY_PY_ARRAY` (CORE_FEATURES). Pins typed-array storage

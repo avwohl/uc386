@@ -4747,6 +4747,163 @@ _atan:
         pop     ebp
         ret
 
+; tan(x) — fptan pushes 1.0 + tan(x) onto FPU stack; pop the 1.0.
+_tan:
+        push    ebp
+        mov     ebp, esp
+        fld     qword [ebp + 8]
+        fptan
+        fstp    st0                         ; drop the implicit 1.0
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; asin(x) = atan2(x, sqrt(1 - x*x))
+_asin:
+        push    ebp
+        mov     ebp, esp
+        fld     qword [ebp + 8]             ; x
+        fld     st0                         ; x, x
+        fmul    st0, st0                    ; x*x, x
+        fld1                                ; 1, x*x, x
+        fsubrp  st1, st0                    ; 1-x*x, x
+        fsqrt                               ; sqrt(1-x*x), x
+        fxch    st1                         ; x, sqrt(1-x*x)
+        fpatan                              ; atan2(x, sqrt(1-x*x))
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; acos(x) = atan2(sqrt(1 - x*x), x)
+_acos:
+        push    ebp
+        mov     ebp, esp
+        fld     qword [ebp + 8]             ; x
+        fld     st0                         ; x, x
+        fmul    st0, st0                    ; x*x, x
+        fld1                                ; 1, x*x, x
+        fsubrp  st1, st0                    ; 1-x*x, x
+        fsqrt                               ; sqrt(1-x*x), x
+        fpatan                              ; atan2(sqrt(1-x*x), x)
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; fmod(x, y) — fprem repeats until reduction complete (C2 of FPU
+; status word clear). Standard 387 idiom.
+_fmod:
+        push    ebp
+        mov     ebp, esp
+        fld     qword [ebp + 16]            ; y
+        fld     qword [ebp + 8]             ; x, y
+.fmod_loop:
+        fprem                               ; partial remainder of x/y
+        fnstsw  ax                          ; status into ax
+        test    ax, 0x0400                  ; C2 = bit 10: reduction incomplete
+        jnz     .fmod_loop
+        fstp    st1                         ; drop y, leaving result
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; isfinite(x) — alias to the __builtin form (uc_core's float-builtin
+; lowering uses the __builtin_ name; modmath.c calls plain `isfinite`).
+_isfinite:
+        jmp     ___builtin_isfinite
+
+; nan(const char *tagp) — return a quiet NaN. We ignore `tagp` (the
+; standard says it's optional and may be ignored). The bit pattern
+; is the standard quiet NaN payload (sign=0, exp=all ones, mantissa
+; MSB set). Emit via fld of a precomputed double in static data.
+        section .data
+_nan_quiet_dbl: dd 0x00000000, 0x7FF80000
+        section .text
+_nan:
+        fld     qword [_nan_quiet_dbl]
+        ret
+
+; nearbyint(x) — round to integer using the current rounding mode
+; (default: round-to-nearest-even). frndint does exactly this.
+; Used by Python `round()` for floats.
+_nearbyint:
+        push    ebp
+        mov     ebp, esp
+        fld     qword [ebp + 8]
+        frndint
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; trunc(x) — round toward zero. Standard idiom: temporarily flip
+; the FPU rounding mode to "truncate" (RC=11), frndint, restore.
+_trunc:
+        push    ebp
+        mov     ebp, esp
+        sub     esp, 4
+        fld     qword [ebp + 8]
+        fnstcw  [ebp - 2]                   ; save current control word
+        mov     ax, [ebp - 2]
+        and     ax, 0xF3FF                  ; clear RC bits
+        or      ax, 0x0C00                  ; RC=11 → truncate
+        mov     [ebp - 4], ax
+        fldcw   [ebp - 4]
+        frndint
+        fldcw   [ebp - 2]                   ; restore
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ldexp(x, n): x * 2^n. fscale takes scale factor in st(1).
+_ldexp:
+        push    ebp
+        mov     ebp, esp
+        sub     esp, 8
+        ; Convert int n (at [ebp+16]) to double on the FPU.
+        fild    dword [ebp + 16]            ; (double)n
+        fld     qword [ebp + 8]             ; x, n
+        fscale                              ; x * 2^n, n
+        fstp    st1                         ; drop n, leaving result
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; frexp(x, *exp): split x into mantissa m in [0.5, 1.0) and integer
+; exponent. fxtract returns unbiased exponent E such that
+; x = m_x * 2^E with m_x in [1, 2). Adjust to mantissa in [0.5, 1)
+; by halving the mantissa and bumping E by 1.
+_frexp:
+        push    ebp
+        mov     ebp, esp
+        sub     esp, 8
+        fld     qword [ebp + 8]             ; x
+        ; Special-case x == 0: return 0, *exp = 0.
+        fldz
+        fucomip st0, st1                    ; compare x with 0
+        jne     .frexp_normal
+        ; x is zero — *exp = 0, return 0.
+        mov     ecx, [ebp + 16]
+        mov     dword [ecx], 0
+        ; st(0) is x (which is zero), leave it
+        jmp     .frexp_done
+.frexp_normal:
+        fxtract                             ; st(0) = mantissa [1,2), st(1) = E
+        ; Convert E to int and store at *exp_p, then add 1.
+        fxch    st1                         ; E, m
+        fistp   dword [ebp - 4]             ; pop E as int
+        mov     eax, [ebp - 4]
+        add     eax, 1
+        mov     ecx, [ebp + 16]
+        mov     [ecx], eax
+        ; Halve the mantissa: m / 2.
+        fld1
+        fld1
+        faddp   st1, st0                    ; 2.0
+        fdivp   st1, st0                    ; m / 2
+.frexp_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
 _log10:
         push    ebp
         mov     ebp, esp

@@ -42,6 +42,21 @@ mkdir -p build build/genhdr
 # emit these from the source tree; for triage we ship empty stubs
 # so the preprocessor finds them and we see compile-class failures
 # (uc386 limitations) instead of a wall of missing-header errors.
+# Patch upstream/py/formatfloat.c so the DOUBLE-mode `repr()` doesn't
+# request more digits than uc386's double-precision FPU can deliver.
+# Default is `MAX_MANTISSA_DIGITS=19` (designed for the EXACT formatter
+# that runs on long double, ~80-bit). uc386 lowers double through the
+# x87 FPU but stores `long double` as 8 bytes (= double), so the
+# APPROX formatter at 19 digits surfaces the last 3 noise digits as
+# wrong values: `print(4.0)` becomes `3.99999999999999382` instead of
+# `4.0`. Lower the request to SAFE_MANTISSA_DIGITS=16 (already
+# defined adjacent in the file). Idempotent: checks for the
+# already-patched value before re-applying.
+if grep -q "^#define MAX_MANTISSA_DIGITS  (19)$" upstream/py/formatfloat.c; then
+    sed -i.bak 's/^#define MAX_MANTISSA_DIGITS  (19)$/#define MAX_MANTISSA_DIGITS  (16)  \/\/ uc386: long double == double, cap at SAFE/' upstream/py/formatfloat.c
+    rm -f upstream/py/formatfloat.c.bak
+fi
+
 if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
     # Emit a triage qstr table by grep over upstream/py/ +
     # upstream/shared/. Real builds use upstream's
@@ -137,8 +152,9 @@ fi
 // drops the entry consistently.
 //
 // Modules NOT registered here:
-//   - math / cmath  — require MICROPY_PY_BUILTINS_FLOAT (port is
-//                     int-only, no DOS-side libm wired up yet).
+//   - cmath         — requires MICROPY_PY_CMATH; we have float math
+//                     via the x87 FPU but no complex-number support
+//                     today.
 //   - _thread       — requires MICROPY_PY_THREAD (single-threaded
 //                     DOS, no need today).
 //   - weakref       — requires MICROPY_PY_WEAKREF (off at CORE).
@@ -160,6 +176,13 @@ extern const struct _mp_obj_module_t mp_module_gc;
 #define UCDOS_MOD_ENTRY_GC { MP_ROM_QSTR(MP_QSTR_gc), MP_ROM_PTR(&mp_module_gc) },
 #else
 #define UCDOS_MOD_ENTRY_GC
+#endif
+
+#if MICROPY_PY_MATH
+extern const struct _mp_obj_module_t mp_module_math;
+#define UCDOS_MOD_ENTRY_MATH { MP_ROM_QSTR(MP_QSTR_math), MP_ROM_PTR(&mp_module_math) },
+#else
+#define UCDOS_MOD_ENTRY_MATH
 #endif
 
 #if MICROPY_PY_MICROPYTHON
@@ -202,6 +225,7 @@ extern const struct _mp_obj_module_t mp_module_struct;
     { MP_ROM_QSTR(MP_QSTR_sys), MP_ROM_PTR(&mp_module_sys) }, \
     { MP_ROM_QSTR(MP_QSTR___main__), MP_ROM_PTR(&mp_module___main__) }, \
     UCDOS_MOD_ENTRY_GC \
+    UCDOS_MOD_ENTRY_MATH \
     UCDOS_MOD_ENTRY_MICROPYTHON \
     UCDOS_MOD_ENTRY_ARRAY \
     UCDOS_MOD_ENTRY_COLLECTIONS \

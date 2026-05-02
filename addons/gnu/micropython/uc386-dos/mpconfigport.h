@@ -97,6 +97,17 @@
 #define MICROPY_USE_INTERNAL_ERRNO        (1)
 #define MICROPY_PY_COLLECTIONS_ORDEREDDICT (1)
 
+// Float support — uc386 lowers double through the x87 FPU and
+// uc386's libc (lib/i386_dos_libc.asm) provides sin/cos/atan/
+// atan2/exp/log/log10/pow/sqrt/ceil/floor/fabs/copysign/isnan/
+// isinf/signbit in raw 387 asm. Other math functions
+// (tan/asin/acos/fmod/trunc/ldexp/frexp/modf) are added
+// alongside this opt-in. DOUBLE rather than FLOAT so the libc's
+// `sin`/`cos`/... unsuffixed names match what micropython calls
+// (FLOAT_IMPL_FLOAT calls `sinf` / `cosf` / ... which we don't
+// have).
+#define MICROPY_FLOAT_IMPL                (MICROPY_FLOAT_IMPL_DOUBLE)
+
 typedef long mp_off_t;
 
 #define MICROPY_HW_BOARD_NAME "uc386-dos"

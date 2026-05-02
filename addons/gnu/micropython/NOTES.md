@@ -29,7 +29,7 @@ Type "help()" for more information.
 caught
 ```
 
-What works (24 smoke tests pin the core wins):
+What works (26 smoke tests pin the core wins):
 
 - arithmetic + control flow (`if/else`, `for/range`, `while/break`)
 - function def + call (`def f(x): return x*2; f(7)` → `14`)
@@ -54,15 +54,31 @@ What works (24 smoke tests pin the core wins):
   `name not defined`)
 - `import sys` / `import gc` / `import micropython` /
   `import collections` (OrderedDict + namedtuple) /
-  `import struct` / `import array` / `import errno` —
-  registered via `build/genhdr/moduledefs.h` (hand-rolled
-  equivalent of upstream's `tools/makemoduledefs.py` output,
-  with `#if` guards mirroring each module's `MICROPY_PY_<X>`
-  gate). `errno` additionally needs `MICROPY_USE_INTERNAL_ERRNO=1`
-  (uc386's `<errno.h>` ships only the Linux subset, missing
-  EOPNOTSUPP/EADDRINUSE/ECONN*/EHOST*/EALREADY/EINPROGRESS) plus
-  build.sh's X-macro-aware grep for the EPERM/ENOENT/... qstrs
-  that `MP_QSTR_##e` token paste needs.
+  `import struct` / `import array` / `import errno` /
+  `import math` — registered via `build/genhdr/moduledefs.h`
+  (hand-rolled equivalent of upstream's
+  `tools/makemoduledefs.py` output, with `#if` guards
+  mirroring each module's `MICROPY_PY_<X>` gate). `errno`
+  additionally needs `MICROPY_USE_INTERNAL_ERRNO=1` (uc386's
+  `<errno.h>` ships only the Linux subset, missing
+  EOPNOTSUPP/EADDRINUSE/ECONN*/EHOST*/EALREADY/EINPROGRESS)
+  plus build.sh's X-macro-aware grep for the EPERM/ENOENT/...
+  qstrs that `MP_QSTR_##e` token paste needs.
+- `MICROPY_FLOAT_IMPL=DOUBLE` — uc386 lowers `double` through the
+  x87 FPU. lib/i386_dos_libc.asm provides `sin`/`cos`/`tan`/
+  `asin`/`acos`/`atan`/`atan2`/`exp`/`log`/`log10`/`pow`/`sqrt`/
+  `floor`/`ceil`/`trunc`/`fmod`/`modf`/`fabs`/`copysign`/`signbit`/
+  `isnan`/`isinf`/`isfinite`/`nan`/`nearbyint`/`ldexp`/`frexp` in
+  raw 387 asm. `import math; math.sqrt(2.0)` → `1.41421356...`
+  works end-to-end. **Caveat**: at DOUBLE without long-double
+  precision, upstream's APPROX float formatter accumulates round-
+  off across digit-extract multiplies and `print(4.0)` shows
+  `3.999999999999997` instead of `4.0`. We patch
+  `upstream/py/formatfloat.c` in build.sh to cap
+  `MAX_MANTISSA_DIGITS` at 16 (= SAFE_MANTISSA_DIGITS) so the
+  noise is bounded; full fix would require switching to the
+  EXACT formatter on real long-double, which uc386 doesn't
+  support today.
 - static qstrs (`__name__` → `'__main__'`)
 - `print()` with real newlines (qstr reverse-mangling correctly
   decodes `_brace_open__colon__hash_b_brace_close_` → `{:#b}`)
@@ -70,10 +86,14 @@ What works (24 smoke tests pin the core wins):
 
 What doesn't work yet (separate gates, pinned in mpconfigport.h):
 
-- `import math` / `import cmath` — gated on
-  `MICROPY_PY_BUILTINS_FLOAT`. Port is int-only today; enabling
-  floats needs a softfloat library hooked into uc386's libc plus
-  a few percent of additional bin size.
+- `import cmath` — needs `MICROPY_PY_CMATH`; we have float math
+  but no complex-number support today. Adding it is mostly a
+  matter of opting in plus the few extra qstrs it needs.
+- `MICROPY_PY_MATH_SPECIAL_FUNCTIONS` (`expm1`, `log2`, `log1p`,
+  `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `erf`,
+  `erfc`, `gamma`, `lgamma`) — gated at EXTRA_FEATURES; uc386's
+  libc doesn't yet have these, opt-in waits on adding the
+  hyperbolic / exponential primitives.
 - `import _thread` / `import weakref` — `MICROPY_PY_THREAD` and
   `MICROPY_PY_WEAKREF` not enabled at CORE_FEATURES.
 - `MICROPY_PY_IO` (open/io machinery) — port has no VFS.
