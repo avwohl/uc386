@@ -2292,51 +2292,48 @@ _snprintf:
 _printf:
         jmp     _printf_legacy
 
-; vprintf(const char *fmt, va_list ap) — same as printf but `ap` is the
+; vprintf(const char *fmt, va_list ap) — like printf but `ap` is the
 ; va_ptr passed in directly instead of derived from the call frame.
+; Forwards to `_printf_legacy_va` (a register-args entry point into
+; the same engine `_printf_legacy` uses). Output → stdout via the
+; in-asm format engine, real-DOS-safe under both runners.
 _vprintf:
         push    ebp
         mov     ebp, esp
-        push    ebx
-        mov     ebx, [_stdout]       ; fd
         mov     ecx, [ebp + 8]       ; fmt
         mov     edx, [ebp + 12]      ; ap (va_ptr)
-        mov     ah, 0x5F
-        int     21h
-        pop     ebx
+        call    _printf_legacy_va
         mov     esp, ebp
         pop     ebp
         ret
 
 ; fprintf(FILE *stream, const char *fmt, ...) — formats to the FILE.
-; The harness reads stream as fd (1=stdout, 2=stderr). Since our
-; libc declares stdin/stdout/stderr as 0/1/2 globals, the FILE *
-; arg evaluates to one of those small ints.
+; LIMITATION: under .exe (PMODE/W) we can't easily route per-stream
+; output through the legacy format engine (it uses INT 21h AH=02h
+; which is hardcoded to stdout). Output goes to stdout regardless
+; of `stream`. Under dos_emu .bin the same engine writes to stdout
+; via the harness intercept. So `fprintf(stderr, "…")` lands on
+; stdout — wrong stream but visibly emitted, which is better than
+; silently dropping. Programs that need real stderr separation
+; under .exe should use AH=0x40 directly (e.g., via fputs).
 _fprintf:
         push    ebp
         mov     ebp, esp
-        push    ebx
-        mov     ebx, [ebp + 8]       ; FILE *stream → fd
         mov     ecx, [ebp + 12]      ; fmt
-        lea     edx, [ebp + 16]      ; va_args
-        mov     ah, 0x5F
-        int     21h
-        pop     ebx
+        lea     edx, [ebp + 16]      ; va_ptr (first vararg)
+        call    _printf_legacy_va
         mov     esp, ebp
         pop     ebp
         ret
 
 ; vfprintf(FILE *stream, const char *fmt, va_list ap) — fprintf with ap.
+; Same stream-discard caveat as fprintf.
 _vfprintf:
         push    ebp
         mov     ebp, esp
-        push    ebx
-        mov     ebx, [ebp + 8]       ; FILE *stream → fd
         mov     ecx, [ebp + 12]      ; fmt
         mov     edx, [ebp + 16]      ; ap
-        mov     ah, 0x5F
-        int     21h
-        pop     ebx
+        call    _printf_legacy_va
         mov     esp, ebp
         pop     ebp
         ret
@@ -2355,6 +2352,24 @@ _vsprintf:
         mov     esp, ebp
         pop     ebp
         ret
+
+; _printf_legacy_va(ECX=fmt, EDX=va_ptr) — internal entry point.
+; Same engine as `_printf_legacy` but takes its inputs in registers
+; instead of via cdecl stack args. Used by `_vprintf` / `_fprintf` /
+; `_vfprintf`, which can't tail-jump to `_printf_legacy` because of
+; calling-convention differences (extra FILE* arg, va_ptr already
+; resolved, etc.). Output goes through the same INT 21h AH=02h path.
+_printf_legacy_va:
+        push    ebp
+        mov     ebp, esp
+        sub     esp, 8                ; [ebp-4] = zero_pad flag (per-spec)
+        push    ebx
+        push    esi
+        push    edi
+        mov     esi, ecx              ; fmt from caller
+        mov     edi, edx              ; va_ptr from caller
+        xor     ebx, ebx              ; bytes count
+        jmp     _printf_legacy.next
 
 ; The legacy ASM format engine is kept below as `_printf_legacy` so any
 ; user code that called it indirectly (via `&printf` taken to a function
