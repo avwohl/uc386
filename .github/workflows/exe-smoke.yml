@@ -146,16 +146,17 @@ jobs:
           echo "dosbox exit: $?"
           echo '== /tmp/dosbox-cwd contents =='
           ls -la /tmp/dosbox-cwd
-          echo '== mount-test.txt =='
-          cat /tmp/dosbox-cwd/mount-test.txt 2>&1
-          echo '== result.txt =='
-          cat /tmp/dosbox-cwd/result.txt 2>&1
+          # DOSBox 0.74-3 writes files with 8.3 short names (uppercase).
+          # echo > result.txt ends up as RESULT.TXT on the host.
+          RESULT="/tmp/dosbox-cwd/RESULT.TXT"
+          echo '== RESULT.TXT =='
+          cat "$RESULT" 2>&1
           echo '== dosbox log (filtered) =='
           grep -v '^ALSA\|^MIXER\|^MIDI\|^DOSBox switched' /tmp/dosbox.log | tail -25
-          # Pass condition: result.txt has all three markers.
-          if grep -q '^before' /tmp/dosbox-cwd/result.txt 2>/dev/null \
-             && grep -q '^errorlevel=0' /tmp/dosbox-cwd/result.txt 2>/dev/null \
-             && grep -q '^after' /tmp/dosbox-cwd/result.txt 2>/dev/null; then
+          # Pass condition: RESULT.TXT has all three markers.
+          if grep -q '^before' "$RESULT" 2>/dev/null \
+             && grep -q '^errorlevel=0' "$RESULT" 2>/dev/null \
+             && grep -q '^after' "$RESULT" 2>/dev/null; then
             echo "PASS: true.exe ran cleanly with errorlevel 0"
           else
             echo "FAIL: see diagnostic dumps above"
