@@ -150,16 +150,16 @@ def build_exe(
         if stripped.startswith("section .bss"):
             rewritten.append("        section _BSS use32 class=BSS")
             continue
+        # Strip libc's _stdin/_stdout/_stderr definitions — the
+        # bridge stub redefines them with real DOS handles 0/1/2
+        # instead of the dos_emu sentinels 0xF0/F1/F2. Match the
+        # exact one-line `_stdNN: dd 0xFN` form the codegen emits;
+        # don't touch lines that merely *reference* the symbols
+        # (e.g. `mov ebx, [_stdout]`).
+        if stripped.startswith(("_stdin:", "_stdout:", "_stderr:")) \
+                and "dd 0xF" in stripped:
+            continue
         rewritten.append(line)
-    # Export the libc-private stream globals so the bridge stub
-    # (which patches the dos_emu sentinels at PMODE/W entry) can
-    # take their address. NASM `-f obj` only exports symbols with
-    # an explicit `global` directive — the codegen output globals
-    # only `_start`, so wlink would otherwise see `_stdin/_stdout/
-    # _stderr is an undefined reference`.
-    rewritten.append("        global _stdin")
-    rewritten.append("        global _stdout")
-    rewritten.append("        global _stderr")
     asm_for_omf = out_path.with_suffix(".omf.asm")
     asm_for_omf.write_text("\n".join(rewritten) + "\n")
 
@@ -181,16 +181,17 @@ def build_exe(
     # INT 31h) lands in the same stub once stdout is verified working.
     bridge_asm = out_path.with_suffix(".bridge.asm")
     bridge_asm.write_text(
+        "        section _DATA use32 class=DATA\n"
+        "        global _stdin\n"
+        "        global _stdout\n"
+        "        global _stderr\n"
+        "_stdin:  dd 0\n"
+        "_stdout: dd 1\n"
+        "_stderr: dd 2\n"
         "        section _TEXT use32 class=CODE\n"
         "        global _pmodew_start\n"
-        "        extern _stdin\n"
-        "        extern _stdout\n"
-        "        extern _stderr\n"
         "        extern _start\n"
         "_pmodew_start:\n"
-        "        mov     dword [_stdin], 0\n"
-        "        mov     dword [_stdout], 1\n"
-        "        mov     dword [_stderr], 2\n"
         "        jmp     _start\n"
     )
     bridge_obj = out_path.with_suffix(".bridge.obj")
