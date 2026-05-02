@@ -118,20 +118,22 @@ jobs:
         run: |
           set +e   # don't let `cat` non-zero kill the diagnostic dump
           mkdir -p /tmp/dosbox-cwd
+          chmod 777 /tmp/dosbox-cwd
           cp /tmp/true.exe /tmp/dosbox-cwd/true.exe
+          # Diagnostic: first verify the mount can even write back
+          # to the host. If `mount-test.txt` doesn't materialize,
+          # the mount is read-only or syncs lazily.
           cat > /tmp/dosbox.conf <<'EOF'
           [sdl]
           fullscreen=false
 
           [cpu]
-          # core=normal is the interpreter; dynrec/auto choke on
-          # PMODE/W's protected-mode setup with "Can't run code in
-          # this page". Slower but correct.
           core=normal
 
           [autoexec]
           mount c /tmp/dosbox-cwd
           c:
+          echo mount-write-test > mount-test.txt
           echo before > result.txt
           true.exe
           echo errorlevel=%errorlevel% >> result.txt
@@ -142,18 +144,20 @@ jobs:
           timeout 30 dosbox -conf /tmp/dosbox.conf -exit \
             > /tmp/dosbox.log 2>&1
           echo "dosbox exit: $?"
+          echo '== /tmp/dosbox-cwd contents =='
+          ls -la /tmp/dosbox-cwd
+          echo '== mount-test.txt =='
+          cat /tmp/dosbox-cwd/mount-test.txt 2>&1
           echo '== result.txt =='
           cat /tmp/dosbox-cwd/result.txt 2>&1
-          echo '== dosbox log =='
-          # Strip ALSA/SDL noise that's irrelevant to whether true.exe ran.
-          grep -v '^ALSA\|^MIXER\|^MIDI\|^DOSBox switched' /tmp/dosbox.log | tail -20
-          # Pass condition: result.txt has "before", "errorlevel=0",
-          # AND "after" — meaning autoexec reached past true.exe.
+          echo '== dosbox log (filtered) =='
+          grep -v '^ALSA\|^MIXER\|^MIDI\|^DOSBox switched' /tmp/dosbox.log | tail -25
+          # Pass condition: result.txt has all three markers.
           if grep -q '^before' /tmp/dosbox-cwd/result.txt 2>/dev/null \
              && grep -q '^errorlevel=0' /tmp/dosbox-cwd/result.txt 2>/dev/null \
              && grep -q '^after' /tmp/dosbox-cwd/result.txt 2>/dev/null; then
             echo "PASS: true.exe ran cleanly with errorlevel 0"
           else
-            echo "FAIL: see result.txt + log above"
+            echo "FAIL: see diagnostic dumps above"
             exit 1
           fi
