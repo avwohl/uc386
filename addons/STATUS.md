@@ -25,14 +25,18 @@ test runner). Status:
   + exits 0; `false.exe` exits 1; `myecho.exe hello dos` writes
   literal `hello dos\n` via libc fputs through real DOS handles;
   `argv_pr.exe alpha beta` prints `argc=3 / argv[1]='alpha' /
-  argv[2]='beta'`. The bridge stub in `addons/harness/exe.py`
-  handles the two PMODE/W ↔ uc386 mismatches: stream sentinels
-  (libc's `_stdout=0xF1` was a dos_emu sentinel; real DOS needs
-  raw fd 0/1/2) and argv parsing (PMODE/W puts the PSP selector
-  in ES at entry per the OpenWatcom CRT convention; the bridge
-  reads `[es:0x80]` for cmdline length and `[es:0x81..]` for the
-  tail). 14 in-tree manifest addons all build .exe successfully.
-  Full progression in `docs/path-a-mz-le.md`.
+  argv[2]='beta'`; `factor.exe 2 12 60 97` emits multi-arg printf
+  output (`2: 2 / 12: 2 2 3 / 60: 2 2 3 5 / 97: 97`) via the
+  legacy in-asm format engine. The bridge stub handles three
+  PMODE/W ↔ uc386 mismatches: (1) stream sentinels (libc's
+  `_stdout=0xF1` was dos_emu-only; real DOS needs raw fd 1),
+  (2) argv parsing (PMODE/W puts the PSP selector in ES at entry
+  per the OpenWatcom CRT convention; the bridge reads `[es:0x80]`
+  for cmdline length and `[es:0x81..]` for the tail), and (3)
+  `_printf` now tail-jumps to `_printf_legacy` (real-DOS-safe
+  via INT 21h AH=02h per char). 14 in-tree manifest addons all
+  build .exe successfully. Full progression in
+  `docs/path-a-mz-le.md`.
 - **dosiz integration** ◐ — Path A makes the dosiz-side
   flat-bin-loader gap moot for the FreeDOS case (.exe runs on
   any DOS). dosiz can still be useful as a third runner for
