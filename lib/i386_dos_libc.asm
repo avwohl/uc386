@@ -2282,22 +2282,15 @@ _snprintf:
         pop     ebp
         ret
 
-; printf(const char *fmt, ...) — formats and writes to stdout.
-; Loads [_stdout] as the destination fd and routes through AH=0x5F so
-; freopen-redirected stdout works correctly.
+; printf(const char *fmt, ...) — delegates to the legacy in-asm
+; format engine. Both runners (dos_emu .bin + PMODE/W .exe) get
+; correct output via INT 21h AH=02h (display char, real-DOS-safe).
+; The earlier AH=0x5F harness path was dos_emu-only and silently
+; dropped output under PMODE/W. The legacy engine reads its inputs
+; via the same cdecl convention (fmt + va_args), so a tail-jump
+; preserves the call frame without rebuilding it.
 _printf:
-        push    ebp
-        mov     ebp, esp
-        push    ebx
-        mov     ebx, [_stdout]       ; fd
-        mov     ecx, [ebp + 8]       ; fmt
-        lea     edx, [ebp + 12]      ; va_args
-        mov     ah, 0x5F
-        int     21h
-        pop     ebx
-        mov     esp, ebp
-        pop     ebp
-        ret
+        jmp     _printf_legacy
 
 ; vprintf(const char *fmt, va_list ap) — same as printf but `ap` is the
 ; va_ptr passed in directly instead of derived from the call frame.
