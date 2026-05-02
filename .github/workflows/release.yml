@@ -150,6 +150,18 @@ jobs:
           cd /tmp/foss-smoke/uc386-foss
           python test_addons.py
 
+      - name: Smoke-test the games tarball end-to-end
+        # Same idea for the games tarball: extract, run the doom smoke
+        # test against the shipped bin/doom/doom.bin (which the
+        # tarball-mode bin discovery in test_doom_smoke.py finds
+        # alongside the test). Skips cleanly if doom.bin didn't ship
+        # (build failed earlier in this run).
+        run: |
+          mkdir -p /tmp/games-smoke
+          tar xzf dist/uc386-games-build-scripts-*.tar.gz -C /tmp/games-smoke
+          cd /tmp/games-smoke/uc386-games/doom
+          python -m pytest test_doom_smoke.py -v
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
