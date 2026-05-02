@@ -121,8 +121,11 @@ jobs:
           fullscreen=false
 
           [cpu]
-          core=auto
-          cputype=auto
+          # core=normal is the interpreter; dynrec/auto choke on
+          # PMODE/W's protected-mode setup with "Can't run code in
+          # this page". Slower but correct.
+          core=normal
+          cputype=pentium
 
           [autoexec]
           mount c /tmp/dosbox-cwd
