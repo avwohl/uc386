@@ -86,6 +86,17 @@ double fma(double x, double y, double z);
 double fmax(double x, double y);
 double fmin(double x, double y);
 
+/* Error and gamma functions (C99). uc386 ships an Abramowitz
+ * polynomial for erf/erfc and NaN stubs for tgamma/lgamma. */
+double erf(double x);
+double erfc(double x);
+double tgamma(double x);
+double lgamma(double x);
+
+/* Round to integer using current rounding mode (default = nearest
+ * even). Used by Python's `round()` builtin. */
+double nearbyint(double x);
+
 /* Classification macros (C99) */
 #define FP_NAN       0
 #define FP_INFINITE  1

@@ -108,6 +108,14 @@
 // have).
 #define MICROPY_FLOAT_IMPL                (MICROPY_FLOAT_IMPL_DOUBLE)
 
+// Pull in the hyperbolic / inverse-hyperbolic / log2 / expm1 /
+// erf / erfc / tgamma / lgamma surface modmath.c gates on this
+// flag. uc386's libc provides FPU-backed implementations for
+// sinh/cosh/tanh/asinh/acosh/atanh/log2/expm1, an Abramowitz
+// polynomial for erf/erfc, and NaN stubs for tgamma/lgamma
+// (full Lanczos approximation is a future slice).
+#define MICROPY_PY_MATH_SPECIAL_FUNCTIONS  (1)
+
 typedef long mp_off_t;
 
 #define MICROPY_HW_BOARD_NAME "uc386-dos"

@@ -29,7 +29,7 @@ Type "help()" for more information.
 caught
 ```
 
-What works (26 smoke tests pin the core wins):
+What works (27 smoke tests pin the core wins):
 
 - arithmetic + control flow (`if/else`, `for/range`, `while/break`)
 - function def + call (`def f(x): return x*2; f(7)` → `14`)
@@ -64,13 +64,20 @@ What works (26 smoke tests pin the core wins):
   EOPNOTSUPP/EADDRINUSE/ECONN*/EHOST*/EALREADY/EINPROGRESS)
   plus build.sh's X-macro-aware grep for the EPERM/ENOENT/...
   qstrs that `MP_QSTR_##e` token paste needs.
-- `MICROPY_FLOAT_IMPL=DOUBLE` — uc386 lowers `double` through the
-  x87 FPU. lib/i386_dos_libc.asm provides `sin`/`cos`/`tan`/
-  `asin`/`acos`/`atan`/`atan2`/`exp`/`log`/`log10`/`pow`/`sqrt`/
+- `MICROPY_FLOAT_IMPL=DOUBLE` + `MICROPY_PY_MATH_SPECIAL_FUNCTIONS=1`
+  — uc386 lowers `double` through the x87 FPU.
+  lib/i386_dos_libc.asm provides `sin`/`cos`/`tan`/`asin`/`acos`/
+  `atan`/`atan2`/`sinh`/`cosh`/`tanh`/`asinh`/`acosh`/`atanh`/
+  `exp`/`log`/`log10`/`log2`/`expm1`/`pow`/`sqrt`/
   `floor`/`ceil`/`trunc`/`fmod`/`modf`/`fabs`/`copysign`/`signbit`/
-  `isnan`/`isinf`/`isfinite`/`nan`/`nearbyint`/`ldexp`/`frexp` in
-  raw 387 asm. `import math; math.sqrt(2.0)` → `1.41421356...`
-  works end-to-end. **Caveat**: at DOUBLE without long-double
+  `isnan`/`isinf`/`isfinite`/`nan`/`nearbyint`/`ldexp`/`frexp`/
+  `erf`/`erfc` in raw 387 asm; `tgamma`/`lgamma` are NaN stubs.
+  Hyperbolics use `e^±x` via the existing `_exp` (sinh/cosh/tanh)
+  or sqrt+log identities (asinh/acosh/atanh). `log2` uses fyl2x
+  with `y=1`. `expm1` uses `f2xm1` directly when |x*log2(e)| < 1
+  (preserves precision near 0). `erf` uses Abramowitz & Stegun
+  7.1.26 (5-term polynomial; ~1.5e-7 max error). `import math;
+  math.sqrt(2.0)` → `1.41421356...` works end-to-end. **Caveat**: at DOUBLE without long-double
   precision, upstream's APPROX float formatter accumulates round-
   off across digit-extract multiplies and `print(4.0)` shows
   `3.999999999999997` instead of `4.0`. We patch
@@ -89,11 +96,8 @@ What doesn't work yet (separate gates, pinned in mpconfigport.h):
 - `import cmath` — needs `MICROPY_PY_CMATH`; we have float math
   but no complex-number support today. Adding it is mostly a
   matter of opting in plus the few extra qstrs it needs.
-- `MICROPY_PY_MATH_SPECIAL_FUNCTIONS` (`expm1`, `log2`, `log1p`,
-  `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `erf`,
-  `erfc`, `gamma`, `lgamma`) — gated at EXTRA_FEATURES; uc386's
-  libc doesn't yet have these, opt-in waits on adding the
-  hyperbolic / exponential primitives.
+- Full `tgamma` / `lgamma` — currently NaN stubs in libc. A real
+  Lanczos approximation is the EXTRA_FEATURES follow-up.
 - `import _thread` / `import weakref` — `MICROPY_PY_THREAD` and
   `MICROPY_PY_WEAKREF` not enabled at CORE_FEATURES.
 - `MICROPY_PY_IO` (open/io machinery) — port has no VFS.

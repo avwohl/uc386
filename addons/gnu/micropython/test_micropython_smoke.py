@@ -701,6 +701,54 @@ def test_micropython_float_arithmetic(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_math_special_functions(micropython_bin: Path) -> None:
+    """`MICROPY_PY_MATH_SPECIAL_FUNCTIONS` opens hyperbolic +
+    log2 + expm1 + erf/erfc surface. Pin a small subset
+    (sinh/cosh ≈ identity at 0, log2(8) = 3, atanh(0.5) ≈ 0.549,
+    erf(0.5) ≈ 0.520) so a future libc-side regression in any of
+    the FPU primitives shows up here."""
+    import math as cmath_local
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import math\n"
+                  b"print(round(math.sinh(0.0), 4))\n"
+                  b"print(round(math.cosh(0.0), 4))\n"
+                  b"print(round(math.log2(8.0), 4))\n"
+                  b"print(round(math.atanh(0.5), 4))\n"
+                  b"print(round(math.erf(0.5), 4))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # Each result is rounded to 4 decimal digits in-Python before
+    # printing, dodging the formatter-precision quirk for sub-1
+    # results (those don't need MAX_MANTISSA_DIGITS=19 anyway).
+    expected = [
+        ("sinh(0)", 0.0),
+        ("cosh(0)", 1.0),
+        ("log2(8)", 3.0),
+        ("atanh(0.5)", round(cmath_local.atanh(0.5), 4)),
+        ("erf(0.5)", round(cmath_local.erf(0.5), 4)),
+    ]
+    out_lines = [l for l in res.stdout.splitlines() if l and l[0].isdigit() or (l and l[0] == '-')]
+    assert len(out_lines) >= 5, (
+        f"expected 5 numeric lines, got: {res.stdout!r}"
+    )
+    for (label, exp), actual_str in zip(expected, out_lines):
+        actual = float(actual_str)
+        # Abramowitz erf is good to ~1.5e-7; round-to-4 leaves
+        # plenty of room for that.
+        assert abs(actual - exp) < 1e-3, (
+            f"{label}: expected ≈ {exp}, got {actual}"
+        )
+
+
 def test_micropython_import_array(micropython_bin: Path) -> None:
     """`import array; array.array('i', ...)` — gated on
     `MICROPY_PY_ARRAY` (CORE_FEATURES). Pins typed-array storage

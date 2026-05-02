@@ -4914,3 +4914,287 @@ _log10:
         pop     ebp
         ret
 
+; ---- MICROPY_PY_MATH_SPECIAL_FUNCTIONS surface --------------------------
+; modmath.c gates these on MICROPY_PY_MATH_SPECIAL_FUNCTIONS (= 1 in
+; uc386-dos/mpconfigport.h). All implemented via the existing _exp /
+; _log / _sqrt primitives plus FPU instructions; no extra arg-marshal
+; beyond the standard `qword [ebp+8]` / result-on-st(0) calling
+; convention the rest of this file uses.
+
+; log2(x) — log2(x) = 1 * log2(x) via fyl2x with y=1. Fast and exact
+; for powers of 2.
+_log2:
+        push    ebp
+        mov     ebp, esp
+        fld1                                ; y = 1.0
+        fld     qword [ebp + 8]             ; x
+        fyl2x                               ; y * log2(x) = log2(x)
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; expm1(x) — e^x - 1. Loses precision near 0 with the naive
+; expression because (1 + tiny) - 1 cancels. We use f2xm1 (which
+; computes 2^y - 1 directly) for |x*log2(e)| < 1, and fall back to
+; exp(x) - 1 for larger magnitudes.
+_expm1:
+        push    ebp
+        mov     ebp, esp
+        fld     qword [ebp + 8]             ; x
+        fldl2e                              ; log2(e), x
+        fmulp   st1, st0                    ; x * log2(e) =: y
+        ; if |y| > 1.0, fall back to exp(x) - 1.
+        fld     st0                         ; y, y
+        fabs                                ; |y|, y
+        fld1                                ; 1.0, |y|, y
+        fcompp                              ; pop both, set flags
+        fnstsw  ax
+        sahf
+        ja      .expm1_smallrange           ; |y| < 1.0
+        ; |y| >= 1.0: compute exp(x) - 1 by reusing _exp's algorithm.
+        ; y = x * log2(e) on st(0). Use the same epilogue as _exp.
+        fld     st0                         ; y, y
+        frndint                             ; int(y), y
+        fxch    st1                         ; y, int(y)
+        fsub    st0, st1                    ; frac = y - int(y), int(y)
+        f2xm1                               ; 2^frac - 1, int(y)
+        fld1
+        faddp   st1, st0                    ; 2^frac, int(y)
+        fscale                              ; 2^y = e^x, int(y)
+        fstp    st1                         ; e^x
+        fld1
+        fsubp   st1, st0                    ; e^x - 1
+        jmp     .expm1_done
+.expm1_smallrange:
+        ; |y| < 1.0: use f2xm1 directly = 2^y - 1 = e^x - 1.
+        f2xm1
+.expm1_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; cosh(x) = (e^x + e^-x) / 2.  Calls _exp twice on x and -x.
+_cosh:
+        push    ebp
+        mov     ebp, esp
+        sub     esp, 8
+        fld     qword [ebp + 8]
+        fstp    qword [esp]
+        call    _exp                        ; e^x on st(0)
+        fld     qword [ebp + 8]
+        fchs                                ; -x
+        fstp    qword [esp]
+        call    _exp                        ; e^-x on st(0), e^x on st(1)
+        faddp   st1, st0                    ; e^x + e^-x
+        fld1
+        fld1
+        faddp   st1, st0                    ; 2.0
+        fdivp   st1, st0                    ; / 2
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; sinh(x) = (e^x - e^-x) / 2.  Same pattern as cosh.
+_sinh:
+        push    ebp
+        mov     ebp, esp
+        sub     esp, 8
+        fld     qword [ebp + 8]
+        fstp    qword [esp]
+        call    _exp                        ; e^x
+        fld     qword [ebp + 8]
+        fchs
+        fstp    qword [esp]
+        call    _exp                        ; e^-x on st(0), e^x on st(1)
+        fsubp   st1, st0                    ; st(1) -= st(0); pop. Result e^x - e^-x.
+        fld1
+        fld1
+        faddp   st1, st0
+        fdivp   st1, st0
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; tanh(x) = (e^x - e^-x) / (e^x + e^-x). Save both e^x and e^-x to
+; memory temps to keep the FPU stack ops trivial (the alternative
+; in-stack juggle hits a confusing fsubp/fdivp orientation case).
+_tanh:
+        push    ebp
+        mov     ebp, esp
+        sub     esp, 24                     ; 8 for arg + 2*8 for temps
+        fld     qword [ebp + 8]
+        fstp    qword [esp]
+        call    _exp                        ; e^x
+        fstp    qword [ebp - 8]             ; save e^x
+        fld     qword [ebp + 8]
+        fchs
+        fstp    qword [esp]
+        call    _exp                        ; e^-x
+        fstp    qword [ebp - 16]            ; save e^-x
+        ; Now FPU stack is empty. Compute num/denom directly.
+        fld     qword [ebp - 8]             ; e^x
+        fsub    qword [ebp - 16]            ; e^x - e^-x        (numerator)
+        fld     qword [ebp - 8]             ; e^x, num
+        fadd    qword [ebp - 16]            ; e^x + e^-x, num   (denom on top)
+        fdivp   st1, st0                    ; st1 = num / denom; pop
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; asinh(x) = log(x + sqrt(x*x + 1))
+_asinh:
+        push    ebp
+        mov     ebp, esp
+        fld     qword [ebp + 8]             ; x
+        fld     st0                         ; x, x
+        fmul    st0, st0                    ; x*x, x
+        fld1                                ; 1, x*x, x
+        faddp   st1, st0                    ; 1+x*x, x
+        fsqrt                               ; sqrt(1+x*x), x
+        faddp   st1, st0                    ; x + sqrt(1+x*x)
+        sub     esp, 8
+        fstp    qword [esp]
+        call    _log
+        add     esp, 8
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; acosh(x) = log(x + sqrt(x*x - 1))
+_acosh:
+        push    ebp
+        mov     ebp, esp
+        fld     qword [ebp + 8]             ; x
+        fld     st0                         ; x, x
+        fmul    st0, st0                    ; x*x, x
+        fld1                                ; 1, x*x, x
+        fsubp   st1, st0                    ; x*x - 1, x
+        fsqrt                               ; sqrt(x*x - 1), x
+        faddp   st1, st0                    ; x + sqrt(x*x - 1)
+        sub     esp, 8
+        fstp    qword [esp]
+        call    _log
+        add     esp, 8
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; atanh(x) = 0.5 * log((1 + x) / (1 - x))
+_atanh:
+        push    ebp
+        mov     ebp, esp
+        fld     qword [ebp + 8]             ; x
+        fld1                                ; 1, x
+        fld     st1                         ; x, 1, x
+        faddp   st1, st0                    ; 1+x, x
+        fld1                                ; 1, 1+x, x
+        fsub    st0, st2                    ; 1-x, 1+x, x
+        fdivp   st1, st0                    ; (1+x)/(1-x), x
+        sub     esp, 8
+        fstp    qword [esp]
+        call    _log                        ; log((1+x)/(1-x))
+        add     esp, 8
+        fstp    st1                         ; drop the still-on-stack x
+        fld1
+        fld1
+        faddp   st1, st0                    ; 2.0
+        fdivp   st1, st0                    ; / 2.0
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; erf(x) — Abramowitz & Stegun 7.1.26 polynomial approximation.
+; Maximum absolute error 1.5e-7 — single-precision good, not great
+; for a double, but matches what most embedded ports ship.
+;   erf(x) = 1 - (a1*t + a2*t^2 + a3*t^3 + a4*t^4 + a5*t^5) * exp(-x^2)
+;   t = 1 / (1 + p*|x|);  p = 0.3275911
+; For x < 0, use erf(-x) = -erf(x).
+        section .data
+_erf_p:  dq 0.3275911
+_erf_a1: dq 0.254829592
+_erf_a2: dq -0.284496736
+_erf_a3: dq 1.421413741
+_erf_a4: dq -1.453152027
+_erf_a5: dq 1.061405429
+        section .text
+_erf:
+        push    ebp
+        mov     ebp, esp
+        sub     esp, 8
+        fld     qword [ebp + 8]             ; x
+        ; sign = signbit(x); compute on |x| and re-sign at end.
+        fld     st0                         ; x, x
+        fabs                                ; |x|, x
+        ; t = 1 / (1 + p * |x|)
+        fld     qword [_erf_p]              ; p, |x|, x
+        fmul    st0, st1                    ; p*|x|, |x|, x
+        fld1                                ; 1, p*|x|, |x|, x
+        faddp   st1, st0                    ; 1+p*|x|, |x|, x
+        fld1                                ; 1, 1+p*|x|, |x|, x
+        fdivrp  st1, st0                    ; t = 1/(1+p*|x|), |x|, x
+        ; Horner-evaluate the polynomial in t:
+        ;   poly = ((((a5*t + a4)*t + a3)*t + a2)*t + a1) * t
+        fld     qword [_erf_a5]             ; a5, t, |x|, x
+        fmul    st0, st1                    ; a5*t, t, ...
+        fadd    qword [_erf_a4]             ; a5*t + a4, t, ...
+        fmul    st0, st1                    ; (a5*t+a4)*t, t, ...
+        fadd    qword [_erf_a3]
+        fmul    st0, st1
+        fadd    qword [_erf_a2]
+        fmul    st0, st1
+        fadd    qword [_erf_a1]             ; a1+a2t+a3t^2+a4t^3+a5t^4, t, |x|, x
+        fmulp   st1, st0                    ; poly = a1*t + ... + a5*t^5, |x|, x
+        ; Multiply by exp(-x*x). We need |x| no longer; compute -x*x
+        ; using |x| (= x in magnitude).
+        fxch    st1                         ; |x|, poly, x
+        fmul    st0, st0                    ; x*x, poly, x
+        fchs                                ; -x*x, poly, x
+        fstp    qword [esp]
+        ; Need to call _exp; it leaves a value on st(0). The poly is
+        ; on st(0) right now and will be st(1) after _exp pushes.
+        call    _exp                        ; exp(-x*x), poly, x
+        fmulp   st1, st0                    ; poly * exp(-x*x), x
+        fld1
+        fsubrp  st1, st0                    ; 1 - poly*exp(-x*x), x
+        ; Re-sign: if x < 0, negate result.
+        fxch    st1                         ; x, result
+        ftst                                ; compare x to 0
+        fnstsw  ax
+        fstp    st0                         ; drop x
+        sahf
+        jae     .erf_done                   ; x >= 0: keep result as-is
+        fchs                                ; x < 0: erf(-|x|) = -erf(|x|)
+.erf_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; erfc(x) = 1 - erf(x).  Quick implementation; loses precision for
+; large positive x where direct erfc would be more accurate, but
+; matches what the libm-less ports do today.
+_erfc:
+        push    ebp
+        mov     ebp, esp
+        sub     esp, 8
+        fld     qword [ebp + 8]
+        fstp    qword [esp]
+        call    _erf                        ; erf(x)
+        fld1
+        fsubrp  st1, st0                    ; 1 - erf(x)
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; tgamma(x), lgamma(x) — stubs returning NaN. A full implementation
+; would use Lanczos (tgamma) + Stirling-with-Bernoulli (lgamma);
+; we don't ship that today because no smoke test exercises gamma
+; and the asm cost is ~100 lines. Documented in
+; addons/gnu/micropython/NOTES.md as an EXTRA_FEATURES follow-up.
+_tgamma:
+        fld     qword [_nan_quiet_dbl]
+        ret
+
+_lgamma:
+        fld     qword [_nan_quiet_dbl]
+        ret
+
