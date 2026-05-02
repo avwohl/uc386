@@ -361,11 +361,14 @@ write `ports/uc386-dos/` with INT-21h-backed `mp_hal_stdout_tx_strn`).
 - `test_addons.py` at the top level — walks
   `src/<name>/manifest.toml`, runs each `<name>.bin` under
   `uc386.dos_emu.run` with the manifest's argv / stdin / vfiles,
-  asserts stdout + exit code match the expected values.
+  asserts stdout + exit code match the expected values. Also
+  runs end-to-end smoke checks for the upstream-port binaries
+  that don't carry a manifest (awk → `BEGIN { print 2*3 }`,
+  micropython → REPL banner + Ctrl-D exit).
 
 End-to-end verified: extract the tarball, `python test_addons.py`
-prints `16/16 passed (0 skipped)` against the shipped manifests
-+ binaries.
+prints `18/18 passed (0 skipped)` against the shipped manifests
++ binaries (16 manifest-driven + awk + micropython).
 
 For the games tarball, "some games ship" is **just Doom today** —
 the only game that boots end-to-end. `addons/games/doom/build/doom.bin`
