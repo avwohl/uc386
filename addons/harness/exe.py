@@ -109,9 +109,33 @@ def build_exe(
             "macOS hasn't a native Watcom build today."
         )
 
+    # uc386 emits `section .text` / `section .data` / `section .bss`
+    # without the OMF-specific `use32 class=...` modifiers. NASM's
+    # `-f obj` defaults to USE16 segments, which makes the resulting
+    # OMF declare 32-bit code as 16-bit. wlink links it cleanly but
+    # the LE-loader runs it with the D-bit clear → CPU treats every
+    # instruction as 16-bit and execution wanders off into garbage
+    # (DOSBox: "Illegal read from 4cb4f3*").
+    # Rewrite each section line to include `use32` + an OMF class
+    # before NASM sees it.
+    asm_text = asm_path.read_text()
+    rewritten = []
+    for line in asm_text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("section .text"):
+            rewritten.append("        section _TEXT use32 class=CODE")
+        elif stripped.startswith("section .data"):
+            rewritten.append("        section _DATA use32 class=DATA")
+        elif stripped.startswith("section .bss"):
+            rewritten.append("        section _BSS use32 class=BSS")
+        else:
+            rewritten.append(line)
+    asm_for_omf = out_path.with_suffix(".omf.asm")
+    asm_for_omf.write_text("\n".join(rewritten) + "\n")
+
     obj_path = out_path.with_suffix(".obj")
     proc = subprocess.run(
-        ["nasm", "-f", "obj", "-o", str(obj_path), str(asm_path)],
+        ["nasm", "-f", "obj", "-o", str(obj_path), str(asm_for_omf)],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
