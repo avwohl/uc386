@@ -158,6 +158,64 @@ def main() -> int:
                     print(f"    want stdout={want[:120]!r}{'…' if len(want) > 120 else ''}")
             fails += 1
 
+    # Run a tiny smoke check on the upstream-port binaries the FOSS
+    # tarball ships outside the manifest set: awk.bin and
+    # micropython.bin. These don't have a manifest.toml because their
+    # build path (fetch.sh + build.sh + multi-TU compile) doesn't
+    # plug into the per-source harness, but a one-shot probe through
+    # dos_emu still gives end-to-end confidence.
+    awk_bin = here / "awk.bin"
+    if awk_bin.exists():
+        try:
+            res = run(
+                awk_bin, argv=["awk", "BEGIN { print 2*3 }"],
+                stdin_bytes=b"", timeout_seconds=10.0,
+                instruction_limit=200_000_000,
+            )
+            ok = res.exit_code == 0 and res.stdout == "6\n" and not res.timed_out
+        except Exception as e:
+            print(f"  awk: RUN FAIL — {type(e).__name__}: {e}")
+            fails += 1
+        else:
+            if ok:
+                print("  awk: PASS (BEGIN { print 2*3 } → 6)")
+                passes += 1
+            else:
+                print(
+                    f"  awk: FAIL exit={res.exit_code} stdout={res.stdout!r}"
+                )
+                fails += 1
+
+    mp_bin = here / "micropython.bin"
+    if mp_bin.exists():
+        try:
+            res = run(
+                mp_bin, stdin_bytes=b"\x04",
+                timeout_seconds=15.0, instruction_limit=2_000_000_000,
+            )
+            # Ctrl-D-only path: REPL boots, prints banner + prompt,
+            # then exits cleanly.
+            ok = (
+                res.exit_code == 0
+                and not res.timed_out
+                and "MicroPython" in res.stdout
+                and ">>> " in res.stdout
+            )
+        except Exception as e:
+            print(f"  micropython: RUN FAIL — {type(e).__name__}: {e}")
+            fails += 1
+        else:
+            if ok:
+                print("  micropython: PASS (REPL banner + clean Ctrl-D exit)")
+                passes += 1
+            else:
+                tail = res.stdout[-160:]
+                print(
+                    f"  micropython: FAIL exit={res.exit_code} "
+                    f"timed_out={res.timed_out} tail={tail!r}"
+                )
+                fails += 1
+
     total = passes + fails
     print()
     print(f"== {passes}/{total} passed ({skips} skipped) ==")
