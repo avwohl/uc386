@@ -268,6 +268,47 @@ jobs:
             exit 1
           fi
 
+      - name: Phase 8 — factor.exe with many argv args
+        # Stresses argv with 4 numeric args + per-arg integer parsing
+        # and stdout output. Expected output lines:
+        #   2: 2
+        #   12: 2 2 3
+        #   60: 2 2 3 5
+        #   97: 97
+        run: |
+          set +e
+          mkdir -p /tmp/dosbox-fac
+          chmod 777 /tmp/dosbox-fac
+          cp /tmp/exe-all/factor.exe /tmp/dosbox-fac/fac.exe
+          cat > /tmp/dosbox-fac.conf <<'EOF'
+          [sdl]
+          fullscreen=false
+
+          [cpu]
+          core=normal
+
+          [autoexec]
+          mount c /tmp/dosbox-fac
+          c:
+          fac.exe 2 12 60 97 > out.txt
+          exit
+          EOF
+          export SDL_VIDEODRIVER=dummy
+          timeout 30 dosbox -conf /tmp/dosbox-fac.conf -exit \
+            > /tmp/dosbox-fac.log 2>&1
+          OUT="/tmp/dosbox-fac/OUT.TXT"
+          echo '== OUT.TXT =='
+          cat "$OUT" 2>&1
+          if grep -q '^2: 2$' "$OUT" \
+             && grep -q '^12: 2 2 3$' "$OUT" \
+             && grep -q '^60: 2 2 3 5$' "$OUT" \
+             && grep -q '^97: 97$' "$OUT"; then
+            echo "PASS: factor.exe processed 4 argv numbers correctly"
+          else
+            echo "FAIL: factor output missing expected factorizations"
+            exit 1
+          fi
+
       - name: Phase 7 — argv parsing under DOSBox
         # Asserts the bridge stub correctly parses argc/argv from
         # the PSP. Builds argv_probe.exe (prints argc + each argv[i]),
