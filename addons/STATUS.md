@@ -18,13 +18,18 @@ test runner). Status:
   no longer excludes `upstream/` from either tarball, so when the
   CI fetches + builds awk-bwk or doom, the matching upstream
   source tree ships alongside the binary.
-- **dosiz integration** ◐ — gap analysed in
-  `docs/dosiz-integration.md`. dosiz today loads MZ / MZ+LE /
-  bare LE; uc386 emits flat .bin via `nasm -f bin`. Smallest
-  bridge is a `--flat-bin` loader on the dosiz side (reuses its
-  existing PM / LDT plumbing); the larger payoff is uc386
-  emitting MZ+LE so the binaries run on real DOS too. Path-B
-  first; tracked there.
+- **MZ+LE .exe output (Path A)** ✓ — uc386 produces self-contained
+  `.exe` files via `addons/harness/exe.py`
+  (uc386 → nasm OMF → wlink → MZ+LE bound to PMODE/W). Verified
+  end-to-end in CI: `true.exe` (~11.8 KB) boots PMODE/W, runs
+  our 32-bit code under DOSBox, exits with errorlevel 0. Same
+  pipeline produces .exe for any in-tree addon that compiles
+  through uc386. Full progression in `docs/path-a-mz-le.md`.
+- **dosiz integration** ◐ — Path A makes the dosiz-side
+  flat-bin-loader gap moot for the FreeDOS case (.exe runs on
+  any DOS). dosiz can still be useful as a third runner for
+  differential testing — gap analysis stays in
+  `docs/dosiz-integration.md`.
 
 ## ✓ Port GNU utilities to this compiler
 
