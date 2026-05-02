@@ -70,29 +70,43 @@ def unescape(macro_tail: str) -> str:
             i += 1
             continue
         # Found a `_` — could be a literal underscore in the source
-        # qstr (no decoding needed) or the start of `_<name>_`.
-        # Probe forward for the closing `_` and check the candidate
-        # name. Fall back to literal `_` if no match.
-        j = macro_tail.find("_", i + 1)
-        if j == -1:
+        # qstr (e.g. `__name__`) or the start of `_<name>_` where
+        # `<name>` is an entry in `codepoint2name` (HTML entity name)
+        # or `0xNN` (hex byte literal). Some entity names CONTAIN
+        # underscores themselves: `brace_open`, `brace_close`,
+        # `paren_open`, `bracket_open`, etc. So a naive
+        # `find("_", i+1)` would split `_brace_open_` on the inner
+        # `_` and produce `brace` as the candidate name (which
+        # doesn't match anything, so we'd silently drop the escape).
+        # Iterate forward over EVERY `_` that follows and accept the
+        # first candidate that's a known name (longest valid by
+        # construction — names don't share prefixes that are also
+        # names). Fall back to literal `_` if no closing `_` matches.
+        matched = False
+        j = i + 1
+        while True:
+            k = macro_tail.find("_", j)
+            if k == -1:
+                break
+            candidate = macro_tail[i + 1 : k]
+            if candidate in name2char:
+                out.append(name2char[candidate])
+                i = k + 1
+                matched = True
+                break
+            if (
+                len(candidate) == 4
+                and candidate[:2] == "0x"
+                and all(ch in "0123456789abcdef" for ch in candidate[2:])
+            ):
+                out.append(chr(int(candidate[2:], 16)))
+                i = k + 1
+                matched = True
+                break
+            j = k + 1
+        if not matched:
             out.append("_")
             i += 1
-            continue
-        candidate = macro_tail[i + 1 : j]
-        if candidate in name2char:
-            out.append(name2char[candidate])
-            i = j + 1
-            continue
-        if (
-            len(candidate) == 4
-            and candidate[:2] == "0x"
-            and all(ch in "0123456789abcdef" for ch in candidate[2:])
-        ):
-            out.append(chr(int(candidate[2:], 16)))
-            i = j + 1
-            continue
-        out.append("_")
-        i += 1
     return "".join(out)
 
 

@@ -274,6 +274,44 @@ def test_micropython_list_comprehension(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_bin_hex_oct(micropython_bin: Path) -> None:
+    """`bin(10)` → `0b1010`, `hex(255)` → `0xff`, `oct(8)` → `0o10`.
+    These exercise qstrs whose escape names CONTAIN underscores
+    (`brace_open`, `brace_close`, `colon`, `hash`) — the reverse-
+    mangler must not split `_brace_open_` on the inner `_` and
+    candidate-match `brace`. Pre-fix output was the macro-mangled
+    text: `_brace_open_:#b_brace_close_` instead of `0b1010`."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"print(bin(10))\n"
+                  b"print(hex(255))\n"
+                  b"print(oct(8))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "0b1010" in res.stdout, (
+        f"expected `bin(10)` → `0b1010`, got: {res.stdout!r}"
+    )
+    assert "0xff" in res.stdout, (
+        f"expected `hex(255)` → `0xff`, got: {res.stdout!r}"
+    )
+    assert "0o10" in res.stdout, (
+        f"expected `oct(8)` → `0o10`, got: {res.stdout!r}"
+    )
+    # Belt-and-suspenders against regression: the macro-mangled form
+    # `_brace_open_` should never appear in output.
+    assert "_brace_open_" not in res.stdout, (
+        f"qstr macro-mangling leaked: {res.stdout!r}"
+    )
+
+
 def test_micropython_min_max_reversed(micropython_bin: Path) -> None:
     """`min([3,1,2])`, `max([3,1,2])`, `reversed([1,2,3])` exercise
     the CORE_FEATURES-gated builtins that the port now opts into
