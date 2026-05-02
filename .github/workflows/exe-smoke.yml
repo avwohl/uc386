@@ -98,3 +98,44 @@ jobs:
           # `strings` should show "PMODE/W" since the extender is
           # bundled as the MZ portion.
           strings /tmp/true.exe | grep -i "PMODE/W" | head -3
+
+      - name: Install DOSBox
+        # Phase 3: actually run the .exe under DOSBox to verify the
+        # PMODE/W extender boots, switches to PM, runs our 32-bit
+        # code, and exits cleanly. headless via SDL_VIDEODRIVER=dummy.
+        run: |
+          sudo apt-get install -y dosbox
+          dosbox -version || true
+
+      - name: Phase 3 smoke — true.exe under DOSBox
+        # Drop true.exe into a working dir, write an autoexec.bat
+        # that mounts it as C:, runs true.exe, and exits. DOSBox
+        # captures errors to its log; capture and inspect.
+        # Best-effort — failures don't block the rest of CI.
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/dosbox-cwd
+          cp /tmp/true.exe /tmp/dosbox-cwd/true.exe
+          cat > /tmp/dosbox.conf <<'EOF'
+          [sdl]
+          fullscreen=false
+
+          [cpu]
+          core=auto
+          cputype=auto
+
+          [autoexec]
+          mount c /tmp/dosbox-cwd
+          c:
+          true.exe
+          echo errorlevel=%errorlevel%
+          exit
+          EOF
+          export SDL_VIDEODRIVER=dummy
+          # `-exit` exits DOSBox after autoexec runs out of commands.
+          # `-conf` loads our config. stdout/stderr capture whatever
+          # the DOS program prints (DOSBox 0.74-3 forwards via SDL).
+          timeout 30 dosbox -conf /tmp/dosbox.conf -exit \
+            > /tmp/dosbox.log 2>&1 || rc=$?
+          echo "dosbox exit: ${rc:-0}"
+          cat /tmp/dosbox.log | tail -30
