@@ -231,6 +231,43 @@ jobs:
             exit 1
           fi
 
+      - name: Phase 8 — basename.exe with realistic argv
+        # End-to-end check that a non-trivial argv-using program
+        # produces correct output: `basename /a/b/c.exe .exe` → "c\n".
+        # Exercises argv[1] (path) + argv[2] (suffix), strlen, fputs.
+        run: |
+          set +e
+          mkdir -p /tmp/dosbox-base
+          chmod 777 /tmp/dosbox-base
+          # basename.exe builds via the all-addons step; copy from there.
+          cp /tmp/exe-all/basename.exe /tmp/dosbox-base/base.exe
+          cat > /tmp/dosbox-base.conf <<'EOF'
+          [sdl]
+          fullscreen=false
+
+          [cpu]
+          core=normal
+
+          [autoexec]
+          mount c /tmp/dosbox-base
+          c:
+          base.exe /a/b/c.exe .exe > out.txt
+          exit
+          EOF
+          export SDL_VIDEODRIVER=dummy
+          timeout 30 dosbox -conf /tmp/dosbox-base.conf -exit \
+            > /tmp/dosbox-base.log 2>&1
+          echo "dosbox exit: $?"
+          OUT="/tmp/dosbox-base/OUT.TXT"
+          echo '== OUT.TXT =='
+          cat "$OUT" 2>&1
+          if grep -q '^c$' "$OUT" 2>/dev/null; then
+            echo "PASS: basename /a/b/c.exe .exe → 'c'"
+          else
+            echo "FAIL: expected 'c\\n', got something else"
+            exit 1
+          fi
+
       - name: Phase 7 — argv parsing under DOSBox
         # Asserts the bridge stub correctly parses argc/argv from
         # the PSP. Builds argv_probe.exe (prints argc + each argv[i]),
