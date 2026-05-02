@@ -74,6 +74,10 @@ class Result:
     error: str | None = None
     # bytes consumed by INT 21h string ops, useful for diagnostics
     instructions_executed: int | None = None
+    # Synthetic BIOS-tick counter for INT 1Ah AH=00h. Increments on
+    # every read, simulating a monotonic clock; user code that uses
+    # `time.ticks_ms()` / `sleep_ms` exercises this counter.
+    _bios_tick: int = 0
 
 
 def _read_cstr(uc: Uc, addr: int, max_len: int = 4096, term: bytes = b"\x00") -> bytes:
@@ -609,6 +613,27 @@ def run(
                 return
             res.error = "SIGFPE: no handler"
             uc.emu_stop()
+            return
+        if intno == 0x1A and ah == 0x00:
+            # BIOS time-of-day read. Real BIOS returns CX:DX = system
+            # tick count (~18.2 Hz, ~55 ms/tick). Under emulation
+            # there's no clock tied to wall time, so we synthesize a
+            # monotonically-increasing counter that advances every
+            # time the program reads it. That gives user code a
+            # `ticks_ms` source whose `ticks_diff` is always positive
+            # and whose absolute progression matches the number of
+            # times user code polled the BIOS counter — which is
+            # exactly what `time.sleep_ms()`'s busy-wait depends on.
+            tick = res._bios_tick
+            res._bios_tick = (tick + 1) & 0xFFFFFFFF
+            ecx = uc.reg_read(UC_X86_REG_ECX)
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            uc.reg_write(UC_X86_REG_ECX,
+                         (ecx & 0xFFFF0000) | ((tick >> 16) & 0xFFFF))
+            uc.reg_write(UC_X86_REG_EDX,
+                         (edx & 0xFFFF0000) | (tick & 0xFFFF))
+            # AL = 0 (no midnight rollover this call).
+            uc.reg_write(UC_X86_REG_EAX, eax & ~0xFF)
             return
         if intno != 0x21:
             res.error = f"unexpected interrupt {intno:#x}"

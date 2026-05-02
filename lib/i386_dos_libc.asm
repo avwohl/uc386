@@ -4054,6 +4054,21 @@ _clock:
         inc     dword [_time_counter]
         ret
 
+; uint32_t bios_ticks(void) — INT 1Ah AH=00h, returns the BIOS
+; system-tick counter as a 32-bit value. CX holds the high 16 bits,
+; DX the low 16. Each tick is ~55 ms on a stock PC (PIT runs at
+; 1193180 Hz, BIOS divides by 65536 = 18.20649 Hz).
+_bios_ticks:
+        push    ebx
+        xor     eax, eax                    ; AH = 0
+        int     0x1A                        ; CX:DX = ticks
+        movzx   eax, cx
+        shl     eax, 16
+        movzx   ebx, dx
+        or      eax, ebx
+        pop     ebx
+        ret
+
 ; ---- ungetc(c, stream): simple one-byte unget --------------------------------
         section .bss
 _ungetc_buf:    resd 1                      ; -1 = empty, else the byte

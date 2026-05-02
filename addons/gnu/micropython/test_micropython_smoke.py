@@ -749,6 +749,63 @@ def test_micropython_math_special_functions(micropython_bin: Path) -> None:
         )
 
 
+def test_micropython_import_time_ticks(micropython_bin: Path) -> None:
+    """`import time; time.ticks_ms()` exercises the BIOS-tick-backed
+    HAL path: lib/i386_dos_libc.asm:_bios_ticks (INT 1Ah AH=00h)
+    + uc386-dos/mphal_uc386dos.c's mp_hal_ticks_ms scaling.
+    Pin `ticks_diff(after, before) >= 0` and that two consecutive
+    reads don't move backwards — that's the contract user code
+    relies on."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import time\n"
+                  b"a = time.ticks_ms()\n"
+                  b"b = time.ticks_ms()\n"
+                  b"print(time.ticks_diff(b, a) >= 0)\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "True" in res.stdout, (
+        f"expected ticks_diff >= 0, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_time_sleep_ms(micropython_bin: Path) -> None:
+    """`time.sleep_ms(60)` busy-waits one BIOS tick (~55 ms). Pin
+    that ticks_ms advances by at least 50 ms across the call —
+    proves mp_hal_delay_ms wires through to the BIOS counter and
+    actually polls. Without the BIOS poll loop the call returns
+    instantly and ticks_diff stays at 0."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import time\n"
+                  b"a = time.ticks_ms()\n"
+                  b"time.sleep_ms(60)\n"
+                  b"b = time.ticks_ms()\n"
+                  b"print(time.ticks_diff(b, a) >= 50)\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "True" in res.stdout, (
+        f"expected ticks advance >= 50ms after sleep, got: "
+        f"{res.stdout!r}"
+    )
+
+
 def test_micropython_import_array(micropython_bin: Path) -> None:
     """`import array; array.array('i', ...)` — gated on
     `MICROPY_PY_ARRAY` (CORE_FEATURES). Pins typed-array storage

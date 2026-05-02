@@ -131,7 +131,7 @@ if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
         # gen_qstrdefs.py treats identically to a regular reference.
         {
             grep -rhoE "MP_QSTR_[A-Za-z_][A-Za-z0-9_]*" \
-                    upstream/py/ upstream/shared/
+                    upstream/py/ upstream/shared/ upstream/extmod/
             # POSIX `[[:space:]]` rather than `\s` — macOS's BSD
             # `sed -E` doesn't honor PCRE shorthand in BRE/ERE.
             grep -hoE "^[[:space:]]*X\([A-Z][A-Z0-9_]*\)" \
@@ -220,6 +220,13 @@ extern const struct _mp_obj_module_t mp_module_struct;
 #define UCDOS_MOD_ENTRY_STRUCT
 #endif
 
+#if MICROPY_PY_TIME
+extern const struct _mp_obj_module_t mp_module_time;
+#define UCDOS_MOD_ENTRY_TIME { MP_ROM_QSTR(MP_QSTR_time), MP_ROM_PTR(&mp_module_time) },
+#else
+#define UCDOS_MOD_ENTRY_TIME
+#endif
+
 #define MICROPY_REGISTERED_MODULES \
     { MP_ROM_QSTR(MP_QSTR_builtins), MP_ROM_PTR(&mp_module_builtins) }, \
     { MP_ROM_QSTR(MP_QSTR_sys), MP_ROM_PTR(&mp_module_sys) }, \
@@ -230,7 +237,8 @@ extern const struct _mp_obj_module_t mp_module_struct;
     UCDOS_MOD_ENTRY_ARRAY \
     UCDOS_MOD_ENTRY_COLLECTIONS \
     UCDOS_MOD_ENTRY_ERRNO \
-    UCDOS_MOD_ENTRY_STRUCT
+    UCDOS_MOD_ENTRY_STRUCT \
+    UCDOS_MOD_ENTRY_TIME
 
 #define MICROPY_REGISTERED_EXTENSIBLE_MODULES
 EOF

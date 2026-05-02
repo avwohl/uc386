@@ -29,7 +29,7 @@ Type "help()" for more information.
 caught
 ```
 
-What works (27 smoke tests pin the core wins):
+What works (29 smoke tests pin the core wins):
 
 - arithmetic + control flow (`if/else`, `for/range`, `while/break`)
 - function def + call (`def f(x): return x*2; f(7)` → `14`)
@@ -55,7 +55,8 @@ What works (27 smoke tests pin the core wins):
 - `import sys` / `import gc` / `import micropython` /
   `import collections` (OrderedDict + namedtuple) /
   `import struct` / `import array` / `import errno` /
-  `import math` — registered via `build/genhdr/moduledefs.h`
+  `import math` / `import time` — registered via
+  `build/genhdr/moduledefs.h`
   (hand-rolled equivalent of upstream's
   `tools/makemoduledefs.py` output, with `#if` guards
   mirroring each module's `MICROPY_PY_<X>` gate). `errno`
@@ -77,7 +78,17 @@ What works (27 smoke tests pin the core wins):
   with `y=1`. `expm1` uses `f2xm1` directly when |x*log2(e)| < 1
   (preserves precision near 0). `erf` uses Abramowitz & Stegun
   7.1.26 (5-term polynomial; ~1.5e-7 max error). `import math;
-  math.sqrt(2.0)` → `1.41421356...` works end-to-end. **Caveat**: at DOUBLE without long-double
+  math.sqrt(2.0)` → `1.41421356...` works end-to-end.
+- `time` module — `time.ticks_ms`, `time.ticks_us`, `time.ticks_diff`,
+  `time.ticks_add`, `time.sleep`, `time.sleep_ms`, `time.sleep_us`
+  wired through INT 1Ah AH=00h (BIOS tick counter, ~18.2 Hz,
+  ~55 ms/tick). lib/i386_dos_libc.asm:`_bios_ticks` makes the BIOS
+  call, uc386-dos/mphal_uc386dos.c scales to ms/µs and busy-waits
+  in `mp_hal_delay_ms`. `time.time` / `time.time_ns` are gated on
+  `MICROPY_PY_TIME_TIME_TIME_NS` (default off — DOS lacks an
+  always-running RTC integration). dos_emu emulates INT 1Ah AH=0
+  with a synthetic monotonic counter so smoke tests can exercise
+  the path without wall-clock timing. **Caveat**: at DOUBLE without long-double
   precision, upstream's APPROX float formatter accumulates round-
   off across digit-extract multiplies and `print(4.0)` shows
   `3.999999999999997` instead of `4.0`. We patch

@@ -116,6 +116,17 @@
 // (full Lanczos approximation is a future slice).
 #define MICROPY_PY_MATH_SPECIAL_FUNCTIONS  (1)
 
+// `time` module — `time.ticks_ms`, `time.sleep_ms`, etc. wired
+// through INT 1Ah AH=0 BIOS tick counter (~18.2 Hz, ~55 ms/tick)
+// in lib/i386_dos_libc.asm and uc386-dos/mphal_uc386dos.c.
+//
+// Default-off at CORE_FEATURES because upstream's ROM-level
+// numbering puts BASIC_FEATURES (20) ABOVE CORE_FEATURES (10),
+// so `MICROPY_PY_TIME = AT_LEAST_BASIC_FEATURES` evaluates to 0.
+// Opt in here so `import time` works at our CORE_FEATURES
+// baseline.
+#define MICROPY_PY_TIME                    (1)
+
 typedef long mp_off_t;
 
 #define MICROPY_HW_BOARD_NAME "uc386-dos"
