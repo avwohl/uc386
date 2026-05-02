@@ -1,23 +1,17 @@
 /* argv_probe — dump argc + each argv[i] using only putchar/fputs.
  *
  * Diagnostic for Phase 7 (the .exe argv bridge): under PMODE/W,
- * `echo hello dos` produces "exe hello dos", meaning argv[1..] are
- * "exe", "hello", "dos" and argc=4. We don't yet know what argv[0]
- * holds — could be the program path, the basename, "" or NULL. This
- * probe prints argc and argv[0..argc-1] explicitly.
+ * argv_probe.exe shows argc=768 + every argv[i] empty — the dos_emu
+ * register-passing convention (EAX=argc, EBX=&argv) doesn't match
+ * what PMODE/W puts in EAX/EBX at entry. The companion register
+ * probe `addons/harness/exe_regs_probe.c` (CI-only) reveals the
+ * actual entry contract.
  *
- * Why no printf: our libc's `_printf` routes through INT 21h AH=0x5F
- * which is a dos_emu harness intercept, not a real DOS call. Under
- * PMODE/W → real DOS that's a no-op, so printf output disappears.
- * `_putchar` / `_fputs` use AH=02h (display char) which IS real DOS,
- * so they work under both runners.
+ * Under dos_emu (.bin) the answer is normal: argc + argv strings
+ * match what the manifest passes.
  */
 #include <stdio.h>
 
-/* Print v as an unsigned decimal. Uses recursion instead of an
- * `if-zero-return; while-positive` shape — that pattern triggers
- * a uc386 codegen bug where the while emits jle with no cmp,
- * relying on stale flags from the prior if. */
 static void putdec_u(unsigned int v) {
     if (v >= 10) {
         putdec_u(v / 10);
@@ -47,7 +41,7 @@ int main(int argc, char **argv) {
     fputs("argc=", stdout);
     putdec(argc);
     putchar('\n');
-    for (i = 0; i < argc; i++) {
+    for (i = 0; i < argc && i < 10; i++) {
         fputs("argv[", stdout);
         putdec(i);
         fputs("]@", stdout);

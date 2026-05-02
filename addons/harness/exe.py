@@ -194,10 +194,38 @@ def build_exe(
         "_stdin:  dd 0\n"
         "_stdout: dd 1\n"
         "_stderr: dd 2\n"
+        # Capture register state at PMODE/W entry into globals so a
+        # diagnostic program can later printf them. Cheap (8 stores)
+        # and keeps the bridge generic — addons that don't probe
+        # just ignore the symbols.
+        "        global _pmodew_eax_at_entry\n"
+        "        global _pmodew_ebx_at_entry\n"
+        "        global _pmodew_ecx_at_entry\n"
+        "        global _pmodew_edx_at_entry\n"
+        "        global _pmodew_esi_at_entry\n"
+        "        global _pmodew_edi_at_entry\n"
+        "        global _pmodew_ebp_at_entry\n"
+        "        global _pmodew_esp_at_entry\n"
+        "_pmodew_eax_at_entry: dd 0\n"
+        "_pmodew_ebx_at_entry: dd 0\n"
+        "_pmodew_ecx_at_entry: dd 0\n"
+        "_pmodew_edx_at_entry: dd 0\n"
+        "_pmodew_esi_at_entry: dd 0\n"
+        "_pmodew_edi_at_entry: dd 0\n"
+        "_pmodew_ebp_at_entry: dd 0\n"
+        "_pmodew_esp_at_entry: dd 0\n"
         "        section _TEXT use32 class=CODE\n"
         "        global _pmodew_start\n"
         "        extern _start\n"
         "_pmodew_start:\n"
+        "        mov     [_pmodew_eax_at_entry], eax\n"
+        "        mov     [_pmodew_ebx_at_entry], ebx\n"
+        "        mov     [_pmodew_ecx_at_entry], ecx\n"
+        "        mov     [_pmodew_edx_at_entry], edx\n"
+        "        mov     [_pmodew_esi_at_entry], esi\n"
+        "        mov     [_pmodew_edi_at_entry], edi\n"
+        "        mov     [_pmodew_ebp_at_entry], ebp\n"
+        "        mov     [_pmodew_esp_at_entry], esp\n"
         "        jmp     _start\n"
     )
     bridge_obj = out_path.with_suffix(".bridge.obj")
