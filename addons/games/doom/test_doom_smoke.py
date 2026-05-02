@@ -61,8 +61,26 @@ def doom_bin() -> Path:
 
 
 def test_doom_boots_to_wad_load(doom_bin: Path) -> None:
-    """DOOM should boot through Z_Init and reach W_InitFiles, exiting
-    1 because we don't supply a WAD."""
+    """DOOM should boot through every visible init phase and reach
+    W_InitFiles, exiting 1 because we don't supply a WAD.
+
+    Asserts the full sequence of boot-progress lines that DOOM emits
+    in `D_DoomMain` before it tries to load any WAD. Each line below
+    corresponds to a different init function (the linuxdoom-1.10
+    source has them in this order in `i_main.c` / `d_main.c`):
+
+      Game mode indeterminate.   ← D_IdentifyVersion has no WAD
+      Public DOOM - v1.10        ← printed banner
+      V_Init: allocate screens.  ← V_Init  (memory for screen[0..3])
+      M_LoadDefaults             ← config-file load
+      Z_Init                     ← zone allocator + main heap
+      W_Init: Init WADfiles      ← WAD loader (this is where it fails)
+
+    Reaching ALL of these means uc386 codegen is correct for the
+    full boot path: int locals, struct return, pointer arithmetic,
+    static-init data tables, switch-case, libc calls (printf, malloc,
+    open, lseek, read, exit). If any phase regresses, the test will
+    say which one didn't print."""
     # Make uc386 importable when running from the dev tree (the
     # tarball variant assumes the user's already pip-installed it).
     sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -72,9 +90,26 @@ def test_doom_boots_to_wad_load(doom_bin: Path) -> None:
               instruction_limit=2_000_000_000)
     assert not res.timed_out, "DOOM hit the dos_emu timeout"
     assert res.error is None, f"dos_emu reported error: {res.error}"
-    assert "W_Init: Init WADfiles." in res.stdout, (
-        f"DOOM didn't reach W_Init: tail = {res.stdout[-300:]!r}"
-    )
+
+    # Each init phase the runnable boot reaches today. The order
+    # matters — we assert phases appear sequentially in stdout.
+    expected_phases = [
+        "Game mode indeterminate.",
+        "Public DOOM - v1.10",
+        "V_Init: allocate screens.",
+        "M_LoadDefaults: Load system defaults.",
+        "Z_Init: Init zone memory allocation daemon.",
+        "W_Init: Init WADfiles.",
+    ]
+    cursor = 0
+    for phase in expected_phases:
+        idx = res.stdout.find(phase, cursor)
+        assert idx != -1, (
+            f"DOOM boot regressed: phase {phase!r} missing or "
+            f"out-of-order. tail = {res.stdout[-400:]!r}"
+        )
+        cursor = idx + len(phase)
+
     # Without a WAD, DOOM's W_InitFiles aborts via I_Error — exit 1.
     # If this changes (e.g. exit code propagation gets wired up
     # differently), update this expectation alongside the boot trace.
