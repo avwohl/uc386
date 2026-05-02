@@ -151,6 +151,15 @@ def build_exe(
             rewritten.append("        section _BSS use32 class=BSS")
             continue
         rewritten.append(line)
+    # Export the libc-private stream globals so the bridge stub
+    # (which patches the dos_emu sentinels at PMODE/W entry) can
+    # take their address. NASM `-f obj` only exports symbols with
+    # an explicit `global` directive — the codegen output globals
+    # only `_start`, so wlink would otherwise see `_stdin/_stdout/
+    # _stderr is an undefined reference`.
+    rewritten.append("        global _stdin")
+    rewritten.append("        global _stdout")
+    rewritten.append("        global _stderr")
     asm_for_omf = out_path.with_suffix(".omf.asm")
     asm_for_omf.write_text("\n".join(rewritten) + "\n")
 
