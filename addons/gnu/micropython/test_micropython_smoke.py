@@ -39,11 +39,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 #           = parent / build / micropython.bin
 # Tarball:  uc386-foss/src/micropython/test_micropython_smoke.py
 #           → uc386-foss/micropython.bin
-#           = parent.parent.parent / micropython.bin
+#           = parent.parent / micropython.bin (src/<name>/.. = src/.. = uc386-foss/)
 _HERE = Path(__file__).resolve().parent
 _BIN_CANDIDATES = [
     _HERE / "build" / "micropython.bin",
-    _HERE.parent.parent.parent / "micropython.bin",
+    _HERE.parent.parent / "micropython.bin",
 ]
 
 

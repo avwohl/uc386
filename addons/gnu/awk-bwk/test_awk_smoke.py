@@ -34,11 +34,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 #           = parent / build / awk.bin
 # Tarball:  uc386-foss/src/awk-bwk/test_awk_smoke.py
 #           → uc386-foss/awk.bin
-#           = parent.parent.parent / awk.bin
+#           = parent.parent / awk.bin (src/<name>/.. = src/.. = uc386-foss/)
 _HERE = Path(__file__).resolve().parent
 _BIN_CANDIDATES = [
     _HERE / "build" / "awk.bin",
-    _HERE.parent.parent.parent / "awk.bin",
+    _HERE.parent.parent / "awk.bin",
 ]
 
 
