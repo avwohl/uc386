@@ -131,6 +131,15 @@ def package_foss(version: str) -> Path:
             arcname = f"uc386-foss/{name}.bin"
             tar.add(bin_path, arcname=arcname)
             print(f"  {name}: {bin_path.stat().st_size:,} bytes")
+            # If a corresponding .exe was built earlier in the
+            # release pipeline (release.yml's "Build .exe variants"
+            # step), ship it under exe/<name>.exe. Skip silently
+            # when missing so dev runs (no Watcom on macOS) still
+            # work.
+            exe_path = REPO_ROOT / "build" / "exe" / f"{name}.exe"
+            if exe_path.exists():
+                tar.add(exe_path, arcname=f"uc386-foss/exe/{name}.exe")
+                print(f"    + {name}.exe: {exe_path.stat().st_size:,} bytes")
 
         # Per-addon sources, manifests, and scripts under src/.
         # Includes every gnu/* dir (the manifest-driven 16, the

@@ -78,6 +78,27 @@ jobs:
             echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Install nasm (for .exe pipeline)
+        run: sudo apt-get install -y nasm
+
+      - name: Build .exe variants for every in-tree addon
+        # Phase 5: produce .exe alongside .bin for each manifest-driven
+        # addon. Output to build/exe/ — package.py picks them up and
+        # ships them under uc386-foss/exe/ in the FOSS tarball.
+        # continue-on-error: if a single addon fails to build .exe,
+        # the rest of the release continues with whatever did build.
+        continue-on-error: true
+        run: |
+          mkdir -p build/exe
+          for d in addons/gnu/*/; do
+            name=$(basename "$d")
+            case "$name" in _*|awk-bwk|gawk|micropython) continue ;; esac
+            [ -f "$d/main.c" ] || continue
+            python -m addons.harness.exe "$d/main.c" \
+              -o "build/exe/$name.exe" 2>&1 | tail -2
+          done
+          ls -la build/exe/
+
       - name: Build addon binaries (FOSS tarball)
         run: python -m addons.harness.package --version "${{ steps.ver.outputs.version }}" --foss-only
 
