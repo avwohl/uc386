@@ -43,9 +43,11 @@ jobs:
       # uc_core is not yet on PyPI; install it from GitHub. Remove this
       # step (and the uc_core>=... dep in pyproject will pick it up from
       # PyPI) once uc_core is published.
+      # `unicorn`: required by `uc386.dos_emu` so the addon harness +
+      # parametrized GNU addon tests can run the assembled binaries.
       run: |
         python -m pip install --upgrade pip
-        pip install pytest pytest-cov
+        pip install pytest pytest-cov unicorn
         pip install "uc_core @ git+https://github.com/avwohl/uc_core@main"
         pip install -e .
     - name: Run tests
