@@ -268,15 +268,10 @@ jobs:
             exit 1
           fi
 
-      - name: Phase 8 — factor.exe with many argv args (known-fail)
+      - name: Phase 8 — factor.exe with many argv args
         # Stresses argv with 4 numeric args + per-arg integer parsing
-        # and stdout output. Currently fails because factor uses
-        # printf, and `_printf` routes through INT 21h AH=0x5F (a
-        # dos_emu-only harness intercept) — under PMODE/W → real DOS
-        # the format calls produce no output. `_printf_legacy` exists
-        # but has multi-arg/%ld bugs that wc/factor/strtol_test trip
-        # over. Will pass once printf has a real-DOS-safe path.
-        continue-on-error: true
+        # and printf output through the legacy format engine.
+        # Verifies the libc → real-DOS-safe printf path works end-to-end.
         run: |
           set +e
           mkdir -p /tmp/dosbox-fac
