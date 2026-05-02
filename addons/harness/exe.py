@@ -151,6 +151,16 @@ def build_exe(
         wlink, "system", extender,
         "name", str(out_path),
         "file", str(obj_path),
+        # `option stack=64k` allocates a 64-KB protected-mode stack
+        # at link time. Without it wlink prints `W1014: stack segment
+        # not found` and the .exe runs with a stack at whatever
+        # garbage address the LE-loader picks — DOSBox reports
+        # "Illegal read from <addr>" when the program tries to push.
+        "option", "stack=64k",
+        # `option start=_start` overrides wlink's default of looking
+        # for `_cstart_` (Watcom clib startup). uc386's prologue is
+        # `_start:` which sets up FPU/BSS then jumps to `_main`.
+        "option", "start=_start",
     ]
     if stub_path is not None:
         # wlink's `option stub=...` directive writes <stub-file>
