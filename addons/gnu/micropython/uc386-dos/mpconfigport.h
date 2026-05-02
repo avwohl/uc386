@@ -28,26 +28,19 @@
 // 6-byte declaration would have caused setjmp to buffer-overflow.
 #define MICROPY_NLR_SETJMP                (1)
 
-// MINIMUM today; bumping to CORE_FEATURES (upstream's default; adds
-// min/max/reversed + slicing) hits a uc_core preprocessor bug. The
-// `mp_seq_replace_slice_grow_inplace` macro in obj.h has parameter
-// list `(dest, dest_len, beg, end, slice, slice_len, len_adj, ...)`
-// — the 5th param name `slice` collides with the user's local
-// `mp_bound_slice_t slice;` in objlist.c's call site:
-//
-//   mp_seq_replace_slice_grow_inplace(self->items, self->len,
-//       slice.start, slice.stop, value_items, value_len, ...)
-//
-// Param `beg = slice.start`. The C standard says parameter
-// substitution is simultaneous (one pass) — `slice` in `slice.start`
-// (which came from the `beg` arg) is the user's identifier and must
-// not be re-substituted. uc_core appears to do iterative substitution
-// instead, turning `slice.start` into `value_items.start` (because
-// the param `slice = value_items` also fires). uc386 codegen then
-// correctly errors `.` on PointerType. Tracked as a uc_core
-// preprocessor fix; staying at MINIMUM until that lands. The
-// MINIMUM build already covers def, class, list comp, try/except,
-// range, sum, sorted, zip, divmod, and most arithmetic.
+// MINIMUM today. The uc_core preprocessor fix unblocked the
+// objlist.c compile (slice/value_items macro-param shadowing was
+// the original blocker), but bumping the ROM level to CORE_FEATURES
+// causes a separate regression: `print`, `min`, `__name__`, and
+// other named builtins all NameError at runtime, while raw
+// arithmetic / `pass` / Ctrl-D still work. The qstr pool size is
+// unchanged (879 entries either way) so the binary search isn't
+// the issue — most likely the CORE_FEATURES default-enables a
+// codepath that uc386 mis-compiles in the static-init of
+// `mp_module_builtins_globals` or one of its tables. Leaving at
+// MINIMUM until the regression's traced; the working bin still
+// covers def, class, list comp, try/except, range, sum, sorted,
+// zip, divmod, recursion, and most arithmetic.
 #define MICROPY_CONFIG_ROM_LEVEL          (MICROPY_CONFIG_ROM_LEVEL_MINIMUM)
 
 #define MICROPY_ENABLE_COMPILER           (1)
@@ -63,6 +56,13 @@
 #define MICROPY_PY_SYS_EXIT               (0)
 #define MICROPY_PY_SYS_PATH               (0)
 #define MICROPY_PY_SYS_ARGV               (0)
+
+// CORE_FEATURES (when we can re-enable it) default-enables
+// MICROPY_PY_IO, which references `mp_builtin_open_obj` — a
+// port-supplied symbol the uc386-dos port doesn't define (no VFS).
+// Pre-set to 0 so a future ROM-level bump doesn't pull in
+// `open()` / `io` machinery.
+#define MICROPY_PY_IO                     (0)
 
 typedef long mp_off_t;
 
