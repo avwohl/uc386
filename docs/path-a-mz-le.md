@@ -27,51 +27,38 @@ a `.exe` that runs on FreeDOS. Remaining polish:
   shell's `echo` builtin intercepting `echo.exe hello dos` →
   `echo` + `exe hello dos`. Renamed test to `myecho.exe` to avoid
   the shell-builtin trap.
-- Phase 7 (in progress): bridge stub `_pmodew_start` (in
+- Phase 7 ✓: bridge stub `_pmodew_start` (in
   `addons/harness/exe.py`) handles two PMODE/W ↔ uc386 mismatches:
   - **stdout/stdin/stderr fd**: libc's `_stdout = 0xF1` is a
     dos_emu sentinel; real DOS AH=0x40 wants raw 0/1/2. Bridge
     redefines them with real handles; libc's sentinel definitions
     are stripped from the codegen .obj at build time. ✓
-  - **argv**: PMODE/W doesn't pass argc/argv in registers
-    (empirical regs at entry: EAX=0x300 EBX=0x21 ECX=0 EDX=0xF1xx
-    where EBX is the PSP selector and EDX is the real-mode PSP
-    segment — segment varies per run as PMODE/W allocates fresh).
-    Bridge currently sets argc=1 + argv[0]='program' placeholder.
-    Reading the actual cmdline tail at PSP+0x80 needs real-mode
-    memory access — every approach tried hits a wall:
-      - **DPMI INT 31h AX=0x06** (Get Segment Base) returned
-        linear=0 for selector 0x21. Either DOSBox stub or PMODE/W
-        doesn't implement this for that selector.
-      - **Flat DS read at `EDX_at_entry << 4`**: dumps 32 bytes
-        from PSP_linear+0x80, gets all zeros every run — DS
-        doesn't map real-mode physical memory in PMODE/W's setup.
-        (cmdline_len read varies 0/1/0x80 across runs because
-         we're reading garbage at the wrong address.)
-      - **`mov es, 0x21` + `[es:0x80]`**: hung the program for
-        30s (DOSBox timeout). ES is critical to PMODE/W (likely
-        used for INT 21h reflection); overwriting it broke the
-        runtime.
-      - **`mov fs, 0x21` + `[fs:0x80]`**: produced "JMP Illegal
-        descriptor type 0" fault — corrupted segment-register
-        state somewhere in the libc → INT 21h path.
-    Further attempts in this session:
-      - **INT 21h AH=0x62** (reflects to real DOS, returns PSP
-        segment in BX) returned 0x68. EDX_at_entry was 0xF232 —
-        a PMODE/W internal value, NOT the PSP. Confirmed via
-        diagnostic globals: `int21h_psp=0x68`, `psp_linear=0x680`.
-      - **DPMI INT 31h AX=0x0002** (Segment to Descriptor) with
-        BX=0x68 returned a fresh selector (0x70, CY=0). FS load
-        of that selector + read at `[fs:0x80]` did NOT crash,
-        but read returned 0. Bytes nearby were sparse and didn't
-        match the cmdline format.
-      - **Conclusion**: PMODE/W's protected-mode PSP at segment
-        0x68 doesn't carry the cmdline tail at PSP+0x80 in the
-        real-mode layout. The original cmdline lives elsewhere —
-        accessible only via extender-specific structures or by
-        linking Watcom's `_cstart_` (`clib3r.lib`).
-    Programs that don't read argv work cleanly under PMODE/W;
-    argv-dependent programs see argc=1 with a placeholder argv[0].
+  - **argv**: PMODE/W puts the **PSP selector in ES** at entry
+    (the standard generic-DOS DPMI convention — confirmed via
+    OpenWatcom's `bld/clib/startup/a/cstrt386.asm`, which uses
+    `mov esi,es` to find the PSP). Bridge reads `[es:0x80]` for
+    cmdline length and `[es:0x81..]` for the tail, copies into a
+    flat-DS buffer, and tokenizes on space/tab/CR into argv[].
+    `argv_probe.exe alpha beta` now prints argc=3, argv[1]='alpha',
+    argv[2]='beta'. argv[0] stays as a "program" placeholder
+    (DOS PSP doesn't carry the program name; getting it requires
+    walking the environment block).
+
+    The path to this took six failed attempts. **The fix is to
+    USE the ES that PMODE/W provides, not load a different
+    selector into ES.** Earlier experiments (`mov es, 0x21`,
+    `mov fs, fresh-DPMI-selector`) overwrote PMODE/W's ES,
+    breaking its INT 21h reflection. Honoring the convention is
+    a 1-line change conceptually; the bridge writes `[es:0x80]`
+    at the very top of `_pmodew_start` before anything else can
+    clobber ES.
+
+    Other dead ends documented for the record:
+    DPMI INT 31h AX=0x06 (Get Segment Base) returned linear=0;
+    flat DS read at PSP*16 returned zeros (DS doesn't map
+    real-mode memory); INT 21h AH=0x62 returned a different PSP
+    segment (PMODE/W's internal protected-mode PSP) which doesn't
+    have the cmdline at offset 0x80.
 
 Phase 7 also surfaces a uc386 codegen bug noted via probe: the C
 idiom `if (v == 0) { putchar('0'); return; } while (v > 0) { ... }`
