@@ -138,47 +138,57 @@ _pmodew_start:
         mov     [_pmodew_esp_at_entry], esp
 
         ; --- argv parsing ---
-        ; PMODE/W passes the PSP real-mode segment in EDX at entry.
-        ; (Empirically verified: EDX=0xF1B3 matched the actual PSP
-        ; segment.) Convert that to a linear address inside our flat
-        ; DS — DS covers the full 4 GB starting at 0, so linear =
-        ; segment*16 IS the offset for `mov al, [linear]`.
+        ; PMODE/W passes the PSP selector in EBX at entry (matches
+        ; what DPMI INT 31h AX=0x51 returns). Reading via that
+        ; selector with ES override accesses the real-mode PSP
+        ; through the descriptor's base — works even when our flat
+        ; DS doesn't map the real-mode address.
         ;
-        ; We tried DPMI INT 31h AX=0x51 (get PSP selector → 0x21,
-        ; matches EBX at entry) + AX=0x06 (translate to linear base
-        ; → returned 0) — the AX=0x06 path didn't yield a usable
-        ; address under PMODE/W. The EDX-at-entry shortcut sidesteps
-        ; both calls. Selector trick is left as a diagnostic.
+        ; Earlier attempts: flat DS read at segment*16 returned 0
+        ; (DS doesn't cover real-mode memory in PMODE/W's setup);
+        ; DPMI 0x06 returned linear=0. ES override on the documented
+        ; PSP selector is the cleanest path.
         mov     eax, [_pmodew_ebx_at_entry]
         mov     [_pmodew_psp_selector], eax
 
         mov     eax, [_pmodew_edx_at_entry]
-        and     eax, 0xFFFF       ; PSP segment is the low 16 bits
-        shl     eax, 4            ; segment*16 = linear address
+        and     eax, 0xFFFF
+        shl     eax, 4
         mov     [_pmodew_psp_linear], eax
-        mov     ecx, eax          ; ECX = PSP linear base
 
-        ; 3. Read command tail length at PSP+0x80
-        movzx   eax, byte [ecx + 0x80]
+        ; Load PSP selector into ES so [es:offset] reads the PSP.
+        push    es
+        mov     bx, [_pmodew_ebx_at_entry]
+        mov     es, bx
+
+        ; Read command tail length at [es:0x80]
+        movzx   eax, byte [es:0x80]
         mov     [_pmodew_cmdline_len], eax
 
-        ; 4. Copy command tail from PSP+0x81 into our flat buffer
-        ;    so we can null-terminate tokens in-place.
+        ; Copy command tail from [es:0x81..0x81+len] into our flat
+        ; buffer, byte by byte (rep movsb wouldn't honor the ES
+        ; override on the source side without prefix gymnastics).
         push    eax               ; save length
-        lea     esi, [ecx + 0x81]
-        mov     edi, _pmodew_argv_buffer
         mov     ecx, eax
         test    ecx, ecx
         jz      .copy_done
-        cmp     ecx, 255          ; clamp to buffer size
+        cmp     ecx, 255
         jbe     .copy_ok
         mov     ecx, 255
 .copy_ok:
-        cld
-        rep     movsb
+        mov     edi, _pmodew_argv_buffer
+        mov     edx, 0x81         ; PSP cmdline tail offset
+.copy_loop:
+        mov     al, [es:edx]
+        mov     [edi], al
+        inc     edx
+        inc     edi
+        dec     ecx
+        jnz     .copy_loop
 .copy_done:
         mov     byte [edi], 0     ; null-terminator
         pop     eax
+        pop     es
 
         ; 5. Tokenize. argv[0] = placeholder. Then walk buffer
         ;    splitting on space/tab into argv[1..argc-1].
