@@ -137,26 +137,24 @@ _pmodew_start:
         mov     [_pmodew_ebp_at_entry], ebp
         mov     [_pmodew_esp_at_entry], esp
 
-        ; --- DPMI argv parsing ---
-
-        ; 1. DPMI INT 31h AX=0x51 — get current PSP selector in BX.
-        mov     ax, 0x0051
-        int     0x31
-        ; CY clear on success, BX = PSP selector.
-        movzx   eax, bx
+        ; --- argv parsing ---
+        ; PMODE/W passes the PSP real-mode segment in EDX at entry.
+        ; (Empirically verified: EDX=0xF1B3 matched the actual PSP
+        ; segment.) Convert that to a linear address inside our flat
+        ; DS — DS covers the full 4 GB starting at 0, so linear =
+        ; segment*16 IS the offset for `mov al, [linear]`.
+        ;
+        ; We tried DPMI INT 31h AX=0x51 (get PSP selector → 0x21,
+        ; matches EBX at entry) + AX=0x06 (translate to linear base
+        ; → returned 0) — the AX=0x06 path didn't yield a usable
+        ; address under PMODE/W. The EDX-at-entry shortcut sidesteps
+        ; both calls. Selector trick is left as a diagnostic.
+        mov     eax, [_pmodew_ebx_at_entry]
         mov     [_pmodew_psp_selector], eax
 
-        ; 2. DPMI INT 31h AX=0x06 — get segment base address.
-        ; Input: BX = selector. Output: CX:DX = linear base
-        ; (CX=high 16 bits, DX=low 16 bits).
-        mov     ax, 0x0006
-        ; BX still has PSP selector
-        int     0x31
-        ; Combine CX:DX into ECX = linear base
-        movzx   eax, cx
-        shl     eax, 16
-        movzx   edx, dx
-        or      eax, edx          ; EAX = PSP linear base
+        mov     eax, [_pmodew_edx_at_entry]
+        and     eax, 0xFFFF       ; PSP segment is the low 16 bits
+        shl     eax, 4            ; segment*16 = linear address
         mov     [_pmodew_psp_linear], eax
         mov     ecx, eax          ; ECX = PSP linear base
 
