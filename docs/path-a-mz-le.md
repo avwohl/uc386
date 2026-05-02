@@ -20,19 +20,28 @@ a `.exe` that runs on FreeDOS. Remaining polish:
 - Phase 5 ✓: FOSS tarball ships .exe variants alongside .bin
   (`addons/harness/package.py` + `release.yml` build .exe for
   every in-tree addon and place under `uc386-foss/exe/<name>.exe`).
-- Phase 6 ✓: DOSBox runtime smoke for true / false / echo.
-  `true.exe` exits 0, `false.exe` exits 1 (via `if errorlevel`
-  syntax), `echo.exe hello dos > echo_out.txt` writes to disk
-  via libc → INT 21h reflection. **libc INT 21h calls work
-  end-to-end through PMODE/W.**
-- Phase 7 (open): calling-convention bridge so argv is fully
-  correct. Empirically: `echo hello dos` produces
-  `exe hello dos` — argv[1] and argv[2] are right but argv[0]
-  is truncated/garbage. PMODE/W sets up SOMETHING for argv but
-  uc386's `_start` reads EAX=argc / EBX=&argv (the dos_emu
-  contract) which doesn't match. Bridge stub needs to parse
-  PSP+0x80 (real-mode command-line tail) into argc/argv before
-  jumping to uc386's _start.
+- Phase 6 ◐: DOSBox runtime smoke for true / false. `true.exe`
+  exits 0, `false.exe` exits 1 (via `if errorlevel` syntax) —
+  exit codes propagate via INT 21h AH=4Ch correctly. **Earlier
+  claim that echo.exe wrote "hello dos" via libc → INT 21h was
+  WRONG**: that output came from the DOS COMMAND.COM `echo`
+  builtin, not from echo.exe. The shell parses `echo.exe hello
+  dos` as `echo` (builtin) + `exe hello dos` (args), strips the
+  `.` extension separator, and prints "exe hello dos" — echo.exe
+  never executes. Renaming to `myecho.exe` in Phase 7 will reveal
+  whether libc's fputs path actually works (currently suspected
+  broken: `_stdout = 0xF1` is a dos_emu sentinel, but real DOS
+  AH=0x40 needs a real handle 0/1/2). `_putchar` works because
+  it uses AH=02h which doesn't take a handle.
+- Phase 7 (open): calling-convention bridge so argv is correct.
+  argv_probe.exe (named to avoid the shell-builtin trap) shows
+  argc=768 + argv[*] full of garbage — PMODE/W passes nothing
+  in EAX/EBX that matches dos_emu's contract. Bridge stub needs
+  to parse PSP+0x80 (real-mode command-line tail) via DPMI
+  INT 31h, allocate argv[] in the LE data segment, set
+  EAX=argc / EBX=&argv, jump to uc386's _start. Also need to
+  fix _stdout to be a real DOS handle (1 not 0xF1) so fputs/
+  fwrite/printf work under the .exe build path.
 
 Phase 3 findings:
 - DOSBox `core=auto` (dynrec) chokes on PMODE/W's PM setup with

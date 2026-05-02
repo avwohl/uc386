@@ -157,7 +157,11 @@ jobs:
           set +e   # don't let `cat` non-zero kill the diagnostic dump
           mkdir -p /tmp/dosbox-cwd
           chmod 777 /tmp/dosbox-cwd
-          cp /tmp/true.exe /tmp/false.exe /tmp/echo.exe /tmp/dosbox-cwd/
+          cp /tmp/true.exe /tmp/false.exe /tmp/dosbox-cwd/
+          # Rename echo.exe → myecho.exe so the DOS shell builtin
+          # `echo` doesn't intercept (`echo.exe args` is parsed as
+          # the builtin `echo` with `exe args` — the .exe never runs).
+          cp /tmp/echo.exe /tmp/dosbox-cwd/myecho.exe
           # Use `if errorlevel N` syntax (real DOS) instead of
           # `%errorlevel%` (DOSBox 0.74-3 doesn't expand it). The
           # `if errorlevel 1` branch fires for codes >= 1; the
@@ -182,7 +186,7 @@ jobs:
           false.exe
           if errorlevel 1 echo false_ok >> result.txt
           if not errorlevel 1 echo false_unexpected_zero >> result.txt
-          echo.exe hello dos > echo_out.txt
+          myecho.exe hello dos > echo_out.txt
           echo after >> result.txt
           exit
           EOF
