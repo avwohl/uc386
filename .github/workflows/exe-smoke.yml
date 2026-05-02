@@ -76,6 +76,25 @@ jobs:
             -o /tmp/cat.exe
           ls -la /tmp/cat.exe
 
+      - name: Survey watcom install for stubs
+        # Both `system causeway` and `system pmodew` produce unbound
+        # LE files (371 bytes — just the "this is a X executable"
+        # stub). To get a self-contained .exe, the extender stub
+        # itself needs to be the MZ part. wlink supports that via
+        # `option stub=<file>`. Check what stubs the Watcom install
+        # actually ships so we know what to pass.
+        run: |
+          echo '== files matching pmodew/causeway/dos4g/dos32 =='
+          find ~/.local/opt/watcom -iname '*pmodew*' -o -iname '*causeway*' \
+            -o -iname '*dos4g*' -o -iname '*cw32*' -o -iname '*dos32a*' \
+            2>/dev/null | head -20
+          echo '== bin dirs =='
+          ls ~/.local/opt/watcom/binl64 | grep -iE 'stub|pmod|cause|dos' | head -10
+          ls ~/.local/opt/watcom/binl 2>/dev/null | grep -iE 'stub|pmod|cause|dos' | head -10
+          echo '== system block defs =='
+          grep -r "system begin pmodew\|system begin causeway" \
+            ~/.local/opt/watcom 2>/dev/null | head -5
+
       - name: Inspect true.exe structure
         # Phase 2 baseline: dump the MZ header + first few bytes so we
         # can compare against what FreeDOS / DOSBox expect. 371 bytes
