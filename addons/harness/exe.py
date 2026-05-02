@@ -160,6 +160,12 @@ def build_exe(
                 and "dd 0xF" in stripped:
             continue
         rewritten.append(line)
+    # Declare the stripped stream globals as externs so user code
+    # like `push dword [_stdout]` still assembles. The definitions
+    # come from the bridge stub at link time.
+    rewritten.insert(0, "        extern _stderr")
+    rewritten.insert(0, "        extern _stdout")
+    rewritten.insert(0, "        extern _stdin")
     asm_for_omf = out_path.with_suffix(".omf.asm")
     asm_for_omf.write_text("\n".join(rewritten) + "\n")
 
