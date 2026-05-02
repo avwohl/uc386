@@ -20,11 +20,19 @@ test runner). Status:
   source tree ships alongside the binary.
 - **MZ+LE .exe output (Path A)** ✓ — uc386 produces self-contained
   `.exe` files via `addons/harness/exe.py`
-  (uc386 → nasm OMF → wlink → MZ+LE bound to PMODE/W). Verified
-  end-to-end in CI: `true.exe` (~11.8 KB) boots PMODE/W, runs
-  our 32-bit code under DOSBox, exits with errorlevel 0. Same
-  pipeline produces .exe for any in-tree addon that compiles
-  through uc386. Full progression in `docs/path-a-mz-le.md`.
+  (uc386 → nasm OMF → wlink → MZ+LE bound to PMODE/W). All seven
+  Path A phases verified end-to-end in CI: `true.exe` boots PMODE/W
+  + exits 0; `false.exe` exits 1; `myecho.exe hello dos` writes
+  literal `hello dos\n` via libc fputs through real DOS handles;
+  `argv_pr.exe alpha beta` prints `argc=3 / argv[1]='alpha' /
+  argv[2]='beta'`. The bridge stub in `addons/harness/exe.py`
+  handles the two PMODE/W ↔ uc386 mismatches: stream sentinels
+  (libc's `_stdout=0xF1` was a dos_emu sentinel; real DOS needs
+  raw fd 0/1/2) and argv parsing (PMODE/W puts the PSP selector
+  in ES at entry per the OpenWatcom CRT convention; the bridge
+  reads `[es:0x80]` for cmdline length and `[es:0x81..]` for the
+  tail). 14 in-tree manifest addons all build .exe successfully.
+  Full progression in `docs/path-a-mz-le.md`.
 - **dosiz integration** ◐ — Path A makes the dosiz-side
   flat-bin-loader gap moot for the FreeDOS case (.exe runs on
   any DOS). dosiz can still be useful as a third runner for
