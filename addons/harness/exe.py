@@ -211,6 +211,13 @@ _pmodew_start:
         inc     edx                    ; past second NUL
         add     edx, 2                 ; past 16-bit count
         ; Now [fs:edx] is the start of the program path string.
+        ; Bail if the first byte is NUL — PMODE/W's env block may
+        ; not include the program path (empirically: the env-walk
+        ; completes cleanly but the path string is empty). Keep
+        ; the placeholder in that case.
+        movzx   eax, byte [fs:edx]
+        test    eax, eax
+        jz      .env_walk_done
         mov     edi, _pmodew_argv0_buffer
         mov     ecx, 127               ; max bytes to copy
 .path_copy:
