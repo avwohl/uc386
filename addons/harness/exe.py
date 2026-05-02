@@ -47,6 +47,206 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 LIB_INCLUDE = REPO_ROOT / "lib" / "include"
 
+
+# The PMODE/W bridge stub. Linked into every .exe build; provides:
+#   - Real DOS handles (0/1/2) for stdin/stdout/stderr (libc's
+#     0xF0/F1/F2 dos_emu sentinels are stripped by the asm rewriter).
+#   - Captured-at-entry register snapshot for diagnostic programs.
+#   - DPMI INT 31h-driven argv parsing: get PSP selector (AX=0x51),
+#     translate to linear address (AX=0x06), copy command tail from
+#     PSP+0x80 into a flat buffer, tokenize on whitespace into an
+#     argv[] of pointers, set EAX=argc and EBX=&argv[0] so the
+#     codegen-emitted _start (which `push ebx; push eax`) hands main
+#     the right cdecl args.
+#
+# Empirical PMODE/W contract (from exe_regs_probe.c output):
+#   EAX = 0x300 (768)   — opaque, possibly stack/PSP related
+#   EBX = 0x21 (33)     — opaque
+#   ECX = 0
+#   EDX = 0xF159        — looks like a real-mode segment value
+#   ESI = 0xD2 / EDI = 0x2CC6 / EBP = 0x2CC6 / ESP = 0x2D00
+# None of these are argc/argv. PMODE/W expects the program to parse
+# the cmdline itself, same as the Watcom CRT does.
+BRIDGE_ASM = """
+        section _DATA use32 class=DATA
+        global _stdin
+        global _stdout
+        global _stderr
+_stdin:  dd 0
+_stdout: dd 1
+_stderr: dd 2
+
+        global _pmodew_eax_at_entry
+        global _pmodew_ebx_at_entry
+        global _pmodew_ecx_at_entry
+        global _pmodew_edx_at_entry
+        global _pmodew_esi_at_entry
+        global _pmodew_edi_at_entry
+        global _pmodew_ebp_at_entry
+        global _pmodew_esp_at_entry
+_pmodew_eax_at_entry: dd 0
+_pmodew_ebx_at_entry: dd 0
+_pmodew_ecx_at_entry: dd 0
+_pmodew_edx_at_entry: dd 0
+_pmodew_esi_at_entry: dd 0
+_pmodew_edi_at_entry: dd 0
+_pmodew_ebp_at_entry: dd 0
+_pmodew_esp_at_entry: dd 0
+
+        ; Diagnostic globals for the DPMI argv parser. Exported so a
+        ; probe can verify each step worked (selector valid, linear
+        ; base computed, cmdline length read, etc.).
+        global _pmodew_psp_selector
+        global _pmodew_psp_linear
+        global _pmodew_cmdline_len
+        global _pmodew_argc
+        global _pmodew_argv
+_pmodew_psp_selector: dd 0
+_pmodew_psp_linear:   dd 0
+_pmodew_cmdline_len:  dd 0
+_pmodew_argc:         dd 0
+_pmodew_argv:         dd _pmodew_argv_array
+
+        ; argv array: up to 32 args, NULL-terminated. argv[0] is the
+        ; program-name placeholder (DOS PSP doesn't include argv[0];
+        ; the real program path requires DPMI 0x60h env-block walk).
+_pmodew_argv_array: times 33 dd 0
+
+        ; Flat buffer holding the parsed/tokenized command tail.
+        ; PSP cmdline tail max is 127 bytes; double for safety.
+_pmodew_argv_buffer: times 256 db 0
+
+        ; Placeholder for argv[0] — real DOS doesn't put the program
+        ; name in PSP+0x80, so we fake it with a neutral string. Real
+        ; argv[0] needs DPMI 0x60h to walk the environment block,
+        ; which lands as a follow-up if needed.
+_pmodew_argv0_placeholder: db "program", 0
+
+        section _TEXT use32 class=CODE
+        global _pmodew_start
+        extern _start
+
+_pmodew_start:
+        ; Capture entry state for diagnostics
+        mov     [_pmodew_eax_at_entry], eax
+        mov     [_pmodew_ebx_at_entry], ebx
+        mov     [_pmodew_ecx_at_entry], ecx
+        mov     [_pmodew_edx_at_entry], edx
+        mov     [_pmodew_esi_at_entry], esi
+        mov     [_pmodew_edi_at_entry], edi
+        mov     [_pmodew_ebp_at_entry], ebp
+        mov     [_pmodew_esp_at_entry], esp
+
+        ; --- DPMI argv parsing ---
+
+        ; 1. DPMI INT 31h AX=0x51 — get current PSP selector in BX.
+        mov     ax, 0x0051
+        int     0x31
+        ; CY clear on success, BX = PSP selector.
+        movzx   eax, bx
+        mov     [_pmodew_psp_selector], eax
+
+        ; 2. DPMI INT 31h AX=0x06 — get segment base address.
+        ; Input: BX = selector. Output: CX:DX = linear base
+        ; (CX=high 16 bits, DX=low 16 bits).
+        mov     ax, 0x0006
+        ; BX still has PSP selector
+        int     0x31
+        ; Combine CX:DX into ECX = linear base
+        movzx   eax, cx
+        shl     eax, 16
+        movzx   edx, dx
+        or      eax, edx          ; EAX = PSP linear base
+        mov     [_pmodew_psp_linear], eax
+        mov     ecx, eax          ; ECX = PSP linear base
+
+        ; 3. Read command tail length at PSP+0x80
+        movzx   eax, byte [ecx + 0x80]
+        mov     [_pmodew_cmdline_len], eax
+
+        ; 4. Copy command tail from PSP+0x81 into our flat buffer
+        ;    so we can null-terminate tokens in-place.
+        push    eax               ; save length
+        lea     esi, [ecx + 0x81]
+        mov     edi, _pmodew_argv_buffer
+        mov     ecx, eax
+        test    ecx, ecx
+        jz      .copy_done
+        cmp     ecx, 255          ; clamp to buffer size
+        jbe     .copy_ok
+        mov     ecx, 255
+.copy_ok:
+        cld
+        rep     movsb
+.copy_done:
+        mov     byte [edi], 0     ; null-terminator
+        pop     eax
+
+        ; 5. Tokenize. argv[0] = placeholder. Then walk buffer
+        ;    splitting on space/tab into argv[1..argc-1].
+        mov     edi, _pmodew_argv_array
+        mov     dword [edi], _pmodew_argv0_placeholder
+        add     edi, 4
+        mov     ecx, 1            ; argc starts at 1 (placeholder argv[0])
+        mov     esi, _pmodew_argv_buffer
+
+.skip_ws:
+        cmp     ecx, 32           ; argv array has 33 slots; leave 1 for NULL
+        jge     .tokenize_done
+        mov     al, [esi]
+        test    al, al
+        jz      .tokenize_done
+        cmp     al, ' '
+        je      .skip_one
+        cmp     al, 9
+        je      .skip_one
+        cmp     al, 13            ; CR — PSP cmdline terminator
+        je      .tokenize_done
+        ; start of token: record pointer
+        mov     [edi], esi
+        add     edi, 4
+        inc     ecx
+
+.in_token:
+        inc     esi
+        mov     al, [esi]
+        test    al, al
+        jz      .tokenize_done
+        cmp     al, ' '
+        je      .end_token
+        cmp     al, 9
+        je      .end_token
+        cmp     al, 13
+        je      .end_token_cr
+        jmp     .in_token
+
+.end_token:
+        mov     byte [esi], 0     ; null-terminate this token
+        inc     esi
+        jmp     .skip_ws
+
+.end_token_cr:
+        mov     byte [esi], 0
+        jmp     .tokenize_done
+
+.skip_one:
+        inc     esi
+        jmp     .skip_ws
+
+.tokenize_done:
+        mov     dword [edi], 0    ; argv[argc] = NULL
+        mov     [_pmodew_argc], ecx
+
+        ; 6. Hand off to the codegen-emitted _start. Set up the
+        ;    dos_emu register-passing convention: EAX=argc,
+        ;    EBX=&argv[0]. _start does `push ebx; push eax`, then
+        ;    `call _main` — main reads [ebp+8]=argc, [ebp+12]=argv.
+        mov     eax, [_pmodew_argc]
+        mov     ebx, _pmodew_argv_array
+        jmp     _start
+"""
+
+
 # Same Watcom-discovery pattern as `compare.py` (CI sets WATCOM env;
 # dev hosts on Linux typically install via `~/.local/opt/watcom`).
 WATCOM_CANDIDATES = [
@@ -186,48 +386,7 @@ def build_exe(
     # to the codegen-emitted _start. argv parsing (PSP+0x80 via DPMI
     # INT 31h) lands in the same stub once stdout is verified working.
     bridge_asm = out_path.with_suffix(".bridge.asm")
-    bridge_asm.write_text(
-        "        section _DATA use32 class=DATA\n"
-        "        global _stdin\n"
-        "        global _stdout\n"
-        "        global _stderr\n"
-        "_stdin:  dd 0\n"
-        "_stdout: dd 1\n"
-        "_stderr: dd 2\n"
-        # Capture register state at PMODE/W entry into globals so a
-        # diagnostic program can later printf them. Cheap (8 stores)
-        # and keeps the bridge generic — addons that don't probe
-        # just ignore the symbols.
-        "        global _pmodew_eax_at_entry\n"
-        "        global _pmodew_ebx_at_entry\n"
-        "        global _pmodew_ecx_at_entry\n"
-        "        global _pmodew_edx_at_entry\n"
-        "        global _pmodew_esi_at_entry\n"
-        "        global _pmodew_edi_at_entry\n"
-        "        global _pmodew_ebp_at_entry\n"
-        "        global _pmodew_esp_at_entry\n"
-        "_pmodew_eax_at_entry: dd 0\n"
-        "_pmodew_ebx_at_entry: dd 0\n"
-        "_pmodew_ecx_at_entry: dd 0\n"
-        "_pmodew_edx_at_entry: dd 0\n"
-        "_pmodew_esi_at_entry: dd 0\n"
-        "_pmodew_edi_at_entry: dd 0\n"
-        "_pmodew_ebp_at_entry: dd 0\n"
-        "_pmodew_esp_at_entry: dd 0\n"
-        "        section _TEXT use32 class=CODE\n"
-        "        global _pmodew_start\n"
-        "        extern _start\n"
-        "_pmodew_start:\n"
-        "        mov     [_pmodew_eax_at_entry], eax\n"
-        "        mov     [_pmodew_ebx_at_entry], ebx\n"
-        "        mov     [_pmodew_ecx_at_entry], ecx\n"
-        "        mov     [_pmodew_edx_at_entry], edx\n"
-        "        mov     [_pmodew_esi_at_entry], esi\n"
-        "        mov     [_pmodew_edi_at_entry], edi\n"
-        "        mov     [_pmodew_ebp_at_entry], ebp\n"
-        "        mov     [_pmodew_esp_at_entry], esp\n"
-        "        jmp     _start\n"
-    )
+    bridge_asm.write_text(BRIDGE_ASM)
     bridge_obj = out_path.with_suffix(".bridge.obj")
     proc = subprocess.run(
         ["nasm", "-f", "obj", "-o", str(bridge_obj), str(bridge_asm)],

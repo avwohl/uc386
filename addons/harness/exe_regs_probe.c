@@ -20,6 +20,10 @@ extern unsigned int pmodew_esi_at_entry;
 extern unsigned int pmodew_edi_at_entry;
 extern unsigned int pmodew_ebp_at_entry;
 extern unsigned int pmodew_esp_at_entry;
+extern unsigned int pmodew_psp_selector;
+extern unsigned int pmodew_psp_linear;
+extern unsigned int pmodew_cmdline_len;
+extern unsigned int pmodew_argc;
 
 static void puthex8(unsigned int v) {
     static const char hex[] = "0123456789abcdef";
@@ -46,5 +50,10 @@ int main(void) {
     put_named_reg("edi", pmodew_edi_at_entry);
     put_named_reg("ebp", pmodew_ebp_at_entry);
     put_named_reg("esp", pmodew_esp_at_entry);
+    fputs("--DPMI argv parser--\n", stdout);
+    put_named_reg("psp_selector", pmodew_psp_selector);
+    put_named_reg("psp_linear", pmodew_psp_linear);
+    put_named_reg("cmdline_len", pmodew_cmdline_len);
+    put_named_reg("parsed_argc", pmodew_argc);
     return 0;
 }
