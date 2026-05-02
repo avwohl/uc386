@@ -116,6 +116,7 @@ jobs:
         # Best-effort — failures don't block the rest of CI.
         continue-on-error: true
         run: |
+          set +e   # don't let `cat` non-zero kill the diagnostic dump
           mkdir -p /tmp/dosbox-cwd
           cp /tmp/true.exe /tmp/dosbox-cwd/true.exe
           cat > /tmp/dosbox.conf <<'EOF'
@@ -131,22 +132,28 @@ jobs:
           [autoexec]
           mount c /tmp/dosbox-cwd
           c:
+          echo before > result.txt
           true.exe
-          echo errorlevel=%errorlevel% > result.txt
+          echo errorlevel=%errorlevel% >> result.txt
+          echo after >> result.txt
           exit
           EOF
           export SDL_VIDEODRIVER=dummy
           timeout 30 dosbox -conf /tmp/dosbox.conf -exit \
-            > /tmp/dosbox.log 2>&1 || rc=$?
-          echo "dosbox exit: ${rc:-0}"
+            > /tmp/dosbox.log 2>&1
+          echo "dosbox exit: $?"
           echo '== result.txt =='
           cat /tmp/dosbox-cwd/result.txt 2>&1
-          echo '== dosbox log tail =='
-          tail -15 /tmp/dosbox.log
-          # The .exe must exit with errorlevel 0 for `true`.
-          if grep -q 'errorlevel=0' /tmp/dosbox-cwd/result.txt; then
+          echo '== dosbox log =='
+          # Strip ALSA/SDL noise that's irrelevant to whether true.exe ran.
+          grep -v '^ALSA\|^MIXER\|^MIDI\|^DOSBox switched' /tmp/dosbox.log | tail -20
+          # Pass condition: result.txt has "before", "errorlevel=0",
+          # AND "after" — meaning autoexec reached past true.exe.
+          if grep -q '^before' /tmp/dosbox-cwd/result.txt 2>/dev/null \
+             && grep -q '^errorlevel=0' /tmp/dosbox-cwd/result.txt 2>/dev/null \
+             && grep -q '^after' /tmp/dosbox-cwd/result.txt 2>/dev/null; then
             echo "PASS: true.exe ran cleanly with errorlevel 0"
           else
-            echo "FAIL: result.txt didn't contain errorlevel=0"
+            echo "FAIL: see result.txt + log above"
             exit 1
           fi
