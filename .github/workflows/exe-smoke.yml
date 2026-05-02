@@ -76,6 +76,39 @@ jobs:
             -o /tmp/cat.exe
           ls -la /tmp/cat.exe
 
+      - name: Build true.exe with explicit pmodew.exe stub
+        # The Watcom Linux install ships pmodew.exe under binw/. Try
+        # binding it explicitly via wlink's `option stub=<path>` —
+        # that should produce a self-contained .exe where the MZ
+        # part IS pmodew.exe (which then loads the LE payload that
+        # follows).
+        continue-on-error: true
+        run: |
+          STUB="$WATCOM/binw/pmodew.exe"
+          ls -la "$STUB"
+          # Compile uc386 → asm → obj → exe with explicit stub.
+          python -m uc386.main addons/gnu/true/main.c \
+            -o /tmp/true_bound.asm -I lib/include
+          nasm -f obj -o /tmp/true_bound.obj /tmp/true_bound.asm
+          $WATCOM/binl64/wlink \
+            system pmodew \
+            option stub=$STUB \
+            name /tmp/true_bound.exe \
+            file /tmp/true_bound.obj
+          ls -la /tmp/true_bound.exe
+          file /tmp/true_bound.exe
+          xxd /tmp/true_bound.exe | head -4
+
+      - name: Show pmodew system block
+        # Inspect the wlink config so we know what defaults the
+        # `system pmodew` directive embeds.
+        run: |
+          awk '/system begin pmodew/,/system end/' \
+            $WATCOM/binl/wlink.lnk | head -25
+          echo '---'
+          awk '/system begin causeway/,/system end/' \
+            $WATCOM/binl/wlink.lnk | head -25
+
       - name: Survey watcom install for stubs
         # Both `system causeway` and `system pmodew` produce unbound
         # LE files (371 bytes — just the "this is a X executable"
