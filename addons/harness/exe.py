@@ -80,6 +80,10 @@ _pmodew_argv_array: times 33 dd 0
         ; Buffer for the parsed/null-terminated cmdline (PSP tail
         ; max is 127 bytes; round to 128 for alignment).
 _pmodew_argv_buffer: times 128 db 0
+        ; Buffer for argv[0] (the program path, found by walking the
+        ; DOS environment block). Falls back to a placeholder if
+        ; the env-walk fails (DPMI selector alloc fails, etc.).
+_pmodew_argv0_buffer: times 128 db 0
 _pmodew_argv0_placeholder: db "program", 0
 
         section _TEXT use32 class=CODE
@@ -168,6 +172,66 @@ _pmodew_start:
 .tokenize_done:
         mov     dword [edi], 0         ; argv[argc] = NULL
         mov     [_pmodew_argc], ecx
+
+        ; Step 3: try to find the real program path for argv[0] by
+        ; walking the DOS environment block. PSP+0x2C holds the env
+        ; segment as a word. After the env vars (each NUL-terminated,
+        ; doubly NUL-terminated as a group), DOS appends a 16-bit
+        ; count followed by the program path string. Allocate a
+        ; fresh DPMI selector for the env segment and walk it.
+        ;
+        ; Best-effort: if any DPMI step fails, argv[0] stays as the
+        ; "program" placeholder.
+        movzx   eax, word [es:0x2C]    ; env segment
+        test    eax, eax
+        jz      .argv0_done            ; no env block
+        push    eax
+        push    ebx
+        mov     bx, ax
+        mov     ax, 0x0002             ; DPMI: Segment to Descriptor
+        int     0x31
+        jc      .argv0_alloc_failed
+        movzx   eax, ax                ; env selector
+        push    fs
+        mov     fs, ax
+        ; Skip env vars: each is NUL-terminated; group ends at double NUL.
+        xor     edx, edx
+.env_walk:
+        cmp     edx, 0x7FFE            ; clamp env-walk distance
+        jae     .env_walk_done
+        movzx   eax, byte [fs:edx]
+        inc     edx
+        test    eax, eax
+        jnz     .env_walk
+        ; Saw NUL. Check if next byte is also NUL.
+        movzx   eax, byte [fs:edx]
+        test    eax, eax
+        jnz     .env_walk              ; single NUL — keep walking
+        ; Double NUL found. Skip past it and the count word.
+        inc     edx                    ; past second NUL
+        add     edx, 2                 ; past 16-bit count
+        ; Now [fs:edx] is the start of the program path string.
+        mov     edi, _pmodew_argv0_buffer
+        mov     ecx, 127               ; max bytes to copy
+.path_copy:
+        movzx   eax, byte [fs:edx]
+        mov     [edi], al
+        test    al, al
+        jz      .path_done
+        inc     edx
+        inc     edi
+        dec     ecx
+        jnz     .path_copy
+.path_done:
+        mov     byte [edi], 0          ; ensure NUL-terminated
+        ; Replace argv[0] placeholder with the real path.
+        mov     dword [_pmodew_argv_array], _pmodew_argv0_buffer
+.env_walk_done:
+        pop     fs
+.argv0_alloc_failed:
+        pop     ebx
+        pop     eax
+.argv0_done:
 
         ; Hand off to the codegen-emitted _start. dos_emu convention:
         ; EAX=argc, EBX=&argv[0].
