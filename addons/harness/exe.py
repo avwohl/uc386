@@ -122,11 +122,41 @@ def build_exe(
     if "WATCOM" not in env:
         env["WATCOM"] = str(Path(wlink).parent.parent)
 
+    # Locate the extender stub binary so wlink can BIND it as the
+    # MZ portion of the .exe (the file becomes self-contained: real
+    # DOS / FreeDOS / DOSBox load the MZ stub, which is the extender
+    # itself, which then loads the LE payload that follows).
+    # Without `option stub=...`, `system <X>` produces a 371-byte LE
+    # whose MZ portion just prints "This is a X executable" and
+    # exits — verified empirically in CI.
+    stub_name = {
+        "pmodew": "pmodew.exe",
+        "causeway": "cwstub.exe",
+        "dos4g": "dos4gw.exe",
+    }.get(extender)
+    stub_path: Path | None = None
+    if stub_name:
+        # Watcom ships these under $WATCOM/binw/ (the 16-bit DOS
+        # binaries — the stubs themselves are real-mode .exe).
+        candidates = [
+            Path(env["WATCOM"]) / "binw" / stub_name,
+            Path(env["WATCOM"]) / "binnt" / stub_name,
+        ]
+        for p in candidates:
+            if p.is_file():
+                stub_path = p
+                break
+
     cmd = [
         wlink, "system", extender,
         "name", str(out_path),
         "file", str(obj_path),
     ]
+    if stub_path is not None:
+        # wlink's `option stub=...` directive writes <stub-file>
+        # bytes verbatim as the .exe's MZ portion, then writes the
+        # LE payload after it.
+        cmd.extend(["option", f"stub={stub_path}"])
     for extra in extra_obj_files or []:
         cmd.extend(["file", str(extra)])
     proc = subprocess.run(

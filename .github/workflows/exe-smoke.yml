@@ -58,14 +58,27 @@ jobs:
         # Any wlink failure is a Phase 1 wrapper bug or an OMF
         # compatibility issue, not "this addon happens to use a libc
         # symbol the bridge doesn't provide."
+        # exe.py auto-binds pmodew.exe (the default extender) so the
+        # output should be ~11 KB self-contained (PMODE/W + LE
+        # payload), not 371 bytes (unbound LE that prints "This is
+        # a PMODE/W executable" and exits).
         run: |
           python -m addons.harness.exe addons/gnu/true/main.c \
             -o /tmp/true.exe
           ls -la /tmp/true.exe
           file /tmp/true.exe
-          # MZ header should be the first two bytes.
-          head -c 2 /tmp/true.exe | od -c -N2 | head -1 | grep -q 'M.*Z' \
-            || (echo "MZ header missing" && exit 1)
+          # Self-contained .exe should be > 1 KB (PMODE/W is ~11 KB).
+          # Catches the regression where the stub binary doesn't get
+          # bound in.
+          SIZE=$(stat -c '%s' /tmp/true.exe)
+          if [ "$SIZE" -lt 1024 ]; then
+            echo "FAIL: true.exe is only $SIZE bytes — extender wasn't bound"
+            exit 1
+          fi
+          # `file` should mention PMODE/W explicitly.
+          file /tmp/true.exe | grep -qi "PMODE/W" \
+            || (echo "FAIL: file output doesn't mention PMODE/W" && exit 1)
+          echo "PASS: true.exe is $SIZE bytes, PMODE/W bound"
       - name: Build cat.exe
         # cat exercises libc (putchar via INT 21h, file open/read/close).
         # Most likely failure mode if Phase 1 needs the calling-convention
