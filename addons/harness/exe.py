@@ -122,6 +122,11 @@ _pmodew_argv_buffer: times 256 db 0
         ; which lands as a follow-up if needed.
 _pmodew_argv0_placeholder: db "program", 0
 
+        ; Diagnostic: 32 bytes copied from PSP_linear to PSP_linear+32
+        ; via flat DS view, exposed for hex inspection by a probe.
+        global _pmodew_psp_dump
+_pmodew_psp_dump: times 32 db 0
+
         section _TEXT use32 class=CODE
         global _pmodew_start
         extern _start
@@ -157,6 +162,22 @@ _pmodew_start:
         shl     eax, 4            ; segment*16 = linear address
         mov     [_pmodew_psp_linear], eax
         mov     ecx, eax          ; ECX = PSP linear base
+
+        ; Diagnostic: dump 32 bytes from PSP_linear+0x80 (via flat DS)
+        ; into a global so a probe can inspect what's there. If all
+        ; zero, flat DS doesn't map real-mode memory. If non-zero but
+        ; not the cmdline format, PSP layout differs from expected.
+        push    ecx
+        push    esi
+        push    edi
+        lea     esi, [ecx + 0x80]
+        mov     edi, _pmodew_psp_dump
+        mov     ecx, 32
+        cld
+        rep     movsb
+        pop     edi
+        pop     esi
+        pop     ecx
 
         ; 3. Read command tail length at PSP+0x80
         movzx   eax, byte [ecx + 0x80]
