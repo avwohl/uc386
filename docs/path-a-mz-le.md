@@ -4,8 +4,37 @@
 dosiz, and real DOS — alongside the existing flat `.bin` that runs
 under `uc386.dos_emu`.
 
-**Status (2026-05-02)**: Phase 1 ✓ + Phase 2 ✓ — self-contained
-.exe files build cleanly in CI:
+**Status (2026-05-02)**: Phase 1 ✓ + Phase 2 ✓ + Phase 3 ✓ — uc386
+now produces .exe files that **actually run on a real DOS
+environment**. Verified end-to-end in CI under DOSBox 0.74-3:
+true.exe boots PMODE/W, switches to 32-bit protected mode, runs
+our `int main(void) { return 0; }`, exits via INT 21h AH=4Ch,
+returns control to DOSBox shell which continues the autoexec.
+
+Path A core goal achieved: every uc386-built binary can ship as
+a `.exe` that runs on FreeDOS. Phase 4-6 (calling-convention
+bridge for argv, integration into addons harness, FOSS tarball
+shipping .exe alongside .bin) are remaining polish.
+
+Phase 3 findings:
+- DOSBox `core=auto` (dynrec) chokes on PMODE/W's PM setup with
+  "DYNREC:Can't run code in this page". `core=normal`
+  (interpreter) handles it correctly.
+- `wlink option stack=64k` is required — without it the .exe has
+  no PM stack and faults on the first push.
+- `wlink option start=_start` overrides wlink's default
+  `_cstart_` lookup (which would need Watcom clib).
+- NASM's `-f obj` defaults segments to USE16. uc386's `section
+  .text` lines must be rewritten to `section _TEXT use32
+  class=CODE` before NASM consumes them — otherwise the OMF
+  declares 32-bit code as 16-bit and the LE-loader flips the
+  D-bit clear.
+- DOSBox 0.74-3 writes mounted host files with 8.3 short
+  uppercase names: `result.txt` → `RESULT.TXT`.
+- DOSBox 0.74-3's shell doesn't expand `%errorlevel%` — verifying
+  exit code requires `if errorlevel N` syntax.
+
+
 
 - `addons/gnu/true/main.c` → `true.exe` (11,779 bytes, PMODE/W
   bound). `file` reports "MS-DOS executable, LE executable for

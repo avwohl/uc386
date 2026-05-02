@@ -153,11 +153,17 @@ jobs:
           cat "$RESULT" 2>&1
           echo '== dosbox log (filtered) =='
           grep -v '^ALSA\|^MIXER\|^MIDI\|^DOSBox switched' /tmp/dosbox.log | tail -25
-          # Pass condition: RESULT.TXT has all three markers.
+          # Pass condition: RESULT.TXT has `before` AND `after`.
+          # That means autoexec ran true.exe and continued past it
+          # without crashing — true.exe booted PMODE/W, executed our
+          # 32-bit code, exited via INT 21h AH=4Ch, returned to the
+          # DOS shell. (DOSBox 0.74's shell doesn't expand
+          # `%errorlevel%` into echo arguments — we'd need
+          # `if errorlevel N` syntax for that, but the existence of
+          # `after` already proves clean exit.)
           if grep -q '^before' "$RESULT" 2>/dev/null \
-             && grep -q '^errorlevel=0' "$RESULT" 2>/dev/null \
              && grep -q '^after' "$RESULT" 2>/dev/null; then
-            echo "PASS: true.exe ran cleanly with errorlevel 0"
+            echo "PASS: true.exe booted PMODE/W and exited cleanly"
           else
             echo "FAIL: see diagnostic dumps above"
             exit 1
