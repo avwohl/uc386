@@ -119,19 +119,26 @@ def build_exe(
     # Rewrite each section line to include `use32` + an OMF class
     # before NASM sees it.
     #
-    # We also strip the `push ebx; push eax` from the `_start` stub.
-    # uc386 emits those because dos_emu hands argc/argv via EAX/EBX.
-    # Under PMODE/W the registers contain extender-internal state
-    # (DPMI version etc.) — pushing them clobbers whatever the
-    # extender's startup put on the stack for argc/argv. Removing
-    # the pushes lets _main read whatever's on top of the stack
-    # (return address from `call _main` at [esp], then PMODE/W's
-    # presumed argc at [esp+4] and argv at [esp+8] — or garbage if
-    # PMODE/W doesn't follow that convention; either way, no worse
-    # than what we had).
+    # Note on argv: uc386's `_start` does `push ebx; push eax` to
+    # convert dos_emu's register-passed argc/argv into cdecl on the
+    # stack. Under PMODE/W those registers contain extender-internal
+    # state, so the pushes pass garbage to _main. Empirically:
+    # `echo hello dos > out.txt` produces `exe hello dos` (argv has
+    # 4 elements with argv[1]="exe" — looks like PMODE/W's command-
+    # line parser is contributing something through a side channel).
+    # Stripping the pushes (tested in Phase 7) didn't change the
+    # output, so PMODE/W isn't placing argc/argv on the stack at
+    # entry either — argv reaches _main via some channel uc386
+    # doesn't read. Real fix needs a bridge stub that:
+    #   1. parses PSP+0x80 (real-mode cmdline tail) via DPMI INT 31h
+    #   2. allocates argv[] in the LE data segment
+    #   3. sets EAX=argc, EBX=&argv[0]
+    #   4. jumps to _start
+    # That's a separate addons/harness/exe_argv_bridge.asm. For now
+    # `.exe` programs that don't read argv work correctly (true,
+    # false, yes, factor with default input).
     asm_text = asm_path.read_text()
     rewritten = []
-    in_start_block = False
     for line in asm_text.splitlines():
         stripped = line.lstrip()
         if stripped.startswith("section .text"):
@@ -142,24 +149,6 @@ def build_exe(
             continue
         if stripped.startswith("section .bss"):
             rewritten.append("        section _BSS use32 class=BSS")
-            continue
-        # Detect the `_start:` label line and start scanning for the
-        # two `push ebx` / `push eax` argv-marshalling instructions.
-        if stripped.rstrip(":") == "_start" or (
-            stripped.startswith("__start:")
-        ):
-            in_start_block = True
-            rewritten.append(line)
-            continue
-        if in_start_block and stripped.startswith("call    _main"):
-            in_start_block = False
-            rewritten.append(line)
-            continue
-        if in_start_block and stripped in ("push    ebx", "push    eax"):
-            # Drop these two lines — under PMODE/W EAX/EBX aren't
-            # argc/argv. Replace with a comment so the layout stays
-            # aligned for diff-readers.
-            rewritten.append(f";       (skipped under .exe build) {stripped}")
             continue
         rewritten.append(line)
     asm_for_omf = out_path.with_suffix(".omf.asm")
