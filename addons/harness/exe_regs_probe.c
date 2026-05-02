@@ -25,6 +25,8 @@ extern unsigned int pmodew_psp_linear;
 extern unsigned int pmodew_cmdline_len;
 extern unsigned int pmodew_argc;
 extern unsigned char pmodew_psp_dump[32];
+extern unsigned int pmodew_dpmi_alloc_sel;
+extern unsigned int pmodew_dpmi_alloc_cy;
 
 static void puthex8(unsigned int v) {
     static const char hex[] = "0123456789abcdef";
@@ -56,6 +58,8 @@ int main(void) {
     put_named_reg("psp_linear", pmodew_psp_linear);
     put_named_reg("cmdline_len", pmodew_cmdline_len);
     put_named_reg("parsed_argc", pmodew_argc);
+    put_named_reg("dpmi_alloc_sel", pmodew_dpmi_alloc_sel);
+    put_named_reg("dpmi_alloc_cy", pmodew_dpmi_alloc_cy);
     fputs("psp_dump[0x80..0xA0]:", stdout);
     {
         int i;

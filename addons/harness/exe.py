@@ -101,11 +101,15 @@ _pmodew_esp_at_entry: dd 0
         global _pmodew_cmdline_len
         global _pmodew_argc
         global _pmodew_argv
+        global _pmodew_dpmi_alloc_sel
+        global _pmodew_dpmi_alloc_cy
 _pmodew_psp_selector: dd 0
 _pmodew_psp_linear:   dd 0
 _pmodew_cmdline_len:  dd 0
 _pmodew_argc:         dd 0
 _pmodew_argv:         dd _pmodew_argv_array
+_pmodew_dpmi_alloc_sel: dd 0
+_pmodew_dpmi_alloc_cy:  dd 0
 
         ; argv array: up to 32 args, NULL-terminated. argv[0] is the
         ; program-name placeholder (DOS PSP doesn't include argv[0];
@@ -162,6 +166,26 @@ _pmodew_start:
         shl     eax, 4            ; segment*16 = linear address
         mov     [_pmodew_psp_linear], eax
         mov     ecx, eax          ; ECX = PSP linear base
+
+        ; Diagnostic: try DPMI 0x0002 (Segment to Descriptor) to
+        ; allocate a fresh selector for the PSP real-mode segment.
+        ; This is the standard DPMI way to access real-mode memory
+        ; without touching pre-existing selectors. Just diagnostic
+        ; — record the result but don't load it (mov es/fs hung
+        ; the program last attempts).
+        push    eax
+        push    ebx
+        mov     bx, [_pmodew_edx_at_entry]   ; PSP segment
+        mov     ax, 0x0002
+        int     0x31
+        pushfd
+        pop     edx
+        and     edx, 1                       ; CF only
+        mov     [_pmodew_dpmi_alloc_cy], edx
+        movzx   eax, ax
+        mov     [_pmodew_dpmi_alloc_sel], eax
+        pop     ebx
+        pop     eax
 
         ; Diagnostic: dump 32 bytes from PSP_linear+0x80 (via flat DS)
         ; into a global so a probe can inspect what's there. If all
