@@ -53,6 +53,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install "uc_core @ git+https://github.com/avwohl/uc_core@main"
           pip install -e .
+      - name: Show emitted .asm _start (verify Phase 7 rewrite)
+        # Dump the _start block of the rewritten .asm so we can
+        # verify the `push ebx; push eax` actually got stripped.
+        run: |
+          python -m addons.harness.exe addons/gnu/echo/main.c -o /tmp/echo_phase7.exe
+          echo '== /tmp/echo_phase7.omf.asm _start block =='
+          awk '/^_start:/,/call.*_main/' /tmp/echo_phase7.omf.asm | head -10
+
       - name: Build true.exe
         # Smallest possible C surface: `int main(void) { return 0; }`.
         # Any wlink failure is a Phase 1 wrapper bug or an OMF
