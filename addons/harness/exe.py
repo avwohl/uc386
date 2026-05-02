@@ -75,7 +75,11 @@ _stderr: dd 2
 _pmodew_argc:         dd 0
 _pmodew_argv:         dd _pmodew_argv_array
 
-_pmodew_argv_array: times 2 dd 0      ; argv[0] + NULL terminator
+        ; Up to 32 args + NULL terminator.
+_pmodew_argv_array: times 33 dd 0
+        ; Buffer for the parsed/null-terminated cmdline (PSP tail
+        ; max is 127 bytes; round to 128 for alignment).
+_pmodew_argv_buffer: times 128 db 0
 _pmodew_argv0_placeholder: db "program", 0
 
         section _TEXT use32 class=CODE
@@ -83,15 +87,91 @@ _pmodew_argv0_placeholder: db "program", 0
         extern _start
 
 _pmodew_start:
-        ; argv[0] = placeholder, argv[1] = NULL. argc=1.
-        mov     dword [_pmodew_argv_array], _pmodew_argv0_placeholder
-        mov     dword [_pmodew_argv_array + 4], 0
-        mov     dword [_pmodew_argc], 1
+        ; OpenWatcom's cstrt386.asm (the standard 32-bit CRT for
+        ; DOS/4GW + PMODE/W + generic DPMI hosts) uses `mov esi,es`
+        ; to reach the PSP under generic-DOS — at entry, ES holds the
+        ; PSP selector that the extender set up. The cmdline tail is
+        ; at [es:0x80] (length byte) and [es:0x81..] (the tail).
+        ;
+        ; Earlier attempts overwrote ES via `mov es, 0x21` which
+        ; broke PMODE/W. The fix: USE the ES PMODE/W gave us at
+        ; entry, don't replace it.
+
+        ; Step 1: copy cmdline length + tail via [es:offset].
+        ; Buffer copy with es-override per byte.
+        movzx   ecx, byte [es:0x80]   ; cmdline length
+        cmp     ecx, 127
+        jbe     .len_ok
+        mov     ecx, 127
+.len_ok:
+        mov     edi, _pmodew_argv_buffer
+        mov     edx, 0x81
+        test    ecx, ecx
+        jz      .copy_done
+.copy_loop:
+        mov     al, [es:edx]
+        mov     [edi], al
+        inc     edx
+        inc     edi
+        dec     ecx
+        jnz     .copy_loop
+.copy_done:
+        mov     byte [edi], 0          ; NUL-terminate
+
+        ; Step 2: tokenize. argv[0] = placeholder. Walk the buffer
+        ; splitting on space/tab/CR into argv[1..].
+        mov     edi, _pmodew_argv_array
+        mov     dword [edi], _pmodew_argv0_placeholder
+        add     edi, 4
+        mov     ecx, 1                 ; argc starts at 1
+        mov     esi, _pmodew_argv_buffer
+
+.skip_ws:
+        cmp     ecx, 32
+        jge     .tokenize_done
+        mov     al, [esi]
+        test    al, al
+        jz      .tokenize_done
+        cmp     al, ' '
+        je      .skip_one
+        cmp     al, 9
+        je      .skip_one
+        cmp     al, 13
+        je      .tokenize_done
+        ; start of token: record pointer
+        mov     [edi], esi
+        add     edi, 4
+        inc     ecx
+
+.in_token:
+        inc     esi
+        mov     al, [esi]
+        test    al, al
+        jz      .tokenize_done
+        cmp     al, ' '
+        je      .end_token
+        cmp     al, 9
+        je      .end_token
+        cmp     al, 13
+        je      .end_token
+        jmp     .in_token
+
+.end_token:
+        mov     byte [esi], 0          ; null-terminate token
+        inc     esi
+        jmp     .skip_ws
+
+.skip_one:
+        inc     esi
+        jmp     .skip_ws
+
+.tokenize_done:
+        mov     dword [edi], 0         ; argv[argc] = NULL
+        mov     [_pmodew_argc], ecx
 
         ; Hand off to the codegen-emitted _start. dos_emu convention:
-        ; EAX=argc, EBX=&argv[0]. _start does `push ebx; push eax`,
-        ; then `call _main` — main reads [ebp+8]=argc, [ebp+12]=argv.
-        mov     eax, 1
+        ; EAX=argc, EBX=&argv[0].
+        mov     eax, [_pmodew_argc]
         mov     ebx, _pmodew_argv_array
         jmp     _start
 """
