@@ -110,6 +110,8 @@ _pmodew_argc:         dd 0
 _pmodew_argv:         dd _pmodew_argv_array
 _pmodew_dpmi_alloc_sel: dd 0
 _pmodew_dpmi_alloc_cy:  dd 0
+        global _pmodew_int21h_psp
+_pmodew_int21h_psp:     dd 0
 
         ; argv array: up to 32 args, NULL-terminated. argv[0] is the
         ; program-name placeholder (DOS PSP doesn't include argv[0];
@@ -166,6 +168,19 @@ _pmodew_start:
         shl     eax, 4            ; segment*16 = linear address
         mov     [_pmodew_psp_linear], eax
         mov     ecx, eax          ; ECX = PSP linear base
+
+        ; Diagnostic: ask DOS for the real-mode PSP segment via
+        ; INT 21h AH=0x62. PMODE/W reflects to real DOS, which puts
+        ; the answer in BX. Compare against EDX_at_entry to see if
+        ; our assumption (EDX = PSP segment) was right.
+        push    eax
+        push    ebx
+        mov     ah, 0x62
+        int     0x21
+        movzx   eax, bx
+        mov     [_pmodew_int21h_psp], eax
+        pop     ebx
+        pop     eax
 
         ; Diagnostic: try DPMI 0x0002 (Segment to Descriptor) to
         ; allocate a fresh selector for the PSP real-mode segment.
