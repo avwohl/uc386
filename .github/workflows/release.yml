@@ -167,6 +167,23 @@ jobs:
           ./build.sh
           ls -la build/doom.bin
 
+      - name: Try doom.exe (PMODE/W bind)
+        # Speculative — feed doom.asm through the .exe pipeline and
+        # see if wlink links it cleanly. doom.bin works under
+        # dos_emu via libc INT 21h; the .exe path needs the bridge
+        # stub's stream-fd fix + argv parsing (Path A Phases 6 + 7).
+        # If wlink chokes on missing externs or relocation issues,
+        # the games tarball still ships the .bin.
+        continue-on-error: true
+        run: |
+          if [ -f addons/games/doom/build/doom.asm ]; then
+            python -m addons.harness.exe \
+              addons/games/doom/build/doom.asm \
+              -o addons/games/doom/build/doom.exe || true
+            ls -la addons/games/doom/build/doom.exe 2>&1 || \
+              echo "(doom.exe didn't build — see error above)"
+          fi
+
       - name: Repackage games with doom.bin
         if: success()
         run: python -m addons.harness.package --version "${{ steps.ver.outputs.version }}" --games-only
