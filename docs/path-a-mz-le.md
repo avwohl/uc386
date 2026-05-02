@@ -20,28 +20,44 @@ a `.exe` that runs on FreeDOS. Remaining polish:
 - Phase 5 ✓: FOSS tarball ships .exe variants alongside .bin
   (`addons/harness/package.py` + `release.yml` build .exe for
   every in-tree addon and place under `uc386-foss/exe/<name>.exe`).
-- Phase 6 ◐: DOSBox runtime smoke for true / false. `true.exe`
+- Phase 6 ✓: DOSBox runtime smoke for true / false. `true.exe`
   exits 0, `false.exe` exits 1 (via `if errorlevel` syntax) —
-  exit codes propagate via INT 21h AH=4Ch correctly. **Earlier
-  claim that echo.exe wrote "hello dos" via libc → INT 21h was
-  WRONG**: that output came from the DOS COMMAND.COM `echo`
-  builtin, not from echo.exe. The shell parses `echo.exe hello
-  dos` as `echo` (builtin) + `exe hello dos` (args), strips the
-  `.` extension separator, and prints "exe hello dos" — echo.exe
-  never executes. Renaming to `myecho.exe` in Phase 7 will reveal
-  whether libc's fputs path actually works (currently suspected
-  broken: `_stdout = 0xF1` is a dos_emu sentinel, but real DOS
-  AH=0x40 needs a real handle 0/1/2). `_putchar` works because
-  it uses AH=02h which doesn't take a handle.
-- Phase 7 (open): calling-convention bridge so argv is correct.
-  argv_probe.exe (named to avoid the shell-builtin trap) shows
-  argc=768 + argv[*] full of garbage — PMODE/W passes nothing
-  in EAX/EBX that matches dos_emu's contract. Bridge stub needs
-  to parse PSP+0x80 (real-mode command-line tail) via DPMI
-  INT 31h, allocate argv[] in the LE data segment, set
-  EAX=argc / EBX=&argv, jump to uc386's _start. Also need to
-  fix _stdout to be a real DOS handle (1 not 0xF1) so fputs/
-  fwrite/printf work under the .exe build path.
+  exit codes propagate via INT 21h AH=4Ch correctly. **Note**:
+  the earlier "echo.exe writes hello dos" was actually the DOS
+  shell's `echo` builtin intercepting `echo.exe hello dos` →
+  `echo` + `exe hello dos`. Renamed test to `myecho.exe` to avoid
+  the shell-builtin trap.
+- Phase 7 (in progress): bridge stub `_pmodew_start` (in
+  `addons/harness/exe.py`) handles two PMODE/W ↔ uc386 mismatches:
+  - **stdout/stdin/stderr fd**: libc's `_stdout = 0xF1` is a
+    dos_emu sentinel; real DOS AH=0x40 wants raw 0/1/2. Bridge
+    redefines them with real handles; libc's sentinel definitions
+    are stripped from the codegen .obj at build time. ✓
+  - **argv**: PMODE/W doesn't pass argc/argv in registers
+    (empirical regs at entry: EAX=0x300 EBX=0x21 ECX=0 EDX=0xF1B3
+    where EBX is the PSP selector and EDX is the real-mode PSP
+    segment). Bridge currently sets argc=1 + argv[0]='program'
+    placeholder. Reading the actual cmdline tail at PSP+0x80
+    requires accessing real-mode memory:
+      - DPMI INT 31h AX=0x06 (Get Segment Base) returned linear=0
+        for selector 0x21 — broken or unsupported under PMODE/W.
+      - Flat DS read at `EDX_at_entry << 4` (= 0xF1B30) returns 0
+        — DS doesn't map real-mode physical memory.
+      - `mov es, 0x21` followed by `[es:0x80]` HUNG the program
+        (DOSBox timeout 30s) — PMODE/W's PSP selector apparently
+        can't be loaded into ES this way, or the limit faults.
+    Outstanding: try DPMI INT 31h AX=0x0002 (Segment to Descriptor)
+    to allocate a fresh selector for the PSP segment, or use
+    DPMI 0x0007 to query the existing 0x21 selector's limit.
+    Programs that don't read argv work fine; argv-dependent
+    programs see argc=1 only.
+
+Phase 7 also surfaces a uc386 codegen bug noted via probe: the C
+idiom `if (v == 0) { putchar('0'); return; } while (v > 0) { ... }`
+emits `jle .end` at the loop top with no preceding `cmp` —
+relying on stale flags from the prior `cmp dword [ebp+8], 0`.
+Workaround: recursive helper or explicit comparison. Tracked for
+a separate codegen pass.
 
 Phase 3 findings:
 - DOSBox `core=auto` (dynrec) chokes on PMODE/W's PM setup with
