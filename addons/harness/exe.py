@@ -118,18 +118,50 @@ def build_exe(
     # (DOSBox: "Illegal read from 4cb4f3*").
     # Rewrite each section line to include `use32` + an OMF class
     # before NASM sees it.
+    #
+    # We also strip the `push ebx; push eax` from the `_start` stub.
+    # uc386 emits those because dos_emu hands argc/argv via EAX/EBX.
+    # Under PMODE/W the registers contain extender-internal state
+    # (DPMI version etc.) — pushing them clobbers whatever the
+    # extender's startup put on the stack for argc/argv. Removing
+    # the pushes lets _main read whatever's on top of the stack
+    # (return address from `call _main` at [esp], then PMODE/W's
+    # presumed argc at [esp+4] and argv at [esp+8] — or garbage if
+    # PMODE/W doesn't follow that convention; either way, no worse
+    # than what we had).
     asm_text = asm_path.read_text()
     rewritten = []
+    in_start_block = False
     for line in asm_text.splitlines():
         stripped = line.lstrip()
         if stripped.startswith("section .text"):
             rewritten.append("        section _TEXT use32 class=CODE")
-        elif stripped.startswith("section .data"):
+            continue
+        if stripped.startswith("section .data"):
             rewritten.append("        section _DATA use32 class=DATA")
-        elif stripped.startswith("section .bss"):
+            continue
+        if stripped.startswith("section .bss"):
             rewritten.append("        section _BSS use32 class=BSS")
-        else:
+            continue
+        # Detect the `_start:` label line and start scanning for the
+        # two `push ebx` / `push eax` argv-marshalling instructions.
+        if stripped.rstrip(":") == "_start" or (
+            stripped.startswith("__start:")
+        ):
+            in_start_block = True
             rewritten.append(line)
+            continue
+        if in_start_block and stripped.startswith("call    _main"):
+            in_start_block = False
+            rewritten.append(line)
+            continue
+        if in_start_block and stripped in ("push    ebx", "push    eax"):
+            # Drop these two lines — under PMODE/W EAX/EBX aren't
+            # argc/argv. Replace with a comment so the layout stays
+            # aligned for diff-readers.
+            rewritten.append(f";       (skipped under .exe build) {stripped}")
+            continue
+        rewritten.append(line)
     asm_for_omf = out_path.with_suffix(".omf.asm")
     asm_for_omf.write_text("\n".join(rewritten) + "\n")
 
