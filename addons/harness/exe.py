@@ -75,7 +75,7 @@ def build_exe(
     asm_path: Path,
     out_path: Path,
     *,
-    extender: str = "causeway",
+    extender: str = "pmodew",
     extra_obj_files: list[Path] | None = None,
 ) -> tuple[bool, str]:
     """Run nasm + wlink to turn `asm_path` into `out_path` (.exe).
@@ -84,8 +84,13 @@ def build_exe(
     (preserved stderr from whichever tool died) or empty on success.
 
     `extender` controls the wlink `system <X>` directive:
-        - "causeway" : bundles CauseWay (free) — self-contained .exe.
-        - "pmodew"   : bundles PMODE/W (BSD) if Watcom ships it.
+        - "pmodew"   : bundles PMODE/W (BSD-ish) — self-contained
+                       .exe, ~9 KB stub overhead. Default.
+        - "causeway" : LE binary that needs cwstub.exe alongside.
+                       (verified empirically: `system causeway`
+                       does not bind the extender — it produces a
+                       371-byte stub-only .exe whose MZ stub prints
+                       "This is a CauseWay executable" and exits.)
         - "dos4g"    : LE binary that needs dos4gw.exe alongside.
 
     `extra_obj_files` are additional .obj files to link in (e.g. a
@@ -144,9 +149,9 @@ def main() -> int:
     ap.add_argument("source", help=".c source to compile, OR .asm to skip uc386")
     ap.add_argument("-o", "--output", required=True, help="output .exe path")
     ap.add_argument(
-        "--extender", default="causeway",
-        choices=["causeway", "pmodew", "dos4g"],
-        help="DOS extender to bundle (default: causeway)",
+        "--extender", default="pmodew",
+        choices=["pmodew", "causeway", "dos4g"],
+        help="DOS extender to bundle (default: pmodew)",
     )
     args = ap.parse_args()
 
