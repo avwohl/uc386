@@ -29,7 +29,7 @@ Type "help()" for more information.
 caught
 ```
 
-What works (23 smoke tests pin the core wins):
+What works (24 smoke tests pin the core wins):
 
 - arithmetic + control flow (`if/else`, `for/range`, `while/break`)
 - function def + call (`def f(x): return x*2; f(7)` → `14`)
@@ -54,10 +54,15 @@ What works (23 smoke tests pin the core wins):
   `name not defined`)
 - `import sys` / `import gc` / `import micropython` /
   `import collections` (OrderedDict + namedtuple) /
-  `import struct` / `import array` — registered via
-  `build/genhdr/moduledefs.h` (hand-rolled equivalent of
-  upstream's `tools/makemoduledefs.py` output, with `#if`
-  guards mirroring each module's `MICROPY_PY_<X>` gate)
+  `import struct` / `import array` / `import errno` —
+  registered via `build/genhdr/moduledefs.h` (hand-rolled
+  equivalent of upstream's `tools/makemoduledefs.py` output,
+  with `#if` guards mirroring each module's `MICROPY_PY_<X>`
+  gate). `errno` additionally needs `MICROPY_USE_INTERNAL_ERRNO=1`
+  (uc386's `<errno.h>` ships only the Linux subset, missing
+  EOPNOTSUPP/EADDRINUSE/ECONN*/EHOST*/EALREADY/EINPROGRESS) plus
+  build.sh's X-macro-aware grep for the EPERM/ENOENT/... qstrs
+  that `MP_QSTR_##e` token paste needs.
 - static qstrs (`__name__` → `'__main__'`)
 - `print()` with real newlines (qstr reverse-mangling correctly
   decodes `_brace_open__colon__hash_b_brace_close_` → `{:#b}`)
@@ -69,13 +74,6 @@ What doesn't work yet (separate gates, pinned in mpconfigport.h):
   `MICROPY_PY_BUILTINS_FLOAT`. Port is int-only today; enabling
   floats needs a softfloat library hooked into uc386's libc plus
   a few percent of additional bin size.
-- `import errno` — module compiles fine but its `errorcode_dict`
-  static-init uses `MP_QSTR_##e` token paste over an X-macro list
-  (EPERM/ENOENT/EINVAL/...), which our grep-based
-  `gen_qstrdefs.py` can't see (those qstr names appear nowhere as
-  literal text). Fix would be to extend gen_qstrdefs.py with a
-  pre-baked list of errno qstrs, or to run upstream's full
-  preprocessor-based `tools/makeqstrdefs.py`.
 - `import _thread` / `import weakref` — `MICROPY_PY_THREAD` and
   `MICROPY_PY_WEAKREF` not enabled at CORE_FEATURES.
 - `MICROPY_PY_IO` (open/io machinery) — port has no VFS.

@@ -79,18 +79,22 @@
 #define MICROPY_PY_BUILTINS_PROPERTY      (1)
 
 // EXTRA_FEATURES-gated extras worth pulling in to the
-// CORE_FEATURES-baseline port. `OrderedDict` is a common-enough
-// idiom that the small static-init cost is worth the import
-// surface.
+// CORE_FEATURES-baseline port. `OrderedDict` and `errno` are
+// common-enough idioms that the small static-init cost is worth
+// the import surface.
 //
-// `errno` is NOT opted in: its globals table uses `MP_QSTR_##e`
-// token paste over an X-macro list (EPERM, ENOENT, EINVAL, ...),
-// which our grep-based gen_qstrdefs.py can't see — none of those
-// qstr names appear as literal text in any source file. Enabling
-// MICROPY_PY_ERRNO without first extending the qstr table would
-// fail with `__static_moderrno__errorcode_table.value: float init
-// must be a constant expression (got Identifier)` because uc386
-// can't resolve `MP_QSTR_EPERM` etc. as enum constants.
+// errno requires:
+//  - build.sh to pre-emit the EPERM/ENOENT/... qstrs (the module's
+//    globals table uses `MP_QSTR_##e` token paste over its X-macro
+//    list, which our grep-based gen_qstrdefs.py can't see otherwise).
+//  - MICROPY_USE_INTERNAL_ERRNO=1 so MP_EPERM resolves to the
+//    upstream's hardcoded MP_##e values rather than to the system's
+//    EPERM macros from <errno.h>. uc386's libc errno.h ships only
+//    a Linux subset (no EOPNOTSUPP / EADDRINUSE / ECONN* / EHOST* /
+//    EALREADY / EINPROGRESS), so the system path leaves several
+//    MP_##e references as bare Identifiers that fail const-eval.
+#define MICROPY_PY_ERRNO                  (1)
+#define MICROPY_USE_INTERNAL_ERRNO        (1)
 #define MICROPY_PY_COLLECTIONS_ORDEREDDICT (1)
 
 typedef long mp_off_t;

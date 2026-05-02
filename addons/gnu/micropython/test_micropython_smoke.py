@@ -616,6 +616,30 @@ def test_micropython_import_struct(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_import_errno(micropython_bin: Path) -> None:
+    """`import errno; errno.EINVAL` exercises the errno module —
+    pulled in via explicit `MICROPY_PY_ERRNO=1` opt-in. The X-macro
+    qstrs (`MP_QSTR_EPERM`, `MP_QSTR_EINVAL`, etc.) are pre-emitted
+    into qstrdefs.generated.h by build.sh's X-macro-aware grep —
+    without that, uc386 fails compile with `float init must be a
+    constant expression (got Identifier)` because the qstrs aren't
+    enum constants the static-init can resolve. Pin so a future
+    config change doesn't silently drop the surface."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"import errno\nprint(errno.EINVAL)\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "22" in res.stdout, (
+        f"expected EINVAL=22 from errno module, got: {res.stdout!r}"
+    )
+
+
 def test_micropython_import_array(micropython_bin: Path) -> None:
     """`import array; array.array('i', ...)` — gated on
     `MICROPY_PY_ARRAY` (CORE_FEATURES). Pins typed-array storage

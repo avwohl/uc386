@@ -326,7 +326,7 @@ Layered evidence:
   links cleanly under `nasm -f bin` to a ~169 KB `.bin`. Only
   externs remaining are dead libm names left in a string table
   (DCE doesn't strip those today).
-- **REPL smoke tests** (23 cases):
+- **REPL smoke tests** (24 cases):
   `addons/gnu/micropython/test_micropython_smoke.py` runs the bin
   under dos_emu and pins: banner, clean Ctrl-D exit, arithmetic
   (`2+3` → `5`), assignment (`x = 5`), `pass`, named builtins
@@ -342,7 +342,7 @@ Layered evidence:
   `bytes.decode`, generator expressions, `'%' %` formatting,
   detailed-NameError-with-qstr-name, `import sys` / `gc` /
   `micropython` / `collections` (OrderedDict + namedtuple) /
-  `struct` / `array`.
+  `struct` / `array` / `errno`.
 
 - **Module imports** (2026-05-02): hand-rolled equivalent of
   upstream's `tools/makemoduledefs.py` output written into
@@ -350,12 +350,18 @@ Layered evidence:
   guarded by its `MICROPY_PY_<X>` define so flipping the gate in
   mpconfigport.h adds or drops the entry consistently. Modules
   registered: `builtins`, `sys`, `__main__`, `gc`, `micropython`,
-  `array`, `collections`, `struct`. Modules deliberately not
-  registered: `math` / `cmath` (need
-  `MICROPY_PY_BUILTINS_FLOAT`), `_thread` (no thread support),
-  `weakref` (off at CORE_FEATURES), `io` (no VFS), `errno`
-  (the module's `errorcode_dict` static-init uses
-  `MP_QSTR_##e` token paste — see NOTES.md for the followup).
+  `array`, `collections`, `struct`, `errno`. `errno` requires two
+  helpers: build.sh's grep also extracts the X-macro
+  `MICROPY_PY_ERRNO_LIST` entries (EPERM/ENOENT/EINVAL/...) into
+  the qstr table so the module's `MP_QSTR_##e` token paste
+  resolves at compile time, and `MICROPY_USE_INTERNAL_ERRNO=1`
+  routes `MP_##e` to upstream's hardcoded values rather than to
+  uc386's libc `<errno.h>` (which ships only the Linux subset —
+  EOPNOTSUPP / EADDRINUSE / ECONN* / EHOST* / EALREADY /
+  EINPROGRESS aren't there). Modules deliberately not registered:
+  `math` / `cmath` (need `MICROPY_PY_BUILTINS_FLOAT`), `_thread`
+  (no thread support), `weakref` (off at CORE_FEATURES), `io`
+  (no VFS).
 
 - **CORE_FEATURES baseline** (2026-05-02): the previous "every
   named-builtin NameErrors when ROM_LEVEL is bumped" runtime

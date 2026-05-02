@@ -104,9 +104,25 @@ if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
         # qstrdefs rebuild. Required: qstr_find_strn's post-binary-
         # search filter does `pool->hashes[at] == str_hash` before
         # memcmp at any non-zero MICROPY_QSTR_BYTES_IN_HASH.
-        grep -rhoE "MP_QSTR_[A-Za-z_][A-Za-z0-9_]*" \
-                upstream/py/ upstream/shared/ \
-            | "$PYTHON" gen_qstrdefs.py --bytes-hash 1
+        #
+        # The grep also pulls in X-macro NAMES from moderrno.c's
+        # MICROPY_PY_ERRNO_LIST so the `MP_QSTR_##e` token paste
+        # in moderrno.c's globals table resolves at compile time.
+        # Without this, enabling MICROPY_PY_ERRNO would fail with
+        # `__static_moderrno__errorcode_table.value: float init must
+        # be a constant expression (got Identifier)` because uc386
+        # can't resolve `MP_QSTR_EPERM` etc. as enum constants.
+        # Translate `X(NAME)` lines into `MP_QSTR_NAME` lines that
+        # gen_qstrdefs.py treats identically to a regular reference.
+        {
+            grep -rhoE "MP_QSTR_[A-Za-z_][A-Za-z0-9_]*" \
+                    upstream/py/ upstream/shared/
+            # POSIX `[[:space:]]` rather than `\s` — macOS's BSD
+            # `sed -E` doesn't honor PCRE shorthand in BRE/ERE.
+            grep -hoE "^[[:space:]]*X\([A-Z][A-Z0-9_]*\)" \
+                    upstream/py/moderrno.c \
+                | sed -E 's/^[[:space:]]*X\(([A-Z][A-Z0-9_]*)\)/MP_QSTR_\1/'
+        } | "$PYTHON" gen_qstrdefs.py --bytes-hash 1
     } > build/genhdr/qstrdefs.generated.h
 fi
 [ -f build/genhdr/moduledefs.h ] || cat > build/genhdr/moduledefs.h <<'EOF'
