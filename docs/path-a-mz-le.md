@@ -4,18 +4,27 @@
 dosiz, and real DOS — alongside the existing flat `.bin` that runs
 under `uc386.dos_emu`.
 
-**Status (2026-05-02)**: Phase 1 ✓ — pipeline validated end-to-end
-in CI. `addons/harness/exe.py` produces working .exe files via the
-`exe-smoke` workflow on Linux. First two test cases pass:
+**Status (2026-05-02)**: Phase 1 ✓ + Phase 2 ✓ — self-contained
+.exe files build cleanly in CI:
 
-- `addons/gnu/true/main.c` → `true.exe` (371 bytes, MZ+LE wrapped)
-- `addons/gnu/cat/main.c` → `cat.exe` (1,024 bytes)
+- `addons/gnu/true/main.c` → `true.exe` (11,779 bytes, PMODE/W
+  bound). `file` reports "MS-DOS executable, LE executable for
+  MS-DOS, PMODE/W DOS extender."
+- `addons/gnu/cat/main.c` → `cat.exe` (12,432 bytes, PMODE/W bound)
 
-Both bind CauseWay as the DOS extender. The exe-smoke workflow
-fires on every push that touches the pipeline, so Phase 2 work
-gets continuous validation. Next steps: actually run these .exe
-under DOSBox in CI to verify the runtime behavior, not just the
-build.
+Phase 2 finding: `wlink system pmodew` alone produced a 371-byte
+unbound LE that printed "This is a PMODE/W executable" and
+exited. To get a self-contained .exe, the extender stub binary
+itself has to be the MZ portion. `addons/harness/exe.py` now
+auto-locates `$WATCOM/binw/pmodew.exe` and passes
+`option stub=...` to wlink, which embeds the stub as the .exe's
+MZ part with the LE payload appended.
+
+CI smoke-test asserts >1 KB output and "PMODE/W" in `file`
+output — catches a regression where stub-binding silently fails.
+
+Next steps: actually run these .exe under DOSBox in CI to verify
+runtime behavior (Phase 3).
 
 ## Why Path A over Path B
 

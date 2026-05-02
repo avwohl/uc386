@@ -89,103 +89,12 @@ jobs:
             -o /tmp/cat.exe
           ls -la /tmp/cat.exe
 
-      - name: Build true.exe with explicit pmodew.exe stub
-        # The Watcom Linux install ships pmodew.exe under binw/. Try
-        # binding it explicitly via wlink's `option stub=<path>` —
-        # that should produce a self-contained .exe where the MZ
-        # part IS pmodew.exe (which then loads the LE payload that
-        # follows).
-        continue-on-error: true
-        run: |
-          STUB="$WATCOM/binw/pmodew.exe"
-          ls -la "$STUB"
-          # Compile uc386 → asm → obj → exe with explicit stub.
-          python -m uc386.main addons/gnu/true/main.c \
-            -o /tmp/true_bound.asm -I lib/include
-          nasm -f obj -o /tmp/true_bound.obj /tmp/true_bound.asm
-          $WATCOM/binl64/wlink \
-            system pmodew \
-            option stub=$STUB \
-            name /tmp/true_bound.exe \
-            file /tmp/true_bound.obj
-          ls -la /tmp/true_bound.exe
-          file /tmp/true_bound.exe
-          xxd /tmp/true_bound.exe | head -4
-
-      - name: Show pmodew system block
-        # Inspect the wlink config so we know what defaults the
-        # `system pmodew` directive embeds.
-        run: |
-          awk '/system begin pmodew/,/system end/' \
-            $WATCOM/binl/wlink.lnk | head -25
-          echo '---'
-          awk '/system begin causeway/,/system end/' \
-            $WATCOM/binl/wlink.lnk | head -25
-
-      - name: Survey watcom install for stubs
-        # Both `system causeway` and `system pmodew` produce unbound
-        # LE files (371 bytes — just the "this is a X executable"
-        # stub). To get a self-contained .exe, the extender stub
-        # itself needs to be the MZ part. wlink supports that via
-        # `option stub=<file>`. Check what stubs the Watcom install
-        # actually ships so we know what to pass.
-        run: |
-          echo '== files matching pmodew/causeway/dos4g/dos32 =='
-          find ~/.local/opt/watcom -iname '*pmodew*' -o -iname '*causeway*' \
-            -o -iname '*dos4g*' -o -iname '*cw32*' -o -iname '*dos32a*' \
-            2>/dev/null | head -20
-          echo '== bin dirs =='
-          ls ~/.local/opt/watcom/binl64 | grep -iE 'stub|pmod|cause|dos' | head -10
-          ls ~/.local/opt/watcom/binl 2>/dev/null | grep -iE 'stub|pmod|cause|dos' | head -10
-          echo '== system block defs =='
-          grep -r "system begin pmodew\|system begin causeway" \
-            ~/.local/opt/watcom 2>/dev/null | head -5
-
       - name: Inspect true.exe structure
-        # Phase 2 baseline: dump the MZ header + first few bytes so we
-        # can compare against what FreeDOS / DOSBox expect. 371 bytes
-        # for `int main(void) { return 0; }` is suspiciously small for
-        # a self-contained .exe — CauseWay is ~20 KB. Likely the
-        # .exe is the LE payload only and needs causeway.exe alongside,
-        # which means `system causeway` doesn't bind by default. Phase
-        # 2 will iterate on the wlink directives.
+        # Quick post-build sanity: the file should have the MZ header,
+        # an LE signature at the new-exe offset, and the PMODE/W
+        # version banner somewhere in the bound stub.
         run: |
           xxd /tmp/true.exe | head -8
-          # MZ header decode (first 28 bytes):
-          # offset  meaning
-          #   00-01  signature (MZ)
-          #   02-03  bytes in last page
-          #   04-05  pages in file (each 512 bytes)
-          #   06-07  relocations
-          #   08-09  size of header in 16-byte paragraphs
-          #   0A-0B  min extra paras
-          #   0C-0D  max extra paras
-          #   0E-0F  initial SS
-          #   10-11  initial SP
-          #   12-13  checksum
-          #   14-15  initial IP
-          #   16-17  initial CS
-          #   18-19  reloc table offset
-          #   1A-1B  overlay number
-          # The "new exe" magic at offset 3C points to the LE/PE/NE header.
-          python3 -c "
-          import sys, struct
-          data = open('/tmp/true.exe', 'rb').read()
-          print(f'file size: {len(data)} bytes')
-          if data[:2] != b'MZ':
-              print('not MZ')
-              sys.exit(1)
-          (_, lp, pages, relocs, hdr_para, _, _, _, sp, _, ip, cs,
-           _, _) = struct.unpack('<2sHHHHHHHHHHHHH', data[:28])
-          print(f'pages={pages} bytes_in_last={lp} hdr_para={hdr_para}')
-          print(f'  → real-mode size = {pages * 512 - (512 - lp if lp else 0)} bytes')
-          print(f'  → header size = {hdr_para * 16} bytes')
-          print(f'cs:ip = {cs:04x}:{ip:04x}, ss:sp = ?:{sp:04x}')
-          # New-exe pointer at 0x3C:
-          if len(data) >= 0x40:
-              ne = struct.unpack('<I', data[0x3C:0x40])[0]
-              print(f'new-exe header offset: 0x{ne:08x}')
-              if ne and ne < len(data):
-                  sig = data[ne:ne+2]
-                  print(f'new-exe signature: {sig!r}  (LE/LX/PE/NE)')
-          "
+          # `strings` should show "PMODE/W" since the extender is
+          # bundled as the MZ portion.
+          strings /tmp/true.exe | grep -i "PMODE/W" | head -3
