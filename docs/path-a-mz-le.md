@@ -17,11 +17,22 @@ under `uc386.dos_emu`.
 Path A core goal achieved: every uc386-built binary can ship as
 a `.exe` that runs on FreeDOS. Remaining polish:
 
-- Phase 5: calling-convention bridge so argv works (today the
-  addons that read argv would see PMODE/W's startup garbage in
-  EAX/EBX instead of argc/&argv[0]).
-- Phase 6: ship .exe variants in the FOSS release tarball.
-- Phase 7: DOSBox runtime smoke for more than just true.exe.
+- Phase 5 ✓: FOSS tarball ships .exe variants alongside .bin
+  (`addons/harness/package.py` + `release.yml` build .exe for
+  every in-tree addon and place under `uc386-foss/exe/<name>.exe`).
+- Phase 6 ✓: DOSBox runtime smoke for true / false / echo.
+  `true.exe` exits 0, `false.exe` exits 1 (via `if errorlevel`
+  syntax), `echo.exe hello dos > echo_out.txt` writes to disk
+  via libc → INT 21h reflection. **libc INT 21h calls work
+  end-to-end through PMODE/W.**
+- Phase 7 (open): calling-convention bridge so argv is fully
+  correct. Empirically: `echo hello dos` produces
+  `exe hello dos` — argv[1] and argv[2] are right but argv[0]
+  is truncated/garbage. PMODE/W sets up SOMETHING for argv but
+  uc386's `_start` reads EAX=argc / EBX=&argv (the dos_emu
+  contract) which doesn't match. Bridge stub needs to parse
+  PSP+0x80 (real-mode command-line tail) into argc/argv before
+  jumping to uc386's _start.
 
 Phase 3 findings:
 - DOSBox `core=auto` (dynrec) chokes on PMODE/W's PM setup with
