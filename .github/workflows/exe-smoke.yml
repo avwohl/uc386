@@ -224,3 +224,50 @@ jobs:
             echo "FAIL: see diagnostic dumps above"
             exit 1
           fi
+
+      - name: Phase 7 probe — argv_probe.exe under DOSBox
+        # Diagnostic for the .exe argv-bridge work. echo.exe outputs
+        # "exe hello dos" given `echo hello dos` (argv[1..]="exe",
+        # "hello", "dos", argc=4) but we don't know what argv[0] is
+        # or where PMODE/W is sourcing the strings from. argv_probe
+        # prints argc + every argv[i] address & contents — capture
+        # to a host-readable file via redirect, dump in CI log.
+        # Best-effort. The actual bridge work is a separate step.
+        continue-on-error: true
+        run: |
+          set +e
+          python -m addons.harness.exe addons/gnu/argv_probe/main.c \
+            -o /tmp/argv_probe.exe
+          ls -la /tmp/argv_probe.exe
+          mkdir -p /tmp/dosbox-probe
+          chmod 777 /tmp/dosbox-probe
+          cp /tmp/argv_probe.exe /tmp/dosbox-probe/
+          cat > /tmp/dosbox-probe.conf <<'EOF'
+          [sdl]
+          fullscreen=false
+
+          [cpu]
+          core=normal
+
+          [autoexec]
+          mount c /tmp/dosbox-probe
+          c:
+          argv_pr.exe alpha beta > probe.txt
+          exit
+          EOF
+          # Copy with the 8.3 name DOSBox will see — argv_probe.exe
+          # would truncate to ARGV_P~1.EXE in mounted dir, simpler
+          # to give it a short name up front.
+          mv /tmp/dosbox-probe/argv_probe.exe /tmp/dosbox-probe/argv_pr.exe
+          export SDL_VIDEODRIVER=dummy
+          timeout 30 dosbox -conf /tmp/dosbox-probe.conf -exit \
+            > /tmp/dosbox-probe.log 2>&1
+          echo "dosbox exit: $?"
+          echo '== /tmp/dosbox-probe contents =='
+          ls -la /tmp/dosbox-probe
+          PROBE="/tmp/dosbox-probe/PROBE.TXT"
+          echo '== PROBE.TXT =='
+          cat "$PROBE" 2>&1
+          echo '== dosbox log (filtered) =='
+          grep -v '^ALSA\|^MIXER\|^MIDI\|^DOSBox switched' \
+            /tmp/dosbox-probe.log | tail -15

@@ -1,0 +1,5 @@
+name = "argv_probe"
+description = "Dumps argc + each argv[i] address & contents (Phase 7 diagnostic)"
+sources = ["main.c"]
+argv = ["argv_probe", "alpha", "beta"]
+expect_exit = 0
