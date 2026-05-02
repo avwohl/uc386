@@ -98,6 +98,23 @@ jobs:
         if: success()
         run: python -m addons.harness.package --version "${{ steps.ver.outputs.version }}" --foss-only
 
+      - name: Build MicroPython binary (full Python REPL under dos_emu)
+        # Best-effort: the build is multi-TU + ~14 min wall-clock, so a
+        # uc386 regression here shouldn't block the rest of the
+        # release. The FOSS tarball ships scripts either way. The
+        # repackage step below picks up the binary if it built.
+        continue-on-error: true
+        run: |
+          cd addons/gnu/micropython
+          ./fetch.sh
+          ./build.sh > /dev/null  # produces genhdr/ stubs
+          ./build_port.sh
+          ls -la build/micropython.bin
+
+      - name: Repackage with micropython
+        if: success()
+        run: python -m addons.harness.package --version "${{ steps.ver.outputs.version }}" --foss-only
+
       - name: Build games-scripts tarball
         run: python -m addons.harness.package --version "${{ steps.ver.outputs.version }}" --games-only
 
@@ -141,15 +158,16 @@ jobs:
 
             - **`uc386-foss-addons-*.tar.gz`** — built FOSS binaries
               + sources + a test runner. 16 utilities + BWK awk
-              (~62 KB built) plus a per-addon `src/` tree
-              (manifest.toml + .c sources or fetch.sh / build.sh)
-              and `test_addons.py` that walks the manifests and
-              runs every binary under `uc386.dos_emu`. When awk.bin
-              ships, the matching one-true-awk upstream tree ships
-              under `src/awk-bwk/upstream/` so every shipped binary
-              travels with its source. Source provenance: this
-              repo (GPL-3.0) + sbase upstream (MIT) + one-true-awk
-              (Lucent free license).
+              (~107 KB) + MicroPython REPL (~169 KB) plus a per-addon
+              `src/` tree (manifest.toml + .c sources or fetch.sh /
+              build.sh) and `test_addons.py` that walks the manifests
+              and runs every binary under `uc386.dos_emu`. When a
+              built upstream-port binary ships (awk.bin,
+              micropython.bin), the matching upstream tree ships
+              under `src/<name>/upstream/` so every shipped binary
+              travels with its source. Source provenance: this repo
+              (GPL-3.0) + sbase upstream (MIT) + one-true-awk
+              (Lucent free license) + MicroPython (MIT).
 
             - **`uc386-games-build-scripts-*.tar.gz`** — fetch +
               build scripts for Doom, Duke3D, Heretic, Hexen, ROTT,
