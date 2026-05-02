@@ -13,7 +13,15 @@ optimization) lives in [uc_core](https://github.com/avwohl/uc_core);
 this repo owns the driver, the x86-32 NASM emitter, and the DOS
 runtime bindings. See `CLAUDE.md` for the per-slice development log.
 
-**Highlights**: DOOM boots end-to-end through uc386 → NASM → dos_emu
+**Highlights**: uc386 also produces real DOS `.exe` files — `addons/harness/exe.py`
+drives `nasm -f obj` → `wlink system pmodew` to build self-contained
+`.exe` (PMODE/W bound, ~12 KB stub overhead) for any in-tree addon.
+Validated end-to-end in CI: `true.exe` boots PMODE/W under DOSBox
+0.74-3, runs the 32-bit code, exits with the correct errorlevel
+(`false.exe` → 1, `true.exe` → 0). All 13 manifest-driven addons
+build .exe successfully (basename, cat, dirname, echo, factor, false,
+head, open_test, strtol_test, tail, true, wc, yes — sizes 11.7-16.2 KB).
+See `docs/path-a-mz-le.md`. DOOM boots end-to-end through uc386 → NASM → dos_emu
 (reaches W_InitFiles after V_Init / M_LoadDefaults / Z_Init; exits 1
 at WAD-not-found as expected; smoke-tested via
 `addons/games/doom/test_doom_smoke.py`). MicroPython is a
