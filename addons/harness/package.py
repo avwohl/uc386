@@ -169,6 +169,17 @@ def package_foss(version: str) -> Path:
         awk_lic = REPO_ROOT / "addons" / "gnu" / "awk-bwk" / "upstream" / "LICENSE"
         if awk_lic.exists():
             tar.add(awk_lic, arcname="uc386-foss/AWK-LICENSE")
+        # micropython is the same special case: multi-TU build via
+        # build_port.sh; ship the binary if it's been built. The
+        # smoke test goes alongside so users can validate the bin
+        # under their own dos_emu install.
+        mp_bin = REPO_ROOT / "addons" / "gnu" / "micropython" / "build" / "micropython.bin"
+        if mp_bin.exists():
+            tar.add(mp_bin, arcname="uc386-foss/micropython.bin")
+            print(f"  micropython: {mp_bin.stat().st_size:,} bytes")
+        mp_lic = REPO_ROOT / "addons" / "gnu" / "micropython" / "upstream" / "LICENSE"
+        if mp_lic.exists():
+            tar.add(mp_lic, arcname="uc386-foss/MICROPYTHON-LICENSE")
 
     print(f"\nWrote {out_path} ({out_path.stat().st_size:,} bytes)")
     return out_path
