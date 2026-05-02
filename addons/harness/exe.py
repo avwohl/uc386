@@ -163,9 +163,14 @@ _pmodew_start:
         mov     eax, [_pmodew_ebx_at_entry]
         mov     [_pmodew_psp_selector], eax
 
-        mov     eax, [_pmodew_edx_at_entry]
-        and     eax, 0xFFFF       ; PSP segment is the low 16 bits
-        shl     eax, 4            ; segment*16 = linear address
+        ; CORRECTED: EDX_at_entry was a misread — INT 21h AH=0x62
+        ; reflects to real DOS and returns the actual PSP segment in
+        ; BX. Empirically: EDX=0xF232 (random PMODE/W internal),
+        ; int21h_psp=0x0068 (the real PSP). Multiply by 16 to get
+        ; the linear address inside our flat DS.
+        mov     eax, [_pmodew_int21h_psp]
+        and     eax, 0xFFFF
+        shl     eax, 4
         mov     [_pmodew_psp_linear], eax
         mov     ecx, eax          ; ECX = PSP linear base
 
