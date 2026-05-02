@@ -178,6 +178,31 @@ def build_uc386(addon: Path) -> int | None:
     return bin_path.stat().st_size
 
 
+def build_uc386_exe(addon: Path) -> int | None:
+    """Build via the .exe pipeline: uc386 → nasm OMF → wlink → MZ+LE PMODE/W .exe.
+
+    Returns the bound .exe size, or None if the toolchain isn't
+    available (no Watcom on macOS) or the build fails. Sizes are
+    larger than .bin because the PMODE/W stub (~11 KB) is bundled.
+    The honest comparator vs Watcom/DJGPP for FreeDOS deployment."""
+    from addons.harness.exe import build_exe  # local import: optional dep
+    out = REPO_ROOT / "build" / "compare" / addon.name
+    out.mkdir(parents=True, exist_ok=True)
+    asm_path = out / "uc386.exe.asm"
+    proc = subprocess.run(
+        [sys.executable, "-m", "uc386.main", str(addon / "main.c"),
+         "-o", str(asm_path), "-I", str(LIB_INCLUDE)],
+        capture_output=True, text=True, cwd=REPO_ROOT,
+    )
+    if proc.returncode != 0:
+        return None
+    exe_path = out / "uc386.exe"
+    ok, _msg = build_exe(asm_path, exe_path)
+    if not ok or not exe_path.exists():
+        return None
+    return exe_path.stat().st_size
+
+
 def build_watcom(addon: Path) -> int | None:
     """Build via Open Watcom wcc386. Linux/Windows hosts only — there is
     no native macOS build, so this returns None on the dev host and the
@@ -259,50 +284,58 @@ def main() -> int:
     args = ap.parse_args()
 
     addons = find_addons()
-    rows: list[tuple[str, int | None, int | None, int | None, int | None]] = []
+    rows: list[tuple[str, int | None, int | None, int | None, int | None, int | None]] = []
     for addon in addons:
         gcc_sz = build_gcc(addon)
         uc_sz = build_uc386(addon)
+        uc_exe_sz = build_uc386_exe(addon)
         wcc_sz = build_watcom(addon)
         djgpp_sz = build_djgpp(addon)
-        rows.append((addon.name, uc_sz, gcc_sz, wcc_sz, djgpp_sz))
+        rows.append((addon.name, uc_sz, uc_exe_sz, gcc_sz, wcc_sz, djgpp_sz))
 
-    # Upstream addons (awk-bwk today) — same four columns, but the
+    # Upstream addons (awk-bwk today) — same columns, but the
     # uc386 size comes from the pre-built .bin under build/ instead of
     # being re-built per invocation. Watcom isn't wired up for the
     # upstream path yet (period BWK awk used K&R declarations that
-    # need extra `wcc386` flags) — column shows `—`.
+    # need extra `wcc386` flags) — column shows `—`. The .exe column
+    # also stays `—` for upstream because the .exe pipeline can't
+    # consume an already-assembled .bin.
     for addon in find_upstream_addons():
         uc_sz = uc386_upstream_size(addon)
         gcc_sz = build_gcc_upstream(addon)
         djgpp_sz = build_djgpp_upstream(addon)
-        rows.append((addon.name, uc_sz, gcc_sz, None, djgpp_sz))
+        rows.append((addon.name, uc_sz, None, gcc_sz, None, djgpp_sz))
 
     def cell(n: int | None) -> str:
         return f"{n:,}" if n is not None else "—"
 
     md = ["# Build comparison: uc386 vs gcc / Watcom / DJGPP", "",
-          "Sizes in bytes of the produced executable. The four columns ",
-          "use four different output formats — the comparison is about ",
+          "Sizes in bytes of the produced executable. The columns ",
+          "use different output formats — the comparison is about ",
           "_how big does each compiler's smallest hello-world-class ",
           "program get_, not strict like-for-like:", "",
-          "- **uc386**: flat i386 `.bin` that runs under dos_emu. ",
-          "  Compile-time libc bundling + asm DCE strip everything ",
-          "  the program doesn't reference.",
+          "- **uc386 (.bin)**: flat i386 binary that runs under ",
+          "  dos_emu. Compile-time libc bundling + asm DCE strip ",
+          "  everything the program doesn't reference.",
+          "- **uc386 (.exe)**: same uc386 codegen, then `nasm -f obj` ",
+          "  → `wlink system pmodew` produces an MZ+LE .exe with the ",
+          "  PMODE/W extender bound (~11 KB stub overhead). Runs ",
+          "  unmodified on FreeDOS / DOSBox / real DOS. Empty cells ",
+          "  on hosts without Open Watcom (no native macOS build).",
           "- **gcc**: native host ELF (Linux/macOS). Includes glibc ",
           "  startup machinery — biggest by a wide margin.",
-          "- **Watcom (`wcc386`)**: 32-bit DOS/4GW `.exe`. Empty ",
-          "  cells mean the toolchain wasn't available in this build ",
-          "  environment (no native macOS build; CI populates it on ",
-          "  the Linux-x64 runner).",
+          "- **Watcom (`wcc386`)**: 32-bit DOS/4GW `.exe` via ",
+          "  Watcom's own clib. Empty cells mean the toolchain wasn't ",
+          "  available in this build environment.",
           "- **DJGPP**: COFF DOS executable for the go32 DPMI ",
           "  extender (gcc 12.2.0 cross). Includes the full djgpp ",
           "  C runtime — explains why even `true` is ~148 KB.", "",
-          "| Tool | uc386 | gcc (host ELF) | Watcom wcc386 | DJGPP |",
-          "|------|-------|----------------|---------------|-------|"]
-    for name, uc_sz, gcc_sz, wcc_sz, djgpp_sz in rows:
+          "| Tool | uc386 (.bin) | uc386 (.exe) | gcc (host ELF) | Watcom wcc386 | DJGPP |",
+          "|------|--------------|--------------|----------------|---------------|-------|"]
+    for name, uc_sz, uc_exe_sz, gcc_sz, wcc_sz, djgpp_sz in rows:
         md.append(
-            f"| {name} | {cell(uc_sz)} | {cell(gcc_sz)} | {cell(wcc_sz)} | {cell(djgpp_sz)} |"
+            f"| {name} | {cell(uc_sz)} | {cell(uc_exe_sz)} | "
+            f"{cell(gcc_sz)} | {cell(wcc_sz)} | {cell(djgpp_sz)} |"
         )
     md.append("")
     md.append("_Generated by `python -m addons.harness.compare --write`._")
