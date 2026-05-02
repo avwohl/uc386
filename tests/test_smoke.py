@@ -4503,6 +4503,30 @@ def test_global_int_init_with_float_cast():
     assert "_g1:" in asm
 
 
+def test_global_float_init_with_float_cast_preserves_value():
+    # `double g = (double)3.141592...;` used to truncate to `dq 3.0`.
+    # `_const_eval_float`'s "try integer first" path called `_const_eval`,
+    # which happily folded the cast by float-evaluating the operand,
+    # truncating to int (3), and returning that as a "constant
+    # integer" — then `_const_eval_float` lifted the wrong value back
+    # to a float. micropython's `mp_const_float_pi_obj` initializer
+    # `{{&mp_type_float}, (mp_float_t)M_PI}` was the trigger:
+    # `math.pi` printed as `2.999999999999997` instead of `3.14159...`.
+    # Fix: refuse the integer fold for casts whose target is a float
+    # type, so the float-eval path runs instead.
+    asm = _compile(
+        "double g_pi = (double)3.141592653589793;\n"
+        "float g_e_f = (float)2.718281828;\n"
+        "int main(void) { return (int)(g_pi + g_e_f); }\n"
+    )
+    assert "_g_pi:" in asm
+    # The full double should round-trip without truncation.
+    assert "3.141592653589793" in asm, (
+        f"expected full double precision in asm, got: "
+        f"{[l for l in asm.splitlines() if 'g_pi' in l or 'g_e_f' in l]}"
+    )
+
+
 def test_global_pointer_init_with_braces():
     # `int *p = {0};` (brace-wrapped scalar pointer init) was raising
     # in `_const_eval` because the InitializerList wasn't unwrapped

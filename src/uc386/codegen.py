@@ -2600,6 +2600,22 @@ class CodeGenerator:
             # Cast from float-typed source to int target — fold the
             # operand via the float evaluator, then truncate toward
             # zero (C semantics for float→int cast).
+            #
+            # If the target is a float type, refuse the integer fold
+            # entirely. `_const_eval_float`'s "try integer first" path
+            # would otherwise call us, see this Cast(double→float),
+            # truncate the operand to int, and lift back to a wrong
+            # float value — exactly what made `mp_const_float_pi_obj`
+            # initialize from `(double)3.14159...` end up as 3.0.
+            ty = expr.target_type
+            if (
+                isinstance(ty, ast.BasicType)
+                and self._is_float_type(ty)
+            ):
+                raise CodegenError(
+                    f"global `{name}`: cast to float not foldable as "
+                    f"integer constant — defer to float-eval path"
+                )
             try:
                 inner = self._const_eval(expr.expr, name)
             except CodegenError:
@@ -2608,7 +2624,6 @@ class CodeGenerator:
                 f_inner = self._const_eval_float(expr.expr, name)
                 # Truncate toward zero for int casts.
                 inner = int(f_inner) if f_inner >= 0 else -int(-f_inner)
-            ty = expr.target_type
             if isinstance(ty, ast.BasicType):
                 size = self._size_of(ty)
                 if size == 1:

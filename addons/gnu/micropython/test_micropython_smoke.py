@@ -656,7 +656,12 @@ def test_micropython_import_math(micropython_bin: Path) -> None:
     from uc386.dos_emu import run
 
     res = run(micropython_bin,
-              stdin_bytes=b"import math\nprint(math.sqrt(2.0))\n\x04",
+              stdin_bytes=(
+                  b"import math\n"
+                  b"print(math.sqrt(2.0))\n"
+                  b"print(math.pi)\n"
+                  b"\x04"
+              ),
               timeout_seconds=15.0,
               instruction_limit=4_000_000_000)
     assert not res.timed_out, "REPL didn't exit"
@@ -664,6 +669,12 @@ def test_micropython_import_math(micropython_bin: Path) -> None:
     assert res.exit_code == 0
     assert "1.41421" in res.stdout, (
         f"expected sqrt(2) ≈ 1.41421..., got: {res.stdout!r}"
+    )
+    # math.pi static-init was producing 3.0 (`(mp_float_t)M_PI` cast
+    # truncated through uc386's `_const_eval` Cast handler before
+    # the integer-fold-refused-for-float fix).
+    assert "3.14159" in res.stdout, (
+        f"expected math.pi ≈ 3.14159..., got: {res.stdout!r}"
     )
 
 
