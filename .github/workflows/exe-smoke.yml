@@ -138,6 +138,9 @@ jobs:
           sudo apt-get install -y dosbox
           dosbox -version || true
 
+      - name: Build false.exe
+        run: python -m addons.harness.exe addons/gnu/false/main.c -o /tmp/false.exe
+
       - name: Phase 3 smoke — true.exe under DOSBox
         # Drop true.exe into a working dir, write an autoexec.bat
         # that mounts it as C:, runs true.exe, then writes the DOS
@@ -150,11 +153,14 @@ jobs:
           set +e   # don't let `cat` non-zero kill the diagnostic dump
           mkdir -p /tmp/dosbox-cwd
           chmod 777 /tmp/dosbox-cwd
-          cp /tmp/true.exe /tmp/dosbox-cwd/true.exe
+          cp /tmp/true.exe /tmp/false.exe /tmp/dosbox-cwd/
           # Use `if errorlevel N` syntax (real DOS) instead of
           # `%errorlevel%` (DOSBox 0.74-3 doesn't expand it). The
           # `if errorlevel 1` branch fires for codes >= 1; the
           # negation (`if not errorlevel 1`) catches exit code 0.
+          # Run BOTH true.exe (expect exit 0) and false.exe
+          # (expect exit 1) — verifies we propagate non-zero
+          # exits correctly via INT 21h AH=4Ch.
           cat > /tmp/dosbox.conf <<'EOF'
           [sdl]
           fullscreen=false
@@ -169,6 +175,9 @@ jobs:
           true.exe
           if errorlevel 1 echo true_failed >> result.txt
           if not errorlevel 1 echo true_ok >> result.txt
+          false.exe
+          if errorlevel 1 echo false_ok >> result.txt
+          if not errorlevel 1 echo false_unexpected_zero >> result.txt
           echo after >> result.txt
           exit
           EOF
@@ -185,16 +194,19 @@ jobs:
           cat "$RESULT" 2>&1
           echo '== dosbox log (filtered) =='
           grep -v '^ALSA\|^MIXER\|^MIDI\|^DOSBox switched' /tmp/dosbox.log | tail -25
-          # Pass condition: RESULT.TXT shows true.exe exit-code 0
-          # AND autoexec reached `after`. That's strong end-to-end
-          # evidence: PMODE/W booted, 32-bit code ran, exit happened
-          # via INT 21h AH=4Ch with AL=0, control returned to shell.
+          # Pass condition: both true.exe (exit 0) and false.exe
+          # (exit 1) ran cleanly. That proves INT 21h AH=4Ch with
+          # AL=N propagates the actual exit code, not just runs.
           if grep -q '^before' "$RESULT" \
              && grep -q '^true_ok' "$RESULT" \
+             && grep -q '^false_ok' "$RESULT" \
              && grep -q '^after' "$RESULT"; then
-            echo "PASS: true.exe boot + exit 0 confirmed"
+            echo "PASS: true.exe (exit 0) + false.exe (exit 1) both work"
           elif grep -q '^true_failed' "$RESULT"; then
-            echo "FAIL: true.exe exited with non-zero errorlevel"
+            echo "FAIL: true.exe exited non-zero (expected 0)"
+            exit 1
+          elif grep -q '^false_unexpected_zero' "$RESULT"; then
+            echo "FAIL: false.exe exited 0 (expected 1) — INT 21h AH=4Ch lost AL"
             exit 1
           else
             echo "FAIL: see diagnostic dumps above"
