@@ -32,18 +32,37 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
+# Two locations: the dev-tree path and the FOSS-tarball path.
+#
+# Dev tree: addons/gnu/micropython/test_micropython_smoke.py
+#           → addons/gnu/micropython/build/micropython.bin
+#           = parent / build / micropython.bin
+# Tarball:  uc386-foss/src/micropython/test_micropython_smoke.py
+#           → uc386-foss/micropython.bin
+#           = parent.parent.parent / micropython.bin
 _HERE = Path(__file__).resolve().parent
-_BIN = _HERE / "build" / "micropython.bin"
+_BIN_CANDIDATES = [
+    _HERE / "build" / "micropython.bin",
+    _HERE.parent.parent.parent / "micropython.bin",
+]
+
+
+def _find_bin() -> Path | None:
+    for p in _BIN_CANDIDATES:
+        if p.exists():
+            return p
+    return None
 
 
 @pytest.fixture(scope="module")
 def micropython_bin() -> Path:
-    if not _BIN.exists():
+    p = _find_bin()
+    if p is None:
         pytest.skip(
             "micropython.bin not built — run "
             "addons/gnu/micropython/build_port.sh first (~14 min)"
         )
-    return _BIN
+    return p
 
 
 def test_micropython_repl_banner(micropython_bin: Path) -> None:
