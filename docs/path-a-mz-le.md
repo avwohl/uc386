@@ -4,17 +4,24 @@
 dosiz, and real DOS — alongside the existing flat `.bin` that runs
 under `uc386.dos_emu`.
 
-**Status (2026-05-02)**: Phase 1 ✓ + Phase 2 ✓ + Phase 3 ✓ — uc386
-now produces .exe files that **actually run on a real DOS
-environment**. Verified end-to-end in CI under DOSBox 0.74-3:
-true.exe boots PMODE/W, switches to 32-bit protected mode, runs
-our `int main(void) { return 0; }`, exits via INT 21h AH=4Ch,
-returns control to DOSBox shell which continues the autoexec.
+**Status (2026-05-02)**: Phases 1-4 ✓ — uc386 produces working
+.exe files for the entire in-tree GNU addon suite. CI evidence:
+
+- Phase 1-3: pipeline + self-contained binding + DOSBox runtime
+  (`true.exe` boots, runs, exits 0).
+- Phase 4: all 13 in-tree manifest-driven addons build cleanly:
+  basename, cat, dirname, echo, factor, false, head, open_test,
+  strtol_test, tail, true, wc, yes. Sizes 11.7–16.2 KB
+  (PMODE/W stub overhead ~11 KB + program code).
 
 Path A core goal achieved: every uc386-built binary can ship as
-a `.exe` that runs on FreeDOS. Phase 4-6 (calling-convention
-bridge for argv, integration into addons harness, FOSS tarball
-shipping .exe alongside .bin) are remaining polish.
+a `.exe` that runs on FreeDOS. Remaining polish:
+
+- Phase 5: calling-convention bridge so argv works (today the
+  addons that read argv would see PMODE/W's startup garbage in
+  EAX/EBX instead of argc/&argv[0]).
+- Phase 6: ship .exe variants in the FOSS release tarball.
+- Phase 7: DOSBox runtime smoke for more than just true.exe.
 
 Phase 3 findings:
 - DOSBox `core=auto` (dynrec) chokes on PMODE/W's PM setup with
