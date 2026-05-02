@@ -138,60 +138,47 @@ _pmodew_start:
         mov     [_pmodew_esp_at_entry], esp
 
         ; --- argv parsing ---
-        ; PMODE/W passes the PSP selector in EBX (=0x21 empirically)
-        ; and the PSP real-mode segment in EDX (=0xF1B3 empirically).
-        ; Try reading PSP via FS override using PMODE/W's selector.
+        ; PMODE/W passes the PSP real-mode segment in EDX at entry.
+        ; (Empirically verified: EDX=0xF1B3 matched the actual PSP
+        ; segment.) Convert that to a linear address inside our flat
+        ; DS — DS covers the full 4 GB starting at 0, so linear =
+        ; segment*16 IS the offset for `mov al, [linear]`.
         ;
-        ; History of attempts:
-        ; - DPMI INT 31h AX=0x06 (Get Segment Base) returned linear=0
-        ;   for selector 0x21. Likely DOSBox/PMODE/W gap.
-        ; - Flat DS read at EDX*16 (= 0xF1B30) returned 0 — flat DS
-        ;   doesn't map real-mode physical memory in PMODE/W.
-        ; - `mov es, 0x21` HUNG the program. ES is critical to PMODE/W
-        ;   (probably used for INT 21h reflection); overwriting it
-        ;   broke the runtime.
-        ; - Trying FS instead: PMODE/W shouldn't touch FS. If FS
-        ;   override works, we get the cmdline tail. If it ALSO hangs,
-        ;   we fall back to argc=1+placeholder.
+        ; We tried DPMI INT 31h AX=0x51 (get PSP selector → 0x21,
+        ; matches EBX at entry) + AX=0x06 (translate to linear base
+        ; → returned 0) — the AX=0x06 path didn't yield a usable
+        ; address under PMODE/W. The EDX-at-entry shortcut sidesteps
+        ; both calls. Selector trick is left as a diagnostic.
         mov     eax, [_pmodew_ebx_at_entry]
         mov     [_pmodew_psp_selector], eax
 
         mov     eax, [_pmodew_edx_at_entry]
-        and     eax, 0xFFFF
-        shl     eax, 4
+        and     eax, 0xFFFF       ; PSP segment is the low 16 bits
+        shl     eax, 4            ; segment*16 = linear address
         mov     [_pmodew_psp_linear], eax
+        mov     ecx, eax          ; ECX = PSP linear base
 
-        push    fs
-        mov     bx, [_pmodew_ebx_at_entry]
-        mov     fs, bx
-
-        ; Read command tail length at FS:0x80. Use 32-bit form
-        ; explicitly via dword displacement to avoid USE16 ambiguity.
-        movzx   eax, byte [fs:0x80]
+        ; 3. Read command tail length at PSP+0x80
+        movzx   eax, byte [ecx + 0x80]
         mov     [_pmodew_cmdline_len], eax
 
-        ; Copy command tail from FS:0x81 into our flat (DS) buffer.
+        ; 4. Copy command tail from PSP+0x81 into our flat buffer
+        ;    so we can null-terminate tokens in-place.
         push    eax               ; save length
+        lea     esi, [ecx + 0x81]
+        mov     edi, _pmodew_argv_buffer
         mov     ecx, eax
         test    ecx, ecx
         jz      .copy_done
-        cmp     ecx, 255
+        cmp     ecx, 255          ; clamp to buffer size
         jbe     .copy_ok
         mov     ecx, 255
 .copy_ok:
-        mov     edi, _pmodew_argv_buffer
-        mov     edx, 0x81
-.copy_loop:
-        mov     al, [fs:edx]
-        mov     [edi], al
-        inc     edx
-        inc     edi
-        dec     ecx
-        jnz     .copy_loop
+        cld
+        rep     movsb
 .copy_done:
-        mov     byte [edi], 0
+        mov     byte [edi], 0     ; null-terminator
         pop     eax
-        pop     fs
 
         ; 5. Tokenize. argv[0] = placeholder. Then walk buffer
         ;    splitting on space/tab into argv[1..argc-1].
