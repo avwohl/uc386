@@ -3223,6 +3223,20 @@ class PeepholeOptimizer:
         "esp": frozenset({"esp", "sp"}),
     }
 
+    # libc internal helpers that read EAX as a non-cdecl input
+    # register (the value to print/format). Without this set, the
+    # liveness analyzer treats `call _printf_emit_dec` like any
+    # cdecl call — assumes EAX is dead — and the dead-mov pass
+    # then drops the `mov eax, [edi]` that loads the actual value
+    # to print. Result: random values printed via `_printf_legacy`.
+    _CALLS_READ_EAX: frozenset[str] = frozenset({
+        "_printf_emit_dec",
+        "_printf_emit_udec",
+        "_printf_emit_hex",
+        "_printf_emit_oct",
+        "_printf_emit_double",
+    })
+
     @staticmethod
     def _references_reg_family(text: str, reg32: str) -> bool:
         """Does `text` reference reg32 or any of its sub-aliases?"""
@@ -3274,6 +3288,14 @@ class PeepholeOptimizer:
                 # `call [reg + N]` reads reg.
                 if PeepholeOptimizer._references_reg_family(operand, reg32):
                     return False
+            # uc386's libc has helpers that READ EAX as input
+            # (non-cdecl, register-passing — see _CALLS_READ_EAX).
+            # Those calls are NOT a pure-write of EAX since they
+            # use the prior value first.
+            if reg32 == "eax" and operand in (
+                PeepholeOptimizer._CALLS_READ_EAX
+            ):
+                return False
             if reg32 in {"eax", "ecx", "edx"}:
                 return True
         # `cdq` sign-extends EAX into EDX — pure write to EDX (doesn't
@@ -3467,6 +3489,12 @@ class PeepholeOptimizer:
                     return False
                 if "[" in operand and self._references_reg_family(
                         operand, reg32):
+                    return False
+                # uc386's libc has internal helpers that read EAX as
+                # an INPUT register (a non-cdecl, register-passing
+                # convention chosen because they're hot inner loops).
+                # Treat the call as a read of EAX in that case.
+                if reg32 == "eax" and operand in self._CALLS_READ_EAX:
                     return False
                 if reg32 in {"eax", "ecx", "edx"}:
                     return True
