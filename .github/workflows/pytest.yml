@@ -24,6 +24,21 @@ jobs:
       uses: actions/setup-python@v6
       with:
         python-version: ${{ matrix.python-version }}
+    - name: Install nasm
+      # Required by addons/test_gnu_addons.py — that test compiles each
+      # in-tree addon's .c through uc386 (Python) → .asm and then
+      # assembles via nasm before running under dos_emu. The addon
+      # smoke tests for awk/doom/micropython skip cleanly without
+      # nasm (their .bin is pre-built), but the parametrized GNU
+      # path always builds fresh. apt + brew both ship nasm.
+      run: |
+        if [ "$RUNNER_OS" = "Linux" ]; then
+          sudo apt-get update -y && sudo apt-get install -y nasm
+        else
+          brew install nasm
+        fi
+        nasm -v
+      shell: bash
     - name: Install dependencies
       # uc_core is not yet on PyPI; install it from GitHub. Remove this
       # step (and the uc_core>=... dep in pyproject will pick it up from
