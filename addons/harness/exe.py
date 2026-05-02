@@ -269,16 +269,20 @@ def build_exe(
     # false, yes, factor with default input).
     asm_text = asm_path.read_text()
     rewritten = []
+    skip_until_blank = False
     for line in asm_text.splitlines():
         stripped = line.lstrip()
         if stripped.startswith("section .text"):
             rewritten.append("        section _TEXT use32 class=CODE")
+            skip_until_blank = False
             continue
         if stripped.startswith("section .data"):
             rewritten.append("        section _DATA use32 class=DATA")
+            skip_until_blank = False
             continue
         if stripped.startswith("section .bss"):
             rewritten.append("        section _BSS use32 class=BSS")
+            skip_until_blank = False
             continue
         # Strip libc's _stdin/_stdout/_stderr definitions — the
         # bridge stub redefines them with real DOS handles 0/1/2
@@ -288,6 +292,24 @@ def build_exe(
         # (e.g. `mov ebx, [_stdout]`).
         if stripped.startswith(("_stdin:", "_stdout:", "_stderr:")) \
                 and "dd 0xF" in stripped:
+            continue
+        # Replace libc's `_printf:` body with a tail-jump to
+        # `_printf_legacy`. The shipped `_printf` routes through
+        # INT 21h AH=0x5F (a dos_emu harness intercept) which is
+        # invalid under real DOS / PMODE/W. The legacy in-asm
+        # format engine uses putchar (AH=02h, real DOS) for every
+        # output char and works under both runners. Replace the
+        # entire body up through the first `ret` with a single
+        # `jmp _printf_legacy`. Same calling convention (cdecl,
+        # fmt + va_args), so a tail-jump is sound.
+        if skip_until_blank:
+            if stripped.startswith("ret"):
+                skip_until_blank = False
+            continue
+        if stripped == "_printf:":
+            rewritten.append("_printf:")
+            rewritten.append("        jmp     _printf_legacy")
+            skip_until_blank = True
             continue
         rewritten.append(line)
     # Declare the stripped stream globals as externs so user code
