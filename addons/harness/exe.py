@@ -163,29 +163,20 @@ _pmodew_start:
         mov     eax, [_pmodew_ebx_at_entry]
         mov     [_pmodew_psp_selector], eax
 
-        ; CORRECTED: EDX_at_entry was a misread — INT 21h AH=0x62
-        ; reflects to real DOS and returns the actual PSP segment in
-        ; BX. Empirically: EDX=0xF232 (random PMODE/W internal),
-        ; int21h_psp=0x0068 (the real PSP). Multiply by 16 to get
-        ; the linear address inside our flat DS.
-        mov     eax, [_pmodew_int21h_psp]
-        and     eax, 0xFFFF
-        shl     eax, 4
-        mov     [_pmodew_psp_linear], eax
-        mov     ecx, eax          ; ECX = PSP linear base
-
-        ; Diagnostic: ask DOS for the real-mode PSP segment via
-        ; INT 21h AH=0x62. PMODE/W reflects to real DOS, which puts
-        ; the answer in BX. Compare against EDX_at_entry to see if
-        ; our assumption (EDX = PSP segment) was right.
-        push    eax
-        push    ebx
+        ; Ask DOS for the real-mode PSP segment via INT 21h AH=0x62.
+        ; PMODE/W reflects to real DOS, returns segment in BX.
+        ; This is authoritative — EDX_at_entry was a misread (random
+        ; PMODE/W internal value, not the PSP).
         mov     ah, 0x62
         int     0x21
         movzx   eax, bx
         mov     [_pmodew_int21h_psp], eax
-        pop     ebx
-        pop     eax
+
+        ; Compute PSP linear from the real PSP segment.
+        and     eax, 0xFFFF
+        shl     eax, 4
+        mov     [_pmodew_psp_linear], eax
+        mov     ecx, eax          ; ECX = PSP linear base
 
         ; Diagnostic: try DPMI 0x0002 (Segment to Descriptor) to
         ; allocate a fresh selector for the PSP real-mode segment.
