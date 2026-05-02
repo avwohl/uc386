@@ -109,8 +109,10 @@ jobs:
 
       - name: Phase 3 smoke — true.exe under DOSBox
         # Drop true.exe into a working dir, write an autoexec.bat
-        # that mounts it as C:, runs true.exe, and exits. DOSBox
-        # captures errors to its log; capture and inspect.
+        # that mounts it as C:, runs true.exe, then writes the DOS
+        # errorlevel to a file we can read from the host. DOSBox
+        # 0.74-3 doesn't forward DOS-side stdout to host stdout, so
+        # the file-redirect trick is the cleanest signal.
         # Best-effort — failures don't block the rest of CI.
         continue-on-error: true
         run: |
@@ -125,20 +127,26 @@ jobs:
           # PMODE/W's protected-mode setup with "Can't run code in
           # this page". Slower but correct.
           core=normal
-          cputype=pentium
 
           [autoexec]
           mount c /tmp/dosbox-cwd
           c:
           true.exe
-          echo errorlevel=%errorlevel%
+          echo errorlevel=%errorlevel% > result.txt
           exit
           EOF
           export SDL_VIDEODRIVER=dummy
-          # `-exit` exits DOSBox after autoexec runs out of commands.
-          # `-conf` loads our config. stdout/stderr capture whatever
-          # the DOS program prints (DOSBox 0.74-3 forwards via SDL).
           timeout 30 dosbox -conf /tmp/dosbox.conf -exit \
             > /tmp/dosbox.log 2>&1 || rc=$?
           echo "dosbox exit: ${rc:-0}"
-          cat /tmp/dosbox.log | tail -30
+          echo '== result.txt =='
+          cat /tmp/dosbox-cwd/result.txt 2>&1
+          echo '== dosbox log tail =='
+          tail -15 /tmp/dosbox.log
+          # The .exe must exit with errorlevel 0 for `true`.
+          if grep -q 'errorlevel=0' /tmp/dosbox-cwd/result.txt; then
+            echo "PASS: true.exe ran cleanly with errorlevel 0"
+          else
+            echo "FAIL: result.txt didn't contain errorlevel=0"
+            exit 1
+          fi
