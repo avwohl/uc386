@@ -178,84 +178,63 @@ _pmodew_start:
         mov     [_pmodew_psp_linear], eax
         mov     ecx, eax          ; ECX = PSP linear base
 
-        ; DPMI 0x0002: allocate a fresh PM selector for the real PSP
-        ; segment (from int21h_psp, NOT EDX_at_entry). Need a separate
-        ; selector because flat DS only maps from our LE program data
-        ; (~0x10000+) — real-mode 0x680 isn't in that view.
+        ; Diagnostic: try DPMI 0x0002 (Segment to Descriptor) to
+        ; allocate a fresh selector for the PSP real-mode segment.
+        ; This is the standard DPMI way to access real-mode memory
+        ; without touching pre-existing selectors. Just diagnostic
+        ; — record the result but don't load it (mov es/fs hung
+        ; the program last attempts).
         push    eax
         push    ebx
-        mov     bx, [_pmodew_int21h_psp]
+        mov     bx, [_pmodew_edx_at_entry]   ; PSP segment
         mov     ax, 0x0002
         int     0x31
         pushfd
         pop     edx
-        and     edx, 1
+        and     edx, 1                       ; CF only
         mov     [_pmodew_dpmi_alloc_cy], edx
         movzx   eax, ax
         mov     [_pmodew_dpmi_alloc_sel], eax
         pop     ebx
         pop     eax
 
-        ; Read 32 bytes from PSP+0x80 via FS using the fresh selector.
-        ; Skip the read if alloc failed; fall through to keep argc=1
-        ; placeholder behavior in that case.
-        cmp     dword [_pmodew_dpmi_alloc_cy], 0
-        jne     .skip_psp_read
-        cmp     dword [_pmodew_dpmi_alloc_sel], 0
-        je      .skip_psp_read
-        push    fs
-        mov     ax, [_pmodew_dpmi_alloc_sel]
-        mov     fs, ax
-        ; cmdline length at PSP+0x80
-        movzx   eax, byte [fs:0x80]
-        mov     [_pmodew_cmdline_len], eax
-        ; copy 32 bytes from PSP+0x80 into _pmodew_psp_dump
+        ; Diagnostic: dump 32 bytes from PSP_linear+0x80 (via flat DS)
+        ; into a global so a probe can inspect what's there. If all
+        ; zero, flat DS doesn't map real-mode memory. If non-zero but
+        ; not the cmdline format, PSP layout differs from expected.
+        push    ecx
+        push    esi
         push    edi
-        push    edx
+        lea     esi, [ecx + 0x80]
         mov     edi, _pmodew_psp_dump
-        mov     edx, 0x80
-.psp_dump_loop:
-        mov     al, [fs:edx]
-        mov     [edi], al
-        inc     edx
-        inc     edi
-        cmp     edx, 0xA0
-        jne     .psp_dump_loop
-        pop     edx
+        mov     ecx, 32
+        cld
+        rep     movsb
         pop     edi
-        pop     fs
-.skip_psp_read:
+        pop     esi
+        pop     ecx
 
-        ; Copy cmdline tail from PSP+0x81..PSP+0x80+len via FS into
-        ; our flat (DS) buffer. Always initialize edi to the buffer
-        ; start so the null-terminator at .copy_done is valid even
-        ; on the early-skip paths.
+        ; 3. Read command tail length at PSP+0x80
+        movzx   eax, byte [ecx + 0x80]
+        mov     [_pmodew_cmdline_len], eax
+
+        ; 4. Copy command tail from PSP+0x81 into our flat buffer
+        ;    so we can null-terminate tokens in-place.
+        push    eax               ; save length
+        lea     esi, [ecx + 0x81]
         mov     edi, _pmodew_argv_buffer
-        cmp     dword [_pmodew_dpmi_alloc_cy], 0
-        jne     .copy_done
-        cmp     dword [_pmodew_dpmi_alloc_sel], 0
-        je      .copy_done
-        mov     ecx, [_pmodew_cmdline_len]
+        mov     ecx, eax
         test    ecx, ecx
         jz      .copy_done
-        cmp     ecx, 255
+        cmp     ecx, 255          ; clamp to buffer size
         jbe     .copy_ok
         mov     ecx, 255
 .copy_ok:
-        push    fs
-        mov     ax, [_pmodew_dpmi_alloc_sel]
-        mov     fs, ax
-        mov     edx, 0x81
-.copy_loop:
-        mov     al, [fs:edx]
-        mov     [edi], al
-        inc     edx
-        inc     edi
-        dec     ecx
-        jnz     .copy_loop
-        pop     fs
+        cld
+        rep     movsb
 .copy_done:
         mov     byte [edi], 0     ; null-terminator
+        pop     eax
 
         ; 5. Tokenize. argv[0] = placeholder. Then walk buffer
         ;    splitting on space/tab into argv[1..argc-1].
