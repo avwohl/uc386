@@ -274,6 +274,42 @@ def test_micropython_list_comprehension(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_min_max_reversed(micropython_bin: Path) -> None:
+    """`min([3,1,2])`, `max([3,1,2])`, `reversed([1,2,3])` exercise
+    the CORE_FEATURES-gated builtins that the port now opts into
+    selectively (MICROPY_PY_BUILTINS_MIN_MAX, MICROPY_PY_BUILTINS_REVERSED
+    in mpconfigport.h, while staying at ROM_LEVEL_MINIMUM).
+
+    Pinned because they're easy to lose: a future rebuild that
+    forgets the opt-ins would silently lose `min`/`max`/`reversed`
+    without breaking any other test."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"print(min([3,1,2]))\n"
+                  b"print(max([3,1,2]))\n"
+                  b"print(list(reversed([1,2,3])))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "\n1\n" in res.stdout, (
+        f"expected `min` result `1` in stdout, got: {res.stdout!r}"
+    )
+    assert "\n3\n" in res.stdout, (
+        f"expected `max` result `3` in stdout, got: {res.stdout!r}"
+    )
+    assert "[3, 2, 1]" in res.stdout, (
+        f"expected `reversed` result `[3, 2, 1]` in stdout, got: "
+        f"{res.stdout!r}"
+    )
+
+
 def test_micropython_try_except(micropython_bin: Path) -> None:
     """`try: 1/0 except ZeroDivisionError: print(\"caught\")`
     exercises the NLR (non-local return) path: the VM raises

@@ -64,6 +64,14 @@
 // `open()` / `io` machinery.
 #define MICROPY_PY_IO                     (0)
 
+// Selective opt-ins from CORE_FEATURES while staying at the
+// MINIMUM ROM level. min/max/reversed are pure-functional builtins
+// with no module-state dependency, so they pull in self-contained
+// .c (e.g. modbuiltins.c, objreversed.c) without touching the
+// builtins-init code-path that broke under a full ROM-level bump.
+#define MICROPY_PY_BUILTINS_MIN_MAX       (1)
+#define MICROPY_PY_BUILTINS_REVERSED      (1)
+
 typedef long mp_off_t;
 
 #define MICROPY_HW_BOARD_NAME "uc386-dos"
