@@ -120,9 +120,10 @@ jobs:
           mkdir -p /tmp/dosbox-cwd
           chmod 777 /tmp/dosbox-cwd
           cp /tmp/true.exe /tmp/dosbox-cwd/true.exe
-          # Diagnostic: first verify the mount can even write back
-          # to the host. If `mount-test.txt` doesn't materialize,
-          # the mount is read-only or syncs lazily.
+          # Use `if errorlevel N` syntax (real DOS) instead of
+          # `%errorlevel%` (DOSBox 0.74-3 doesn't expand it). The
+          # `if errorlevel 1` branch fires for codes >= 1; the
+          # negation (`if not errorlevel 1`) catches exit code 0.
           cat > /tmp/dosbox.conf <<'EOF'
           [sdl]
           fullscreen=false
@@ -133,10 +134,10 @@ jobs:
           [autoexec]
           mount c /tmp/dosbox-cwd
           c:
-          echo mount-write-test > mount-test.txt
           echo before > result.txt
           true.exe
-          echo errorlevel=%errorlevel% >> result.txt
+          if errorlevel 1 echo true_failed >> result.txt
+          if not errorlevel 1 echo true_ok >> result.txt
           echo after >> result.txt
           exit
           EOF
@@ -153,17 +154,17 @@ jobs:
           cat "$RESULT" 2>&1
           echo '== dosbox log (filtered) =='
           grep -v '^ALSA\|^MIXER\|^MIDI\|^DOSBox switched' /tmp/dosbox.log | tail -25
-          # Pass condition: RESULT.TXT has `before` AND `after`.
-          # That means autoexec ran true.exe and continued past it
-          # without crashing — true.exe booted PMODE/W, executed our
-          # 32-bit code, exited via INT 21h AH=4Ch, returned to the
-          # DOS shell. (DOSBox 0.74's shell doesn't expand
-          # `%errorlevel%` into echo arguments — we'd need
-          # `if errorlevel N` syntax for that, but the existence of
-          # `after` already proves clean exit.)
-          if grep -q '^before' "$RESULT" 2>/dev/null \
-             && grep -q '^after' "$RESULT" 2>/dev/null; then
-            echo "PASS: true.exe booted PMODE/W and exited cleanly"
+          # Pass condition: RESULT.TXT shows true.exe exit-code 0
+          # AND autoexec reached `after`. That's strong end-to-end
+          # evidence: PMODE/W booted, 32-bit code ran, exit happened
+          # via INT 21h AH=4Ch with AL=0, control returned to shell.
+          if grep -q '^before' "$RESULT" \
+             && grep -q '^true_ok' "$RESULT" \
+             && grep -q '^after' "$RESULT"; then
+            echo "PASS: true.exe boot + exit 0 confirmed"
+          elif grep -q '^true_failed' "$RESULT"; then
+            echo "FAIL: true.exe exited with non-zero errorlevel"
+            exit 1
           else
             echo "FAIL: see diagnostic dumps above"
             exit 1
