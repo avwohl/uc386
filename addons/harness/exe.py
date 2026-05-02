@@ -162,6 +162,36 @@ def build_exe(
     if proc.returncode != 0:
         return False, f"nasm rc={proc.returncode}: {proc.stderr[:400]}"
 
+    # Phase 7 bridge: dos_emu uses 0xF0/F1/F2 as magic stdin/out/err
+    # values (so `fp == NULL` doesn't accidentally match stdin); real
+    # DOS via PMODE/W needs raw fd 0/1/2 for INT 21h AH=0x40 (write).
+    # A 7-byte mismatch silently breaks every fputs / fwrite / fprintf
+    # call — `myecho.exe hello dos > out.txt` produces 767 spaces and
+    # no actual content. Patch the globals at PMODE/W entry, then jump
+    # to the codegen-emitted _start. argv parsing (PSP+0x80 via DPMI
+    # INT 31h) lands in the same stub once stdout is verified working.
+    bridge_asm = out_path.with_suffix(".bridge.asm")
+    bridge_asm.write_text(
+        "        section _TEXT use32 class=CODE\n"
+        "        global _pmodew_start\n"
+        "        extern _stdin\n"
+        "        extern _stdout\n"
+        "        extern _stderr\n"
+        "        extern _start\n"
+        "_pmodew_start:\n"
+        "        mov     dword [_stdin], 0\n"
+        "        mov     dword [_stdout], 1\n"
+        "        mov     dword [_stderr], 2\n"
+        "        jmp     _start\n"
+    )
+    bridge_obj = out_path.with_suffix(".bridge.obj")
+    proc = subprocess.run(
+        ["nasm", "-f", "obj", "-o", str(bridge_obj), str(bridge_asm)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return False, f"nasm bridge rc={proc.returncode}: {proc.stderr[:400]}"
+
     # wlink wants WATCOM in env so it can find its stub library.
     env = os.environ.copy()
     if "WATCOM" not in env:
@@ -202,10 +232,12 @@ def build_exe(
         # garbage address the LE-loader picks — DOSBox reports
         # "Illegal read from <addr>" when the program tries to push.
         "option", "stack=64k",
-        # `option start=_start` overrides wlink's default of looking
-        # for `_cstart_` (Watcom clib startup). uc386's prologue is
-        # `_start:` which sets up FPU/BSS then jumps to `_main`.
-        "option", "start=_start",
+        # `option start=_pmodew_start` enters via the bridge stub
+        # (fixes stdin/out/err sentinels, future home of argv setup),
+        # which falls through to the codegen-emitted `_start` (FPU
+        # init, BSS init, call _main, INT 21h AH=4Ch exit).
+        "option", "start=_pmodew_start",
+        "file", str(bridge_obj),
     ]
     if stub_path is not None:
         # wlink's `option stub=...` directive writes <stub-file>
