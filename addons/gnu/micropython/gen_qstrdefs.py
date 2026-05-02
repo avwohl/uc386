@@ -37,7 +37,30 @@ sys.path.insert(0, "upstream/py")
 from makeqstrdata import codepoint2name  # type: ignore[import-not-found]
 
 # Inverse map: HTML entity name -> single-character byte string.
-name2char = {name: chr(cp) for cp, name in codepoint2name.items()}
+# Two filters:
+#   1. Codepoint must be < 256 — qstrs are byte sequences, so
+#      escapes for high-codepoint Unicode chars never appear in real
+#      source. Without this, `_omega_` etc. would false-match.
+#   2. The decoded char must NOT itself be an identifier char
+#      (`[A-Za-z0-9_]`). Upstream's `qstr_escape` only produces
+#      `_<name>_` wrappers for NON-identifier chars (the regex
+#      `RE_NO_ESCAPE = r"[A-Za-z0-9_]"` passes identifier chars
+#      through unchanged). So `_<name>_` in a macro tail can only
+#      have come from escaping a punctuation/whitespace byte —
+#      never from an alphanumeric escape. This filter eliminates
+#      false matches like `__not__` (a real Python dunder, not an
+#      escape of `¬` U+00AC) and `__and__` (likewise, not `∧`).
+_IDENT_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+# Restrict to ASCII printable punctuation (32–126, excluding the
+# identifier subset). Control chars (`\n`, `\t`, …) and high-byte
+# chars (¬ U+00AC, ∧ U+2227, Α U+0391, …) are handled either via
+# the `0x%02x` literal path or are simply unreachable in real qstr
+# source — `__not__` is a real Python dunder, not an escape for `¬`.
+name2char = {
+    name: chr(cp)
+    for cp, name in codepoint2name.items()
+    if 32 <= cp <= 126 and chr(cp) not in _IDENT_CHARS
+}
 
 
 def unescape(macro_tail: str) -> str:
