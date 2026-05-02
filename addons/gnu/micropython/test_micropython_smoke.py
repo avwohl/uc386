@@ -331,6 +331,61 @@ def test_micropython_bin_hex_oct(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_enumerate_filter_property(micropython_bin: Path) -> None:
+    """`enumerate`, `filter`, and `@property` are the next batch of
+    CORE_FEATURES-gated builtins the port opts into selectively (
+    MICROPY_PY_BUILTINS_ENUMERATE / FILTER / PROPERTY in
+    mpconfigport.h, while staying at ROM_LEVEL_MINIMUM). Each pulls
+    in self-contained .c that's already in the multi-TU compile."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"print(list(enumerate(['a','b','c'])))\n"
+                  b"print(list(filter(lambda x: x>2, [1,2,3,4])))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "[(0, 'a'), (1, 'b'), (2, 'c')]" in res.stdout, (
+        f"expected enumerate output, got: {res.stdout!r}"
+    )
+    assert "[3, 4]" in res.stdout, (
+        f"expected filter output `[3, 4]`, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_property_decorator(micropython_bin: Path) -> None:
+    """`@property` decorator wraps an instance method as a read-only
+    attribute. Pins the descriptor protocol + decorator dispatch."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(
+        micropython_bin,
+        stdin_bytes=(
+            b"class C:\n"
+            b"    @property\n"
+            b"    def x(self): return 42\n"
+            b"\n"
+            b"print(C().x)\n"
+            b"\x04"
+        ),
+        timeout_seconds=15.0,
+        instruction_limit=4_000_000_000,
+    )
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "\n42\n" in res.stdout, (
+        f"expected `C().x` → `42`, got: {res.stdout!r}"
+    )
+
+
 def test_micropython_min_max_reversed(micropython_bin: Path) -> None:
     """`min([3,1,2])`, `max([3,1,2])`, `reversed([1,2,3])` exercise
     the CORE_FEATURES-gated builtins that the port now opts into
