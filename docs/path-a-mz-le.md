@@ -34,23 +34,36 @@ a `.exe` that runs on FreeDOS. Remaining polish:
     redefines them with real handles; libc's sentinel definitions
     are stripped from the codegen .obj at build time. ✓
   - **argv**: PMODE/W doesn't pass argc/argv in registers
-    (empirical regs at entry: EAX=0x300 EBX=0x21 ECX=0 EDX=0xF1B3
+    (empirical regs at entry: EAX=0x300 EBX=0x21 ECX=0 EDX=0xF1xx
     where EBX is the PSP selector and EDX is the real-mode PSP
-    segment). Bridge currently sets argc=1 + argv[0]='program'
-    placeholder. Reading the actual cmdline tail at PSP+0x80
-    requires accessing real-mode memory:
-      - DPMI INT 31h AX=0x06 (Get Segment Base) returned linear=0
-        for selector 0x21 — broken or unsupported under PMODE/W.
-      - Flat DS read at `EDX_at_entry << 4` (= 0xF1B30) returns 0
-        — DS doesn't map real-mode physical memory.
-      - `mov es, 0x21` followed by `[es:0x80]` HUNG the program
-        (DOSBox timeout 30s) — PMODE/W's PSP selector apparently
-        can't be loaded into ES this way, or the limit faults.
-    Outstanding: try DPMI INT 31h AX=0x0002 (Segment to Descriptor)
-    to allocate a fresh selector for the PSP segment, or use
-    DPMI 0x0007 to query the existing 0x21 selector's limit.
-    Programs that don't read argv work fine; argv-dependent
-    programs see argc=1 only.
+    segment — segment varies per run as PMODE/W allocates fresh).
+    Bridge currently sets argc=1 + argv[0]='program' placeholder.
+    Reading the actual cmdline tail at PSP+0x80 needs real-mode
+    memory access — every approach tried hits a wall:
+      - **DPMI INT 31h AX=0x06** (Get Segment Base) returned
+        linear=0 for selector 0x21. Either DOSBox stub or PMODE/W
+        doesn't implement this for that selector.
+      - **Flat DS read at `EDX_at_entry << 4`**: dumps 32 bytes
+        from PSP_linear+0x80, gets all zeros every run — DS
+        doesn't map real-mode physical memory in PMODE/W's setup.
+        (cmdline_len read varies 0/1/0x80 across runs because
+         we're reading garbage at the wrong address.)
+      - **`mov es, 0x21` + `[es:0x80]`**: hung the program for
+        30s (DOSBox timeout). ES is critical to PMODE/W (likely
+        used for INT 21h reflection); overwriting it broke the
+        runtime.
+      - **`mov fs, 0x21` + `[fs:0x80]`**: produced "JMP Illegal
+        descriptor type 0" fault — corrupted segment-register
+        state somewhere in the libc → INT 21h path.
+    Plausible next steps (not attempted in this session):
+      - DPMI INT 31h AX=0x0002 (Segment to Descriptor) to
+        allocate a brand-new selector for the PSP segment.
+      - DPMI INT 31h AX=0x0007 to query the existing 0x21
+        selector's limit (might be < 0x80 → fault on access).
+      - Switch to Watcom's `_cstart_` and let its CRT do the
+        cmdline parsing (would mean linking `clib3r.lib`).
+    Programs that don't read argv work cleanly under PMODE/W;
+    argv-dependent programs see argc=1 with a placeholder argv[0].
 
 Phase 7 also surfaces a uc386 codegen bug noted via probe: the C
 idiom `if (v == 0) { putchar('0'); return; } while (v > 0) { ... }`
