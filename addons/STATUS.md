@@ -235,7 +235,7 @@ real-mode-32 binaries that dos_emu loads directly.
 ## ✓ Include the latest MicroPython (2026-05-01 ask)
 
 **Runnable `micropython.bin` is a fully-functional Python REPL.**
-A 170 KB flat i386 DOS binary built end-to-end through uc386
+A ~169 KB flat i386 DOS binary built end-to-end through uc386
 prints:
 
 ```
@@ -304,19 +304,22 @@ Layered evidence:
   (`upstream/ports/minimal/main.c` + `uart_core.c` + 132 `py/` +
   9 `shared/`, 143 sources in one uc386 invocation) with the
   uc386-dos config (`MICROPY_MODULE_FROZEN_MPY=0`,
-  `MICROPY_MIN_USE_STDOUT=1`): produces 1.65 MB of NASM, links
-  cleanly under `nasm -f bin` to a 170 KB `.bin`. Only externs
-  remaining are dead libm names left in a string table (DCE
-  doesn't strip those today).
-- **REPL smoke tests** (10 cases):
+  `MICROPY_MIN_USE_STDOUT=1`, `MICROPY_PY_BUILTINS_MIN_MAX=1`,
+  `MICROPY_PY_BUILTINS_REVERSED=1`): produces 1.94 MB of NASM,
+  links cleanly under `nasm -f bin` to a ~169 KB `.bin`. Only
+  externs remaining are dead libm names left in a string table
+  (DCE doesn't strip those today).
+- **REPL smoke tests** (12 cases):
   `addons/gnu/micropython/test_micropython_smoke.py` runs the bin
   under dos_emu and pins: banner, clean Ctrl-D exit, arithmetic
   (`2+3` → `5`), assignment (`x = 5`), `pass`, named builtins
-  (`__name__`), `print()` with real newlines, function
-  def + call, list comprehensions, `try/except`. Skips cleanly
-  when the bin doesn't exist; passes in 11s on the dev Mac when it
-  does (~1.5s per test, dominated by the 5K-instruction VM-init
-  warmup).
+  (`__name__`), `print()` with real newlines, function def + call,
+  list comprehensions, `try/except`, `min`/`max`/`reversed`,
+  `bin`/`hex`/`oct` (qstr reverse-mangling correctly decodes the
+  `_brace_open__colon__hash_b_brace_close_` format string back to
+  `{:#b}`). Skips cleanly when the bin doesn't exist; passes in
+  ~12s on the dev Mac when it does (~1s per test, dominated by
+  the 5K-instruction VM-init warmup).
 
 Triage progression as the slice unfolded:
 - 95 / 132 with empty stubs (most failures were missing-qstr
