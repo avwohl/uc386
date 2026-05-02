@@ -1,0 +1,77 @@
+name: exe-smoke
+
+# Validates `addons/harness/exe.py` end-to-end:
+#   uc386 → .asm → nasm -f obj → wlink system causeway → .exe
+#
+# Runs only on Linux (Watcom has no native macOS build) and only
+# on changes that actually affect the pipeline (the harness, the
+# codegen, lib/, or this workflow itself) — keeps churn off PRs
+# that only touch docs.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'addons/harness/exe.py'
+      - 'src/uc386/**'
+      - 'lib/**'
+      - '.github/workflows/exe-smoke.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'addons/harness/exe.py'
+      - 'src/uc386/**'
+      - 'lib/**'
+      - '.github/workflows/exe-smoke.yml'
+  workflow_dispatch:
+
+jobs:
+  exe-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install nasm
+        run: sudo apt-get update -y && sudo apt-get install -y nasm
+      - name: Install Open Watcom V2
+        # Same install pattern as release.yml: the Linux x64 "installer"
+        # is an ELF wrapper around a regular ZIP archive. Unzip it
+        # directly (the installer FPEs under unattended runs).
+        run: |
+          mkdir -p ~/.local/opt/watcom
+          curl -sL -o /tmp/watcom.bin \
+            https://github.com/open-watcom/open-watcom-v2/releases/download/Current-build/open-watcom-2_0-c-linux-x64
+          unzip -q /tmp/watcom.bin -d ~/.local/opt/watcom
+          chmod +x ~/.local/opt/watcom/binl64/wlink || true
+          echo "WATCOM=$HOME/.local/opt/watcom" >> $GITHUB_ENV
+          echo "$HOME/.local/opt/watcom/binl64" >> $GITHUB_PATH
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install "uc_core @ git+https://github.com/avwohl/uc_core@main"
+          pip install -e .
+      - name: Build true.exe
+        # Smallest possible C surface: `int main(void) { return 0; }`.
+        # Any wlink failure is a Phase 1 wrapper bug or an OMF
+        # compatibility issue, not "this addon happens to use a libc
+        # symbol the bridge doesn't provide."
+        run: |
+          python -m addons.harness.exe addons/gnu/true/main.c \
+            -o /tmp/true.exe
+          ls -la /tmp/true.exe
+          file /tmp/true.exe
+          # MZ header should be the first two bytes.
+          head -c 2 /tmp/true.exe | od -c -N2 | head -1 | grep -q 'M.*Z' \
+            || (echo "MZ header missing" && exit 1)
+      - name: Build cat.exe
+        # cat exercises libc (putchar via INT 21h, file open/read/close).
+        # Most likely failure mode if Phase 1 needs the calling-convention
+        # bridge — surface it now.
+        continue-on-error: true
+        run: |
+          python -m addons.harness.exe addons/gnu/cat/main.c \
+            -o /tmp/cat.exe
+          ls -la /tmp/cat.exe
