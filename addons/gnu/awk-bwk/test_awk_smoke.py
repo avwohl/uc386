@@ -27,18 +27,37 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
+# Two locations: the dev-tree path and the FOSS-tarball path.
+#
+# Dev tree: addons/gnu/awk-bwk/test_awk_smoke.py
+#           → addons/gnu/awk-bwk/build/awk.bin
+#           = parent / build / awk.bin
+# Tarball:  uc386-foss/src/awk-bwk/test_awk_smoke.py
+#           → uc386-foss/awk.bin
+#           = parent.parent.parent / awk.bin
 _HERE = Path(__file__).resolve().parent
-_BIN = _HERE / "build" / "awk.bin"
+_BIN_CANDIDATES = [
+    _HERE / "build" / "awk.bin",
+    _HERE.parent.parent.parent / "awk.bin",
+]
+
+
+def _find_bin() -> Path | None:
+    for p in _BIN_CANDIDATES:
+        if p.exists():
+            return p
+    return None
 
 
 @pytest.fixture(scope="module")
 def awk_bin() -> Path:
-    if not _BIN.exists():
+    p = _find_bin()
+    if p is None:
         pytest.skip(
             "awk.bin not built — run "
             "addons/gnu/awk-bwk/{fetch,build}.sh first"
         )
-    return _BIN
+    return p
 
 
 def _run_awk(awk_bin: Path, script: str, stdin: bytes = b""):
