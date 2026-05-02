@@ -17170,17 +17170,31 @@ class PeepholeOptimizer:
             if not self._preceded_by_terminator(out, target_idx):
                 i += 1
                 continue
-            # Find the first instruction after the label.
+            # Find the first instruction after the label. Bail if we
+            # encounter an intermediate label that has back-edges
+            # (count > 1) — that means another control path can reach
+            # D with different flags. The classic break case is a loop
+            # head: `.L4_endif: / .L5_while_top: / cmp; jle; …; jmp
+            # .L5_while_top`. The flags from A reach D on the first
+            # entry, but the back-jump arrives with whatever flags the
+            # loop body left (often clobbered by idiv/etc.).
             d_idx = None
+            saw_back_edge = False
             for k in range(target_idx + 1, len(out)):
                 ln = out[k]
-                if ln.kind in ("blank", "comment", "label"):
+                if ln.kind == "label":
+                    inner_label = ln.raw.strip().rstrip(":")
+                    if counts.get(inner_label, 0) > 1:
+                        saw_back_edge = True
+                        break
+                    continue
+                if ln.kind in ("blank", "comment"):
                     continue
                 if ln.kind != "instr":
                     break  # directive/data
                 d_idx = k
                 break
-            if d_idx is None:
+            if saw_back_edge or d_idx is None:
                 i += 1
                 continue
             d = out[d_idx]

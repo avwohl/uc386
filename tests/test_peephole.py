@@ -6526,6 +6526,80 @@ def test_redundant_cmp_at_label_basic():
     assert out.count("cmp     dword [ebp + 8], 0") == 1
 
 
+def test_redundant_cmp_at_label_skips_when_inner_label_has_back_edge():
+    """The classic loop-head trap: an intermediate label between the
+    target label and D has back-edges (a `jmp` from inside the loop
+    body). The flags from A reach D on the first entry, but the
+    back-jump arrives with whatever flags the loop body left
+    (typically clobbered by idiv, mul, etc.). Dropping D is unsound.
+
+    Pattern that previously misfired (`if(v==0)return; while(v>0)`):
+
+        cmp [v], 0          ; A
+        jne .L_endif        ; B
+        push '0'; ...; jmp .epilogue
+        .L_endif:
+        .L_while_top:       ; <-- back-edge from `jmp .L_while_top`
+        cmp [v], 0          ; D — must NOT be dropped
+        jle .L_while_end
+        ... body ...
+        idiv ecx            ; clobbers flags
+        jmp .L_while_top    ; back-edge: flags here are NOT A's
+    """
+    asm = (
+        "_f:\n"
+        "        cmp     dword [ebp + 8], 0\n"
+        "        jne     .L_endif\n"
+        "        push    48\n"
+        "        call    _putchar\n"
+        "        pop     ecx\n"
+        "        xor     eax, eax\n"
+        "        jmp     .epilogue\n"
+        ".L_endif:\n"
+        ".L_while_top:\n"
+        "        cmp     dword [ebp + 8], 0\n"
+        "        jle     .L_while_end\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, 10\n"
+        "        cdq\n"
+        "        idiv    ecx\n"
+        "        mov     [ebp + 8], eax\n"
+        "        jmp     .L_while_top\n"
+        ".L_while_end:\n"
+        "        xor     eax, eax\n"
+        ".epilogue:\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("redundant_cmp_at_label", 0) == 0
+    # The loop head MUST set fresh flags before the jle. Other
+    # passes may rewrite the cmp into mov+test, but some
+    # flag-setting instruction has to be there. The bug shape was
+    # `.L_while_top:` directly followed by `jle` with no flag op.
+    lines = out.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == ".L_while_top:":
+            # Walk forward to the first non-blank/comment/label line.
+            j = i + 1
+            while j < len(lines) and (
+                not lines[j].strip()
+                or lines[j].lstrip().startswith(";")
+                or lines[j].rstrip().endswith(":")
+            ):
+                j += 1
+            assert j < len(lines), "fell off end after .L_while_top"
+            first_op = lines[j].split()[0] if lines[j].split() else ""
+            assert first_op not in ("jle", "jl", "jg", "jge", "je",
+                                    "jne", "jz", "jnz"), (
+                f".L_while_top followed directly by {first_op} — "
+                f"stale-flags bug. Line was: {lines[j]!r}"
+            )
+            break
+    else:
+        raise AssertionError(".L_while_top label not found in output")
+
+
 def test_redundant_cmp_at_label_skips_when_operands_differ():
     """If the cmp at the label has different operands, it's not
     a duplicate."""
