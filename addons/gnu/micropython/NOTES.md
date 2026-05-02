@@ -1,29 +1,71 @@
-# MicroPython port — status: **REPL banner running** (2026-05-01)
+# MicroPython port — status: **full Python REPL** (2026-05-01)
 
 **Upstream**: https://github.com/micropython/micropython
 **License**: MIT
 
 **`addons/gnu/micropython/build_port.sh` produces a runnable
-`build/micropython.bin` (170 KB).** Run under `uc386.dos_emu.run`,
-it prints the MicroPython REPL banner and `>>> ` prompt, then waits
-on stdin:
+`build/micropython.bin` (~169 KB).** Run under `uc386.dos_emu.run`,
+it boots the MicroPython REPL and accepts essentially full Python:
 
 ```
 MicroPython uc386-triage on 2026-05-01; uc386-dos with i386
 Type "help()" for more information.
->>>
+>>> def fib(n):
+...     if n < 2: return n
+...     return fib(n-1) + fib(n-2)
+...
+>>> print([fib(i) for i in range(10)])
+[0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+>>> print(min(3, 1, 2), max(3, 1, 2))
+1 3
+>>> print(bin(255), hex(255), oct(255))
+0b11111111 0xff 0o377
+>>> try:
+...     1/0
+... except ZeroDivisionError:
+...     print("caught")
+...
+caught
 ```
 
-The boot path — `gc_init` → `mp_init` → `pyexec_friendly_repl` —
-runs cleanly through 143 multi-TU-compiled sources. Simple
-statements that don't allocate or produce a printable value (`pass`,
-empty line, Ctrl-D-to-exit) execute end-to-end through lex →
-parse → compile → VM dispatch.
+What works (12 smoke tests pin the core wins):
 
-Remaining gap: statements that **allocate** (`x = 5` allocates a
-qstr "x" + dict-stores 5) or **produce a value to print** (`1`,
-`print('hi')`) crash with `UC_ERR_READ_UNMAPPED` somewhere
-downstream of bytecode dispatch.
+- arithmetic + control flow (`if/else`, `for/range`, `while/break`)
+- function def + call (`def f(x): return x*2; f(7)` → `14`)
+- recursion (`fib(10)` → `55`)
+- classes (`class C: x = 1; C.x` → `1`)
+- list/dict/tuple literals + comprehensions
+  (`[i*i for i in range(5)]` → `[0, 1, 4, 9, 16]`)
+- exception handling (`try/except` catching `ZeroDivisionError`)
+- named builtins: `print`, `len`, `range`, `sum`, `sorted`, `zip`,
+  `divmod`, `min`, `max`, `reversed`, `bin`, `hex`, `oct`, `abs`,
+  `chr`, `ord`, `repr`, `type`, `isinstance`, `bytes`, `globals`,
+  `bool`, `any`, `all`
+- string operations + `str.format`/`str.upper`/`str.replace`/`str.join`
+- static qstrs (`__name__` → `'__main__'`)
+- `print()` with real newlines (qstr reverse-mangling correctly
+  decodes `_brace_open__colon__hash_b_brace_close_` → `{:#b}`)
+- clean Ctrl-D exit
+
+What doesn't work yet (separate gates, pinned in mpconfigport.h):
+
+- `import sys` / `import math` — modules disabled in the port
+- `MICROPY_PY_IO` (open/io machinery) — port has no VFS
+- Class instance binary-op overrides (`__and__` etc.) — gated at
+  `MICROPY_PY_ALL_SPECIAL_METHODS` (EXTRA_FEATURES) which we don't
+  enable today, but the qstrs decode correctly so a future bump is
+  ready.
+- Full `MICROPY_CONFIG_ROM_LEVEL_CORE_FEATURES` — triggers a
+  separate runtime regression (`print` NameError) that we haven't
+  bisected. Selective opt-ins for `MIN_MAX` + `REVERSED` work
+  fine.
+
+## Historical investigation (2026-05-01 morning)
+
+The text below traces how the REPL went from "boots banner" to
+"runs `pass`" to "runs arithmetic" to "evaluates Python". Most of
+it is no longer load-bearing for current behavior but documents
+the diagnostic path for future similar bring-ups.
 
 **Crash narrowed to `qstr_find_strn`'s binary search.** Diagnostic
 hook at the dos_emu level pinpoints the failing instruction:
