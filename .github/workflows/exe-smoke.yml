@@ -75,3 +75,52 @@ jobs:
           python -m addons.harness.exe addons/gnu/cat/main.c \
             -o /tmp/cat.exe
           ls -la /tmp/cat.exe
+
+      - name: Inspect true.exe structure
+        # Phase 2 baseline: dump the MZ header + first few bytes so we
+        # can compare against what FreeDOS / DOSBox expect. 371 bytes
+        # for `int main(void) { return 0; }` is suspiciously small for
+        # a self-contained .exe — CauseWay is ~20 KB. Likely the
+        # .exe is the LE payload only and needs causeway.exe alongside,
+        # which means `system causeway` doesn't bind by default. Phase
+        # 2 will iterate on the wlink directives.
+        run: |
+          xxd /tmp/true.exe | head -8
+          # MZ header decode (first 28 bytes):
+          # offset  meaning
+          #   00-01  signature (MZ)
+          #   02-03  bytes in last page
+          #   04-05  pages in file (each 512 bytes)
+          #   06-07  relocations
+          #   08-09  size of header in 16-byte paragraphs
+          #   0A-0B  min extra paras
+          #   0C-0D  max extra paras
+          #   0E-0F  initial SS
+          #   10-11  initial SP
+          #   12-13  checksum
+          #   14-15  initial IP
+          #   16-17  initial CS
+          #   18-19  reloc table offset
+          #   1A-1B  overlay number
+          # The "new exe" magic at offset 3C points to the LE/PE/NE header.
+          python3 -c "
+          import sys, struct
+          data = open('/tmp/true.exe', 'rb').read()
+          print(f'file size: {len(data)} bytes')
+          if data[:2] != b'MZ':
+              print('not MZ')
+              sys.exit(1)
+          (_, lp, pages, relocs, hdr_para, _, _, _, sp, _, ip, cs,
+           _, _) = struct.unpack('<2sHHHHHHHHHHHHH', data[:28])
+          print(f'pages={pages} bytes_in_last={lp} hdr_para={hdr_para}')
+          print(f'  → real-mode size = {pages * 512 - (512 - lp if lp else 0)} bytes')
+          print(f'  → header size = {hdr_para * 16} bytes')
+          print(f'cs:ip = {cs:04x}:{ip:04x}, ss:sp = ?:{sp:04x}')
+          # New-exe pointer at 0x3C:
+          if len(data) >= 0x40:
+              ne = struct.unpack('<I', data[0x3C:0x40])[0]
+              print(f'new-exe header offset: 0x{ne:08x}')
+              if ne and ne < len(data):
+                  sig = data[ne:ne+2]
+                  print(f'new-exe signature: {sig!r}  (LE/LX/PE/NE)')
+          "
