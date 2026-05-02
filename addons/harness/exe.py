@@ -187,6 +187,35 @@ _pmodew_start:
         pop     ebx
         pop     eax
 
+        ; If DPMI 0x0002 succeeded (CY=0, sel != 0), use the fresh
+        ; selector to read PSP via FS. Fresh selector is a clean data
+        ; descriptor — different from PMODE/W's pre-existing 0x21,
+        ; which broke when loaded into ES/FS.
+        cmp     dword [_pmodew_dpmi_alloc_cy], 0
+        jne     .skip_alloc_read
+        cmp     dword [_pmodew_dpmi_alloc_sel], 0
+        je      .skip_alloc_read
+        push    fs
+        mov     ax, [_pmodew_dpmi_alloc_sel]
+        mov     fs, ax
+        ; Dump 32 bytes from FS:0x80 into a global
+        push    edi
+        push    edx
+        mov     edi, _pmodew_psp_dump
+        mov     edx, 0x80
+.fs_dump_loop:
+        mov     al, [fs:edx]
+        mov     [edi], al
+        inc     edx
+        inc     edi
+        cmp     edx, 0xA0
+        jne     .fs_dump_loop
+        pop     edx
+        pop     edi
+        pop     fs
+        jmp     .after_alloc_read
+.skip_alloc_read:
+
         ; Diagnostic: dump 32 bytes from PSP_linear+0x80 (via flat DS)
         ; into a global so a probe can inspect what's there. If all
         ; zero, flat DS doesn't map real-mode memory. If non-zero but
@@ -202,6 +231,7 @@ _pmodew_start:
         pop     edi
         pop     esi
         pop     ecx
+.after_alloc_read:
 
         ; 3. Read command tail length at PSP+0x80
         movzx   eax, byte [ecx + 0x80]
