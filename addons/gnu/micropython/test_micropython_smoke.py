@@ -443,3 +443,84 @@ def test_micropython_try_except(micropython_bin: Path) -> None:
         f"expected `caught` in stdout (try/except didn't work): "
         f"{res.stdout!r}"
     )
+
+
+def test_micropython_core_features_bytearray(micropython_bin: Path) -> None:
+    """`bytearray(b'abc')` is gated at CORE_FEATURES (default-off at
+    MINIMUM via MICROPY_PY_BUILTINS_BYTEARRAY). Pins the type as
+    runnable end-to-end on the uc386-built bin."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"print(bytearray(b'abc'))\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "bytearray(b'abc')" in res.stdout, (
+        f"expected bytearray repr, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_core_features_set(micropython_bin: Path) -> None:
+    """`set` literal + binary `|` exercises CORE_FEATURES gates
+    (MICROPY_PY_BUILTINS_SET). The dedup output `{1, 2, 3}` from
+    `set([1,2,2,3])` proves objset.c's hash-based de-duplication is
+    wired correctly across the multi-TU build."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"print(set([1,2,2,3]))\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "{1, 2, 3}" in res.stdout, (
+        f"expected set output `{{1, 2, 3}}`, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_core_features_named_error(micropython_bin: Path) -> None:
+    """At CORE_FEATURES `MICROPY_ERROR_REPORTING_DETAILED` includes
+    the offending qstr name in NameError messages (vs MINIMUM's
+    `name not defined` placeholder). Pin the rich form so a future
+    ROM-level downgrade is caught loudly."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"print(undefined_name)\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "undefined_name" in res.stdout, (
+        f"expected qstr name in NameError, got: {res.stdout!r}"
+    )
+    assert "NameError" in res.stdout, (
+        f"expected NameError, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_core_features_str_modulo(micropython_bin: Path) -> None:
+    """C-style `%` string formatting (`'%d-%s' % (5, 'x')`) is gated
+    on `MICROPY_PY_BUILTINS_STR_OP_MODULO` which default-enables at
+    CORE_FEATURES. Pins the formatter end-to-end."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"print('%d-%s' % (5, 'x'))\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "5-x" in res.stdout, (
+        f"expected `5-x` from str %% formatting, got: {res.stdout!r}"
+    )

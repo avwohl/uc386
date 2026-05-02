@@ -27,6 +27,33 @@ _GEN_PATH = _HERE / "gen_qstrdefs.py"
 
 
 @pytest.fixture(scope="module")
+def gen_module():
+    """Same loader as `unescape`, but returns the whole module so
+    callers can reach `compute_hash` too."""
+    upstream_dir = _HERE / "upstream" / "py"
+    if not (upstream_dir / "makeqstrdata.py").exists():
+        pytest.skip(
+            "upstream/py/makeqstrdata.py missing — run "
+            "addons/gnu/micropython/fetch.sh first"
+        )
+    spec = importlib.util.spec_from_file_location(
+        "_gen_qstrdefs_under_test",
+        _GEN_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    saved_cwd = Path.cwd()
+    sys.path.insert(0, str(_HERE))
+    try:
+        import os
+        os.chdir(_HERE)
+        spec.loader.exec_module(mod)
+    finally:
+        os.chdir(saved_cwd)
+    return mod
+
+
+@pytest.fixture(scope="module")
 def unescape():
     """Load gen_qstrdefs.py as a module (it lives next to this file
     and isn't installed as a package). Skip cleanly if upstream isn't
@@ -116,3 +143,35 @@ def test_unescape(unescape, macro_tail: str, expected: str, label: str) -> None:
         f"{label}: input {macro_tail!r} → got {actual!r}, "
         f"expected {expected!r}"
     )
+
+
+def test_compute_hash_matches_upstream(gen_module) -> None:
+    """`compute_hash` mirrors upstream's
+    `tools/makeqstrdata.py:compute_hash` — same djb2 sequence, same
+    `(hash & mask) or 1` zero-fix, same fall-back to a 16-bit mask
+    when `bytes_hash == 0`. Any drift would mean
+    `qstr_find_strn`'s `pool->hashes[at] == str_hash` filter rejects
+    every static lookup at runtime."""
+    sys.path.insert(0, str(_HERE / "upstream" / "py"))
+    from makeqstrdata import compute_hash as upstream_hash  # type: ignore
+
+    samples = [
+        b"",
+        b"__name__",
+        b"print",
+        b"\n",
+        b"<stdin>",
+        b"{:#b}",
+        b"\xff",
+    ]
+    for bytes_hash in (0, 1, 2):
+        for s in samples:
+            ours = gen_module.compute_hash(s, bytes_hash)
+            theirs = upstream_hash(s, bytes_hash)
+            assert ours == theirs, (
+                f"bytes_hash={bytes_hash} input={s!r}: "
+                f"ours={ours} upstream={theirs}"
+            )
+            assert ours != 0, (
+                f"hash-zero invariant broken for {s!r}@{bytes_hash}"
+            )

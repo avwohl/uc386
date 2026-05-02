@@ -1,10 +1,11 @@
-# MicroPython port — status: **full Python REPL** (2026-05-01)
+# MicroPython port — status: **full Python REPL @ CORE_FEATURES** (2026-05-02)
 
 **Upstream**: https://github.com/micropython/micropython
 **License**: MIT
 
 **`addons/gnu/micropython/build_port.sh` produces a runnable
-`build/micropython.bin` (~169 KB).** Run under `uc386.dos_emu.run`,
+`build/micropython.bin` (~199 KB at CORE_FEATURES, was ~169 KB at
+MINIMUM).** Run under `uc386.dos_emu.run`,
 it boots the MicroPython REPL and accepts essentially full Python:
 
 ```
@@ -28,7 +29,7 @@ Type "help()" for more information.
 caught
 ```
 
-What works (12 smoke tests pin the core wins):
+What works (18 smoke tests pin the core wins):
 
 - arithmetic + control flow (`if/else`, `for/range`, `while/break`)
 - function def + call (`def f(x): return x*2; f(7)` → `14`)
@@ -42,6 +43,15 @@ What works (12 smoke tests pin the core wins):
   `chr`, `ord`, `repr`, `type`, `isinstance`, `bytes`, `globals`,
   `bool`, `any`, `all`
 - string operations + `str.format`/`str.upper`/`str.replace`/`str.join`
+- C-style str modulo formatting (`'%d-%s' % (5, 'x')` → `5-x`)
+- `set` literals + binary ops (`{1,2,3} | {3,4}` → `{1,2,3,4}`)
+- `bytearray(b'abc')` — pulled in at CORE_FEATURES
+- list slicing (`l[1:4]`)
+- generator expressions (`','.join(str(i) for i in range(5))`)
+- `dict.fromkeys` / `dict.get` / `bytes.decode`
+- detailed error reporting — NameError now includes the offending
+  qstr (`name 'undefined_name' isn't defined` vs MINIMUM's bare
+  `name not defined`)
 - static qstrs (`__name__` → `'__main__'`)
 - `print()` with real newlines (qstr reverse-mangling correctly
   decodes `_brace_open__colon__hash_b_brace_close_` → `{:#b}`)
@@ -49,16 +59,42 @@ What works (12 smoke tests pin the core wins):
 
 What doesn't work yet (separate gates, pinned in mpconfigport.h):
 
-- `import sys` / `import math` — modules disabled in the port
+- `import sys` / `import math` / `import gc` — the modules build
+  fine but `MICROPY_REGISTERED_MODULES` is empty (we don't run
+  upstream's `tools/makemoduledefs.py`). Populating that table is
+  the next slice.
 - `MICROPY_PY_IO` (open/io machinery) — port has no VFS
 - Class instance binary-op overrides (`__and__` etc.) — gated at
   `MICROPY_PY_ALL_SPECIAL_METHODS` (EXTRA_FEATURES) which we don't
   enable today, but the qstrs decode correctly so a future bump is
   ready.
-- Full `MICROPY_CONFIG_ROM_LEVEL_CORE_FEATURES` — triggers a
-  separate runtime regression (`print` NameError) that we haven't
-  bisected. Selective opt-ins for `MIN_MAX` + `REVERSED` work
-  fine.
+- Full `MICROPY_CONFIG_ROM_LEVEL_EXTRA_FEATURES` not yet
+  attempted; CORE_FEATURES is now the baseline.
+
+## Update 2026-05-02 — CORE_FEATURES regression resolved
+
+The "every named-builtin NameErrors at CORE_FEATURES" runtime
+regression was not the static-init bug we suspected. Root cause:
+**`MICROPY_QSTR_BYTES_IN_HASH` flips from 0 (MINIMUM) to 1
+(CORE_FEATURES)**, which adds a `qstr_hash_t hashes[]` array to
+`qstr_pool_t` and gates `qstr_find_strn`'s post-binary-search
+filter on `pool->hashes[at] == str_hash`. Our `gen_qstrdefs.py`
+was emitting `0` for every QDEF1's hash field; the runtime
+computed real djb2 hashes for the lookup string, the filter
+rejected every entry, and `print` / `min` / `__name__` raised
+NameError.
+
+Fix (`gen_qstrdefs.py` + `build.sh`): compute the djb2 hash
+inline at qstrdefs-generation time, mirroring upstream's
+`tools/makeqstrdata.py:compute_hash` (including the
+`(hash & mask) or 1` zero-fix), and emit it as the second
+argument of `QDEF1(...)`. New `--bytes-hash N` arg picks the
+mask width to match `MICROPY_QSTR_BYTES_IN_HASH` —
+`build.sh` passes `--bytes-hash 1` (matches CORE_FEATURES).
+Pinned by a 28-case golden test against upstream's own
+implementation. Extra 4 smoke tests cover the surface
+CORE_FEATURES newly enables: `bytearray`, `set`,
+detailed NameError text, and C-style `%` string formatting.
 
 ## Historical investigation (2026-05-01 morning)
 

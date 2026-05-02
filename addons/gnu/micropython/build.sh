@@ -97,9 +97,16 @@ if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
         # macro-name-as-payload heuristic, escaped qstrs also rendered
         # the *macro tail* as their string content, so `print()`'s
         # trailing `\n` showed up as the literal text `_0x0a_`.
+        # `--bytes-hash 1` matches MICROPY_QSTR_BYTES_IN_HASH at
+        # ROM_LEVEL_CORE_FEATURES (uc386-dos/mpconfigport.h). At
+        # MINIMUM the hash field is unused at runtime, but we still
+        # emit a real hash so a future ROM-level bump doesn't need a
+        # qstrdefs rebuild. Required: qstr_find_strn's post-binary-
+        # search filter does `pool->hashes[at] == str_hash` before
+        # memcmp at any non-zero MICROPY_QSTR_BYTES_IN_HASH.
         grep -rhoE "MP_QSTR_[A-Za-z_][A-Za-z0-9_]*" \
                 upstream/py/ upstream/shared/ \
-            | "$PYTHON" gen_qstrdefs.py
+            | "$PYTHON" gen_qstrdefs.py --bytes-hash 1
     } > build/genhdr/qstrdefs.generated.h
 fi
 [ -f build/genhdr/moduledefs.h ] || cat > build/genhdr/moduledefs.h <<'EOF'

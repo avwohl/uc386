@@ -133,6 +133,25 @@ def unescape(macro_tail: str) -> str:
     return "".join(out)
 
 
+def compute_hash(qbytes: bytes, bytes_hash: int) -> int:
+    """djb2 hash, mirrored from upstream `tools/makeqstrdata.py:compute_hash`.
+    Required at `MICROPY_QSTR_BYTES_IN_HASH > 0` (CORE_FEATURES and
+    above): `qstr_find_strn`'s post-binary-search filter does
+    `pool->hashes[at] == str_hash` before memcmp. If the QDEF emits 0
+    for the hash but the runtime computes a real hash, every static
+    lookup misses and `print`/`__name__` NameError at runtime.
+
+    Mirrors upstream's `(hash & mask) or 1` zero-fix; mask width is
+    `8 * bytes_hash`, with `bytes_hash == 0` falling back to a 16-bit
+    mask so the value still fits in `qstr_hash_t = uint16_t` if the
+    port flips to a wider hash."""
+    h = 5381
+    for b in qbytes:
+        h = (h * 33) ^ b
+    mask = (1 << (8 * (bytes_hash or 2))) - 1
+    return (h & mask) or 1
+
+
 def c_string(s: str) -> str:
     """Render `s` as a C string literal — escape `"`, `\\`, and any
     byte outside printable ASCII."""
@@ -157,6 +176,22 @@ def c_string(s: str) -> str:
 
 
 def main() -> int:
+    # Optional `--bytes-hash N` selects the qstr-hash width (matches
+    # `MICROPY_QSTR_BYTES_IN_HASH` in mpconfigport.h). Default 1 ==
+    # CORE_FEATURES; 0 == MINIMUM (hash field is unused at runtime
+    # but we still emit a non-zero value so a future ROM-level bump
+    # works without regenerating qstrdefs).
+    bytes_hash = 1
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--bytes-hash" and i + 1 < len(args):
+            bytes_hash = int(args[i + 1])
+            i += 2
+        else:
+            sys.stderr.write(f"gen_qstrdefs: unknown arg {args[i]!r}\n")
+            return 2
+
     seen: dict[str, str] = {}  # macro -> original
     for line in sys.stdin:
         macro = line.strip()
@@ -176,8 +211,10 @@ def main() -> int:
     for macro, original in sorted(
         seen.items(), key=lambda item: (item[1].encode("utf-8"), item[0])
     ):
+        qhash = compute_hash(original.encode("utf-8"), bytes_hash)
         out_w(
-            f"QDEF1({macro}, 0, {len(original)}, {c_string(original)})\n"
+            f"QDEF1({macro}, {qhash}, {len(original)}, "
+            f"{c_string(original)})\n"
         )
     return 0
 

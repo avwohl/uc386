@@ -28,20 +28,22 @@
 // 6-byte declaration would have caused setjmp to buffer-overflow.
 #define MICROPY_NLR_SETJMP                (1)
 
-// MINIMUM today. The uc_core preprocessor fix unblocked the
-// objlist.c compile (slice/value_items macro-param shadowing was
-// the original blocker), but bumping the ROM level to CORE_FEATURES
-// causes a separate regression: `print`, `min`, `__name__`, and
-// other named builtins all NameError at runtime, while raw
-// arithmetic / `pass` / Ctrl-D still work. The qstr pool size is
-// unchanged (879 entries either way) so the binary search isn't
-// the issue — most likely the CORE_FEATURES default-enables a
-// codepath that uc386 mis-compiles in the static-init of
-// `mp_module_builtins_globals` or one of its tables. Leaving at
-// MINIMUM until the regression's traced; the working bin still
-// covers def, class, list comp, try/except, range, sum, sorted,
-// zip, divmod, recursion, and most arithmetic.
-#define MICROPY_CONFIG_ROM_LEVEL          (MICROPY_CONFIG_ROM_LEVEL_MINIMUM)
+// CORE_FEATURES. The earlier "every named-builtin NameErrors at
+// runtime" regression turned out to be a missing qstr-hash:
+// CORE_FEATURES sets `MICROPY_QSTR_BYTES_IN_HASH = 1`, which adds
+// a `hashes[]` array to each `qstr_pool_t` and gates
+// `qstr_find_strn`'s post-binary-search filter on
+// `pool->hashes[at] == str_hash`. Our `gen_qstrdefs.py` was
+// emitting `0` for every QDEF1's hash field, so every static
+// lookup missed and `print` / `min` / `__name__` raised
+// NameError. Fix: gen_qstrdefs.py now computes the djb2 hash
+// (mirroring upstream's `tools/makeqstrdata.py:compute_hash`,
+// including the `(hash & mask) or 1` zero-fix) via build.sh's
+// `--bytes-hash 1`. CORE_FEATURES then boots cleanly and unlocks
+// a full builtins surface — `bytearray` / `slice` / `set` types,
+// most `MICROPY_PY_BUILTINS_*` defaults, qstr-named error
+// messages, and the rest of the gates that default-enable here.
+#define MICROPY_CONFIG_ROM_LEVEL          (MICROPY_CONFIG_ROM_LEVEL_CORE_FEATURES)
 
 #define MICROPY_ENABLE_COMPILER           (1)
 #define MICROPY_ENABLE_GC                 (1)

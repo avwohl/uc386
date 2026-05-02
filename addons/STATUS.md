@@ -326,7 +326,7 @@ Layered evidence:
   links cleanly under `nasm -f bin` to a ~169 KB `.bin`. Only
   externs remaining are dead libm names left in a string table
   (DCE doesn't strip those today).
-- **REPL smoke tests** (12 cases):
+- **REPL smoke tests** (18 cases):
   `addons/gnu/micropython/test_micropython_smoke.py` runs the bin
   under dos_emu and pins: banner, clean Ctrl-D exit, arithmetic
   (`2+3` → `5`), assignment (`x = 5`), `pass`, named builtins
@@ -334,9 +334,26 @@ Layered evidence:
   list comprehensions, `try/except`, `min`/`max`/`reversed`,
   `bin`/`hex`/`oct` (qstr reverse-mangling correctly decodes the
   `_brace_open__colon__hash_b_brace_close_` format string back to
-  `{:#b}`). Skips cleanly when the bin doesn't exist; passes in
-  ~12s on the dev Mac when it does (~1s per test, dominated by
-  the 5K-instruction VM-init warmup).
+  `{:#b}`), plus 4 CORE_FEATURES-only cases (`bytearray`, `set`
+  literals, detailed-NameError-with-qstr-name, `'%d-%s' %`
+  formatting). Skips cleanly when the bin doesn't exist; passes
+  in ~12s on the dev Mac when it does.
+
+- **CORE_FEATURES baseline** (2026-05-02): the previous "every
+  named-builtin NameErrors when ROM_LEVEL is bumped" runtime
+  regression turned out to be a missing qstr-hash. CORE_FEATURES
+  flips `MICROPY_QSTR_BYTES_IN_HASH` from 0 to 1, which adds a
+  `qstr_hash_t hashes[]` array to each `qstr_pool_t` and gates
+  `qstr_find_strn`'s post-binary-search filter on
+  `pool->hashes[at] == str_hash`. `gen_qstrdefs.py` was emitting
+  `0` for every QDEF1 hash; the runtime computed real djb2 hashes
+  and the filter rejected every entry. Fix: compute the djb2 hash
+  inline at qstrdefs-generation time (mirrors upstream's
+  `tools/makeqstrdata.py:compute_hash` exactly, including the
+  `(hash & mask) or 1` zero-fix), pass it as the second QDEF1
+  arg. ROM_LEVEL now lives at CORE_FEATURES; bin grew 169 KB →
+  199 KB; `bytearray` / `set` / `slice` / detailed error
+  reporting / `'%' %` formatting all light up.
 
 Triage progression as the slice unfolded:
 - 95 / 132 with empty stubs (most failures were missing-qstr
