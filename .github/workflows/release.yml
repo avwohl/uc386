@@ -81,6 +81,23 @@ jobs:
       - name: Build addon binaries (FOSS tarball)
         run: python -m addons.harness.package --version "${{ steps.ver.outputs.version }}" --foss-only
 
+      - name: Path A smoke — build a .exe via nasm + wlink
+        # Validates `addons/harness/exe.py` end-to-end: uc386 → .asm,
+        # nasm → .obj (OMF), wlink → .exe (MZ+LE bound to CauseWay).
+        # If the pipeline breaks (NASM OMF surprise, wlink linkerd
+        # error, etc.) we want to know at release time, not at user-
+        # report time. Target `true` (smallest in-tree addon) — its
+        # main is `int main(void) { return 0; }`, no libc surface.
+        # `continue-on-error` because Phase 1 is best-effort: if
+        # wlink chokes on uc386's .obj, the tarball still ships.
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/exe-smoke
+          python -m addons.harness.exe addons/gnu/true/main.c \
+            -o /tmp/exe-smoke/true.exe
+          ls -la /tmp/exe-smoke/true.exe
+          file /tmp/exe-smoke/true.exe
+
       - name: Build BWK awk
         # Bison 3.x's awkgram.tab.c output uses typedef chains that
         # uc386 currently misparses inside function bodies (works fine
