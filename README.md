@@ -14,12 +14,21 @@ this repo owns the driver, the x86-32 NASM emitter, and the DOS
 runtime bindings. See `CLAUDE.md` for the per-slice development log.
 
 **Highlights**: DOOM boots end-to-end through uc386 → NASM → dos_emu
-(hits W_InitFiles, exits at WAD-not-found as expected; smoke-tested
-via `addons/games/doom/test_doom_smoke.py`). MicroPython REPL boots
-to its prompt — `addons/gnu/micropython/build_port.sh` produces a
-170 KB i386 DOS binary that runs `pass`, empty lines, and Ctrl-D
-exit cleanly under dos_emu (`addons/gnu/micropython/test_micropython_smoke.py`).
-See `addons/STATUS.md` for the full per-addon report.
+(reaches W_InitFiles after V_Init / M_LoadDefaults / Z_Init; exits 1
+at WAD-not-found as expected; smoke-tested via
+`addons/games/doom/test_doom_smoke.py`). MicroPython is a
+fully-functional Python REPL — `addons/gnu/micropython/build_port.sh`
+produces a ~169 KB i386 DOS binary that evaluates expressions, defines
+functions and classes, runs list comprehensions, handles exceptions,
+and dispatches ~25 named builtins (`print`, `min`, `max`, `sum`,
+`sorted`, `bin`, `hex`, `oct`, `len`, `range`, `repr`, `type`,
+`isinstance`, ...). 12 smoke tests pin the wins (see
+`addons/gnu/micropython/test_micropython_smoke.py`). BWK awk runs
+arithmetic, regex, aggregation, and string functions
+(`addons/gnu/awk-bwk/test_awk_smoke.py`). 16 in-tree GNU utilities
+(`true`, `cat`, `wc`, ...) get parametrized regression coverage via
+`addons/test_gnu_addons.py`. See `addons/STATUS.md` for the full
+per-addon report.
 
 ## Goal
 

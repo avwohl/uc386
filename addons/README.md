@@ -84,12 +84,17 @@ first or none of the rest is testable.
      the rest will join as their link-time gaps close.
 
 9. **MicroPython port** — `addons/gnu/micropython/`. Today a
-   triage skeleton: 115 / 132 (87 %) of `upstream/py/` core
-   compiles via uc386 with a synthetic main + stub generated
-   headers. Real port needs `tools/makeqstrdefs.py` driving real
-   qstrs, two uc386 codegen fixes (`pp->m` chain + packed-flag
-   const-eval), and a `ports/uc386-dos/` with INT-21h-backed
-   `mp_hal_*` HAL. See `addons/gnu/micropython/NOTES.md`.
+   fully-functional Python REPL: `build_port.sh` produces a
+   ~169 KB i386 DOS binary that evaluates expressions, runs
+   `def`/`class`/list comprehensions, handles `try/except`, and
+   dispatches ~25 named builtins (`print`, `min`, `max`, `sum`,
+   `sorted`, `bin`, `hex`, `oct`, `len`, `range`, `repr`, `type`,
+   `isinstance`, ...). 12 smoke tests in
+   `test_micropython_smoke.py` pin the wins.
+   145 / 145 sources (`upstream/py/` + `upstream/shared/`) compile
+   cleanly through uc386 → NASM in the per-file triage; the
+   multi-TU build links a 1.94 MB .asm to flat .bin via NASM.
+   See `addons/gnu/micropython/NOTES.md`.
 
 ## Running the harness
 
