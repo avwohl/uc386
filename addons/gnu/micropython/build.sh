@@ -110,13 +110,88 @@ if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
     } > build/genhdr/qstrdefs.generated.h
 fi
 [ -f build/genhdr/moduledefs.h ] || cat > build/genhdr/moduledefs.h <<'EOF'
-// Triage stub. A real build runs upstream/py/makemoduledefs.py over
-// the source tree to emit per-module MP_ROM_QSTR / MP_ROM_PTR entries
-// followed by `#define MICROPY_REGISTERED_MODULES <list>`. With no
-// registered modules in the triage config we just define the macro
-// empty so py/objmodule.c's `mp_builtin_module_table[] = { ... }`
-// reduces to an empty array initializer.
-#define MICROPY_REGISTERED_MODULES
+// Hand-rolled equivalent of `upstream/py/makemoduledefs.py`'s output,
+// covering the modules our uc386-dos port supports at the
+// CORE_FEATURES ROM level. A real upstream build runs
+// `tools/makeqstrdefs.py cat module` to preprocess each TU and
+// extract MP_REGISTER_MODULE invocations after `#if` filtering, then
+// pipes the result through makemoduledefs.py. We approximate by
+// emitting each entry under the same `#if` gate the module's source
+// file uses, so flipping `MICROPY_PY_<X>` in mpconfigport.h adds or
+// drops the entry consistently.
+//
+// Modules NOT registered here:
+//   - math / cmath  — require MICROPY_PY_BUILTINS_FLOAT (port is
+//                     int-only, no DOS-side libm wired up yet).
+//   - _thread       — requires MICROPY_PY_THREAD (single-threaded
+//                     DOS, no need today).
+//   - weakref       — requires MICROPY_PY_WEAKREF (off at CORE).
+//   - io            — requires MICROPY_PY_IO + a VFS implementation;
+//                     the port has no VFS today so `open()` is a
+//                     no-op. Pre-set MICROPY_PY_IO=0 in
+//                     mpconfigport.h to skip.
+
+// All modules registered as regular (non-extensible). Extensible
+// only matters with a VFS so users can override built-ins with .py
+// files; the port has no VFS so the distinction is moot.
+
+extern const struct _mp_obj_module_t mp_module_builtins;
+extern const struct _mp_obj_module_t mp_module_sys;
+extern const struct _mp_obj_module_t mp_module___main__;
+
+#if MICROPY_PY_GC
+extern const struct _mp_obj_module_t mp_module_gc;
+#define UCDOS_MOD_ENTRY_GC { MP_ROM_QSTR(MP_QSTR_gc), MP_ROM_PTR(&mp_module_gc) },
+#else
+#define UCDOS_MOD_ENTRY_GC
+#endif
+
+#if MICROPY_PY_MICROPYTHON
+extern const struct _mp_obj_module_t mp_module_micropython;
+#define UCDOS_MOD_ENTRY_MICROPYTHON { MP_ROM_QSTR(MP_QSTR_micropython), MP_ROM_PTR(&mp_module_micropython) },
+#else
+#define UCDOS_MOD_ENTRY_MICROPYTHON
+#endif
+
+#if MICROPY_PY_ARRAY
+extern const struct _mp_obj_module_t mp_module_array;
+#define UCDOS_MOD_ENTRY_ARRAY { MP_ROM_QSTR(MP_QSTR_array), MP_ROM_PTR(&mp_module_array) },
+#else
+#define UCDOS_MOD_ENTRY_ARRAY
+#endif
+
+#if MICROPY_PY_COLLECTIONS
+extern const struct _mp_obj_module_t mp_module_collections;
+#define UCDOS_MOD_ENTRY_COLLECTIONS { MP_ROM_QSTR(MP_QSTR_collections), MP_ROM_PTR(&mp_module_collections) },
+#else
+#define UCDOS_MOD_ENTRY_COLLECTIONS
+#endif
+
+#if MICROPY_PY_ERRNO
+extern const struct _mp_obj_module_t mp_module_errno;
+#define UCDOS_MOD_ENTRY_ERRNO { MP_ROM_QSTR(MP_QSTR_errno), MP_ROM_PTR(&mp_module_errno) },
+#else
+#define UCDOS_MOD_ENTRY_ERRNO
+#endif
+
+#if MICROPY_PY_STRUCT
+extern const struct _mp_obj_module_t mp_module_struct;
+#define UCDOS_MOD_ENTRY_STRUCT { MP_ROM_QSTR(MP_QSTR_struct), MP_ROM_PTR(&mp_module_struct) },
+#else
+#define UCDOS_MOD_ENTRY_STRUCT
+#endif
+
+#define MICROPY_REGISTERED_MODULES \
+    { MP_ROM_QSTR(MP_QSTR_builtins), MP_ROM_PTR(&mp_module_builtins) }, \
+    { MP_ROM_QSTR(MP_QSTR_sys), MP_ROM_PTR(&mp_module_sys) }, \
+    { MP_ROM_QSTR(MP_QSTR___main__), MP_ROM_PTR(&mp_module___main__) }, \
+    UCDOS_MOD_ENTRY_GC \
+    UCDOS_MOD_ENTRY_MICROPYTHON \
+    UCDOS_MOD_ENTRY_ARRAY \
+    UCDOS_MOD_ENTRY_COLLECTIONS \
+    UCDOS_MOD_ENTRY_ERRNO \
+    UCDOS_MOD_ENTRY_STRUCT
+
 #define MICROPY_REGISTERED_EXTENSIBLE_MODULES
 EOF
 [ -f build/genhdr/mpversion.h ] || cat > build/genhdr/mpversion.h <<'EOF'

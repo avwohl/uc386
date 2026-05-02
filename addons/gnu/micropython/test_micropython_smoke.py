@@ -524,3 +524,117 @@ def test_micropython_core_features_str_modulo(micropython_bin: Path) -> None:
     assert "5-x" in res.stdout, (
         f"expected `5-x` from str %% formatting, got: {res.stdout!r}"
     )
+
+
+def test_micropython_import_sys(micropython_bin: Path) -> None:
+    """`import sys` exercises the module-table lookup path. Until
+    moduledefs.h registered `mp_module_sys`, this raised
+    `ImportError: no module named 'sys'`. Pins both the registration
+    + the sys module's static-init."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"import sys\nprint(sys.implementation.name)\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "micropython" in res.stdout, (
+        f"expected `micropython` from sys.implementation.name, got: "
+        f"{res.stdout!r}"
+    )
+
+
+def test_micropython_import_gc(micropython_bin: Path) -> None:
+    """`import gc; gc.collect()` exercises the gc module + its
+    `gc.collect` entry. Gated on `MICROPY_PY_GC` which default-on
+    at CORE_FEATURES."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"import gc\ngc.collect()\nprint('ok')\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "ok" in res.stdout, (
+        f"expected `ok` after gc.collect(), got: {res.stdout!r}"
+    )
+
+
+def test_micropython_import_collections(micropython_bin: Path) -> None:
+    """`import collections; OrderedDict` exercises the collections
+    module — gated on `MICROPY_PY_COLLECTIONS` (CORE_FEATURES)
+    and a uc386-side moduledefs.h registration."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"from collections import OrderedDict\n"
+                  b"d = OrderedDict()\n"
+                  b"d['a'] = 1\n"
+                  b"d['b'] = 2\n"
+                  b"print(list(d.keys()))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "['a', 'b']" in res.stdout, (
+        f"expected ordered keys `['a', 'b']`, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_import_struct(micropython_bin: Path) -> None:
+    """`import struct; struct.pack` exercises struct module — gated
+    on `MICROPY_PY_STRUCT` (CORE_FEATURES). Pinned because struct's
+    little-endian byte layout is sensitive to misaligned codegen."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import struct\n"
+                  b"print(struct.pack('<I', 0x12345678))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # 0x12345678 little-endian = 78 56 34 12
+    assert "b'xV4\\x12'" in res.stdout, (
+        f"expected packed bytes `b'xV4\\\\x12'`, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_import_array(micropython_bin: Path) -> None:
+    """`import array; array.array('i', ...)` — gated on
+    `MICROPY_PY_ARRAY` (CORE_FEATURES). Pins typed-array storage
+    + iteration."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import array\n"
+                  b"a = array.array('i', [1,2,3])\n"
+                  b"print(sum(a))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "\n6\n" in res.stdout, (
+        f"expected sum 6 from int array, got: {res.stdout!r}"
+    )

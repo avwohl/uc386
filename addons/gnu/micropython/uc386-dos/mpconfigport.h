@@ -66,17 +66,32 @@
 // `open()` / `io` machinery.
 #define MICROPY_PY_IO                     (0)
 
-// Selective opt-ins from CORE_FEATURES while staying at the
-// MINIMUM ROM level. These builtins are pure-functional with no
-// module-state dependency, so they pull in self-contained .c
-// files (modbuiltins.c, objreversed.c, objenumerate.c, objfilter.c,
-// objproperty.c) without touching the builtins-init code-path that
-// broke under a full ROM-level bump.
+// Selective opt-ins from EXTRA_FEATURES while staying at the
+// CORE_FEATURES ROM level. These were originally MINIMUM-level
+// opt-ins for the pre-CORE_FEATURES build; left in for two
+// reasons: (a) they're explicit about what we use, and (b) they
+// double as on-by-default at CORE_FEATURES so the macros are
+// idempotent.
 #define MICROPY_PY_BUILTINS_MIN_MAX       (1)
 #define MICROPY_PY_BUILTINS_REVERSED      (1)
 #define MICROPY_PY_BUILTINS_ENUMERATE     (1)
 #define MICROPY_PY_BUILTINS_FILTER        (1)
 #define MICROPY_PY_BUILTINS_PROPERTY      (1)
+
+// EXTRA_FEATURES-gated extras worth pulling in to the
+// CORE_FEATURES-baseline port. `OrderedDict` is a common-enough
+// idiom that the small static-init cost is worth the import
+// surface.
+//
+// `errno` is NOT opted in: its globals table uses `MP_QSTR_##e`
+// token paste over an X-macro list (EPERM, ENOENT, EINVAL, ...),
+// which our grep-based gen_qstrdefs.py can't see — none of those
+// qstr names appear as literal text in any source file. Enabling
+// MICROPY_PY_ERRNO without first extending the qstr table would
+// fail with `__static_moderrno__errorcode_table.value: float init
+// must be a constant expression (got Identifier)` because uc386
+// can't resolve `MP_QSTR_EPERM` etc. as enum constants.
+#define MICROPY_PY_COLLECTIONS_ORDEREDDICT (1)
 
 typedef long mp_off_t;
 

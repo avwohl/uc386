@@ -326,7 +326,7 @@ Layered evidence:
   links cleanly under `nasm -f bin` to a ~169 KB `.bin`. Only
   externs remaining are dead libm names left in a string table
   (DCE doesn't strip those today).
-- **REPL smoke tests** (18 cases):
+- **REPL smoke tests** (23 cases):
   `addons/gnu/micropython/test_micropython_smoke.py` runs the bin
   under dos_emu and pins: banner, clean Ctrl-D exit, arithmetic
   (`2+3` → `5`), assignment (`x = 5`), `pass`, named builtins
@@ -337,7 +337,25 @@ Layered evidence:
   `{:#b}`), plus 4 CORE_FEATURES-only cases (`bytearray`, `set`
   literals, detailed-NameError-with-qstr-name, `'%d-%s' %`
   formatting). Skips cleanly when the bin doesn't exist; passes
-  in ~12s on the dev Mac when it does.
+  in ~14s on the dev Mac when it does. New surface (post
+  CORE_FEATURES bump): `bytearray`, `set`, `dict.fromkeys`,
+  `bytes.decode`, generator expressions, `'%' %` formatting,
+  detailed-NameError-with-qstr-name, `import sys` / `gc` /
+  `micropython` / `collections` (OrderedDict + namedtuple) /
+  `struct` / `array`.
+
+- **Module imports** (2026-05-02): hand-rolled equivalent of
+  upstream's `tools/makemoduledefs.py` output written into
+  `build/genhdr/moduledefs.h`. Each registered module's entry is
+  guarded by its `MICROPY_PY_<X>` define so flipping the gate in
+  mpconfigport.h adds or drops the entry consistently. Modules
+  registered: `builtins`, `sys`, `__main__`, `gc`, `micropython`,
+  `array`, `collections`, `struct`. Modules deliberately not
+  registered: `math` / `cmath` (need
+  `MICROPY_PY_BUILTINS_FLOAT`), `_thread` (no thread support),
+  `weakref` (off at CORE_FEATURES), `io` (no VFS), `errno`
+  (the module's `errorcode_dict` static-init uses
+  `MP_QSTR_##e` token paste — see NOTES.md for the followup).
 
 - **CORE_FEATURES baseline** (2026-05-02): the previous "every
   named-builtin NameErrors when ROM_LEVEL is bumped" runtime
