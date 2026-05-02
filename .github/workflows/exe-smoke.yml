@@ -89,6 +89,37 @@ jobs:
             -o /tmp/cat.exe
           ls -la /tmp/cat.exe
 
+      - name: Build .exe for every in-tree GNU addon
+        # Phase 4 surface: build .exe variants for all manifest-driven
+        # addons. Reports which build cleanly vs which fail (the
+        # calling-convention bridge isn't written yet, so addons that
+        # use argv may produce .exe but crash at runtime — that's a
+        # separate test).
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/exe-all
+          ok=0
+          fail=0
+          for d in addons/gnu/*/; do
+            name=$(basename "$d")
+            # Skip non-buildable: special dirs + upstream-fetched ports.
+            case "$name" in
+              _*|awk-bwk|gawk|micropython) continue ;;
+            esac
+            [ -f "$d/main.c" ] || continue
+            if python -m addons.harness.exe "$d/main.c" \
+                 -o "/tmp/exe-all/$name.exe" 2>"/tmp/exe-all/$name.err"; then
+              SIZE=$(stat -c '%s' "/tmp/exe-all/$name.exe" 2>/dev/null || echo 0)
+              echo "PASS $name: $SIZE bytes"
+              ok=$((ok + 1))
+            else
+              echo "FAIL $name: $(head -1 /tmp/exe-all/$name.err)"
+              fail=$((fail + 1))
+            fi
+          done
+          echo
+          echo "== $ok built / $((ok+fail)) total =="
+
       - name: Inspect true.exe structure
         # Quick post-build sanity: the file should have the MZ header,
         # an LE signature at the new-exe offset, and the PMODE/W
