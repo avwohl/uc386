@@ -136,6 +136,20 @@ jobs:
       - name: Generate comparison table
         run: python -m addons.harness.compare --write
 
+      - name: Smoke-test the FOSS tarball end-to-end
+        # Catches packaging regressions that the dev-tree pytest can't
+        # see — paths inside the tarball, missing license files, the
+        # tarball-mode bin lookup in the smoke tests. Extracts the
+        # tarball, runs `python test_addons.py`, asserts every
+        # binary passes (16 manifest-driven + awk + micropython if
+        # they shipped). The tarball runner already returns rc=1 on
+        # any failure, so we just propagate that.
+        run: |
+          mkdir -p /tmp/foss-smoke
+          tar xzf dist/uc386-foss-addons-*.tar.gz -C /tmp/foss-smoke
+          cd /tmp/foss-smoke/uc386-foss
+          python test_addons.py
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
