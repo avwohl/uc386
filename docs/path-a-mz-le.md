@@ -4,9 +4,18 @@
 dosiz, and real DOS — alongside the existing flat `.bin` that runs
 under `uc386.dos_emu`.
 
-**Status (2026-05-01)**: Phase 1 wrapper script landed
-(`addons/harness/exe.py`). Validation pending Linux dev cycle since
-this Mac has no native Watcom build.
+**Status (2026-05-02)**: Phase 1 ✓ — pipeline validated end-to-end
+in CI. `addons/harness/exe.py` produces working .exe files via the
+`exe-smoke` workflow on Linux. First two test cases pass:
+
+- `addons/gnu/true/main.c` → `true.exe` (371 bytes, MZ+LE wrapped)
+- `addons/gnu/cat/main.c` → `cat.exe` (1,024 bytes)
+
+Both bind CauseWay as the DOS extender. The exe-smoke workflow
+fires on every push that touches the pipeline, so Phase 2 work
+gets continuous validation. Next steps: actually run these .exe
+under DOSBox in CI to verify the runtime behavior, not just the
+build.
 
 ## Why Path A over Path B
 
