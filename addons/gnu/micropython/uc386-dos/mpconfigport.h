@@ -36,18 +36,9 @@
 // bytearray slice-assign, plus dozens of smaller surface knobs.
 #define MICROPY_CONFIG_ROM_LEVEL          (MICROPY_CONFIG_ROM_LEVEL_EXTRA_FEATURES)
 
-// Port-incompatible defaults — all of these are EXTRA-default but
-// need port-supplied helpers we don't ship today.
-//
-//   - (was MICROPY_STACK_CHECK — now enabled below; main.c calls
-//     mp_stack_ctrl_init + mp_stack_set_limit at startup)
-//   - (was MICROPY_PY_UCTYPES — now enabled below)
-//   - (was MICROPY_PY_TIME_TIME_TIME_NS — now enabled below)
-//   - MICROPY_PY_BUILTINS_HELP: needs port-supplied help text
-//     table; we don't ship one.
-//   - MICROPY_MODULE___FILE__: needs source-path tracker.
-#define MICROPY_PY_BUILTINS_HELP          (0)
-#define MICROPY_MODULE___FILE__           (0)
+// All previously-disabled EXTRA-default flags now enabled below
+// (STACK_CHECK / PY_UCTYPES / TIME_TIME_TIME_NS / BUILTINS_HELP /
+// MODULE___FILE__).
 
 // Stack-overflow guard. With a 1 MB stack (dos_emu maps STACK_BASE
 // 0x01000000..0x01100000), an unbounded recursion or huge frame
@@ -59,6 +50,19 @@
 // (i.e., raise RecursionError when usage hits 768 KB, well below
 // the 1 MB hard limit).
 #define MICROPY_STACK_CHECK               (1)
+
+// `help()` builtin — uses the upstream default help text from
+// `py/builtinhelp.c:mp_help_default_text`. With
+// MICROPY_PY_BUILTINS_HELP_TEXT undefined, the default
+// (`mp_help_default_text`) is used.
+#define MICROPY_PY_BUILTINS_HELP          (1)
+
+// `__file__` attribute on imported modules. Auto-set by
+// upstream's `do_load_from_lexer` (builtinimport.c:158) using
+// the lexer's `source_name` qstr — which our
+// `uc386-dos/file_uc386dos.c:mp_lexer_new_from_file` initializes
+// from the import filename. No port-supplied helper needed.
+#define MICROPY_MODULE___FILE__           (1)
 // `uctypes` — binary struct access for memoryview/buffer-like
 // objects (define a layout dict, pin it onto a buffer, read/write
 // fields by name). build_port.sh adds extmod/moductypes.c to the

@@ -1061,6 +1061,57 @@ def test_micropython_sys_argv_is_empty_list(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_builtin_help(micropython_bin: Path) -> None:
+    """`help()` (no arg) prints the default help text from
+    `py/builtinhelp.c:mp_help_default_text`. Pin the
+    `Welcome to MicroPython!` first line as a smoke."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"help()\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "Welcome to MicroPython!" in res.stdout, (
+        f"expected default help banner, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_module_dunder_file(micropython_bin: Path) -> None:
+    """`mymod.__file__` is set to the source path the lexer was
+    given. With MICROPY_MODULE___FILE__=1, builtinimport.c's
+    `do_load_from_lexer` (line 158) calls `mp_store_attr` on the
+    module with `__file__` = `lex->source_name`. Our
+    `uc386-dos/file_uc386dos.c:mp_lexer_new_from_file` builds the
+    lexer from the import filename qstr."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import myhelper\n"
+                  b"print(myhelper.__file__)\n"
+                  b"print(myhelper.value)\n"
+                  b"\x04"
+              ),
+              vfiles_init={b"myhelper.py": b"value = 42\n"},
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "myhelper.py" in res.stdout, (
+        f"expected myhelper.__file__ == 'myhelper.py', got: "
+        f"{res.stdout!r}"
+    )
+    assert "\n42\n" in res.stdout, (
+        f"expected myhelper.value == 42, got: {res.stdout!r}"
+    )
+
+
 def test_micropython_stack_check_catches_runaway_recursion(micropython_bin: Path) -> None:
     """`MICROPY_STACK_CHECK=1` enables `mp_stack_check()` calls
     in the VM dispatcher. Combined with the `mp_stack_ctrl_init`
