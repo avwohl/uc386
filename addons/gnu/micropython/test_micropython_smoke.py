@@ -901,6 +901,68 @@ def test_micropython_time_gmtime_constant(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_time_time_ns_dos_rtc(micropython_bin: Path) -> None:
+    """`time.time_ns()` = time.time() * 1e9 with second resolution
+    (DOS RTC has no sub-second contribution). Checks that the
+    nanosecond value is the second value × 1e9. Validates the
+    `MICROPY_LONGINT_IMPL_LONGLONG` int support — without it,
+    `mp_obj_new_int_from_ull` is a stub that always raises
+    `OverflowError`."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import time\n"
+                  b"s = time.time()\n"
+                  b"ns = time.time_ns()\n"
+                  b"print('OK' if ns == s * 1000000000 else 'BAD', ns)\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "OK" in res.stdout, (
+        f"expected time_ns == time * 1e9, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_long_long_int_arithmetic(micropython_bin: Path) -> None:
+    """`MICROPY_LONGINT_IMPL_LONGLONG` enables heap-allocated
+    `mp_obj_int_t` for values that don't fit a small int. Checks
+    `2**62` (= 4611686018427387904) and its negation parse and
+    print correctly — both well outside the 31-bit small-int
+    range. Without long-long support, these raise OverflowError
+    via `mp_obj_new_int_from_ll`."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"x = 2**62\n"
+                  b"print(x)\n"
+                  b"print(-x)\n"
+                  b"print(x + 1 == 4611686018427387905)\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "4611686018427387904" in res.stdout, (
+        f"expected 2**62 = 4611686018427387904, got: {res.stdout!r}"
+    )
+    assert "-4611686018427387904" in res.stdout, (
+        f"expected -(2**62) = -4611686018427387904, got: {res.stdout!r}"
+    )
+    assert "True" in res.stdout, (
+        f"expected x + 1 = 4611686018427387905, got: {res.stdout!r}"
+    )
+
+
 def test_micropython_extra_features_compile(micropython_bin: Path) -> None:
     """`compile()` is gated at EXTRA_FEATURES (already on at CORE
     via `MICROPY_PY_BUILTINS_COMPILE && MICROPY_ENABLE_COMPILER`).

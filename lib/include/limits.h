@@ -36,4 +36,11 @@
 
 #define MB_LEN_MAX  1
 
+/* POSIX: SSIZE_MAX is the upper bound for ssize_t. Our sys/types.h
+ * defines `ssize_t` as `long`, so SSIZE_MAX = LONG_MAX. POSIX headers
+ * normally place this in <limits.h>; including it here means
+ * MicroPython's `MP_SSIZE_MAX` (which defaults to SSIZE_MAX) folds at
+ * compile time without a port-specific override. */
+#define SSIZE_MAX   LONG_MAX
+
 #endif /* _LIMITS_H */

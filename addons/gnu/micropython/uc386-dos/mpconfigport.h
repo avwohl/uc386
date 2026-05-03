@@ -126,6 +126,19 @@
 #define MICROPY_FLOAT_IMPL                (MICROPY_FLOAT_IMPL_DOUBLE)
 #define MICROPY_PY_MATH_SPECIAL_FUNCTIONS (1)
 
+// Long-long int support — heap-allocated `mp_obj_int_t` for
+// values that don't fit a small int. Default is
+// `LONGINT_IMPL_NONE`, where `mp_obj_new_int_from_ll` /
+// `mp_obj_new_int_from_ull` are stubs that always raise
+// `OverflowError("small int overflow")`. That makes
+// `time.time_ns()`, large `struct.unpack` results, and other
+// 64-bit-int paths unusable. LONGLONG enables the real
+// implementations in `upstream/py/objint_longlong.c` (already
+// in our source list) and pulls heap-allocated `mp_obj_int_t`
+// instances onto the GC heap. Same surface as the upstream
+// stm32 / esp32 ports.
+#define MICROPY_LONGINT_IMPL              (MICROPY_LONGINT_IMPL_LONGLONG)
+
 // `time` module — `time.ticks_ms`, `time.sleep_ms`, etc. wired
 // through INT 1Ah AH=0 BIOS tick counter (~18.2 Hz, ~55 ms/tick)
 // in lib/i386_dos_libc.asm and uc386-dos/mphal_uc386dos.c.
