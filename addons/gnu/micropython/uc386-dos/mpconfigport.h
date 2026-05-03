@@ -45,16 +45,44 @@
 //   - MICROPY_PY_UCTYPES: pulls in `extmod/moductypes.c` which
 //     we don't include in build_port.sh's source list; the missing
 //     `mp_module_uctypes` extern crashes the NASM link.
-//   - MICROPY_PY_TIME_TIME_TIME_NS: needs `mp_time_time_get` +
-//     `mp_hal_time_ns`; no RTC integration today.
+//   - (was MICROPY_PY_TIME_TIME_TIME_NS — now enabled below)
 //   - MICROPY_PY_BUILTINS_HELP: needs port-supplied help text
 //     table; we don't ship one.
 //   - MICROPY_MODULE___FILE__: needs source-path tracker.
 #define MICROPY_STACK_CHECK               (0)
 #define MICROPY_PY_UCTYPES                (0)
-#define MICROPY_PY_TIME_TIME_TIME_NS      (0)
 #define MICROPY_PY_BUILTINS_HELP          (0)
 #define MICROPY_MODULE___FILE__           (0)
+
+// `time.time()` / `time.localtime()` / `time.gmtime()` /
+// `time.mktime()` — wired to the DOS RTC via INT 21h AH=0x2A
+// (date) + AH=0x2C (time-of-day) in
+// lib/i386_dos_libc.asm:_dos_get_datetime, then converted to
+// seconds-since-epoch by upstream's shared/timeutils. The port
+// shim lives in `uc386-dos/modtime_uc386dos.c` and is
+// `#include`'d into extmod/modtime.c via the
+// MICROPY_PY_TIME_INCLUDEFILE hook (provides
+// `mp_time_time_get` + `mp_time_localtime_get`).
+//
+// MICROPY_TIMESTAMP_IMPL = 1 (UINT) forces `mp_timestamp_t` to
+// be `mp_uint_t` (32-bit on i386). The default for
+// MICROPY_EPOCH_IS_2000 is LONG_LONG, which we can't safely
+// return from `time.time()` without longlong int support
+// (`mp_obj_new_int_from_ll` is a stub in LONGINT_IMPL_NONE that
+// always raises OverflowError). 32-bit unsigned seconds-since-
+// 2000 covers through year 2136 — adequate for a DOS port.
+//
+// Caveat: TIME_TIME_NS gates BOTH `time.time()` AND
+// `time.time_ns()` in upstream modtime.c. Calling
+// `time.time_ns()` will raise `OverflowError("small int
+// overflow")` because it routes through
+// `mp_obj_new_int_from_ull(mp_hal_time_ns())` and the ull stub
+// rejects everything. Lighting it up cleanly requires
+// MICROPY_LONGINT_IMPL_LONGLONG.
+#define MICROPY_TIMESTAMP_IMPL            (1)
+#define MICROPY_PY_TIME_TIME_TIME_NS      (1)
+#define MICROPY_PY_TIME_GMTIME_LOCALTIME_MKTIME (1)
+#define MICROPY_PY_TIME_INCLUDEFILE       "uc386-dos/modtime_uc386dos.c"
 
 // `open()` + `import xxx` (loading `xxx.py` from disk) wired through
 // uc386's libc INT 21h file syscalls. We provide port-supplied

@@ -77,3 +77,27 @@ uintptr_t mp_hal_stdio_poll(uintptr_t poll_flags) {
     (void)poll_flags;
     return 0;
 }
+
+// `time.time_ns()` — nanoseconds since the configured epoch.
+// We don't have sub-second precision from the DOS RTC (INT 21h
+// AH=0x2C reports hundredths but we drop them for simplicity),
+// so just multiply seconds-since-epoch by 1e9. Returned as
+// uint64 so it can carry the full epoch timestamp without
+// overflow on 32-bit builds.
+#include "shared/timeutils/timeutils.h"
+
+extern void dos_get_datetime(unsigned char out[7]);
+
+uint64_t mp_hal_time_ns(void) {
+    unsigned char raw[7];
+    dos_get_datetime(raw);
+    unsigned int year   = (unsigned int)(raw[0] | (raw[1] << 8));
+    unsigned int month  = raw[2];
+    unsigned int day    = raw[3];
+    unsigned int hour   = raw[4];
+    unsigned int minute = raw[5];
+    unsigned int second = raw[6];
+    mp_timestamp_t secs = timeutils_seconds_since_epoch(
+        year, month, day, hour, minute, second);
+    return (uint64_t)secs * 1000000000ULL;
+}

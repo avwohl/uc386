@@ -4182,6 +4182,46 @@ _bios_ticks:
         pop     ebx
         ret
 
+; void dos_get_datetime(uint8_t out[7])
+;   Calls INT 21h AH=0x2A (date) and AH=0x2C (time-of-day) and
+;   packs the result into a 7-byte buffer:
+;     out[0..1] = year (uint16, e.g. 2026)
+;     out[2]    = month (1-12)
+;     out[3]    = day (1-31)
+;     out[4]    = hour (0-23)
+;     out[5]    = minute (0-59)
+;     out[6]    = second (0-59)
+;   Used by uc386-dos/modtime_uc386dos.c to build `time.time()` /
+;   `time.localtime()` from the DOS clock. Caller-saved regs only
+;   (ESI/EDI preserved by us); the int 21h calls go through
+;   dos_emu's INT 21h shim under emulation, real DOS via PMODE/W
+;   in the .exe pipeline.
+_dos_get_datetime:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    esi
+        mov     esi, [ebp + 8]               ; out
+        ; AH=0x2A — get date
+        mov     ah, 0x2A
+        int     21h
+        ; CX = year, DH = month, DL = day
+        mov     [esi + 0], cx                ; year (uint16)
+        mov     [esi + 2], dh                ; month
+        mov     [esi + 3], dl                ; day
+        ; AH=0x2C — get time
+        mov     ah, 0x2C
+        int     21h
+        ; CH = hour, CL = minute, DH = second
+        mov     [esi + 4], ch                ; hour
+        mov     [esi + 5], cl                ; minute
+        mov     [esi + 6], dh                ; second
+        pop     esi
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
 ; ---- ungetc(c, stream): simple one-byte unget --------------------------------
         section .bss
 _ungetc_buf:    resd 1                      ; -1 = empty, else the byte

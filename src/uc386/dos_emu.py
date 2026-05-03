@@ -726,6 +726,36 @@ def run(
             if dl != 0xFF:
                 _write_stdout(bytes([dl]))
             return
+        if ah == 0x2A:
+            # AH=0x2A — get system date.
+            #   Returns: CX = year (1980-2099), DH = month, DL = day,
+            #            AL = day of week (0=Sun, 6=Sat).
+            # Synthesize a fixed deterministic date for tests
+            # (2026-05-03, the day this slice was written). Real DOS
+            # under PMODE/W in the .exe pipeline gets the real RTC.
+            ecx = uc.reg_read(UC_X86_REG_ECX)
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            uc.reg_write(UC_X86_REG_ECX,
+                         (ecx & 0xFFFF0000) | 2026)
+            uc.reg_write(UC_X86_REG_EDX,
+                         (edx & 0xFFFF0000) | (5 << 8) | 3)
+            uc.reg_write(UC_X86_REG_EAX, (eax & ~0xFF) | 0)
+            return
+        if ah == 0x2C:
+            # AH=0x2C — get system time-of-day.
+            #   Returns: CH = hour, CL = minute,
+            #            DH = second, DL = hundredths.
+            # Synthesize 12:34:00. Adequate for proving the date+time
+            # → epoch-seconds path lights up; the smoke test for
+            # `time.time()` checks that the result lands in the
+            # right ballpark, not an exact value.
+            ecx = uc.reg_read(UC_X86_REG_ECX)
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            uc.reg_write(UC_X86_REG_ECX,
+                         (ecx & 0xFFFF0000) | (12 << 8) | 34)
+            uc.reg_write(UC_X86_REG_EDX,
+                         (edx & 0xFFFF0000) | (0 << 8) | 0)
+            return
         if ah == 0x09:
             edx = uc.reg_read(UC_X86_REG_EDX)
             s = _read_cstr(uc, edx, term=b"$")
@@ -943,7 +973,11 @@ def run(
     except UcError as e:
         # Don't overwrite an already-set error / exit.
         if res.exit_code is None and not res.error:
-            res.error = f"unicorn: {e}"
+            try:
+                eip = mu.reg_read(UC_X86_REG_EIP)
+                res.error = f"unicorn: {e} (EIP={eip:#010x})"
+            except Exception:
+                res.error = f"unicorn: {e}"
 
     res.instructions_executed = insn_count[0]
     if res.exit_code is None and res.error is None and not res.timed_out:

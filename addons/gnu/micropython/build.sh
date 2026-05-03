@@ -42,6 +42,20 @@ mkdir -p build build/genhdr
 # emit these from the source tree; for triage we ship empty stubs
 # so the preprocessor finds them and we see compile-class failures
 # (uc386 limitations) instead of a wall of missing-header errors.
+# Patch upstream/extmod/modtime.c so its `#include MICROPY_PY_TIME_INCLUDEFILE`
+# becomes a literal include of our port shim. uc386's preprocessor
+# doesn't support macro-name-in-#include (the GCC/Clang feature
+# where the preprocessor expands the macro and then re-tokenizes).
+# Idempotent: checks for the already-patched literal before
+# re-applying.
+if grep -q '^#include MICROPY_PY_TIME_INCLUDEFILE$' upstream/extmod/modtime.c; then
+    # Bare filename — found via build_port.sh's `-I uc386-dos` search path.
+    sed -i.bak \
+        's|^#include MICROPY_PY_TIME_INCLUDEFILE$|#include "modtime_uc386dos.c"|' \
+        upstream/extmod/modtime.c
+    rm -f upstream/extmod/modtime.c.bak
+fi
+
 # Patch upstream/ports/minimal/main.c so its stub `mp_import_stat`
 # and `mp_lexer_new_from_file` don't collide with the real
 # implementations our port provides in `uc386-dos/file_uc386dos.c`.
