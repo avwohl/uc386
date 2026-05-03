@@ -39,17 +39,26 @@
 // Port-incompatible defaults — all of these are EXTRA-default but
 // need port-supplied helpers we don't ship today.
 //
-//   - MICROPY_STACK_CHECK: needs `mp_stack_set_top/_limit` calls in
-//     main(); ports/minimal/main.c doesn't make them, every check
-//     fails, and the stack-overflow raise path infinite-loops.
+//   - (was MICROPY_STACK_CHECK — now enabled below; main.c calls
+//     mp_stack_ctrl_init + mp_stack_set_limit at startup)
 //   - (was MICROPY_PY_UCTYPES — now enabled below)
 //   - (was MICROPY_PY_TIME_TIME_TIME_NS — now enabled below)
 //   - MICROPY_PY_BUILTINS_HELP: needs port-supplied help text
 //     table; we don't ship one.
 //   - MICROPY_MODULE___FILE__: needs source-path tracker.
-#define MICROPY_STACK_CHECK               (0)
 #define MICROPY_PY_BUILTINS_HELP          (0)
 #define MICROPY_MODULE___FILE__           (0)
+
+// Stack-overflow guard. With a 1 MB stack (dos_emu maps STACK_BASE
+// 0x01000000..0x01100000), an unbounded recursion or huge frame
+// would otherwise hit unmapped memory and surface as
+// UC_ERR_WRITE_UNMAPPED instead of a clean RuntimeError. main.c
+// (sed-patched in build.sh) calls `mp_stack_ctrl_init()` after
+// mp_init to capture the real stack top, then
+// `mp_stack_set_limit(0xC0000)` to give a 256 KB safety margin
+// (i.e., raise RecursionError when usage hits 768 KB, well below
+// the 1 MB hard limit).
+#define MICROPY_STACK_CHECK               (1)
 // `uctypes` — binary struct access for memoryview/buffer-like
 // objects (define a layout dict, pin it onto a buffer, read/write
 // fields by name). build_port.sh adds extmod/moductypes.c to the

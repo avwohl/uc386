@@ -1061,6 +1061,40 @@ def test_micropython_sys_argv_is_empty_list(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_stack_check_catches_runaway_recursion(micropython_bin: Path) -> None:
+    """`MICROPY_STACK_CHECK=1` enables `mp_stack_check()` calls
+    in the VM dispatcher. Combined with the `mp_stack_ctrl_init`
+    + `mp_stack_set_limit(0xC0000)` calls main.c does at startup
+    (sed-patched in by build.sh), unbounded recursion raises
+    `RuntimeError("maximum recursion depth exceeded")` instead
+    of running off the end of the dos_emu 1 MB stack and
+    triggering UC_ERR_WRITE_UNMAPPED."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"def f(n):\n"
+                  b"  return f(n+1)\n"
+                  b"\n"
+                  b"try:\n"
+                  b"  f(0)\n"
+                  b"except RuntimeError as e:\n"
+                  b"  print('caught:', e)\n"
+                  b"\n"
+                  b"\x04"
+              ),
+              timeout_seconds=30.0,
+              instruction_limit=8_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "maximum recursion depth exceeded" in res.stdout, (
+        f"expected RuntimeError message about recursion depth, "
+        f"got: {res.stdout!r}"
+    )
+
+
 def test_micropython_uctypes_struct_roundtrip(micropython_bin: Path) -> None:
     """`uctypes` (binary struct access for buffer-like objects).
     Defines a layout dict, pins it onto a bytearray, writes

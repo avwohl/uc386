@@ -83,6 +83,21 @@ if ! grep -q "mp_obj_list_init.*mp_sys_argv_obj" upstream/ports/minimal/main.c; 
     rm -f upstream/ports/minimal/main.c.bak
 fi
 
+# Patch upstream/ports/minimal/main.c to wire up `MICROPY_STACK_CHECK`.
+# `mp_stack_ctrl_init()` captures the real stack top from a local
+# stack variable; `mp_stack_set_limit(LIMIT)` sets the recursion-
+# depth cap. Without these calls, every `mp_stack_check()` fires
+# immediately (stack_top is NULL → mp_stack_usage returns a huge
+# value → recursion-depth raise infinite-loops on its own setup).
+# 0xC0000 = 768 KB, leaving 256 KB margin in dos_emu's 1 MB stack.
+# Idempotent: only inserts if not already present.
+if ! grep -q "mp_stack_ctrl_init" upstream/ports/minimal/main.c; then
+    sed -i.bak \
+        's|^    mp_init();$|    mp_stack_ctrl_init();\n    mp_stack_set_limit(0xC0000);\n    mp_init();|' \
+        upstream/ports/minimal/main.c
+    rm -f upstream/ports/minimal/main.c.bak
+fi
+
 # Patch upstream/py/formatfloat.c so the DOUBLE-mode `repr()` doesn't
 # request more digits than uc386's double-precision FPU can deliver.
 # Default is `MAX_MANTISSA_DIGITS=19` (designed for the EXACT formatter
