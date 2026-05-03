@@ -275,6 +275,13 @@ extern const struct _mp_obj_module_t mp_module_time;
 #define UCDOS_MOD_ENTRY_TIME
 #endif
 
+#if MICROPY_PY_UCTYPES
+extern const struct _mp_obj_module_t mp_module_uctypes;
+#define UCDOS_MOD_ENTRY_UCTYPES { MP_ROM_QSTR(MP_QSTR_uctypes), MP_ROM_PTR(&mp_module_uctypes) },
+#else
+#define UCDOS_MOD_ENTRY_UCTYPES
+#endif
+
 #define MICROPY_REGISTERED_MODULES \
     { MP_ROM_QSTR(MP_QSTR_builtins), MP_ROM_PTR(&mp_module_builtins) }, \
     { MP_ROM_QSTR(MP_QSTR_sys), MP_ROM_PTR(&mp_module_sys) }, \
@@ -286,7 +293,8 @@ extern const struct _mp_obj_module_t mp_module_time;
     UCDOS_MOD_ENTRY_COLLECTIONS \
     UCDOS_MOD_ENTRY_ERRNO \
     UCDOS_MOD_ENTRY_STRUCT \
-    UCDOS_MOD_ENTRY_TIME
+    UCDOS_MOD_ENTRY_TIME \
+    UCDOS_MOD_ENTRY_UCTYPES
 
 #define MICROPY_REGISTERED_EXTENSIBLE_MODULES
 EOF

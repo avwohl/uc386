@@ -92,6 +92,7 @@ SOURCES_FILE="build/_port_sources.txt"
     echo upstream/shared/runtime/sys_stdio_mphal.c
     echo upstream/shared/timeutils/timeutils.c
     echo upstream/extmod/modtime.c
+    echo upstream/extmod/moductypes.c
     echo upstream/ports/minimal/main.c
     echo upstream/ports/minimal/uart_core.c
     echo uc386-dos/mphal_uc386dos.c

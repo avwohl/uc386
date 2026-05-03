@@ -1061,6 +1061,40 @@ def test_micropython_sys_argv_is_empty_list(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_uctypes_struct_roundtrip(micropython_bin: Path) -> None:
+    """`uctypes` (binary struct access for buffer-like objects).
+    Defines a layout dict, pins it onto a bytearray, writes
+    fields by name, verifies the underlying bytes are correct
+    little-endian. With MICROPY_PY_UCTYPES=1 build_port.sh adds
+    extmod/moductypes.c to the source list and build.sh's
+    moduledefs.h registers `uctypes`."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import uctypes\n"
+                  b"buf = bytearray(8)\n"
+                  b"desc = {'a': 0 | uctypes.UINT32, 'b': 4 | uctypes.UINT32}\n"
+                  b"s = uctypes.struct(uctypes.addressof(buf), desc, "
+                  b"uctypes.LITTLE_ENDIAN)\n"
+                  b"s.a = 0xDEADBEEF\n"
+                  b"s.b = 0xCAFEBABE\n"
+                  b"print(buf.hex())\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # Little-endian: 0xDEADBEEF → ef be ad de, 0xCAFEBABE → be ba fe ca
+    assert "efbeaddebebafeca" in res.stdout, (
+        f"expected little-endian 0xDEADBEEF + 0xCAFEBABE bytes "
+        f"(`efbeaddebebafeca`), got: {res.stdout!r}"
+    )
+
+
 def test_micropython_extra_features_compile(micropython_bin: Path) -> None:
     """`compile()` is gated at EXTRA_FEATURES (already on at CORE
     via `MICROPY_PY_BUILTINS_COMPILE && MICROPY_ENABLE_COMPILER`).

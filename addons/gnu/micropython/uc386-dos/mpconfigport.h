@@ -42,17 +42,20 @@
 //   - MICROPY_STACK_CHECK: needs `mp_stack_set_top/_limit` calls in
 //     main(); ports/minimal/main.c doesn't make them, every check
 //     fails, and the stack-overflow raise path infinite-loops.
-//   - MICROPY_PY_UCTYPES: pulls in `extmod/moductypes.c` which
-//     we don't include in build_port.sh's source list; the missing
-//     `mp_module_uctypes` extern crashes the NASM link.
+//   - (was MICROPY_PY_UCTYPES — now enabled below)
 //   - (was MICROPY_PY_TIME_TIME_TIME_NS — now enabled below)
 //   - MICROPY_PY_BUILTINS_HELP: needs port-supplied help text
 //     table; we don't ship one.
 //   - MICROPY_MODULE___FILE__: needs source-path tracker.
 #define MICROPY_STACK_CHECK               (0)
-#define MICROPY_PY_UCTYPES                (0)
 #define MICROPY_PY_BUILTINS_HELP          (0)
 #define MICROPY_MODULE___FILE__           (0)
+// `uctypes` — binary struct access for memoryview/buffer-like
+// objects (define a layout dict, pin it onto a buffer, read/write
+// fields by name). build_port.sh adds extmod/moductypes.c to the
+// source list. The module gets registered under MP_QSTR_uctypes
+// via MP_REGISTER_EXTENSIBLE_MODULE.
+#define MICROPY_PY_UCTYPES                (1)
 
 // `time.time()` / `time.localtime()` / `time.gmtime()` /
 // `time.mktime()` — wired to the DOS RTC via INT 21h AH=0x2A
