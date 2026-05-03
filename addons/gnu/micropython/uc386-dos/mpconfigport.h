@@ -50,14 +50,20 @@
 //   - MICROPY_PY_BUILTINS_HELP: needs port-supplied help text
 //     table; we don't ship one.
 //   - MICROPY_MODULE___FILE__: needs source-path tracker.
-//   - MICROPY_PY_IO: references port-supplied `mp_builtin_open_obj`
-//     and a VFS implementation we don't have.
 #define MICROPY_STACK_CHECK               (0)
 #define MICROPY_PY_UCTYPES                (0)
 #define MICROPY_PY_TIME_TIME_TIME_NS      (0)
 #define MICROPY_PY_BUILTINS_HELP          (0)
 #define MICROPY_MODULE___FILE__           (0)
-#define MICROPY_PY_IO                     (0)
+
+// `open()` + `import xxx` (loading `xxx.py` from disk) wired through
+// uc386's libc INT 21h file syscalls. We provide port-supplied
+// `mp_builtin_open_obj` / `mp_import_stat` / `mp_lexer_new_from_file`
+// in `uc386-dos/file_uc386dos.c` (no full VFS — just enough for
+// flat .py imports and read/write file objects). MICROPY_PY_IO=1
+// pulls in modio.c (io.IOBase, BytesIO, StringIO) and exposes
+// `open` in the builtins table.
+#define MICROPY_PY_IO                     (1)
 
 // `sys`-module sub-features. We have basic `sys` (sys.platform,
 // sys.implementation, sys.maxsize) but no sys.modules cache /

@@ -29,7 +29,7 @@ Type "help()" for more information.
 caught
 ```
 
-What works (40 smoke tests pin the core wins):
+What works (43 smoke tests pin the core wins):
 
 - arithmetic + control flow (`if/else`, `for/range`, `while/break`)
 - function def + call (`def f(x): return x*2; f(7)` → `14`)
@@ -138,6 +138,21 @@ What doesn't work yet (separate gates, pinned in mpconfigport.h):
   matter of opting in plus the few extra qstrs it needs.
 - Full `tgamma` / `lgamma` — currently NaN stubs in libc. A real
   Lanczos approximation is the EXTRA_FEATURES follow-up.
+- `open()` + `import xxx` from disk — file I/O wired through
+  uc386's libc INT 21h syscalls. Port-supplied `mp_builtin_open_obj`
+  / `mp_import_stat` / `mp_lexer_new_from_file` in
+  `uc386-dos/file_uc386dos.c` — no full VFS, just enough for
+  flat .py imports and a read/write file object that supports the
+  full mp_stream protocol (read/readinto/readline/write/close/
+  seek/tell/flush/__enter__/__exit__). Required `_stat` + `_fstat`
+  asm in libc that reassembles the full 32-bit DX:AX position
+  return from INT 21h AH=0x42 SEEK_END (was inheriting stale
+  upper-16 bits of EAX, leading to multi-MB phantom file sizes).
+  Required `MICROPY_PY_IO=1` in mpconfigport.h. Stub overrides of
+  `mp_import_stat` / `mp_lexer_new_from_file` in
+  `upstream/ports/minimal/main.c` are sed-patched out by build.sh
+  so our real implementations link cleanly.
+
 - ~~Full `MICROPY_CONFIG_ROM_LEVEL = EXTRA_FEATURES`~~ — DONE
   (2026-05-03). The wholesale-EXTRA hang turned out to be
   `MICROPY_STACK_CHECK`: it needs the port to call

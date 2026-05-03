@@ -42,6 +42,20 @@ mkdir -p build build/genhdr
 # emit these from the source tree; for triage we ship empty stubs
 # so the preprocessor finds them and we see compile-class failures
 # (uc386 limitations) instead of a wall of missing-header errors.
+# Patch upstream/ports/minimal/main.c so its stub `mp_import_stat`
+# and `mp_lexer_new_from_file` don't collide with the real
+# implementations our port provides in `uc386-dos/file_uc386dos.c`.
+# The minimal port hardcodes "no filesystem" responses; we overrride
+# with INT 21h-backed file I/O via uc386's libc. Idempotent: checks
+# for the already-patched marker before re-applying.
+if grep -q "^mp_import_stat_t mp_import_stat" upstream/ports/minimal/main.c; then
+    sed -i.bak \
+        -e 's|^mp_lexer_t \*mp_lexer_new_from_file(qstr filename) {|static mp_lexer_t *_unused_mp_lexer_new_from_file(qstr filename) { (void)filename;|' \
+        -e 's|^mp_import_stat_t mp_import_stat(const char \*path) {|static mp_import_stat_t _unused_mp_import_stat(const char *path) { (void)path;|' \
+        upstream/ports/minimal/main.c
+    rm -f upstream/ports/minimal/main.c.bak
+fi
+
 # Patch upstream/py/formatfloat.c so the DOUBLE-mode `repr()` doesn't
 # request more digits than uc386's double-precision FPU can deliver.
 # Default is `MAX_MANTISSA_DIGITS=19` (designed for the EXACT formatter

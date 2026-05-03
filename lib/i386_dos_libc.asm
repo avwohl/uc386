@@ -3997,13 +3997,126 @@ _setlocale:
         mov     eax, _locale_C
         ret
 
-; ---- stat / lstat / access: filesystem queries — return -1 (not found) ------
+; ---- stat / fstat / lstat — minimal DOS-side implementation ----------------
+; Open the file, lseek to end to get size, close, and write
+; st_mode = S_IFREG + st_size into the caller-supplied struct.
+; Doesn't detect directories (which can't be opened with INT 21h
+; AH=0x3D anyway) — the path either exists as a regular file or is
+; reported as not found. Enough for `mp_import_stat()` to find .py
+; modules and for `mp_lexer_new_from_file()` to size the buffer.
+;
+; struct stat fields we touch (uc386's lib/include/sys/stat.h
+; layout):
+;   offset  8: st_mode    (S_IFREG = 0x8000)
+;   offset 28: st_size    (32-bit byte count)
 _stat:
-        mov     eax, -1
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    esi
+        ; open(path, O_RDONLY=0)
+        mov     edx, [ebp + 8]
+        xor     al, al
+        mov     ah, 0x3D
+        int     21h
+        cmp     eax, -1
+        je      .stat_fail
+        mov     ebx, eax
+        ; lseek(fd, 0, SEEK_END=2) — returns the new (= total) pos
+        ; in DX:AX (low 16 in AX, high 16 in DX). Real DOS sets only
+        ; those halves; the upper bytes of EAX/EDX that we ORed in
+        ; from `mov ah, 0x42 / mov al, 2 / xor edx, edx` are
+        ; preserved from before the int. Reassemble the full 32-bit
+        ; pos by zero-extending each half.
+        mov     ah, 0x42
+        mov     al, 2
+        xor     ecx, ecx
+        xor     edx, edx
+        int     21h
+        ; ESI = (ZX of AX) | (ZX of DX << 16). Save in ESI because
+        ; ESI is callee-saved across the close int below — push/pop
+        ; around int 21h gets eaten by a peephole pass that doesn't
+        ; model int-as-clobber.
+        movzx   esi, ax
+        movzx   eax, dx
+        shl     eax, 16
+        or      esi, eax
+        ; close(fd)
+        mov     ah, 0x3E
+        int     21h
+        ; Fill the caller's struct.
+        mov     edx, [ebp + 12]
+        mov     dword [edx + 8], 0x8000      ; st_mode = S_IFREG
+        mov     [edx + 28], esi              ; st_size
+        xor     eax, eax
+        pop     esi
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
         ret
+.stat_fail:
+        mov     eax, -1
+        pop     esi
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int fstat(int fd, struct stat *buf)
+;   Tell current pos, seek to end (= size), seek back, write
+;   st_mode + st_size. Uses ESI/EDI to carry size + saved-pos
+;   across the multiple int 21h calls (see _stat for the
+;   peephole-eats-push/pop-around-int rationale).
+_fstat:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    esi
+        push    edi
+        mov     ebx, [ebp + 8]
+        ; tell: lseek(fd, 0, SEEK_CUR=1) → DX:AX
+        mov     ah, 0x42
+        mov     al, 1
+        xor     ecx, ecx
+        xor     edx, edx
+        int     21h
+        ; EDI = saved pos full 32-bit (zero-extended from DX:AX).
+        movzx   edi, ax
+        movzx   eax, dx
+        shl     eax, 16
+        or      edi, eax
+        ; seek to end → DX:AX = total size
+        mov     ah, 0x42
+        mov     al, 2
+        xor     ecx, ecx
+        xor     edx, edx
+        int     21h
+        movzx   esi, ax
+        movzx   eax, dx
+        shl     eax, 16
+        or      esi, eax                     ; ESI = full size
+        ; restore pos: lseek(fd, saved, SEEK_SET=0)
+        ; CX:DX = offset (we only need 32-bit, so high 16 = 0).
+        mov     ah, 0x42
+        xor     al, al
+        mov     edx, edi                     ; offset low 16 = EDI low
+        mov     ecx, edi
+        shr     ecx, 16                      ; offset high 16 = EDI high
+        int     21h
+        ; fill struct
+        mov     edx, [ebp + 12]
+        mov     dword [edx + 8], 0x8000
+        mov     [edx + 28], esi
+        xor     eax, eax
+        pop     edi
+        pop     esi
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
 _lstat:
-        mov     eax, -1
-        ret
+        jmp     _stat                        ; no symlinks under DOS
 ; ---- access(path, mode) ---------------------------------------------------
 ; Return 0 if path exists (mode bits ignored — dos_emu has no real
 ; perms). Try to open() the path read-only; on success close + return 0,

@@ -1087,6 +1087,101 @@ def test_micropython_extra_features_special_methods(micropython_bin: Path) -> No
     )
 
 
+def test_micropython_open_read(micropython_bin: Path) -> None:
+    """`open(path).read()` exercises the port-supplied
+    `mp_builtin_open_obj` (uc386-dos/file_uc386dos.c) which wraps
+    a DOS file handle. Backing INT 21h calls (open/read/close)
+    flow through dos_emu's vfile layer for the test, but production
+    just hits real DOS via `_open` etc. in lib/i386_dos_libc.asm."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"f = open('hello.txt')\n"
+                  b"print(f.read())\n"
+                  b"f.close()\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000,
+              vfiles_init={b"hello.txt": b"Hello from disk!"})
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "Hello from disk!" in res.stdout, (
+        f"expected file contents in stdout, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_open_write_read_roundtrip(micropython_bin: Path) -> None:
+    """`open(path, 'w').write(...)` + reopen + `.read()` exercises the
+    full write path via INT 21h AH=0x40 (and create-via-AH=0x3D mode 1).
+    Pin both that the write returns the byte count and that the data
+    survives a close/reopen."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"f = open('out.txt', 'w')\n"
+                  b"print(f.write('hello'))\n"
+                  b"f.close()\n"
+                  b"f = open('out.txt')\n"
+                  b"print(f.read())\n"
+                  b"f.close()\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000,
+              vfiles_init={b"out.txt": b""})
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "\n5\n" in res.stdout, (
+        f"expected write to return 5, got: {res.stdout!r}"
+    )
+    assert "\nhello\n" in res.stdout, (
+        f"expected `hello` round-trip, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_import_from_disk(micropython_bin: Path) -> None:
+    """`import xxx` loads `xxx.py` from disk via the port-supplied
+    `mp_lexer_new_from_file()` + `mp_import_stat()` pair. Pins the
+    full lex → parse → compile → execute path on a non-trivial
+    module body. The `_stat` impl in libc had to be fixed to
+    zero-extend the DX:AX 32-bit-pos return from INT 21h AH=0x42
+    SEEK_END (was inheriting stale upper-16 bits of EAX, leading
+    to multi-MB phantom file sizes and `MemoryError: allocating
+    17760257 bytes`)."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import mymod\n"
+                  b"print(mymod.x, mymod.greet('world'))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000,
+              vfiles_init={
+                  b"mymod.py": (
+                      b"x = 42\n"
+                      b"def greet(name):\n"
+                      b"    return 'hello, ' + name\n"
+                  ),
+              })
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "42 hello, world" in res.stdout, (
+        f"expected `42 hello, world` from imported module, got: "
+        f"{res.stdout!r}"
+    )
+
+
 def test_micropython_import_array(micropython_bin: Path) -> None:
     """`import array; array.array('i', ...)` — gated on
     `MICROPY_PY_ARRAY` (CORE_FEATURES). Pins typed-array storage
