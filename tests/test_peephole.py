@@ -16191,3 +16191,55 @@ def test_slot_constant_propagation_skips_when_reg_source():
     assert opt.stats.get(
         "slot_constant_propagation", 0
     ) == 0
+
+
+
+def test_classify_strips_comment_from_operands():
+    """`Line.operands` was including trailing comments. A line like
+    `push eax  ; save size` ended up with operands =
+    `eax  ; save size`, so downstream passes that test
+    `_is_general_register(operands)` saw a non-register string and
+    treated `push eax` as a non-register push. `_pass_push_pop_to_mov`
+    then matched `push eax / int 21h / pop eax` and rewrote the pop
+    to `mov eax, eax`, losing the EAX save across the int (which
+    DOES clobber EAX).
+
+    Surfaced via lib/i386_dos_libc.asm's `_stat` returning size=0
+    for any file because the lseek-result EAX got eaten by the
+    intermediate close(2). Pinned at the parser layer."""
+    from uc386.peephole import _classify
+    line = _classify("        push    eax                 ; save size")
+    assert line.op == "push"
+    assert line.operands == "eax", (
+        f"expected operands stripped of comment, got: {line.operands!r}"
+    )
+
+
+def test_push_eax_around_int_preserved():
+    """End-to-end: `push eax / int 21h / pop eax` must NOT collapse
+    to `mov eax, eax`. The int call clobbers EAX, so the pop is the
+    only way to recover the saved value. Caught when uc386's `_stat`
+    asm tried this pattern around an INT 21h close call and got
+    silently broken."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        push    eax              ; save it\n"
+        "        mov     ah, 0x3E\n"
+        "        int     21h\n"
+        "        pop     eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    eax" in out, (
+        f"expected push eax preserved, got:\n{out}"
+    )
+    assert "pop     eax" in out, (
+        f"expected pop eax preserved, got:\n{out}"
+    )
+    assert "mov     eax, eax" not in out, (
+        f"unexpected mov eax, eax (push/pop wrongly collapsed):\n{out}"
+    )

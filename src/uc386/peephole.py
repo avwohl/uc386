@@ -209,6 +209,21 @@ def _classify(raw: str) -> Line:
     if m:
         op = m.group(2).lower()
         operands = (m.group(3) or "").strip()
+        # Strip trailing `; comment` from operands. The instr regex
+        # captures everything after the mnemonic into group 3, so a
+        # line like `push eax  ; save size` ends up with operands =
+        # `eax  ; save size`. Downstream passes that test
+        # `operands.strip().lower() == "eax"` (or call
+        # `_is_general_register(operands)`) miss when the comment is
+        # there — leading e.g. `_pass_push_pop_to_mov` to treat
+        # `push eax` as a non-register push and rewrite it to
+        # `mov eax, eax`, dropping the round-trip across an int.
+        # Comments don't appear inside any of our codegen operand
+        # strings (we never emit `mov eax, [foo;bar]`), so the
+        # split is safe.
+        semi_idx = operands.find(";")
+        if semi_idx >= 0:
+            operands = operands[:semi_idx].rstrip()
         # NASM directives like `db`, `dw`, `dd`, `dq`, `times`, `resb`,
         # `resw`, `resd`, `resq`, `equ` — these live in .data/.bss and
         # aren't real instructions. Keep them as "data" so dead-after-jmp
