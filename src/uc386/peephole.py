@@ -18883,6 +18883,21 @@ class PeepholeOptimizer:
                 r"\[\s*ebp\s*-\s*\d+\s*\]", operands, re.IGNORECASE,
             ):
                 return False
+            # [ebp] / [ebp + 0] (saved-EBP slot from prologue). When
+            # the prologue is dropped this slot ceases to exist —
+            # the access would map to `[esp - 4]` (below the new
+            # esp, undefined). Bail. Surfaced in uc386's libc
+            # `_setjmp`, which reads `[ebp]` to capture the caller's
+            # saved ebp into jmp_buf[12]; pre-fix the pass dropped
+            # _setjmp's prologue but left the `[ebp]` access intact,
+            # so jmp_buf[12] wound up holding the *caller's caller's*
+            # ebp. longjmp then restored EBP to that wrong frame and
+            # MicroPython's exception-traceback path crashed reading
+            # `code_state->fun_bc->context` against the bogus ebp.
+            if re.search(
+                r"\[\s*ebp\s*(?:\+\s*0\s*)?\]", operands, re.IGNORECASE,
+            ):
+                return False
             # SIB-form ebp accesses.
             if re.search(
                 r"\[\s*ebp\s*\+\s*\w+\s*\*",

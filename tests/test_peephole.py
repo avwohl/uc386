@@ -13751,6 +13751,60 @@ def test_pure_leaf_drop_frame_skips_when_sub_esp_in_body():
     assert opt.stats.get("pure_leaf_drop_frame", 0) == 0
 
 
+def test_pure_leaf_drop_frame_skips_when_body_reads_saved_ebp_slot():
+    """Function reads `[ebp]` (the saved-EBP slot from the prologue) —
+    must NOT have its prologue dropped, otherwise post-rewrite the
+    access reads from the *caller*'s frame instead of the saved EBP.
+
+    Surfaced by uc386's libc `_setjmp`, which captures the caller's
+    ebp via `mov ecx, [ebp]; mov [eax + 12], ecx` and stores it in
+    `jmp_buf[12]`. With the bug active, jmp_buf[12] held the
+    caller's *caller's* ebp; longjmp later restored EBP to that
+    wrong frame and MicroPython's exception-traceback path crashed
+    reading `code_state->fun_bc->context` against a bogus ebp."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp]\n"
+        "        mov     [eax + 12], ecx\n"
+        "        xor     eax, eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Frame must still be present: prologue + leave intact.
+    assert "push    ebp" in out
+    assert "mov     ebp, esp" in out
+    assert "leave" in out
+    # And the [ebp] access must NOT have been blindly rewritten.
+    assert "[ebp]" in out
+    assert opt.stats.get("pure_leaf_drop_frame", 0) == 0
+
+
+def test_pure_leaf_drop_frame_skips_when_body_reads_ebp_plus_zero():
+    """Same as above but written as `[ebp + 0]` — same slot, same
+    bail."""
+    asm = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        mov     eax, [ebp + 8]\n"
+        "        mov     ecx, [ebp + 0]\n"
+        "        mov     [eax], ecx\n"
+        "        xor     eax, eax\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert "push    ebp" in out
+    assert "leave" in out
+    assert opt.stats.get("pure_leaf_drop_frame", 0) == 0
+
+
 def test_pure_leaf_drop_frame_with_enter_form():
     """`enter K, 0` form is also recognized as the prologue."""
     asm = (

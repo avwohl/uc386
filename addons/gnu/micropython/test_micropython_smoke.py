@@ -422,26 +422,6 @@ def test_micropython_min_max_reversed(micropython_bin: Path) -> None:
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Pre-existing crash in `mp_execute_bytecode`'s traceback "
-        "construction path: a top-level REPL line that raises an "
-        "exception trips a UC_ERR_READ_UNMAPPED at "
-        "`code_state->fun_bc->context->constants.source_file` "
-        "(EIP=0x3426b in vm.c around line 1455). The fun_bc pointer "
-        "from code_state.[+0] reads as a value inside a static "
-        "compiler dispatch table rather than a heap-allocated "
-        "fun_bc — code_state appears mis-initialized along this "
-        "path. Reproduces against the pre-time-module bin too, so "
-        "it's not a regression from time-module work. Exceptions "
-        "raised INSIDE a defined function (`def f(): 1/0; f()`) "
-        "work fine because they unwind to pyexec.c's "
-        "`mp_obj_print_exception` instead. Tracking under "
-        "addons/gnu/micropython/NOTES.md."
-    ),
-    strict=True,
-    raises=AssertionError,
-)
 def test_micropython_try_except(micropython_bin: Path) -> None:
     """`try: 1/0 except ZeroDivisionError: print(\"caught\")`
     exercises the NLR (non-local return) path: the VM raises
@@ -504,17 +484,6 @@ def test_micropython_core_features_set(micropython_bin: Path) -> None:
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Pre-existing traceback-path crash — same root cause as "
-        "test_micropython_try_except. A top-level REPL `NameError` "
-        "trips `mp_execute_bytecode`'s exception-traceback "
-        "construction at EIP=0x3426b dereferencing a bad "
-        "`code_state->fun_bc->context`."
-    ),
-    strict=True,
-    raises=AssertionError,
-)
 def test_micropython_core_features_named_error(micropython_bin: Path) -> None:
     """At CORE_FEATURES `MICROPY_ERROR_REPORTING_DETAILED` includes
     the offending qstr name in NameError messages (vs MINIMUM's

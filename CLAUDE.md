@@ -21,7 +21,7 @@ See `README.md` for the public roadmap (Phase 0–6).
   `brew install python@3.12` (Apple's system 3.9 is too old).
 - Working venv at `.venv/` with `uc_core`, `uc386`, `unicorn` installed.
   - Create: `python3 -m venv .venv && .venv/bin/pip install pytest unicorn -e ../uc_core -e .`
-- Run tests: `.venv/bin/pytest tests/` (expect 1327 passed).
+- Run tests: `.venv/bin/pytest tests/` (expect 1329 passed).
 - Run driver: `.venv/bin/python -m uc386.main examples/hello.c -o /tmp/hello.asm`
 - Assembler target: NASM Intel syntax (`bits 32`, `section .text`).
 - Full per-platform install (brew / apt / dnf), incl. optional bison +
