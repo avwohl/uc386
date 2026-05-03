@@ -116,14 +116,22 @@
 //   - sys.modules: dict of imported modules. `mp_init` already
 //     initializes `mp_loaded_modules_dict` via
 //     `mp_obj_dict_init(...)`; just exposing it as `sys.modules`.
-//   - sys.argv: empty list initialized in main.c (we sed-patch
-//     `mp_obj_list_init(&MP_STATE_VM(mp_sys_argv_obj), 0)` in
-//     after `mp_init()` — see build.sh).
-//   - sys.path stays off: requires MICROPY_PY_SYS_ATTR_DELEGATION
-//     (per modsys.c:267) which adds non-trivial dispatch overhead.
+//   - sys.argv: empty list. `mp_init`'s
+//     `MICROPY_PY_SYS_PATH_ARGV_DEFAULTS` block (runtime.c:142)
+//     auto-initializes both sys.path and sys.argv when the flags
+//     are on, so no port shim needed.
+//   - sys.path: list of directories to search on import. With
+//     MICROPY_PY_SYS_PATH=1, builtinimport.c's `stat_top_level`
+//     iterates the list and our `mp_import_stat` (file_uc386dos.c)
+//     stat-checks each candidate. Initialized in mp_init with
+//     a single empty-string entry meaning "current directory".
+//     Enabling MICROPY_PY_SYS_PATH automatically enables
+//     MICROPY_PY_SYS_ATTR_DELEGATION (per modsys.c:267), which
+//     in turn requires MICROPY_MODULE_ATTR_DELEGATION (already
+//     on at our EXTRA_FEATURES ROM level per mpconfig.h:1127).
 #define MICROPY_PY_SYS_MODULES            (1)
 #define MICROPY_PY_SYS_EXIT               (1)
-#define MICROPY_PY_SYS_PATH               (0)
+#define MICROPY_PY_SYS_PATH               (1)
 #define MICROPY_PY_SYS_ARGV               (1)
 
 // errno requires:

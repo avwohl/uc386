@@ -1057,6 +1057,47 @@ def test_micropython_sys_modules_is_dict(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_sys_path_is_mutable_list(micropython_bin: Path) -> None:
+    """`sys.path` (with MICROPY_PY_SYS_PATH=1) is exposed via
+    attribute delegation: modsys.c registers
+    `mp_module_sys_attr` as the sys-module attr handler, which
+    dispatches `sys.path` reads/writes against
+    `MP_STATE_VM(sys_mutable[MP_SYS_MUTABLE_PATH])`. mp_init's
+    `MICROPY_PY_SYS_PATH_ARGV_DEFAULTS` block initializes the
+    list with one entry — empty string = current directory.
+
+    The hand-rolled `build/genhdr/moduledefs.h` (template in
+    build.sh) gains a `MICROPY_MODULE_DELEGATIONS` macro that
+    routes `mp_module_sys` → `mp_module_sys_attr` for objmodule.c's
+    delegation table; without that, every sys.* attr access raises
+    AttributeError."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import sys\n"
+                  b"print(sys.path)\n"
+                  b"sys.path.append('foo')\n"
+                  b"print(sys.path)\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # Initial: ['']
+    assert "\n['']\n" in res.stdout, (
+        f"expected initial sys.path == [''], got: {res.stdout!r}"
+    )
+    # After append: ['', 'foo']
+    assert "['', 'foo']" in res.stdout, (
+        f"expected sys.path == ['', 'foo'] after append, got: "
+        f"{res.stdout!r}"
+    )
+
+
 def test_micropython_sys_argv_is_empty_list(micropython_bin: Path) -> None:
     """`sys.argv` is initialized by main.c via
     `mp_obj_list_init(&MP_STATE_VM(mp_sys_argv_obj), 0)` (sed-

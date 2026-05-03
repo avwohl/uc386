@@ -326,6 +326,19 @@ extern const struct _mp_obj_module_t mp_module_uctypes;
     UCDOS_MOD_ENTRY_TIME \
     UCDOS_MOD_ENTRY_UCTYPES
 
+// Module attribute-access delegation table — modules whose attr
+// loads/stores need to dispatch through a port-supplied function.
+// Picks up `MP_REGISTER_MODULE_DELEGATION(mod, fun)` calls.
+// Currently only `sys` registers one (modsys.c:412): the
+// `mp_module_sys_attr` function which dispatches `sys.path` /
+// `sys.ps1` / `sys.ps2` / `sys.tracebacklimit` reads and writes
+// against `MP_STATE_VM(sys_mutable[])`.
+#if MICROPY_PY_SYS_ATTR_DELEGATION
+extern void mp_module_sys_attr(mp_obj_t self_in, qstr attr, mp_obj_t *dest);
+#define MICROPY_MODULE_DELEGATIONS \
+    { MP_ROM_PTR(&mp_module_sys), mp_module_sys_attr },
+#endif
+
 #define MICROPY_REGISTERED_EXTENSIBLE_MODULES
 EOF
 [ -f build/genhdr/mpversion.h ] || cat > build/genhdr/mpversion.h <<'EOF'
