@@ -963,6 +963,104 @@ def test_micropython_long_long_int_arithmetic(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_sys_exit_raises_systemexit(micropython_bin: Path) -> None:
+    """`sys.exit(N)` raises `SystemExit(N)`. With
+    MICROPY_PY_SYS_EXIT=1, the function is exposed in sys's
+    globals table; `mp_sys_exit` (modsys.c:194) calls
+    `mp_raise_type_arg(&mp_type_SystemExit, args[0])`. We catch
+    here so the harness can assert the exit code without
+    pyexec_friendly_repl bailing the whole REPL."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import sys\n"
+                  b"try:\n"
+                  b"    sys.exit(42)\n"
+                  b"except SystemExit as e:\n"
+                  b"    print('caught', e)\n"
+                  b"\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "caught 42" in res.stdout, (
+        f"expected `caught 42` after sys.exit(42), got: "
+        f"{res.stdout!r}"
+    )
+
+
+def test_micropython_sys_modules_is_dict(micropython_bin: Path) -> None:
+    """`sys.modules` is a dict initialized by `mp_init` via
+    `mp_obj_dict_init(&MP_STATE_VM(mp_loaded_modules_dict), N)`.
+    With MICROPY_PY_SYS_MODULES=1 it's exposed as `sys.modules`.
+
+    Built-in modules (gc, sys, etc.) don't auto-register —
+    `builtinimport.c` only stores user-imported and `__main__`
+    entries (mp_obj_dict_store call at line 483). So we verify
+    `sys.modules` is a real dict by storing something into it
+    and reading it back."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import sys\n"
+                  b"print(type(sys.modules).__name__)\n"
+                  b"sys.modules['probe'] = 42\n"
+                  b"print('probe' in sys.modules, sys.modules['probe'])\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "\ndict\n" in res.stdout, (
+        f"expected sys.modules type to be dict, got: {res.stdout!r}"
+    )
+    assert "True 42" in res.stdout, (
+        f"expected stored entry to round-trip, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_sys_argv_is_empty_list(micropython_bin: Path) -> None:
+    """`sys.argv` is initialized by main.c via
+    `mp_obj_list_init(&MP_STATE_VM(mp_sys_argv_obj), 0)` (sed-
+    patched into upstream/ports/minimal/main.c by build.sh
+    after mp_init). The minimal port doesn't tokenize the DOS
+    PSP cmdline, so argv is an empty list — matching what
+    `python -c '...'` sees. Verify the type is `list` and
+    `len(argv) == 0`, plus `argv.append('foo')` works (proving
+    the list object is real, not a stub)."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import sys\n"
+                  b"print(type(sys.argv).__name__, len(sys.argv))\n"
+                  b"sys.argv.append('foo')\n"
+                  b"print(sys.argv)\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "list 0" in res.stdout, (
+        f"expected `list 0` (type=list, len=0), got: {res.stdout!r}"
+    )
+    assert "['foo']" in res.stdout, (
+        f"expected `['foo']` after append, got: {res.stdout!r}"
+    )
+
+
 def test_micropython_extra_features_compile(micropython_bin: Path) -> None:
     """`compile()` is gated at EXTRA_FEATURES (already on at CORE
     via `MICROPY_PY_BUILTINS_COMPILE && MICROPY_ENABLE_COMPILER`).

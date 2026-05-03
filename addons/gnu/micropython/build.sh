@@ -70,6 +70,19 @@ if grep -q "^mp_import_stat_t mp_import_stat" upstream/ports/minimal/main.c; the
     rm -f upstream/ports/minimal/main.c.bak
 fi
 
+# Patch upstream/ports/minimal/main.c to initialize sys.argv as an
+# empty list right after mp_init(). MICROPY_PY_SYS_ARGV expects the
+# `mp_sys_argv_obj` root pointer to hold a real list object — without
+# this init, sys.argv reads back as a half-initialized struct and
+# crashes on `len(sys.argv)`. Idempotent: only inserts if not already
+# present.
+if ! grep -q "mp_obj_list_init.*mp_sys_argv_obj" upstream/ports/minimal/main.c; then
+    sed -i.bak \
+        's|^    mp_init();$|    mp_init();\n    mp_obj_list_init((mp_obj_list_t *)\&MP_STATE_VM(mp_sys_argv_obj), 0);|' \
+        upstream/ports/minimal/main.c
+    rm -f upstream/ports/minimal/main.c.bak
+fi
+
 # Patch upstream/py/formatfloat.c so the DOUBLE-mode `repr()` doesn't
 # request more digits than uc386's double-precision FPU can deliver.
 # Default is `MAX_MANTISSA_DIGITS=19` (designed for the EXACT formatter

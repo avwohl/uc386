@@ -93,14 +93,22 @@
 // `open` in the builtins table.
 #define MICROPY_PY_IO                     (1)
 
-// `sys`-module sub-features. We have basic `sys` (sys.platform,
-// sys.implementation, sys.maxsize) but no sys.modules cache /
-// sys.exit / sys.path / sys.argv — those need port-supplied
-// state.
-#define MICROPY_PY_SYS_MODULES            (0)
-#define MICROPY_PY_SYS_EXIT               (0)
+// `sys`-module sub-features.
+//   - sys.exit: raises `SystemExit`; pyexec_friendly_repl catches
+//     it and bails out of the REPL loop, then main() returns to
+//     the libc cleanup → INT 21h AH=4Ch with the exit code.
+//   - sys.modules: dict of imported modules. `mp_init` already
+//     initializes `mp_loaded_modules_dict` via
+//     `mp_obj_dict_init(...)`; just exposing it as `sys.modules`.
+//   - sys.argv: empty list initialized in main.c (we sed-patch
+//     `mp_obj_list_init(&MP_STATE_VM(mp_sys_argv_obj), 0)` in
+//     after `mp_init()` — see build.sh).
+//   - sys.path stays off: requires MICROPY_PY_SYS_ATTR_DELEGATION
+//     (per modsys.c:267) which adds non-trivial dispatch overhead.
+#define MICROPY_PY_SYS_MODULES            (1)
+#define MICROPY_PY_SYS_EXIT               (1)
 #define MICROPY_PY_SYS_PATH               (0)
-#define MICROPY_PY_SYS_ARGV               (0)
+#define MICROPY_PY_SYS_ARGV               (1)
 
 // errno requires:
 //  - build.sh to pre-emit the EPERM/ENOENT/... qstrs (the module's
