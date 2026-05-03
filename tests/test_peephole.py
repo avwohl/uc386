@@ -16243,3 +16243,116 @@ def test_push_eax_around_int_preserved():
     assert "mov     eax, eax" not in out, (
         f"unexpected mov eax, eax (push/pop wrongly collapsed):\n{out}"
     )
+
+
+def test_dead_push_pop_pair_with_comment_drops_correctly():
+    """`push ebx ; save / pop ebx` (when ebx dead after) should drop
+    the pair regardless of the `; save` comment. Without the
+    parser-level comment strip, the pass would test
+    `operands.strip()` == "ebx" against the string `ebx ; save` and
+    not recognize this as a register pop, leaving the pair in
+    place."""
+    asm = (
+        "_f:\n"
+        "        push    ebx                  ; save\n"
+        "        pop     ebx                  ; restore\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    # Same-register no-op: both dropped.
+    assert "push    ebx" not in out, (
+        f"expected push dropped, got:\n{out}"
+    )
+    assert "pop     ebx" not in out, (
+        f"expected pop dropped, got:\n{out}"
+    )
+
+
+def test_peephole_invariant_under_trailing_comments():
+    """Meta-regression: appending `    ; trailing comment` to every
+    instruction line must not change peephole's output (modulo the
+    comments themselves). This is the parser-level invariant the
+    `_classify` comment-strip relies on; ensures any future pass
+    that inspects `Line.operands` stays correct under commented
+    input."""
+    base = (
+        "_f:\n"
+        "        push    ebp\n"
+        "        mov     ebp, esp\n"
+        "        push    ebx\n"
+        "        push    esi\n"
+        "        mov     eax, 5\n"
+        "        mov     ebx, 3\n"
+        "        add     eax, ebx\n"
+        "        push    eax\n"
+        "        mov     ah, 0x3E\n"
+        "        int     21h\n"
+        "        pop     eax\n"
+        "        mov     [esp + 8], eax\n"
+        "        pop     esi\n"
+        "        pop     ebx\n"
+        "        leave\n"
+        "        ret\n"
+    )
+    # Inject ` ; track` after every instruction line. Skip labels +
+    # blank lines.
+    commented_lines = []
+    for line in base.splitlines():
+        s = line.strip()
+        if not s or s.startswith(";") or s.endswith(":"):
+            commented_lines.append(line)
+            continue
+        commented_lines.append(line + "    ; track")
+    commented = "\n".join(commented_lines) + "\n"
+
+    base_out = PeepholeOptimizer().optimize(base)
+    commented_out = PeepholeOptimizer().optimize(commented)
+
+    def normalize(asm: str) -> list[str]:
+        out: list[str] = []
+        for line in asm.splitlines():
+            s = line
+            i = s.find(";")
+            if i >= 0:
+                s = s[:i].rstrip()
+            s = s.rstrip()
+            if s:
+                out.append(s)
+        return out
+
+    a = normalize(base_out)
+    b = normalize(commented_out)
+    assert a == b, (
+        f"peephole output diverged when comments were added.\n"
+        f"--- without comments ---\n" + "\n".join(a) +
+        f"\n--- with comments ---\n" + "\n".join(b)
+    )
+
+
+def test_dup_push_pop_self_op_with_commented_operands():
+    """`_pass_dup_push_pop_self_op` collapses the standard
+    `push X; mov reg1, X; pop reg2; OP reg1, reg2` pattern when the
+    push/mov reload the same X. The pattern matcher previously
+    compared `push_x.lower()` and `mov_src.lower()` directly — if
+    either had a comment, the .lower()s would differ and the
+    rewrite wouldn't fire even when the underlying operands match.
+    Pin the comment-stripped path."""
+    asm = (
+        "_f:\n"
+        "        push    [ebp - 4]            ; arg copy\n"
+        "        mov     eax, [ebp - 4]       ; same value\n"
+        "        pop     ecx                  ; pop the dup\n"
+        "        add     eax, ecx             ; combine\n"
+        "        ret\n"
+    )
+    opt = PeepholeOptimizer()
+    out = opt.optimize(asm)
+    assert opt.stats.get("dup_push_pop_self_op", 0) == 1, (
+        f"expected dup_push_pop_self_op to fire, stats={dict(opt.stats)}, "
+        f"got:\n{out}"
+    )
+    # After rewrite: push and pop dropped, add becomes `add eax, eax`.
+    assert "push    [ebp - 4]" not in out
+    assert "pop     ecx" not in out
+    assert "add     eax, eax" in out

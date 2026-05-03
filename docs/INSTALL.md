@@ -25,7 +25,7 @@ NASM assembles it into a flat 32-bit binary that runs under
 	pip install pytest unicorn "uc_core @ git+https://github.com/avwohl/uc_core@main" -e .
 	pytest tests/
 
-A clean run prints `1324 passed`.
+A clean run prints `1327 passed`.
 
 ## Required tools
 
@@ -135,11 +135,11 @@ embedded archive directly (as above) avoids the installer entirely.
 ## Verifying the install
 
 	. .venv/bin/activate
-	pytest tests/ -q              # 1324 unit tests
+	pytest tests/ -q              # 1327 unit tests
 	python -m uc386.main examples/hello.c -o /tmp/hello.asm
 	nasm -f bin /tmp/hello.asm -o /tmp/hello.bin
 	python -c "from pathlib import Path; from uc386.dos_emu import run; print(run(Path('/tmp/hello.bin')))"
 
-If `pytest` reports `1324 passed`, the core install is healthy.
+If `pytest` reports `1327 passed`, the core install is healthy.
 The optional tools only matter if you plan to build addons or
 run the comparison report.
