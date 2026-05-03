@@ -1216,6 +1216,108 @@ def test_micropython_stack_check_catches_runaway_recursion(micropython_bin: Path
     )
 
 
+def test_micropython_random_seeded(micropython_bin: Path) -> None:
+    """`random.seed(N)` then `random.getrandbits(8)` is
+    deterministic — yasmarang PRNG. Pin a value against the
+    seed-42 sequence."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import random\n"
+                  b"random.seed(42)\n"
+                  b"print(random.getrandbits(8))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "\n156\n" in res.stdout, (
+        f"expected `156` (yasmarang seed=42 first 8-bit getrandbits), "
+        f"got: {res.stdout!r}"
+    )
+
+
+def test_micropython_binascii_hexlify(micropython_bin: Path) -> None:
+    """`binascii.hexlify(b'abc')` → `b'616263'`. Pin a basic
+    round-trip through the binascii module's hex codec."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import binascii\n"
+                  b"print(binascii.hexlify(b'abc'))\n"
+                  b"print(binascii.unhexlify(b'616263'))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "b'616263'" in res.stdout, (
+        f"expected hexlify result, got: {res.stdout!r}"
+    )
+    assert "b'abc'" in res.stdout, (
+        f"expected unhexlify result, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_hashlib_sha256(micropython_bin: Path) -> None:
+    """`hashlib.sha256(b'hello').hexdigest()` → known SHA-256.
+    Validates the inline-included `lib/crypto-algorithms/sha256.c`
+    impl produces the canonical RFC-6234 reference output."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import hashlib\n"
+                  b"import binascii\n"
+                  b"h = hashlib.sha256()\n"
+                  b"h.update(b'hello')\n"
+                  b"print(binascii.hexlify(h.digest()))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" in res.stdout, (
+        f"expected SHA-256(b'hello') canonical output, got: "
+        f"{res.stdout!r}"
+    )
+
+
+def test_micropython_re_match_groups(micropython_bin: Path) -> None:
+    """`re.match(pattern, string)` with capture groups. Validates
+    the `lib/re1.5/*.c` regex engine end-to-end through the re
+    module's MicroPython surface (`m.group(N)` indexing)."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import re\n"
+                  b"m = re.match(r'(\\w+)\\s+(\\w+)', 'hello world')\n"
+                  b"print(m.group(1), m.group(2))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "hello world" in res.stdout, (
+        f"expected captured groups `hello world`, got: {res.stdout!r}"
+    )
+
+
 def test_micropython_uctypes_struct_roundtrip(micropython_bin: Path) -> None:
     """`uctypes` (binary struct access for buffer-like objects).
     Defines a layout dict, pins it onto a bytearray, writes

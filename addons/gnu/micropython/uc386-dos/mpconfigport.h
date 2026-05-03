@@ -200,6 +200,32 @@
 // so `MICROPY_PY_TIME = AT_LEAST_BASIC_FEATURES` evaluates to 0.
 #define MICROPY_PY_TIME                   (1)
 
+// extmod modules: `random`, `binascii`, `hashlib` (SHA-256 only),
+// `re`. Each is a single source file added to build_port.sh's
+// list and registered in build.sh's moduledefs.h. random's
+// seed-init defaults to the BIOS tick counter so `random.seed()`
+// with no arg picks up some entropy. hashlib pulls in the SHA-256
+// implementation from `lib/crypto-algorithms/sha256.c` via inline
+// `#include` (no separate source-list entry needed). re uses
+// `lib/re1.5/*.c` similarly. binascii's CRC32 path is gated on
+// `MICROPY_PY_DEFLATE` (off) so the unzip dep doesn't pull in.
+#define MICROPY_PY_RANDOM                 (1)
+#define MICROPY_PY_RANDOM_EXTRA_FUNCS     (1)
+#define MICROPY_PY_RANDOM_SEED_INIT_FUNC  (bios_ticks())
+extern unsigned long bios_ticks(void);
+#define MICROPY_PY_BINASCII               (1)
+// CRC32 + DEFLATE default-on at EXTRA_FEATURES, but they pull in
+// uzlib (crc32.c + tinflate.c, ~700 lines). Disable for now —
+// can be re-enabled by adding the uzlib sources to build_port.sh.
+#define MICROPY_PY_BINASCII_CRC32         (0)
+#define MICROPY_PY_DEFLATE                (0)
+#define MICROPY_PY_HASHLIB                (1)
+#define MICROPY_PY_HASHLIB_SHA256         (1)
+#define MICROPY_PY_RE                     (1)
+#define MICROPY_PY_RE_SUB                 (1)
+#define MICROPY_PY_RE_MATCH_GROUPS        (1)
+#define MICROPY_PY_RE_MATCH_SPAN_START_END (1)
+
 #define MICROPY_ENABLE_COMPILER           (1)
 #define MICROPY_ENABLE_GC                 (1)
 #define MICROPY_HELPER_REPL               (1)

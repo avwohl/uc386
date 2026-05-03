@@ -312,6 +312,34 @@ extern const struct _mp_obj_module_t mp_module_uctypes;
 #define UCDOS_MOD_ENTRY_UCTYPES
 #endif
 
+#if MICROPY_PY_RANDOM
+extern const struct _mp_obj_module_t mp_module_random;
+#define UCDOS_MOD_ENTRY_RANDOM { MP_ROM_QSTR(MP_QSTR_random), MP_ROM_PTR(&mp_module_random) },
+#else
+#define UCDOS_MOD_ENTRY_RANDOM
+#endif
+
+#if MICROPY_PY_BINASCII
+extern const struct _mp_obj_module_t mp_module_binascii;
+#define UCDOS_MOD_ENTRY_BINASCII { MP_ROM_QSTR(MP_QSTR_binascii), MP_ROM_PTR(&mp_module_binascii) },
+#else
+#define UCDOS_MOD_ENTRY_BINASCII
+#endif
+
+#if MICROPY_PY_HASHLIB
+extern const struct _mp_obj_module_t mp_module_hashlib;
+#define UCDOS_MOD_ENTRY_HASHLIB { MP_ROM_QSTR(MP_QSTR_hashlib), MP_ROM_PTR(&mp_module_hashlib) },
+#else
+#define UCDOS_MOD_ENTRY_HASHLIB
+#endif
+
+#if MICROPY_PY_RE
+extern const struct _mp_obj_module_t mp_module_re;
+#define UCDOS_MOD_ENTRY_RE { MP_ROM_QSTR(MP_QSTR_re), MP_ROM_PTR(&mp_module_re) },
+#else
+#define UCDOS_MOD_ENTRY_RE
+#endif
+
 #define MICROPY_REGISTERED_MODULES \
     { MP_ROM_QSTR(MP_QSTR_builtins), MP_ROM_PTR(&mp_module_builtins) }, \
     { MP_ROM_QSTR(MP_QSTR_sys), MP_ROM_PTR(&mp_module_sys) }, \
@@ -324,7 +352,11 @@ extern const struct _mp_obj_module_t mp_module_uctypes;
     UCDOS_MOD_ENTRY_ERRNO \
     UCDOS_MOD_ENTRY_STRUCT \
     UCDOS_MOD_ENTRY_TIME \
-    UCDOS_MOD_ENTRY_UCTYPES
+    UCDOS_MOD_ENTRY_UCTYPES \
+    UCDOS_MOD_ENTRY_RANDOM \
+    UCDOS_MOD_ENTRY_BINASCII \
+    UCDOS_MOD_ENTRY_HASHLIB \
+    UCDOS_MOD_ENTRY_RE
 
 // Module attribute-access delegation table — modules whose attr
 // loads/stores need to dispatch through a port-supplied function.
