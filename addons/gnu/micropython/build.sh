@@ -117,13 +117,15 @@ if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
         # macro-name-as-payload heuristic, escaped qstrs also rendered
         # the *macro tail* as their string content, so `print()`'s
         # trailing `\n` showed up as the literal text `_0x0a_`.
-        # `--bytes-hash 1` matches MICROPY_QSTR_BYTES_IN_HASH at
-        # ROM_LEVEL_CORE_FEATURES (uc386-dos/mpconfigport.h). At
-        # MINIMUM the hash field is unused at runtime, but we still
-        # emit a real hash so a future ROM-level bump doesn't need a
-        # qstrdefs rebuild. Required: qstr_find_strn's post-binary-
-        # search filter does `pool->hashes[at] == str_hash` before
-        # memcmp at any non-zero MICROPY_QSTR_BYTES_IN_HASH.
+        # `--bytes-hash 2` matches MICROPY_QSTR_BYTES_IN_HASH at
+        # ROM_LEVEL_EXTRA_FEATURES (uc386-dos/mpconfigport.h sets
+        # ROM_LEVEL=EXTRA, which makes BYTES_IN_HASH=2). Required:
+        # qstr_find_strn's post-binary-search filter does
+        # `pool->hashes[at] == str_hash` before memcmp at any
+        # non-zero MICROPY_QSTR_BYTES_IN_HASH — a stale `--bytes-hash 1`
+        # gen would emit 8-bit hashes and the runtime would
+        # truncate the lookup hash to 16 bits, mismatching every
+        # entry.
         #
         # The grep also pulls in X-macro NAMES from moderrno.c's
         # MICROPY_PY_ERRNO_LIST so the `MP_QSTR_##e` token paste
@@ -142,7 +144,7 @@ if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
             grep -hoE "^[[:space:]]*X\([A-Z][A-Z0-9_]*\)" \
                     upstream/py/moderrno.c \
                 | sed -E 's/^[[:space:]]*X\(([A-Z][A-Z0-9_]*)\)/MP_QSTR_\1/'
-        } | "$PYTHON" gen_qstrdefs.py --bytes-hash 1
+        } | "$PYTHON" gen_qstrdefs.py --bytes-hash 2
     } > build/genhdr/qstrdefs.generated.h
 fi
 [ -f build/genhdr/moduledefs.h ] || cat > build/genhdr/moduledefs.h <<'EOF'

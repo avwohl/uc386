@@ -1,11 +1,11 @@
-# MicroPython port — status: **full Python REPL @ CORE_FEATURES** (2026-05-02)
+# MicroPython port — status: **full Python REPL @ EXTRA_FEATURES** (2026-05-03)
 
 **Upstream**: https://github.com/micropython/micropython
 **License**: MIT
 
 **`addons/gnu/micropython/build_port.sh` produces a runnable
-`build/micropython.bin` (~199 KB at CORE_FEATURES, was ~169 KB at
-MINIMUM).** Run under `uc386.dos_emu.run`,
+`build/micropython.bin` (~263 KB at EXTRA_FEATURES, was ~169 KB at
+MINIMUM, ~199 KB at CORE_FEATURES).** Run under `uc386.dos_emu.run`,
 it boots the MicroPython REPL and accepts essentially full Python:
 
 ```
@@ -138,14 +138,14 @@ What doesn't work yet (separate gates, pinned in mpconfigport.h):
   matter of opting in plus the few extra qstrs it needs.
 - Full `tgamma` / `lgamma` — currently NaN stubs in libc. A real
   Lanczos approximation is the EXTRA_FEATURES follow-up.
-- Full `MICROPY_CONFIG_ROM_LEVEL = EXTRA_FEATURES` — the
-  selective-opt-in path above lights up the high-value features
-  without the full ROM bump. A wholesale bump (which we tested)
-  broke the value-print path inside uc386 codegen — `print(1)`
-  hung the REPL with no diagnostic. Root cause not yet narrowed;
-  some EXTRA-default code path (FULL_CHECKS / multiple-inheritance
-  / generator-pend-throw / async-await / module-getattr / …) trips
-  uc386. Bisect is the next step.
+- ~~Full `MICROPY_CONFIG_ROM_LEVEL = EXTRA_FEATURES`~~ — DONE
+  (2026-05-03). The wholesale-EXTRA hang turned out to be
+  `MICROPY_STACK_CHECK`: it needs the port to call
+  `mp_stack_set_top()` / `mp_stack_set_limit()` at init, which
+  ports/minimal/main.c (our entry point) doesn't do. Without
+  those calls every check fails, and the stack-overflow raise
+  path infinite-loops. mpconfigport.h now sets
+  `MICROPY_STACK_CHECK=0` while keeping the wholesale ROM bump.
 - `import _thread` / `import weakref` — `MICROPY_PY_THREAD` and
   `MICROPY_PY_WEAKREF` not enabled at CORE_FEATURES.
 - `MICROPY_PY_IO` (open/io machinery) — port has no VFS.
