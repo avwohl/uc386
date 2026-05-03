@@ -1294,6 +1294,38 @@ def test_micropython_hashlib_sha256(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_cmath_basic(micropython_bin: Path) -> None:
+    """`import cmath` complex-number math. Validates abs(),
+    cmath.exp on imaginary axis (Euler's formula:
+    exp(i*x) = cos(x) + i*sin(x))."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import cmath\n"
+                  b"print(abs(complex(3, 4)))\n"
+                  b"r = cmath.exp(1j)\n"
+                  # int truncation avoids round()'s float-precision quirk;
+                  # check the high-bit digits land in the right place.
+                  b"print(int(r.real * 10000), int(r.imag * 10000))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "5.0" in res.stdout, (
+        f"expected abs(3+4j) == 5.0, got: {res.stdout!r}"
+    )
+    # exp(i) = cos(1) + i*sin(1) ≈ 0.5403 + 0.8415i
+    assert "5402 8414" in res.stdout or "5403 8414" in res.stdout, (
+        f"expected Euler's formula int*10000 ≈ (5403, 8414), got: "
+        f"{res.stdout!r}"
+    )
+
+
 def test_micropython_re_match_groups(micropython_bin: Path) -> None:
     """`re.match(pattern, string)` with capture groups. Validates
     the `lib/re1.5/*.c` regex engine end-to-end through the re
