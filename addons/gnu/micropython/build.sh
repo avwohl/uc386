@@ -113,6 +113,21 @@ if grep -q "^#define MAX_MANTISSA_DIGITS  (19)$" upstream/py/formatfloat.c; then
     rm -f upstream/py/formatfloat.c.bak
 fi
 
+# Patch upstream/py/parsenum.c to neutralize the
+# `assert(sizeof(mp_large_float_t) > sizeof(mp_float_t))` in
+# `mp_decimal_exp`. uc386 stores long double as 8 bytes (= double),
+# so the assert fires at runtime on the first compile-time-evaluated
+# float. The algorithm still works — just at double precision —
+# and the verify-retry loop in formatfloat.c delivers correctness
+# regardless. Idempotent: leaves the assert commented after first
+# patch.
+if grep -q "^    assert(sizeof(mp_large_float_t) > sizeof(mp_float_t));$" upstream/py/parsenum.c; then
+    sed -i.bak \
+        's|^    assert(sizeof(mp_large_float_t) > sizeof(mp_float_t));$|    /* uc386: removed — long double == double, see mpconfigport.h */|' \
+        upstream/py/parsenum.c
+    rm -f upstream/py/parsenum.c.bak
+fi
+
 if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
     # Emit a triage qstr table by grep over upstream/py/ +
     # upstream/shared/. Real builds use upstream's

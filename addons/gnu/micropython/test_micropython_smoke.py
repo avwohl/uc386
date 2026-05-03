@@ -681,16 +681,10 @@ def test_micropython_import_math(micropython_bin: Path) -> None:
 def test_micropython_float_arithmetic(micropython_bin: Path) -> None:
     """`1.5 + 2.5` exercises the FPU path end-to-end inside the REPL:
     lex → parse FloatLiteral → BINARY_OP + → mp_float_t add → repr
-    → print. Without MICROPY_PY_BUILTINS_FLOAT (i.e. before the
-    FLOAT_IMPL=DOUBLE bump) this raised SyntaxError on the dot.
-
-    Tolerates upstream's APPROX float formatter quirk: at
-    MICROPY_FLOAT_IMPL=DOUBLE without a wider-than-double
-    `mp_large_float_t`, the formatter accumulates rounding error
-    across digit-extraction multiplies and `4.0` repr-prints as
-    `3.999999999999997` instead. We assert the parsed value is
-    close to 4.0, not the exact literal."""
-    import re
+    → print. With MICROPY_FLOAT_FORMAT_IMPL=EXACT and the
+    verify-retry loop in py/formatfloat.c, the repr is
+    CPython-compatible — `4.0` prints as `4.0`, not as
+    `3.999999999999997`."""
     sys.path.insert(0, str(REPO_ROOT / "src"))
     from uc386.dos_emu import run
 
@@ -701,14 +695,49 @@ def test_micropython_float_arithmetic(micropython_bin: Path) -> None:
     assert not res.timed_out, "REPL didn't exit"
     assert res.error is None, f"dos_emu reported error: {res.error}"
     assert res.exit_code == 0
-    # Match the printed numeric line between the two `>>> ` prompts.
-    m = re.search(r"\n([0-9.]+)\n", res.stdout)
-    assert m is not None, (
-        f"expected a numeric result line, got: {res.stdout!r}"
+    assert "\n4.0\n" in res.stdout, (
+        f"expected `4.0` (exact repr via verify-retry), got: "
+        f"{res.stdout!r}"
     )
-    val = float(m.group(1))
-    assert abs(val - 4.0) < 1e-6, (
-        f"expected ≈ 4.0, got {val!r} from stdout {res.stdout!r}"
+
+
+def test_micropython_float_repr_round_trips(micropython_bin: Path) -> None:
+    """The EXACT formatter (MICROPY_FLOAT_FORMAT_IMPL_EXACT) picks
+    the SHORTEST decimal that round-trips through the parser back
+    to the same double. Pre-fix (APPROX), `print(1e10)` showed as
+    `09999999999.99998` and `print(0.1)` as `0.0999999999999999`.
+    Post-fix, simple values get their canonical literal form."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"print(0.1)\n"
+                  b"print(1e10)\n"
+                  b"print(0.1 + 0.2)\n"
+                  b"print(1.0 / 3.0)\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "\n0.1\n" in res.stdout, (
+        f"expected `0.1` exact, got: {res.stdout!r}"
+    )
+    assert "\n10000000000.0\n" in res.stdout, (
+        f"expected `10000000000.0` exact for 1e10, got: "
+        f"{res.stdout!r}"
+    )
+    # 0.1 + 0.2 has a real precision artifact in IEEE 754 doubles —
+    # the actual sum is 0.30000000000000004, which CPython prints
+    # similarly. Just check the stable 0.3000... prefix.
+    assert "0.3000000000000001" in res.stdout or "0.30000000000000004" in res.stdout, (
+        f"expected canonical 0.1+0.2 repr, got: {res.stdout!r}"
+    )
+    assert "0.3333333333333333" in res.stdout, (
+        f"expected `0.333...` for 1/3, got: {res.stdout!r}"
     )
 
 

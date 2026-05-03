@@ -150,6 +150,27 @@
 #define MICROPY_FLOAT_IMPL                (MICROPY_FLOAT_IMPL_DOUBLE)
 #define MICROPY_PY_MATH_SPECIAL_FUNCTIONS (1)
 
+// Float formatter — opt into the EXACT formatter (vs the default
+// APPROX picked when long double has the same width as double).
+// EXACT's headline value is a parse-and-retry loop in
+// `py/formatfloat.c:472`: format with N digits, parse the result
+// back, compare against the original; if not equal, retry with
+// N+1. With APPROX the loop is gated out and the formatter walks
+// to MAX_MANTISSA_DIGITS digits unconditionally — accumulating
+// floating-point noise in each multiplication step and producing
+// `print(4.0)` → `3.999999999999996` and `print(1e10)` →
+// `09999999999.99998`. EXACT picks the SHORTEST decimal that
+// round-trips, so simple values like 4.0 / 0.1 / 1e10 get the
+// expected literal form back. Caveat: `mp_decimal_exp` (parsenum.c)
+// has an `assert(sizeof(mp_large_float_t) > sizeof(mp_float_t))`
+// guarding against picking EXACT on a platform where long double
+// isn't wider than double — which IS our case (uc386 lowers long
+// double through the x87 FPU but stores it as 8 bytes). build.sh
+// sed-patches that assertion out: the algorithm still works,
+// just at the same precision as APPROX would have used; the
+// verify-retry loop is what actually delivers the correctness.
+#define MICROPY_FLOAT_FORMAT_IMPL         (MICROPY_FLOAT_FORMAT_IMPL_EXACT)
+
 // Long-long int support — heap-allocated `mp_obj_int_t` for
 // values that don't fit a small int. Default is
 // `LONGINT_IMPL_NONE`, where `mp_obj_new_int_from_ll` /
