@@ -29,7 +29,7 @@ Type "help()" for more information.
 caught
 ```
 
-What works (36 smoke tests pin the core wins):
+What works (40 smoke tests pin the core wins):
 
 - arithmetic + control flow (`if/else`, `for/range`, `while/break`)
 - function def + call (`def f(x): return x*2; f(7)` → `14`)
@@ -93,11 +93,16 @@ What works (36 smoke tests pin the core wins):
   taking the full ROM_LEVEL bump (which broke the value-print
   path under uc386 codegen): `compile()` / `eval()` / `exec()`,
   `input()`, `memoryview`, `next(it, default)` (`MICROPY_PY_BUILTINS_NEXT2`),
-  `collections.deque`, `math.pi` / `math.e` / `math.tau` /
-  `math.inf` / `math.nan`, `math.factorial`, `math.isclose`, and
-  class instance binary-op overrides via
-  `MICROPY_PY_ALL_SPECIAL_METHODS` (e.g. `class V: def __add__(s, o): ...`
-  → `V(2)+V(3)` dispatches through `__add__`).
+  `collections.deque` (with iter + subscr), `math.pi` / `math.e`
+  / `math.tau` / `math.inf` / `math.nan`, `math.factorial`,
+  `math.isclose`, class instance binary-op overrides via
+  `MICROPY_PY_ALL_SPECIAL_METHODS` + INPLACE + REVERSE forms
+  (`__add__` / `__iadd__` / `__radd__` / `__and__` / etc.),
+  `bytes.hex` / `bytes.fromhex`, `str.center` / `str.partition`
+  / `str.splitlines`, `frozenset`, **f-strings** (`f"x={val}"`),
+  function attribute access (`f.__name__`), `delattr` / `setattr`,
+  bytearray slice-assignment, plus REPL polish (Emacs key
+  bindings + auto-indent + Ctrl-C `KeyboardInterrupt`).
   - `INFINITY` / `NAN` / `HUGE_VAL` in lib/include/math.h now use
     `__builtin_inf()` / `__builtin_nan("")` / `__builtin_huge_val()`.
     uc386's `_const_eval_float` recognizes these markers and folds

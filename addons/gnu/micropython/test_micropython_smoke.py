@@ -968,6 +968,99 @@ def test_micropython_extra_features_math_isclose(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_extra_features_bytes_hex(micropython_bin: Path) -> None:
+    """`bytes.hex` / `bytes.fromhex` are EXTRA-gated. Pin both
+    directions of the round-trip."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"print(b'\\x12\\x34'.hex())\n"
+                  b"print(bytes.fromhex('5678'))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "1234" in res.stdout, (
+        f"expected b'\\x12\\x34'.hex() → '1234', got: {res.stdout!r}"
+    )
+    assert "Vx" in res.stdout, (
+        f"expected fromhex('5678') → b'Vx' (0x56='V', 0x78='x'), "
+        f"got: {res.stdout!r}"
+    )
+
+
+def test_micropython_extra_features_fstring(micropython_bin: Path) -> None:
+    """f-strings are EXTRA-gated via `MICROPY_PY_FSTRINGS`. Pin
+    both literal substitution and the formatter."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"x = 42\n"
+                  b"print(f'val={x}')\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "val=42" in res.stdout, (
+        f"expected `val=42` from f-string, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_extra_features_inplace_special(micropython_bin: Path) -> None:
+    """`MICROPY_PY_ALL_INPLACE_SPECIAL_METHODS` lights up
+    `__iadd__` etc. on class instances. Pin a small `__iadd__`
+    override + `+=` round-trip."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"class V:\n"
+                  b"    def __init__(s,x): s.x=x\n"
+                  b"    def __iadd__(s,o): s.x+=o.x; return s\n"
+                  b"\n"
+                  b"v=V(2)\n"
+                  b"v+=V(3)\n"
+                  b"print(v.x)\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "\n5\n" in res.stdout, (
+        f"expected V(2)+=V(3) → 5 via __iadd__, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_extra_features_frozenset(micropython_bin: Path) -> None:
+    """`frozenset` is gated on `MICROPY_PY_BUILTINS_FROZENSET`."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"print(frozenset([1,2,3]))\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "frozenset" in res.stdout, (
+        f"expected frozenset repr, got: {res.stdout!r}"
+    )
+
+
 def test_micropython_extra_features_special_methods(micropython_bin: Path) -> None:
     """`MICROPY_PY_ALL_SPECIAL_METHODS` lights up class instance
     binary-op overrides (`__and__`, `__add__`, etc). Pin a small
