@@ -192,6 +192,21 @@ def main() -> int:
             sys.stderr.write(f"gen_qstrdefs: unknown arg {args[i]!r}\n")
             return 2
 
+    # Pull the static + unsorted qstr lists from upstream so the
+    # qstrs the runtime needs to fit in a `byte` (e.g. the
+    # mp_binary_op_method_name table at py/objtype.c:483 — entries
+    # like `__add__` are stored as 1-byte qstr ids) end up in the
+    # static (QDEF0) pool with id < 256. Without this, enabling
+    # MICROPY_PY_ALL_SPECIAL_METHODS truncates `MP_QSTR___add__`'s
+    # >256 id to its low byte and `V(2)+V(3)` dispatches to
+    # whatever qstr happens to live at id-modulo-256 (we saw
+    # `FLOAT32` instead of `__add__`).
+    from makeqstrdata import (  # type: ignore[import-not-found]
+        static_qstr_list,
+        unsorted_qstr_list,
+    )
+    static_pool = set(static_qstr_list) | set(unsorted_qstr_list)
+
     seen: dict[str, str] = {}  # macro -> original
     for line in sys.stdin:
         macro = line.strip()
@@ -202,15 +217,52 @@ def main() -> int:
         # `MP_QSTR_` is 8 chars; the rest is the sanitized qstr.
         seen[macro] = unescape(macro[8:])
 
-    # Sort by the original string (ASCII byte order), which is the
-    # runtime binary search key. Tiebreak by macro name for stable
-    # output across builds (qstr_escape is 1:1, so ties shouldn't
-    # arise in practice — but a deterministic order keeps diffs
-    # clean if a duplicate slips through).
+    # Emit QDEF0 entries first (in upstream's defined order) so they
+    # get fixed id slots < 256. Then QDEF1 entries sorted by the
+    # original string (ASCII byte order) — that's the runtime's
+    # binary-search key.
     out_w = sys.stdout.write
+
+    static_emitted: set[str] = set()
+    # Walk upstream's static_qstr_list verbatim so the .mpy ABI
+    # ID assignments stay stable across uc386 + upstream builds.
+    for original in static_qstr_list:
+        # Find the macro name for this string from `seen`. If our
+        # grep didn't capture it, synthesize the macro: upstream's
+        # qstr_escape can be re-applied via the `unescape` inverse,
+        # but we already have a forward `qstr_escape` in
+        # makeqstrdata, so use that.
+        from makeqstrdata import qstr_escape  # type: ignore
+        macro = "MP_QSTR_" + qstr_escape(original)
+        qhash = compute_hash(original.encode("utf-8"), bytes_hash)
+        out_w(
+            f"QDEF0({macro}, {qhash}, {len(original)}, "
+            f"{c_string(original)})\n"
+        )
+        static_emitted.add(macro)
+
+    # Then unsorted_qstr_list — also QDEF0 (low ids), but ordering
+    # doesn't matter for .mpy compat (these aren't part of the
+    # public ABI list).
+    for original in sorted(unsorted_qstr_list):
+        from makeqstrdata import qstr_escape  # type: ignore
+        macro = "MP_QSTR_" + qstr_escape(original)
+        if macro in static_emitted:
+            continue
+        qhash = compute_hash(original.encode("utf-8"), bytes_hash)
+        out_w(
+            f"QDEF0({macro}, {qhash}, {len(original)}, "
+            f"{c_string(original)})\n"
+        )
+        static_emitted.add(macro)
+
+    # Everything else goes to QDEF1, sorted for the binary-search
+    # invariant.
     for macro, original in sorted(
         seen.items(), key=lambda item: (item[1].encode("utf-8"), item[0])
     ):
+        if macro in static_emitted or original in static_pool:
+            continue
         qhash = compute_hash(original.encode("utf-8"), bytes_hash)
         out_w(
             f"QDEF1({macro}, {qhash}, {len(original)}, "

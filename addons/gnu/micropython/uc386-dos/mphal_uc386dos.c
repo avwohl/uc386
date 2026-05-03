@@ -67,3 +67,13 @@ void mp_hal_delay_us(mp_uint_t us) {
     unsigned long ms = (us + 999U) / 1000U;
     mp_hal_delay_ms(ms);
 }
+
+// `sys.stdio.poll` and `input()`-readiness checks call this. We
+// don't have a non-blocking stdin path under PMODE/W (INT 21h
+// AH=0Bh exists but isn't reliable inside the dos_emu harness),
+// so return 0 (no events ready). REPL still gets stdin via the
+// normal `mp_hal_stdin_rx_chr` path in uart_core.c.
+uintptr_t mp_hal_stdio_poll(uintptr_t poll_flags) {
+    (void)poll_flags;
+    return 0;
+}

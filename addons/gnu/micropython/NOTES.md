@@ -29,7 +29,7 @@ Type "help()" for more information.
 caught
 ```
 
-What works (29 smoke tests pin the core wins):
+What works (36 smoke tests pin the core wins):
 
 - arithmetic + control flow (`if/else`, `for/range`, `while/break`)
 - function def + call (`def f(x): return x*2; f(7)` → `14`)
@@ -88,7 +88,31 @@ What works (29 smoke tests pin the core wins):
   `MICROPY_PY_TIME_TIME_TIME_NS` (default off — DOS lacks an
   always-running RTC integration). dos_emu emulates INT 1Ah AH=0
   with a synthetic monotonic counter so smoke tests can exercise
-  the path without wall-clock timing. **Caveat**: at DOUBLE without long-double
+  the path without wall-clock timing.
+- **EXTRA_FEATURES surface** — selectively opted into without
+  taking the full ROM_LEVEL bump (which broke the value-print
+  path under uc386 codegen): `compile()` / `eval()` / `exec()`,
+  `input()`, `memoryview`, `next(it, default)` (`MICROPY_PY_BUILTINS_NEXT2`),
+  `collections.deque`, `math.pi` / `math.e` / `math.tau` /
+  `math.inf` / `math.nan`, `math.factorial`, `math.isclose`, and
+  class instance binary-op overrides via
+  `MICROPY_PY_ALL_SPECIAL_METHODS` (e.g. `class V: def __add__(s, o): ...`
+  → `V(2)+V(3)` dispatches through `__add__`).
+  - `INFINITY` / `NAN` / `HUGE_VAL` in lib/include/math.h now use
+    `__builtin_inf()` / `__builtin_nan("")` / `__builtin_huge_val()`.
+    uc386's `_const_eval_float` recognizes these markers and folds
+    them to IEEE-754 +inf / qNaN at compile time — the previous
+    `(double)0x7FFFFFFF` / `(double)0` definitions were just
+    integers cast to double, leading to `math.inf` = 2147483647.0
+    and `math.nan` = 0.0. lib/i386_dos_libc.asm provides matching
+    runtime stubs for the non-const path.
+  - `MICROPY_PY_ALL_SPECIAL_METHODS` requires the dunders
+    (`__add__`, `__sub__`, `__and__`, ...) to fit in 1-byte qstr
+    ids because `mp_binary_op_method_name[]` (py/objtype.c:483)
+    is a `const byte[]`. Our `gen_qstrdefs.py` now mirrors
+    upstream's `static_qstr_list` + `unsorted_qstr_list` (from
+    `tools/makeqstrdata.py`) and emits those qstrs as QDEF0
+    entries with id < 256. **Caveat**: at DOUBLE without long-double
   precision, upstream's APPROX float formatter accumulates round-
   off across digit-extract multiplies and `print(4.0)` shows
   `3.999999999999997` instead of `4.0`. We patch
@@ -109,6 +133,14 @@ What doesn't work yet (separate gates, pinned in mpconfigport.h):
   matter of opting in plus the few extra qstrs it needs.
 - Full `tgamma` / `lgamma` — currently NaN stubs in libc. A real
   Lanczos approximation is the EXTRA_FEATURES follow-up.
+- Full `MICROPY_CONFIG_ROM_LEVEL = EXTRA_FEATURES` — the
+  selective-opt-in path above lights up the high-value features
+  without the full ROM bump. A wholesale bump (which we tested)
+  broke the value-print path inside uc386 codegen — `print(1)`
+  hung the REPL with no diagnostic. Root cause not yet narrowed;
+  some EXTRA-default code path (FULL_CHECKS / multiple-inheritance
+  / generator-pend-throw / async-await / module-getattr / …) trips
+  uc386. Bisect is the next step.
 - `import _thread` / `import weakref` — `MICROPY_PY_THREAD` and
   `MICROPY_PY_WEAKREF` not enabled at CORE_FEATURES.
 - `MICROPY_PY_IO` (open/io machinery) — port has no VFS.

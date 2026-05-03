@@ -28,22 +28,25 @@
 // 6-byte declaration would have caused setjmp to buffer-overflow.
 #define MICROPY_NLR_SETJMP                (1)
 
-// CORE_FEATURES. The earlier "every named-builtin NameErrors at
-// runtime" regression turned out to be a missing qstr-hash:
-// CORE_FEATURES sets `MICROPY_QSTR_BYTES_IN_HASH = 1`, which adds
-// a `hashes[]` array to each `qstr_pool_t` and gates
-// `qstr_find_strn`'s post-binary-search filter on
-// `pool->hashes[at] == str_hash`. Our `gen_qstrdefs.py` was
-// emitting `0` for every QDEF1's hash field, so every static
-// lookup missed and `print` / `min` / `__name__` raised
-// NameError. Fix: gen_qstrdefs.py now computes the djb2 hash
-// (mirroring upstream's `tools/makeqstrdata.py:compute_hash`,
-// including the `(hash & mask) or 1` zero-fix) via build.sh's
-// `--bytes-hash 1`. CORE_FEATURES then boots cleanly and unlocks
-// a full builtins surface — `bytearray` / `slice` / `set` types,
-// most `MICROPY_PY_BUILTINS_*` defaults, qstr-named error
-// messages, and the rest of the gates that default-enable here.
+// CORE_FEATURES baseline + selective EXTRA opt-ins. A previous
+// experiment bumped ROM_LEVEL to EXTRA_FEATURES wholesale, which
+// quietly broke the value-print path — `print(1)` hung the REPL
+// (cause not yet root-caused; some EXTRA-default code path trips
+// uc386 codegen). The selective approach below lets us cherry-pick
+// the high-value EXTRA features without that fallout.
 #define MICROPY_CONFIG_ROM_LEVEL          (MICROPY_CONFIG_ROM_LEVEL_CORE_FEATURES)
+
+// EXTRA-gated features we explicitly opt into. Each addition was
+// proven safe in isolation by a smoke-test pass.
+#define MICROPY_PY_BUILTINS_MEMORYVIEW     (1)
+#define MICROPY_PY_BUILTINS_COMPILE        (1)
+#define MICROPY_PY_BUILTINS_INPUT          (1)
+#define MICROPY_PY_BUILTINS_NEXT2          (1)
+#define MICROPY_PY_COLLECTIONS_DEQUE       (1)
+#define MICROPY_PY_MATH_CONSTANTS          (1)
+#define MICROPY_PY_MATH_FACTORIAL          (1)
+#define MICROPY_PY_MATH_ISCLOSE            (1)
+#define MICROPY_PY_ALL_SPECIAL_METHODS     (1)
 
 #define MICROPY_ENABLE_COMPILER           (1)
 #define MICROPY_ENABLE_GC                 (1)

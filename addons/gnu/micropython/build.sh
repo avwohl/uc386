@@ -78,8 +78,13 @@ if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
     # so the empty-main-pool case never happens. We avoid it by
     # routing every grep'd qstr to QDEF1.
     {
+        # MP_QSTRnull (id 0) is the null/sentinel qstr. The rest of
+        # the static + unsorted qstrs (`__add__`, `print`, `__name__`,
+        # ...) are emitted by gen_qstrdefs.py from upstream's
+        # `static_qstr_list` + `unsorted_qstr_list` so they get
+        # ids < 256 — required for the byte-stored
+        # `mp_binary_op_method_name` table at py/objtype.c:483.
         echo "QDEF0(MP_QSTRnull, 0, 0, \"\")"
-        echo "QDEF1(MP_QSTR_, 0, 0, \"\")"
         # `MP_QSTR_<name>` — skip the 8-char `MP_QSTR_` prefix (M-P-_-Q-S-T-R-_)
         # to recover the actual qstr string. Earlier the prefix-strip used 7
         # chars and left a stray leading underscore (`__repl_print__` came

@@ -25,9 +25,17 @@
 #define M_SQRT2    1.41421356237309504880
 #define M_SQRT1_2  0.70710678118654752440
 
-#define HUGE_VAL   ((double)0x7FFFFFFF)
-#define INFINITY   HUGE_VAL
-#define NAN        ((double)0)
+/* IEEE-754 special values. uc386's _const_eval_float recognizes the
+ * GCC `__builtin_inf` / `__builtin_nan` / `__builtin_huge_val`
+ * markers as compile-time +inf / qNaN constants, so these macros
+ * fold cleanly inside global initializers (e.g. micropython's
+ * `mp_const_float_inf_obj = {{&mp_type_float}, INFINITY}`). The
+ * previous definitions (`(double)0x7FFFFFFF` / `(double)0`) were
+ * just plain integers cast to double, leading to math.inf=
+ * 2147483647.0 and math.nan=0.0. */
+#define HUGE_VAL   (__builtin_huge_val())
+#define INFINITY   (__builtin_inf())
+#define NAN        (__builtin_nan(""))
 
 /* Trigonometric functions */
 double sin(double x);

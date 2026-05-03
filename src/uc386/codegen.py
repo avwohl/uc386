@@ -2465,8 +2465,28 @@ class CodeGenerator:
         ops). This matters for boundary values like FLT_MIN / 2.0 where
         the double approximation of the decimal `1.17549435e-38` differs
         from the actual 32-bit FLT_MIN.
+
+        Also recognizes the standard `__builtin_inf()` /
+        `__builtin_nan(...)` / `__builtin_huge_val()` GCC builtins as
+        constant +inf / qNaN / +inf so user code (and ports' math.h)
+        can express these IEEE-754 values inside a const initializer
+        — which would otherwise need an external symbol load that
+        we can't const-fold.
         """
         import struct
+        # Built-in infinity / nan markers.
+        if (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Identifier)
+        ):
+            fname = expr.func.name
+            if fname in ("__builtin_inf", "__builtin_inff",
+                         "__builtin_infl", "__builtin_huge_val",
+                         "__builtin_huge_valf", "__builtin_huge_vall"):
+                return float("inf")
+            if fname in ("__builtin_nan", "__builtin_nanf",
+                         "__builtin_nanl"):
+                return float("nan")
         # Integer-only subexpression? Period code mixes float and int
         # subexpressions freely (`-.5 * FRACUNIT` where FRACUNIT is
         # `1<<16`); _const_eval handles bit ops we don't replicate

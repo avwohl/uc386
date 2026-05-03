@@ -817,6 +817,183 @@ def test_micropython_time_sleep_ms(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_extra_features_compile(micropython_bin: Path) -> None:
+    """`compile()` is gated at EXTRA_FEATURES (already on at CORE
+    via `MICROPY_PY_BUILTINS_COMPILE && MICROPY_ENABLE_COMPILER`).
+    Compiles a small string-source program and exec's it, proving
+    the runtime parser + bytecode emitter are both reachable from
+    user code."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"c = compile('print(2+3)', '<s>', 'exec')\n"
+                  b"exec(c)\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "\n5\n" in res.stdout, (
+        f"expected compile+exec → 5, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_extra_features_memoryview(micropython_bin: Path) -> None:
+    """`memoryview` is EXTRA_FEATURES-gated. Pin construction over
+    a bytearray + indexing returning the right byte value."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"mv = memoryview(bytearray(b'abc'))\n"
+                  b"print(mv[1])\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # 'b' = 0x62 = 98 decimal.
+    assert "\n98\n" in res.stdout, (
+        f"expected memoryview[1] = 98 (=ord('b')), got: {res.stdout!r}"
+    )
+
+
+def test_micropython_extra_features_collections_deque(micropython_bin: Path) -> None:
+    """`collections.deque` is EXTRA_FEATURES-gated. Pin a basic
+    append + popleft round-trip — proves objdeque.c's static-init
+    + the FIFO behavior end-to-end."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"from collections import deque\n"
+                  b"d = deque((), 4)\n"
+                  b"d.append(1)\n"
+                  b"d.append(2)\n"
+                  b"print(d.popleft())\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "\n1\n" in res.stdout, (
+        f"expected deque popleft → 1, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_extra_features_math_constants(micropython_bin: Path) -> None:
+    """`math.tau` / `math.inf` / `math.nan` are EXTRA_FEATURES-gated
+    constants. Pin tau = 2*pi (≈6.28) and inf-arithmetic (`inf > 1e300`)
+    so a future config change doesn't silently drop them. The nan
+    check uses `math.isnan` (also EXTRA-gated indirectly via
+    `MICROPY_PY_MATH_ISCLOSE`-shape API surface)."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import math\n"
+                  b"print(round(math.tau, 4))\n"
+                  b"print(math.inf > 1e300)\n"
+                  b"print(math.isnan(math.nan))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # `round(math.tau, 4)` → 6.2832 in math, but stored as the
+    # nearest IEEE-754 double, which prints as `6.28319999...`
+    # under uc386's APPROX float formatter. Match the prefix.
+    assert "6.2831" in res.stdout or "6.2832" in res.stdout, (
+        f"expected math.tau ≈ 6.2832, got: {res.stdout!r}"
+    )
+    # `inf > 1e300` and `isnan(nan)` both → True.
+    assert res.stdout.count("True") >= 2, (
+        f"expected 2 True (inf comparison + isnan), got: {res.stdout!r}"
+    )
+
+
+def test_micropython_extra_features_math_factorial(micropython_bin: Path) -> None:
+    """`math.factorial` is EXTRA_FEATURES-gated. Pin the standard
+    `5! = 120` value end-to-end."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=b"import math\nprint(math.factorial(5))\n\x04",
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "\n120\n" in res.stdout, (
+        f"expected math.factorial(5) → 120, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_extra_features_math_isclose(micropython_bin: Path) -> None:
+    """`math.isclose` is EXTRA_FEATURES-gated. Pin both the
+    matching and non-matching cases (1.0 vs 1.0+1e-10 are close;
+    1.0 vs 1.5 are not)."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import math\n"
+                  b"print(math.isclose(1.0, 1.0 + 1e-10))\n"
+                  b"print(math.isclose(1.0, 1.5))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # First True, second False.
+    assert "True" in res.stdout and "False" in res.stdout, (
+        f"expected True + False from math.isclose, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_extra_features_special_methods(micropython_bin: Path) -> None:
+    """`MICROPY_PY_ALL_SPECIAL_METHODS` lights up class instance
+    binary-op overrides (`__and__`, `__add__`, etc). Pin a small
+    `__add__` override to prove the dispatch path resolves."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"class V:\n"
+                  b"    def __init__(s, x): s.x = x\n"
+                  b"    def __add__(s, o): return V(s.x + o.x).x\n"
+                  b"\n"
+                  b"print(V(2) + V(3))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "\n5\n" in res.stdout, (
+        f"expected V(2)+V(3) → 5 via __add__, got: {res.stdout!r}"
+    )
+
+
 def test_micropython_import_array(micropython_bin: Path) -> None:
     """`import array; array.array('i', ...)` — gated on
     `MICROPY_PY_ARRAY` (CORE_FEATURES). Pins typed-array storage

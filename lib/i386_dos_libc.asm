@@ -4830,10 +4830,39 @@ _isfinite:
 ; standard says it's optional and may be ignored). The bit pattern
 ; is the standard quiet NaN payload (sign=0, exp=all ones, mantissa
 ; MSB set). Emit via fld of a precomputed double in static data.
+;
+; `_inf_dbl` and `_huge_val_dbl` are the matching IEEE-754 +inf
+; pattern (0x7FF0000000000000); lib/include/math.h aliases
+; INFINITY/HUGE_VAL/NAN to references to these symbols so micropython
+; (and other code) sees real ±inf / qNaN values rather than
+; integer-cast-to-double placeholders.
         section .data
 _nan_quiet_dbl: dd 0x00000000, 0x7FF80000
+_inf_dbl:       dd 0x00000000, 0x7FF00000
+_huge_val_dbl:  dd 0x00000000, 0x7FF00000
         section .text
 _nan:
+        fld     qword [_nan_quiet_dbl]
+        ret
+
+; GCC `__builtin_inf` / `__builtin_nan` / `__builtin_huge_val`
+; backstops. uc386's const-eval folds these to IEEE-754 +inf / qNaN
+; constants directly inside global initializers, but a regular
+; expression like `double x = INFINITY;` (non-const) lowers to a
+; runtime call. These match the contract: load the matching IEEE
+; pattern onto st(0).
+___builtin_inf:
+___builtin_inff:
+___builtin_infl:
+___builtin_huge_val:
+___builtin_huge_valf:
+___builtin_huge_vall:
+        fld     qword [_inf_dbl]
+        ret
+
+___builtin_nan:
+___builtin_nanf:
+___builtin_nanl:
         fld     qword [_nan_quiet_dbl]
         ret
 

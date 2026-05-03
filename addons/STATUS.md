@@ -326,7 +326,7 @@ Layered evidence:
   links cleanly under `nasm -f bin` to a ~169 KB `.bin`. Only
   externs remaining are dead libm names left in a string table
   (DCE doesn't strip those today).
-- **REPL smoke tests** (29 cases):
+- **REPL smoke tests** (36 cases):
   `addons/gnu/micropython/test_micropython_smoke.py` runs the bin
   under dos_emu and pins: banner, clean Ctrl-D exit, arithmetic
   (`2+3` → `5`), assignment (`x = 5`), `pass`, named builtins
