@@ -2156,6 +2156,50 @@ def test_micropython_os_path_exists(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_os_path_getsize_isabs_abspath(micropython_bin: Path) -> None:
+    """`os.path.getsize` (stat-backed), `os.path.isabs` (string check
+    for sep prefix or drive letter), `os.path.abspath` (prefixes
+    getcwd() if relative + dedups separators)."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import os\n"
+                  b"print(os.path.getsize('data.bin'))\n"
+                  b"print(os.path.isabs('foo'))\n"
+                  b"print(os.path.isabs('\\\\foo'))\n"
+                  b"print(os.path.isabs('C:\\\\foo'))\n"
+                  b"print(os.path.abspath('foo.txt'))\n"
+                  b"print(os.path.abspath('C:\\\\dos\\\\app.exe'))\n"
+                  b"\x04"
+              ),
+              vfiles_init={b"data.bin": b"0123456789"},  # 10 bytes
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # getsize
+    assert "\n10\n" in res.stdout, f"getsize: {res.stdout!r}"
+    # isabs: relative → False, sep-prefixed or drive-prefixed → True
+    assert "isabs('foo'))\nFalse\n" in res.stdout, (
+        f"isabs relative: {res.stdout!r}"
+    )
+    assert "\\\\foo'))\nTrue\n" in res.stdout, (
+        f"isabs sep-prefix: {res.stdout!r}"
+    )
+    assert "C:\\\\foo'))\nTrue\n" in res.stdout, (
+        f"isabs drive: {res.stdout!r}"
+    )
+    # abspath: relative gets cwd-prefixed (dos_emu's synthetic cwd
+    # is "C:\\"); already-absolute passes through.
+    assert "C:\\foo.txt" in res.stdout, f"abspath relative: {res.stdout!r}"
+    assert "C:\\dos\\app.exe" in res.stdout, (
+        f"abspath absolute: {res.stdout!r}"
+    )
+
+
 def test_micropython_os_path_normpath(micropython_bin: Path) -> None:
     """`os.path.normpath` collapses redundant separators and
     canonicalizes forward-slash → backslash. Doesn't resolve `..`

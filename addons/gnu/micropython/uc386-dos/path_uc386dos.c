@@ -11,10 +11,12 @@
 
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "py/runtime.h"
 #include "py/objstr.h"
 #include "py/objtuple.h"
+#include "py/mperrno.h"
 
 // True for backslash and forward-slash. DOS treats both as separators
 // in most contexts, so we accept both for splitting / matching but
@@ -185,6 +187,75 @@ static mp_obj_t mod_path_isfile(mp_obj_t path_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(mod_path_isfile_obj, mod_path_isfile);
 
+// `os.path.getsize(path)` — file size in bytes, raises OSError if
+// the path doesn't exist. Backed by libc stat() (INT 21h AH=0x42
+// lseek-to-end via uc386's libc).
+static mp_obj_t mod_path_getsize(mp_obj_t path_in) {
+    const char *p = mp_obj_str_get_str(path_in);
+    struct stat st;
+    if (stat(p, &st) != 0) {
+        mp_raise_OSError(MP_ENOENT);
+    }
+    return mp_obj_new_int_from_uint((unsigned)st.st_size);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(mod_path_getsize_obj, mod_path_getsize);
+
+// `os.path.isabs(path)` — true if `path` starts with a separator
+// or with a `<letter>:` drive prefix. Pure string check, no I/O.
+static mp_obj_t mod_path_isabs(mp_obj_t path_in) {
+    size_t len;
+    const char *p = mp_obj_str_get_data(path_in, &len);
+    if (len >= 1 && is_sep(p[0])) {
+        return mp_obj_new_bool(1);
+    }
+    if (len >= 2 && p[1] == ':') {
+        return mp_obj_new_bool(1);
+    }
+    return mp_obj_new_bool(0);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(mod_path_isabs_obj, mod_path_isabs);
+
+// `os.path.abspath(path)` — normalize and prefix with getcwd() if
+// the path isn't already absolute. Doesn't resolve symlinks (DOS
+// doesn't have them in any meaningful sense).
+static mp_obj_t mod_path_abspath(mp_obj_t path_in) {
+    size_t len;
+    const char *p = mp_obj_str_get_data(path_in, &len);
+    int absolute = (len >= 1 && is_sep(p[0])) ||
+                   (len >= 2 && p[1] == ':');
+    vstr_t vstr;
+    vstr_init(&vstr, len + 64);
+    if (!absolute) {
+        char cwd[80];
+        if (getcwd(cwd, sizeof(cwd)) == NULL) {
+            mp_raise_OSError(MP_EIO);
+        }
+        vstr_add_str(&vstr, cwd);
+        // getcwd typically returns "C:\\" or "C:\\subdir"; ensure
+        // we have a separator before appending the relative path.
+        if (vstr.len > 0 && !is_sep(vstr.buf[vstr.len - 1])) {
+            vstr_add_char(&vstr, '\\');
+        }
+    }
+    // Append `path`, deduplicating separators while we go (cheap
+    // inline normpath since we already need to scan the bytes).
+    int prev_sep = vstr.len > 0 && is_sep(vstr.buf[vstr.len - 1]);
+    for (size_t i = 0; i < len; i++) {
+        char c = p[i];
+        if (is_sep(c)) {
+            if (!prev_sep) {
+                vstr_add_char(&vstr, '\\');
+                prev_sep = 1;
+            }
+        } else {
+            vstr_add_char(&vstr, c);
+            prev_sep = 0;
+        }
+    }
+    return mp_obj_new_str_from_vstr(&vstr);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(mod_path_abspath_obj, mod_path_abspath);
+
 // `os.path.normpath(path)` — collapse forward slashes to backslash,
 // drop redundant separators. Doesn't resolve `..` (DOS conventions
 // vary; conservative).
@@ -223,6 +294,9 @@ static const mp_rom_map_elem_t mp_module_os_path_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_exists),   MP_ROM_PTR(&mod_path_exists_obj) },
     { MP_ROM_QSTR(MP_QSTR_isfile),   MP_ROM_PTR(&mod_path_isfile_obj) },
     { MP_ROM_QSTR(MP_QSTR_normpath), MP_ROM_PTR(&mod_path_normpath_obj) },
+    { MP_ROM_QSTR(MP_QSTR_getsize),  MP_ROM_PTR(&mod_path_getsize_obj) },
+    { MP_ROM_QSTR(MP_QSTR_isabs),    MP_ROM_PTR(&mod_path_isabs_obj) },
+    { MP_ROM_QSTR(MP_QSTR_abspath),  MP_ROM_PTR(&mod_path_abspath_obj) },
     { MP_ROM_QSTR(MP_QSTR_sep),      MP_ROM_QSTR(MP_QSTR__backslash_) },
 };
 static MP_DEFINE_CONST_DICT(mp_module_os_path_globals, mp_module_os_path_globals_table);
