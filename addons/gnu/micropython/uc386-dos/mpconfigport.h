@@ -225,6 +225,7 @@ extern unsigned long bios_ticks(void);
 #define MICROPY_PY_RE_SUB                 (1)
 #define MICROPY_PY_RE_MATCH_GROUPS        (1)
 #define MICROPY_PY_RE_MATCH_SPAN_START_END (1)
+#define MICROPY_PY_HEAPQ                  (1)
 
 #define MICROPY_ENABLE_COMPILER           (1)
 #define MICROPY_ENABLE_GC                 (1)

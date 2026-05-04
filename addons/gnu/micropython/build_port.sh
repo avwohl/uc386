@@ -97,6 +97,7 @@ SOURCES_FILE="build/_port_sources.txt"
     echo upstream/extmod/modbinascii.c
     echo upstream/extmod/modhashlib.c
     echo upstream/extmod/modre.c
+    echo upstream/extmod/modheapq.c
     echo upstream/ports/minimal/main.c
     echo upstream/ports/minimal/uart_core.c
     echo uc386-dos/mphal_uc386dos.c

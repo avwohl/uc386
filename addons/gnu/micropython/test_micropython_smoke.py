@@ -1325,6 +1325,58 @@ def test_micropython_os_mkdir_chdir_getcwd(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_heapq(micropython_bin: Path) -> None:
+    """`heapq.heappush` + `heappop` round-trip — pop returns
+    elements in sorted order."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import heapq\n"
+                  b"h = []\n"
+                  b"for x in [3, 1, 2, 5, 4]:\n"
+                  b"    heapq.heappush(h, x)\n"
+                  b"\n"
+                  b"print([heapq.heappop(h) for _ in range(5)])\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "[1, 2, 3, 4, 5]" in res.stdout, (
+        f"expected sorted heap-pop, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_os_stat(micropython_bin: Path) -> None:
+    """`os.stat(path)` — returns 10-tuple matching CPython's
+    `os.stat_result`. Index 6 is `st_size`. Backed by uc386's
+    libc `stat()` (INT 21h-based)."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import os\n"
+                  b"st = os.stat('hi.txt')\n"
+                  b"print(len(st), st[6])\n"
+                  b"\x04"
+              ),
+              vfiles_init={b"hi.txt": b"hello world"},
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "10 11" in res.stdout, (
+        f"expected stat result tuple of len 10 with st_size=11, "
+        f"got: {res.stdout!r}"
+    )
+
+
 def test_micropython_os_listdir(micropython_bin: Path) -> None:
     """`os.listdir()` enumerates files via DOS find-first
     (INT 21h AH=0x4E) + find-next (AH=0x4F) using a static DTA

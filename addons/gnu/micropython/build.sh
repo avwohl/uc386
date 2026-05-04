@@ -348,11 +348,18 @@ extern const struct _mp_obj_module_t mp_module_cmath;
 #endif
 
 // `os` is the custom uc386-dos shim from `uc386-dos/os_uc386dos.c`
-// (mkdir/rmdir/unlink/rename/chdir/getcwd backed by INT 21h via
-// uc386's libc). Always registered — there's no MICROPY_PY_OS gate
-// on our shim.
+// (mkdir/rmdir/unlink/rename/chdir/getcwd/listdir backed by INT 21h
+// via uc386's libc). Always registered — there's no MICROPY_PY_OS
+// gate on our shim.
 extern const struct _mp_obj_module_t mp_module_os;
 #define UCDOS_MOD_ENTRY_OS { MP_ROM_QSTR(MP_QSTR_os), MP_ROM_PTR(&mp_module_os) },
+
+#if MICROPY_PY_HEAPQ
+extern const struct _mp_obj_module_t mp_module_heapq;
+#define UCDOS_MOD_ENTRY_HEAPQ { MP_ROM_QSTR(MP_QSTR_heapq), MP_ROM_PTR(&mp_module_heapq) },
+#else
+#define UCDOS_MOD_ENTRY_HEAPQ
+#endif
 
 #define MICROPY_REGISTERED_MODULES \
     { MP_ROM_QSTR(MP_QSTR_builtins), MP_ROM_PTR(&mp_module_builtins) }, \
@@ -372,7 +379,8 @@ extern const struct _mp_obj_module_t mp_module_os;
     UCDOS_MOD_ENTRY_HASHLIB \
     UCDOS_MOD_ENTRY_RE \
     UCDOS_MOD_ENTRY_CMATH \
-    UCDOS_MOD_ENTRY_OS
+    UCDOS_MOD_ENTRY_OS \
+    UCDOS_MOD_ENTRY_HEAPQ
 
 // Module attribute-access delegation table — modules whose attr
 // loads/stores need to dispatch through a port-supplied function.

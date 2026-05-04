@@ -144,6 +144,33 @@ static mp_obj_t mod_uc386dos_os_listdir(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(mod_uc386dos_os_listdir_obj,
     0, 1, mod_uc386dos_os_listdir);
 
+// `os.stat(path)` — returns a 10-tuple matching CPython's
+// `os.stat_result`:
+//   (st_mode, st_ino, st_dev, st_nlink, st_uid, st_gid,
+//    st_size, st_atime, st_mtime, st_ctime).
+// Backed by uc386's libc `stat()` (INT 21h-based).
+static mp_obj_t mod_uc386dos_os_stat(mp_obj_t path_in) {
+    const char *path = get_path_str(path_in);
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        mp_raise_OSError(MP_ENOENT);
+    }
+    mp_obj_t fields[10] = {
+        mp_obj_new_int_from_uint(st.st_mode),
+        mp_obj_new_int_from_uint(0),               // st_ino
+        mp_obj_new_int_from_uint(0),               // st_dev
+        mp_obj_new_int_from_uint(1),               // st_nlink
+        mp_obj_new_int_from_uint(0),               // st_uid
+        mp_obj_new_int_from_uint(0),               // st_gid
+        mp_obj_new_int_from_uint((unsigned)st.st_size),
+        mp_obj_new_int_from_uint((unsigned)st.st_atime),
+        mp_obj_new_int_from_uint((unsigned)st.st_mtime),
+        mp_obj_new_int_from_uint((unsigned)st.st_ctime),
+    };
+    return mp_obj_new_tuple(10, fields);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(mod_uc386dos_os_stat_obj, mod_uc386dos_os_stat);
+
 static const mp_rom_map_elem_t mp_module_os_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_os) },
     { MP_ROM_QSTR(MP_QSTR_mkdir),   MP_ROM_PTR(&mod_uc386dos_os_mkdir_obj) },
@@ -154,6 +181,7 @@ static const mp_rom_map_elem_t mp_module_os_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_chdir),   MP_ROM_PTR(&mod_uc386dos_os_chdir_obj) },
     { MP_ROM_QSTR(MP_QSTR_getcwd),  MP_ROM_PTR(&mod_uc386dos_os_getcwd_obj) },
     { MP_ROM_QSTR(MP_QSTR_listdir), MP_ROM_PTR(&mod_uc386dos_os_listdir_obj) },
+    { MP_ROM_QSTR(MP_QSTR_stat),    MP_ROM_PTR(&mod_uc386dos_os_stat_obj) },
     { MP_ROM_QSTR(MP_QSTR_sep),     MP_ROM_QSTR(MP_QSTR__slash_) },
 };
 static MP_DEFINE_CONST_DICT(mp_module_os_globals, mp_module_os_globals_table);
