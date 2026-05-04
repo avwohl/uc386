@@ -5600,16 +5600,9 @@ _erfc:
         pop     ebp
         ret
 
-; tgamma(x), lgamma(x) — stubs returning NaN. A full implementation
-; would use Lanczos (tgamma) + Stirling-with-Bernoulli (lgamma);
-; we don't ship that today because no smoke test exercises gamma
-; and the asm cost is ~100 lines. Documented in
-; addons/gnu/micropython/NOTES.md as an EXTRA_FEATURES follow-up.
-_tgamma:
-        fld     qword [_nan_quiet_dbl]
-        ret
-
-_lgamma:
-        fld     qword [_nan_quiet_dbl]
-        ret
+; tgamma(x), lgamma(x) — Lanczos approximation. The real C
+; implementations live in `addons/gnu/micropython/uc386-dos/
+; math_gamma.c` (compiled through uc386 alongside the
+; MicroPython port sources). No asm stubs here so the symbols
+; come from the C TU.
 

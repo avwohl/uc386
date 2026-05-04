@@ -1392,6 +1392,48 @@ def test_micropython_os_rename_unlink(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_math_gamma(micropython_bin: Path) -> None:
+    """`math.gamma` and `math.lgamma`. Pre-fix these were NaN
+    stubs in lib/i386_dos_libc.asm. Post-fix they're a Lanczos
+    approximation in C (uc386-dos/math_gamma.c).
+
+    gamma(N) = (N-1)! → gamma(5) ≈ 24, gamma(1) = 1.
+    gamma(0.5) = √π ≈ 1.7724538509.
+    lgamma(10) = log(9!) ≈ log(362880) ≈ 12.8018."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import math\n"
+                  b"print(int(math.gamma(5) + 0.5))\n"
+                  b"print(int(math.gamma(0.5) * 10000))\n"
+                  b"print(int(math.lgamma(10) * 1000))\n"
+                  b"print(math.gamma(1))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "\n24\n" in res.stdout, (
+        f"expected gamma(5) ≈ 24 (4!), got: {res.stdout!r}"
+    )
+    # sqrt(pi) = 1.7724538509...; the Lanczos approx ~10⁻¹⁰ accuracy
+    # gives 17724 or 17725 after *10000+truncation.
+    assert "\n17724\n" in res.stdout or "\n17725\n" in res.stdout, (
+        f"expected gamma(0.5) ≈ √π → 1.7724/1.7725, got: {res.stdout!r}"
+    )
+    # log(9!) = 12.801827...
+    assert "\n12801\n" in res.stdout, (
+        f"expected lgamma(10) ≈ 12.801, got: {res.stdout!r}"
+    )
+    assert "\n1.0\n" in res.stdout, (
+        f"expected gamma(1) == 1.0, got: {res.stdout!r}"
+    )
+
+
 def test_micropython_cmath_basic(micropython_bin: Path) -> None:
     """`import cmath` complex-number math. Validates abs(),
     cmath.exp on imaginary axis (Euler's formula:
