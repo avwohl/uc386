@@ -4,15 +4,15 @@
 **License**: MIT
 
 **`addons/gnu/micropython/build_port.sh` produces a runnable
-`build/micropython.bin` (~281 KB at EXTRA_FEATURES with the
-full surface — `os` (incl. listdir/stat/system/getenv/environ)
-+ `time` (incl. time_ns) + `random`/`binascii`/`hashlib` (md5
-+ sha1 + sha256)/`re`/`cmath`/`heapq`/`deflate`/`io`/`uctypes`/
-`json`/`platform` modules + LONGINT_LONGLONG +
-MICROPY_STACK_CHECK + EXACT float formatter + `help()` +
-module `__file__`. Was ~169 KB at MINIMUM, ~199 KB at
-CORE_FEATURES, ~263 KB at the first EXTRA_FEATURES
-landing).** Run under `uc386.dos_emu.run`,
+`build/micropython.bin` (~293 KB at EXTRA_FEATURES with the
+full surface — `os` (incl. listdir/stat/system/getenv/environ
++ port-supplied `os.path` submodule) + `time` (incl. time_ns)
++ `random`/`binascii`/`hashlib` (md5 + sha1 + sha256)/`re`/
+`cmath`/`heapq`/`deflate`/`io`/`uctypes`/`json`/`platform`
+modules + LONGINT_LONGLONG + MICROPY_STACK_CHECK + EXACT
+float formatter + `help()` + module `__file__`. Was ~169 KB
+at MINIMUM, ~199 KB at CORE_FEATURES, ~263 KB at the first
+EXTRA_FEATURES landing).** Run under `uc386.dos_emu.run`,
 it boots the MicroPython REPL and accepts essentially full Python:
 
 ```

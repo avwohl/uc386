@@ -113,6 +113,11 @@ extern const char *getenv(const char *name);
 extern const char *dos_env_iter(unsigned index);
 extern int system(const char *cmd);
 
+// `os.path` submodule. Defined in path_uc386dos.c — registered as
+// the `path` attribute of mp_module_os below so user code can do
+// `os.path.join(a, b)` the way CPython programs expect.
+extern const struct _mp_obj_module_t mp_module_os_path;
+
 static mp_obj_t mod_uc386dos_os_listdir(size_t n_args, const mp_obj_t *args) {
     char mask[80];
     if (n_args == 0) {
@@ -250,6 +255,7 @@ static const mp_rom_map_elem_t mp_module_os_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_getenv),  MP_ROM_PTR(&mod_uc386dos_os_getenv_obj) },
     { MP_ROM_QSTR(MP_QSTR_environ), MP_ROM_PTR(&mod_uc386dos_os_environ_obj) },
     { MP_ROM_QSTR(MP_QSTR_sep),     MP_ROM_QSTR(MP_QSTR__slash_) },
+    { MP_ROM_QSTR(MP_QSTR_path),    MP_ROM_PTR(&mp_module_os_path) },
 };
 static MP_DEFINE_CONST_DICT(mp_module_os_globals, mp_module_os_globals_table);
 

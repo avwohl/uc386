@@ -2080,6 +2080,107 @@ def test_micropython_os_environ(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_os_path_join_split(micropython_bin: Path) -> None:
+    """`os.path.join` / `split` / `splitext` / `basename` / `dirname`
+    — port-supplied submodule (uc386-dos/path_uc386dos.c). Backslash
+    is the canonical separator; both '\\' and '/' are accepted on
+    input. Drive prefixes (`C:`) reset join() like CPython on Win.
+    Test pins the major edge cases."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import os\n"
+                  b"print(os.path.join('a', 'b', 'c'))\n"
+                  b"print(os.path.join('C:\\\\dos', 'foo.txt'))\n"
+                  b"print(os.path.join('a', 'C:\\\\absolute'))\n"
+                  b"print(os.path.split('C:\\\\dir\\\\file.txt'))\n"
+                  b"print(os.path.splitext('archive.tar.gz'))\n"
+                  b"print(os.path.basename('C:\\\\dos\\\\app.exe'))\n"
+                  b"print(os.path.dirname('C:\\\\dos\\\\app.exe'))\n"
+                  b"print(os.path.sep)\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # join() with backslash separator.
+    assert "a\\b\\c" in res.stdout, f"join 3 parts: {res.stdout!r}"
+    assert "C:\\dos\\foo.txt" in res.stdout, f"join drive: {res.stdout!r}"
+    # Drive-letter prefix in arg 2 resets — matches CPython on Win.
+    assert "C:\\absolute" in res.stdout, f"join abs reset: {res.stdout!r}"
+    # split() returns (head, tail).
+    assert "('C:\\\\dir', 'file.txt')" in res.stdout, (
+        f"split tuple: {res.stdout!r}"
+    )
+    # splitext() — only last dot, ext includes the dot.
+    assert "('archive.tar', '.gz')" in res.stdout, (
+        f"splitext: {res.stdout!r}"
+    )
+    assert "app.exe" in res.stdout, f"basename: {res.stdout!r}"
+    assert "C:\\dos" in res.stdout, f"dirname: {res.stdout!r}"
+
+
+def test_micropython_os_path_exists(micropython_bin: Path) -> None:
+    """`os.path.exists` / `isfile` against a seeded vfile. Backed
+    by libc's stat() (INT 21h AH=0x42 lseek-to-end). True for a
+    file we explicitly seeded; False for a non-existent name."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import os\n"
+                  b"print(os.path.exists('hello.txt'))\n"
+                  b"print(os.path.exists('nope.txt'))\n"
+                  b"print(os.path.isfile('hello.txt'))\n"
+                  b"\x04"
+              ),
+              vfiles_init={b"hello.txt": b"hi"},
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "hello.txt'))\nTrue\n" in res.stdout, (
+        f"expected True for seeded file, got: {res.stdout!r}"
+    )
+    assert "nope.txt'))\nFalse\n" in res.stdout, (
+        f"expected False for absent file, got: {res.stdout!r}"
+    )
+    assert "isfile('hello.txt'))\nTrue\n" in res.stdout, (
+        f"expected isfile True, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_os_path_normpath(micropython_bin: Path) -> None:
+    """`os.path.normpath` collapses redundant separators and
+    canonicalizes forward-slash → backslash. Doesn't resolve `..`
+    (DOS conventions vary, conservative)."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import os\n"
+                  b"print(os.path.normpath('a/b//c'))\n"
+                  b"print(os.path.normpath('C:/dos/\\\\foo'))\n"
+                  b"print(os.path.normpath(''))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "a\\b\\c" in res.stdout, f"normpath dedup: {res.stdout!r}"
+    assert "C:\\dos\\foo" in res.stdout, f"normpath slashes: {res.stdout!r}"
+    assert "\n.\n" in res.stdout, f"normpath empty→dot: {res.stdout!r}"
+
+
 def test_micropython_sys_exc_info(micropython_bin: Path) -> None:
     """`sys.exc_info()` returns the (type, value, tb) tuple inside
     an except block, and (None, None, None) outside. Default OFF

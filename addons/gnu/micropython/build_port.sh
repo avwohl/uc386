@@ -116,6 +116,7 @@ SOURCES_FILE="build/_port_sources.txt"
     echo uc386-dos/mphal_uc386dos.c
     echo uc386-dos/file_uc386dos.c
     echo uc386-dos/os_uc386dos.c
+    echo uc386-dos/path_uc386dos.c
     echo uc386-dos/math_gamma.c
 } > "$SOURCES_FILE"
 
