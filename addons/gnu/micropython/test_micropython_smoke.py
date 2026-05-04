@@ -2080,6 +2080,67 @@ def test_micropython_os_environ(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_json_roundtrip(micropython_bin: Path) -> None:
+    """`json.loads` + `json.dumps` round-trip. Backed by upstream's
+    `extmod/modjson.c`, gated on MICROPY_PY_JSON (default 1 at
+    EXTRA_FEATURES). Pulled into the build alongside modplatform.c
+    in the same slice that adds these tests."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import json\n"
+                  b"d = json.loads('{\"a\": 1, \"b\": [2, 3]}')\n"
+                  b"print(d['a'], d['b'])\n"
+                  b"print(json.dumps({'k': 'v'}))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "1 [2, 3]" in res.stdout, (
+        f"expected parsed JSON values, got: {res.stdout!r}"
+    )
+    assert '{"k": "v"}' in res.stdout, (
+        f"expected JSON dump, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_platform_module(micropython_bin: Path) -> None:
+    """`import platform; platform.platform()` returns a descriptive
+    string built from MICROPY_PLATFORM_* defines. Backed by
+    upstream's `extmod/modplatform.c`. We pin the version stamp
+    set in mpconfigport.h so platform.platform() is recognizable
+    rather than a generic 'MicroPython'."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import platform\n"
+                  b"print(platform.platform())\n"
+                  b"print(platform.machine())\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # MICROPY_PLATFORM_VERSION = "uc386-dos i386 (PMODE/W)" lands
+    # in the platform.platform() string verbatim.
+    assert "uc386-dos" in res.stdout, (
+        f"expected uc386-dos platform marker, got: {res.stdout!r}"
+    )
+    assert "x86" in res.stdout, (
+        f"expected x86 machine marker (from __i386__ detection), "
+        f"got: {res.stdout!r}"
+    )
+
+
 def test_micropython_os_system_stub(micropython_bin: Path) -> None:
     """`os.system(cmd)` calls libc `system()` which is currently a
     stub returning -1 under dos_emu (no fork/exec). Test pins the

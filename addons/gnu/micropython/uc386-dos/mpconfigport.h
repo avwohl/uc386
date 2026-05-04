@@ -249,6 +249,13 @@ typedef long mp_off_t;
 #define MICROPY_HW_BOARD_NAME "uc386-dos"
 #define MICROPY_HW_MCU_NAME   "i386"
 
+// `platform` module identity. modplatform.h's MICROPY_PLATFORM_*
+// detections fall through to the generic "MicroPython" / "" case
+// because our build doesn't define __linux / __GLIBC__ / etc.
+// MICROPY_PLATFORM_VERSION IS `#ifndef`-guarded though, so we can
+// stamp the runtime identity through that one.
+#define MICROPY_PLATFORM_VERSION "uc386-dos i386 (PMODE/W)"
+
 // Use the same STDOUT path the minimal port uses on linux/darwin —
 // uc386's libc turns read(STDIN)/write(STDOUT) into INT 21h DOS calls.
 #define MICROPY_MIN_USE_STDOUT (1)

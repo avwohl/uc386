@@ -103,6 +103,8 @@ SOURCES_FILE="build/_port_sources.txt"
     # so don't add them to the source list — that would duplicate
     # symbols.
     echo upstream/extmod/moddeflate.c
+    echo upstream/extmod/modjson.c
+    echo upstream/extmod/modplatform.c
     echo upstream/ports/minimal/main.c
     echo upstream/ports/minimal/uart_core.c
     echo uc386-dos/mphal_uc386dos.c
