@@ -52,12 +52,27 @@ except ImportError:
 # Memory layout
 #   0x00000000 .. 0x00800000   code/data (8 MB) — the loaded binary lives here
 #   0x00800000 .. 0x01000000   heap (8 MB, growable in principle)
+#   0x000F0000 .. 0x000F1000   fake DOS PSP + env block (within CODE region)
 #   0x00F00000 .. 0x00F01000   argv area (4 KB)
 #   0x01000000 .. 0x01100000   stack (1 MB, top at 0x010FFFF0)
+#
+# PSP_BASE sits within the CODE region so we don't need a separate
+# unicorn mapping. PMODE/W exposes DOS conventional memory directly
+# via flat 32-bit selectors, so a real DOS extender hands the program
+# linear addresses computed from segment*16 — same shape as our fake.
+# 0x000F0000 = 960 KB, well clear of the loaded binary (mp.bin is
+# ~280 KB) and below the 1 MB ceiling so segment*16 (where seg fits
+# in 16 bits) can address it.
 CODE_BASE = 0x00000000
 CODE_SIZE = 0x00800000
 HEAP_BASE = 0x00800000
 HEAP_SIZE = 0x00800000
+PSP_BASE = 0x000F0000
+PSP_SIZE = 0x00001000
+PSP_SEG = PSP_BASE >> 4          # 0xF000
+ENV_OFFSET = 0x100               # PSP is 256 bytes; env block starts after
+ENV_BASE = PSP_BASE + ENV_OFFSET
+ENV_SEG = ENV_BASE >> 4          # 0xF010
 ARGV_BASE = 0x00F00000
 ARGV_SIZE = 0x00001000
 STACK_BASE = 0x01000000
@@ -99,6 +114,8 @@ def run(
     instruction_limit: int = 50_000_000,
     stdin_bytes: bytes = b"",
     argv: list[str] | None = None,
+    env: dict[str, str] | None = None,
+    program_path: str | None = None,
     vfiles_init: dict[bytes, bytes] | None = None,
 ) -> Result:
     """Emulate a flat-binary i386 program; return its stdout + exit code.
@@ -106,6 +123,12 @@ def run(
     `vfiles_init` seeds the virtual file system with named files
     visible to fopen("name", "r"). Pass `{b"data.txt": b"hello\n"}`
     so a program can open and read `data.txt`.
+
+    `env` populates a fake DOS environment block reachable through
+    PSP[0x2C] (INT 21h AH=0x62 returns BX=PSP_seg). `program_path`
+    sets the trailing argv[0] string DOS 3.0+ writes after the env
+    block — used by libc's `_dos_argv0()` helper. Defaults to the
+    first element of `argv` (or "PROGRAM.EXE" if argv is empty).
     """
     if not _UNICORN_AVAILABLE:
         raise RuntimeError(
@@ -144,6 +167,44 @@ def run(
     if cursor > ARGV_SIZE:
         return Result(error=f"argv too large: {cursor} > {ARGV_SIZE}")
     mu.mem_write(ARGV_BASE, bytes(abuf))
+
+    # Fake DOS PSP + environment block. PSP[0x2C] holds the env
+    # segment; the env block is `KEY=VAL\0` strings terminated by
+    # an extra `\0`, then (DOS 3.0+) a 16-bit count word and the
+    # program's full path as a `\0`-terminated string. INT 21h
+    # AH=0x62 returns BX = PSP_seg so the program can find its
+    # PSP without needing extender-specific calls.
+    psp = bytearray(PSP_SIZE)
+    # Standard PSP markers we don't actually use but might as well
+    # populate for parity with real DOS:
+    psp[0x00] = 0xCD  # INT 20h opcode (legacy CP/M-style exit)
+    psp[0x01] = 0x20
+    # PSP[0x2C..0x2D]: env segment (little-endian word).
+    psp[0x2C] = ENV_SEG & 0xFF
+    psp[0x2D] = (ENV_SEG >> 8) & 0xFF
+
+    # Build the env block at ENV_BASE (offset ENV_OFFSET into the PSP
+    # page). `env` defaults to empty so the block is just the
+    # double-NUL terminator + program-path tail.
+    env_buf = bytearray()
+    if env:
+        for key, val in env.items():
+            entry = f"{key}={val}".encode("utf-8")
+            if b"\x00" in entry:
+                return Result(error=f"env entry contains NUL: {key!r}")
+            env_buf.extend(entry)
+            env_buf.append(0)
+    env_buf.append(0)  # terminating empty string ("\0\0" overall)
+    # DOS 3.0+ tail: count word (1) + program path (NUL-terminated).
+    if program_path is None:
+        program_path = argv[0] if argv else "PROGRAM.EXE"
+    env_buf.extend(struct.pack("<H", 1))
+    env_buf.extend(program_path.encode("utf-8"))
+    env_buf.append(0)
+    if ENV_OFFSET + len(env_buf) > PSP_SIZE:
+        return Result(error=f"env block too large: {len(env_buf)} bytes")
+    psp[ENV_OFFSET:ENV_OFFSET + len(env_buf)] = env_buf
+    mu.mem_write(PSP_BASE, bytes(psp))
 
     # Initialize stack near the top of the stack region. Push a fake return
     # address (0xFFFFFFFF) so `ret` from the entry function ends up at an
@@ -1066,6 +1127,12 @@ def run(
             new_eax = (eax & ~0xFFFFFFFF) | (edx & 0xFFFFFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
             return
+        if ah == 0x62:
+            # Get current PSP segment. Returns BX = PSP_seg.
+            ebx = uc.reg_read(UC_X86_REG_EBX)
+            new_ebx = (ebx & ~0xFFFF) | (PSP_SEG & 0xFFFF)
+            uc.reg_write(UC_X86_REG_EBX, new_ebx)
+            return
         if ah == 0x99:
             # signal(signum, handler): AL=signum, EBX=handler.
             # Returns prev handler in EAX.
@@ -1394,6 +1461,8 @@ def assemble_and_run(
     keep_intermediate: bool = False,
     stdin_bytes: bytes = b"",
     argv: list[str] | None = None,
+    env: dict[str, str] | None = None,
+    program_path: str | None = None,
     vfiles_init: dict[bytes, bytes] | None = None,
 ) -> Result:
     """Convenience: optionally bundle libc, nasm-assemble (-f bin), and run.
@@ -1418,6 +1487,8 @@ def assemble_and_run(
         instruction_limit=instruction_limit,
         stdin_bytes=stdin_bytes,
         argv=argv,
+        env=env,
+        program_path=program_path,
         vfiles_init=vfiles_init,
     )
     if not keep_intermediate:

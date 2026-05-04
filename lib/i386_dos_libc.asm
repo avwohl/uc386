@@ -4440,6 +4440,204 @@ _dos_dta_attr:
         movzx   eax, byte [__dta_buf + 21]
         ret
 
+; ============================================================================
+; PSP / environment-block access (DOS 3.0+).
+;
+; The DOS Program Segment Prefix is a 256-byte block the loader places
+; at PSP_seg:0000 just below the program. Offset 0x2C holds the
+; environment segment — a separate paragraph holding NUL-terminated
+; "KEY=VAL" strings, an empty-string terminator, then (DOS 3.0+) a
+; 16-bit count word and the program's full path.
+;
+; Under PMODE/W the program runs with flat 32-bit selectors covering
+; all 4 GB of linear memory; conventional DOS memory still lives
+; below the 1 MB ceiling, so a flat pointer = (segment << 4) + offset
+; addresses the PSP and env block directly.
+;
+; INT 21h AH=0x62 returns BX = current PSP segment without any
+; extender-specific calls. dos_emu's handler matches.
+; ============================================================================
+
+; uint16_t _dos_get_psp_seg(void)
+;   Returns PSP segment in EAX (zero-extended). Saves EBX so cdecl
+;   contract holds (INT 21h AH=0x62 returns the value in BX which
+;   is the low half of EBX).
+_dos_get_psp_seg:
+        push    ebx
+        mov     ah, 0x62
+        int     21h
+        movzx   eax, bx
+        pop     ebx
+        ret
+
+; const char *_dos_env_base(void)
+;   Returns flat pointer to the environment block (env_seg << 4),
+;   or NULL when env_seg is 0 (no environment inherited).
+_dos_env_base:
+        push    ebx
+        push    esi
+        mov     ah, 0x62
+        int     21h
+        movzx   esi, bx                     ; PSP_seg
+        shl     esi, 4                      ; PSP linear
+        movzx   eax, word [esi + 0x2C]      ; env_seg
+        test    eax, eax
+        jz      .none
+        shl     eax, 4
+        pop     esi
+        pop     ebx
+        ret
+.none:
+        xor     eax, eax
+        pop     esi
+        pop     ebx
+        ret
+
+; const char *_getenv(const char *name)
+;   Walks the environment block looking for `name=` and returns a
+;   pointer to the value (the byte after `=`). Returns NULL if not
+;   found, or if the env block is empty / unavailable.
+;
+;   The match is case-sensitive (POSIX-style), even though DOS
+;   conventionally upper-cases environment names. Programs that want
+;   case-insensitive lookup can upper-case the query themselves.
+_getenv:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    esi
+        push    edi
+        ; ebx = env_base
+        call    _dos_env_base
+        test    eax, eax
+        jz      .miss
+        mov     ebx, eax
+        ; Compute name length in EDX.
+        mov     edi, [ebp + 8]
+        xor     edx, edx
+.namelen:
+        cmp     byte [edi + edx], 0
+        je      .have_namelen
+        inc     edx
+        jmp     .namelen
+.have_namelen:
+        ; Walk env entries. ebx = current entry start, edx = name_len.
+.next_entry:
+        cmp     byte [ebx], 0
+        je      .miss                       ; empty string → end of block
+        ; Compare edx bytes at [ebx] vs name [ebp+8].
+        mov     esi, ebx
+        mov     edi, [ebp + 8]
+        mov     ecx, edx
+        cld
+        repe    cmpsb
+        jne     .skip                       ; mismatch before name end
+        ; All edx bytes matched. Require '=' immediately after.
+        cmp     byte [esi], '='
+        jne     .skip
+        lea     eax, [esi + 1]              ; value pointer
+        jmp     .done
+.skip:
+        ; Advance ebx past this entry.
+.skip_loop:
+        cmp     byte [ebx], 0
+        je      .skip_done
+        inc     ebx
+        jmp     .skip_loop
+.skip_done:
+        inc     ebx                         ; past the NUL
+        jmp     .next_entry
+.miss:
+        xor     eax, eax
+.done:
+        pop     edi
+        pop     esi
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; const char *_dos_env_iter(unsigned index)
+;   Returns a pointer to the i'th "KEY=VAL" entry in the environment
+;   block, or NULL when index is past the last entry. Useful for
+;   building a snapshot of environ at startup or exposing it to a
+;   higher-level dict (Python's `os.environ`).
+_dos_env_iter:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        call    _dos_env_base
+        test    eax, eax
+        jz      .iter_miss
+        mov     ebx, eax                    ; current entry ptr
+        mov     ecx, [ebp + 8]              ; index
+.iter_loop:
+        cmp     byte [ebx], 0
+        je      .iter_miss                  ; ran off the end
+        test    ecx, ecx
+        jz      .iter_hit
+        ; Skip this entry (NUL-terminated).
+.iter_skip:
+        cmp     byte [ebx], 0
+        je      .iter_skip_done
+        inc     ebx
+        jmp     .iter_skip
+.iter_skip_done:
+        inc     ebx
+        dec     ecx
+        jmp     .iter_loop
+.iter_hit:
+        mov     eax, ebx
+        jmp     .iter_done
+.iter_miss:
+        xor     eax, eax
+.iter_done:
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; const char *_dos_argv0(void)
+;   Walks past the env block's terminator and returns the trailing
+;   program-path string (DOS 3.0+ only). Returns NULL if the env
+;   block lacks the count-word marker. Suitable for filling in
+;   argv[0] under PMODE/W when the loader hasn't already wired one.
+_dos_argv0:
+        push    ebx
+        call    _dos_env_base
+        test    eax, eax
+        jz      .a0_miss
+        mov     ebx, eax
+.a0_skip:
+        ; Walk to the empty-string terminator (\0\0): scan to the
+        ; next NUL, then if the byte AFTER it is also NUL we've
+        ; reached the block end; otherwise advance past the NUL and
+        ; keep going.
+        cmp     byte [ebx], 0
+        jne     .a0_advance
+        inc     ebx                         ; past the trailing NUL
+        jmp     .a0_have_tail
+.a0_advance:
+        inc     ebx
+        cmp     byte [ebx], 0
+        jne     .a0_advance
+        inc     ebx
+        jmp     .a0_skip
+.a0_have_tail:
+        ; ebx now points just past the env terminator. DOS 3.0+ has
+        ; a 16-bit count followed by the program path; require the
+        ; count to be non-zero or we have no path to return.
+        movzx   eax, word [ebx]
+        test    eax, eax
+        jz      .a0_miss
+        lea     eax, [ebx + 2]              ; skip the count word
+        pop     ebx
+        ret
+.a0_miss:
+        xor     eax, eax
+        pop     ebx
+        ret
+
 ; ---- ungetc(c, stream): simple one-byte unget --------------------------------
         section .bss
 _ungetc_buf:    resd 1                      ; -1 = empty, else the byte
