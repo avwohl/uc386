@@ -172,10 +172,12 @@ What doesn't work yet (separate gates, pinned in mpconfigport.h):
   program-path string DOS 3.0+ writes after the env terminator.
   `os.environ()` is a function (not a property) — MicroPython
   modules don't support attribute-getter delegation, so we
-  expose a fresh-snapshot dict on call. `os.system` calls libc
-  `system()` which is currently a -1 stub on dos_emu (no
-  fork/exec); real-DOS routing through INT 21h AH=0x4B EXEC
-  + COMMAND.COM /C is a future slice.
+  expose a fresh-snapshot dict on call. `os.system(cmd)` calls
+  libc `system()` which spawns COMMAND.COM /C `cmd` via INT 21h
+  AH=0x4B sub 0 (LOAD AND EXECUTE) and reads the exit code via
+  AH=0x4D. dos_emu's handler recognizes ECHO and EXIT N for
+  smoke testing; real DOS shells out through whatever path
+  COMSPEC points at.
 
 - ~~Full `MICROPY_CONFIG_ROM_LEVEL = EXTRA_FEATURES`~~ — DONE
   (2026-05-03). The wholesale-EXTRA hang turned out to be

@@ -2403,25 +2403,37 @@ def test_micropython_platform_module(micropython_bin: Path) -> None:
     )
 
 
-def test_micropython_os_system_stub(micropython_bin: Path) -> None:
-    """`os.system(cmd)` calls libc `system()` which is currently a
-    stub returning -1 under dos_emu (no fork/exec). Test pins the
-    libc-side wiring; real DOS would route through INT 21h AH=0x4B
-    EXEC + COMMAND.COM /C in a follow-up slice."""
+def test_micropython_os_system_exec(micropython_bin: Path) -> None:
+    """`os.system(cmd)` invokes the DOS shell via INT 21h AH=0x4B
+    sub 0 (LOAD AND EXECUTE), then reads the child's exit code via
+    AH=0x4D. dos_emu's tiny built-in interpreter recognizes ECHO
+    (writes args to stdout, exit 0) and EXIT N (returns N as the
+    child exit code). Real DOS would shell out through COMMAND.COM
+    via the same call."""
     sys.path.insert(0, str(REPO_ROOT / "src"))
     from uc386.dos_emu import run
 
     res = run(micropython_bin,
               stdin_bytes=(
                   b"import os\n"
-                  b"print(os.system('ECHO hi'))\n"
+                  b"rc = os.system('ECHO hello world')\n"
+                  b"print('echo rc=', rc)\n"
+                  b"rc = os.system('EXIT 7')\n"
+                  b"print('exit rc=', rc)\n"
                   b"\x04"
               ),
+              env={"COMSPEC": "C:\\COMMAND.COM"},
               timeout_seconds=15.0,
               instruction_limit=4_000_000_000)
     assert not res.timed_out, "REPL didn't exit"
     assert res.error is None, f"dos_emu reported error: {res.error}"
     assert res.exit_code == 0
-    assert "\n-1\n" in res.stdout, (
-        f"expected os.system stub return -1, got: {res.stdout!r}"
+    assert "hello world" in res.stdout, (
+        f"expected ECHO output, got: {res.stdout!r}"
+    )
+    assert "echo rc= 0" in res.stdout, (
+        f"expected ECHO exit 0, got: {res.stdout!r}"
+    )
+    assert "exit rc= 7" in res.stdout, (
+        f"expected EXIT 7 to return 7, got: {res.stdout!r}"
     )

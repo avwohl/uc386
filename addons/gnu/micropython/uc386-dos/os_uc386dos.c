@@ -184,11 +184,10 @@ static mp_obj_t mod_uc386dos_os_stat(mp_obj_t path_in) {
 static MP_DEFINE_CONST_FUN_OBJ_1(mod_uc386dos_os_stat_obj, mod_uc386dos_os_stat);
 
 // `os.system(cmd)` — invokes the DOS shell to run `cmd`. Backed by
-// libc's `system()` which currently returns -1 unconditionally on
-// dos_emu (no fork/exec). Real DOS would route through INT 21h
-// AH=0x4B (EXEC) calling COMMAND.COM /C; that's a separate slice.
-// Exposed now so user code can be portable across the eventual
-// real-DOS path.
+// libc's `system()` which calls INT 21h AH=0x4B sub 0 (LOAD AND
+// EXECUTE) on COMMAND.COM (or whatever COMSPEC points at) with
+// "/C <cmd>" as the command tail, then reads the exit code via
+// AH=0x4D (Get Return Code). Returns -1 on exec failure.
 static mp_obj_t mod_uc386dos_os_system(mp_obj_t cmd_in) {
     const char *cmd = get_path_str(cmd_in);
     int rc = system(cmd);

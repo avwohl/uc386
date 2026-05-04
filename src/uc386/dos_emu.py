@@ -246,6 +246,10 @@ def run(
     # DTA address (set by INT 21h AH=0x1A); used by find-first/
     # find-next to write filename matches into the caller's buffer.
     vdta_addr = [0]
+    # INT 21h AH=0x4B (EXEC) → AH=0x4D (Get Return Code) handoff: the
+    # child process's exit code gets stashed by the EXEC handler and
+    # returned by the next AH=0x4D call.
+    child_exit_code = [0]
     # find-first/find-next iteration state. List of (filename_bytes,
     # is_dir_bool) entries left to enumerate after the initial
     # find-first call.
@@ -1132,6 +1136,62 @@ def run(
             ebx = uc.reg_read(UC_X86_REG_EBX)
             new_ebx = (ebx & ~0xFFFF) | (PSP_SEG & 0xFFFF)
             uc.reg_write(UC_X86_REG_EBX, new_ebx)
+            return
+        if ah == 0x4B and al == 0x00:
+            # Load and Execute: DS:DX = path, ES:BX = parameter block.
+            # We can't actually fork/exec under unicorn — instead we
+            # parse the command tail (param_block + 2 → far ptr to
+            # length-prefixed string) and recognize a small set of
+            # built-in DOS commands so libc system() smoke tests can
+            # pin behavior.
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            ebx = uc.reg_read(UC_X86_REG_EBX)
+            path = bytes(_read_cstr_local(edx))
+            # Read far pointer at param_block + 2: low 16 = offset,
+            # high 16 = segment. Linear = (seg << 4) | offset.
+            tail_far = struct.unpack("<HH", uc.mem_read(ebx + 2, 4))
+            tail_off, tail_seg = tail_far
+            tail_lin = (tail_seg << 4) | tail_off
+            # Pascal-string: 1 length byte then chars.
+            tail_len = uc.mem_read(tail_lin, 1)[0]
+            tail = bytes(uc.mem_read(tail_lin + 1, tail_len))
+            # Strip trailing CR (DOS terminator) if present.
+            if tail.endswith(b"\r"):
+                tail = tail[:-1]
+            # Recognize "/C <cmd>" or "/c <cmd>" (libc's system()
+            # prepends " /C " so we lstrip whitespace before matching).
+            cmd = tail.lstrip()
+            if cmd[:3].upper() == b"/C ":
+                cmd = cmd[3:]
+            cmd = cmd.strip()
+            # Tiny built-in interpreter: enough to make smoke tests
+            # observable. ECHO writes its argv to stdout; anything
+            # else exits 0 silently. Real DOS would actually shell
+            # out; our exit code stash matches that contract.
+            child_exit_code[0] = 0
+            if cmd[:5].upper() == b"ECHO ":
+                _write_stdout(cmd[5:] + b"\r\n")
+            elif cmd.upper() == b"ECHO":
+                _write_stdout(b"\r\n")
+            elif cmd[:5].upper() == b"EXIT ":
+                try:
+                    child_exit_code[0] = int(cmd[5:].strip()) & 0xFF
+                except ValueError:
+                    child_exit_code[0] = 0
+            # No carry → success. AX is otherwise unspecified; clear
+            # to 0 to avoid leaking stale state.
+            uc.reg_write(UC_X86_REG_EAX, 0)
+            uc.reg_write(UC_X86_REG_EFLAGS,
+                         uc.reg_read(UC_X86_REG_EFLAGS) & ~1)
+            return
+        if ah == 0x4D:
+            # Get child return code: AL = stored exit code, AH = exit
+            # type (00 = normal). We track the last exec's exit code
+            # in `child_exit_code[0]`; AH=0x4B sets it, AH=0x4D reads
+            # and returns it.
+            code = child_exit_code[0]
+            new_eax = (eax & ~0xFFFF) | (code & 0xFF)
+            uc.reg_write(UC_X86_REG_EAX, new_eax)
             return
         if ah == 0x99:
             # signal(signum, handler): AL=signum, EBX=handler.

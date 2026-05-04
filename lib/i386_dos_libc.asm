@@ -3980,16 +3980,142 @@ _strerror_buf:  times 32 db 0
 
         section .text
 
-; ---- shell-related: popen / pclose / system — all stubbed -------------------
-; dos_emu has no fork/exec. popen returns NULL; pclose / system return -1.
+; ---- shell-related: popen / pclose stubbed; system invokes EXEC ----
+; popen / pclose still stub — there's no pipe API on DOS without a
+; full extender. system() invokes COMMAND.COM /C <cmd> via INT 21h
+; AH=0x4B sub 0 (LOAD AND EXECUTE) and reads the exit code via AH=0x4D.
 _popen:
         xor     eax, eax
         ret
 _pclose:
         mov     eax, -1
         ret
+
+        section .data
+__system_comspec_name:  db "COMSPEC", 0
+__system_default_path:  db "C:\COMMAND.COM", 0
+__system_dash_c:        db " /C ", 0
+; The cmdtail / parameter-block buffers live in .data (not .bss) so
+; their NASM-assigned addresses sit below the 1 MB ceiling. INT 21h
+; AH=0x4B encodes them as (segment, offset) 16:16 pairs in the param
+; block, and segment must fit in 16 bits — i.e. linear < 1 MB.
+; MicroPython's port reserves a 1 MB GC heap in .bss, which pushes
+; anything we declare with `resb` past 1 MB; .data placement comes
+; before .bss in NASM `-f bin`'s output, so we stay safe.
+__system_path_buf:      times 80 db 0
+__system_cmdtail:       times 130 db 0    ; len byte + up to 128 chars + CR
+__system_param_block:   times 22 db 0     ; env_seg(2) + cmdtail far(4) +
+                                          ; FCB1 far(4) + FCB2 far(4) +
+                                          ; child SS:SP(4) + child CS:IP(4)
+        section .text
+
+; int system(const char *cmd)
+;   Spawn a child process via INT 21h AH=0x4B AL=0. The path comes
+;   from COMSPEC (env-block lookup via _getenv) or falls back to
+;   "C:\COMMAND.COM". The command tail is "/C <cmd>\r" packed into
+;   the DOS Pascal-string format the kernel expects (1 length byte
+;   then chars then 0x0D terminator).
+;   Returns the child's exit code (via AH=0x4D), or -1 on exec error.
 _system:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    esi
+        push    edi
+        ; Resolve COMSPEC.
+        push    __system_comspec_name
+        call    _getenv
+        add     esp, 4
+        test    eax, eax
+        jnz     .have_comspec
+        mov     eax, __system_default_path
+.have_comspec:
+        ; Copy the path to our static buffer (in case getenv returned
+        ; a pointer into the env block — we want a stable buffer).
+        mov     esi, eax
+        mov     edi, __system_path_buf
+.copy_path:
+        mov     al, [esi]
+        mov     [edi], al
+        inc     esi
+        inc     edi
+        test    al, al
+        jnz     .copy_path
+        ; Build command tail: " /C " + cmd + 0x0D, length-prefixed.
+        mov     edi, __system_cmdtail
+        inc     edi                          ; skip length byte for now
+        ; Copy " /C " literal.
+        mov     esi, __system_dash_c
+.copy_dashc:
+        mov     al, [esi]
+        test    al, al
+        jz      .dashc_done
+        mov     [edi], al
+        inc     esi
+        inc     edi
+        jmp     .copy_dashc
+.dashc_done:
+        ; Copy user cmd.
+        mov     esi, [ebp + 8]
+.copy_cmd:
+        mov     al, [esi]
+        test    al, al
+        jz      .cmd_done
+        mov     [edi], al
+        inc     esi
+        inc     edi
+        jmp     .copy_cmd
+.cmd_done:
+        ; Append CR terminator.
+        mov     byte [edi], 0x0D
+        inc     edi
+        ; Length = (edi - cmdtail - 1) clamped to 127.
+        mov     eax, edi
+        sub     eax, __system_cmdtail
+        sub     eax, 1
+        cmp     eax, 127
+        jbe     .len_ok
+        mov     eax, 127
+.len_ok:
+        mov     [__system_cmdtail], al
+        ; Build parameter block. Far-pointer fields are encoded as
+        ; (offset 16, segment 16). For flat 32-bit binaries loaded
+        ; below 1 MB, we can use seg = (linear >> 4), off = linear & 0xF.
+        ; DPMI hosts (CWSDPMI / PMODE/W) translate these to the
+        ; in-conventional-memory parameter block the kernel expects.
+        mov     dword [__system_param_block + 0], 0     ; env_seg + offset bytes
+        ; cmdtail far pointer
+        mov     eax, __system_cmdtail
+        mov     edx, eax
+        and     edx, 0x0F                                ; offset
+        shr     eax, 4                                   ; segment
+        mov     [__system_param_block + 2], dx           ; offset (low 16)
+        mov     [__system_param_block + 4], ax           ; segment (high 16)
+        ; FCB1 + FCB2 (use NULL — most programs ignore these)
+        mov     dword [__system_param_block + 6], 0
+        mov     dword [__system_param_block + 10], 0
+        mov     dword [__system_param_block + 14], 0
+        mov     dword [__system_param_block + 18], 0
+        ; INT 21h AH=0x4B AL=0: DS:DX = pgm path, ES:BX = param block.
+        mov     ax, 0x4B00
+        mov     edx, __system_path_buf
+        mov     ebx, __system_param_block
+        int     21h
+        jc      .error
+        ; Read child exit code: INT 21h AH=0x4D returns AX with
+        ; AL=exit code, AH=exit type.
+        mov     ah, 0x4D
+        int     21h
+        movzx   eax, al
+        jmp     .done
+.error:
         mov     eax, -1
+.done:
+        pop     edi
+        pop     esi
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
         ret
 
 ; ---- setlocale(category, locale): always return "C" -------------------------
