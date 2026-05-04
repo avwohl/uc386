@@ -1325,6 +1325,37 @@ def test_micropython_os_mkdir_chdir_getcwd(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_os_listdir(micropython_bin: Path) -> None:
+    """`os.listdir()` enumerates files via DOS find-first
+    (INT 21h AH=0x4E) + find-next (AH=0x4F) using a static DTA
+    in lib/i386_dos_libc.asm. dos_emu's handlers iterate the
+    in-memory `vfiles` and `vdirs` and write filenames into the
+    caller's DTA at +30."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import os\n"
+                  b"print(sorted(os.listdir()))\n"
+                  b"\x04"
+              ),
+              vfiles_init={
+                  b"a.txt": b"A",
+                  b"b.txt": b"B",
+                  b"config.ini": b"",
+              },
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "['a.txt', 'b.txt', 'config.ini']" in res.stdout, (
+        f"expected sorted listing of seeded vfiles, got: "
+        f"{res.stdout!r}"
+    )
+
+
 def test_micropython_os_rename_unlink(micropython_bin: Path) -> None:
     """`os.rename` (INT 21h AH=0x56) + `os.unlink` (AH=0x41).
     Create a file, rename it, read the new name, unlink, verify

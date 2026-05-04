@@ -89,6 +89,61 @@ static mp_obj_t mod_uc386dos_os_getcwd(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(mod_uc386dos_os_getcwd_obj, mod_uc386dos_os_getcwd);
 
+// `os.listdir([path])` — directory listing via DOS find-first /
+// find-next. Returns a Python list of filenames (str).
+//
+//   - No arg: list the current directory (mask "*.*").
+//   - One arg: list the given directory. We append "\\*.*" to the
+//     path and pass that as the find-first mask.
+//
+// Skips the synthetic "." and ".." entries DOS returns for
+// subdirectories (matching CPython's behavior).
+// uc386 prefixes `_` to C identifiers, so C `dos_find_first` →
+// asm label `_dos_find_first` (matches our libc symbol). Don't
+// prepend an extra underscore in C — that would yield asm label
+// `__dos_find_first`, which nasm rejects as an undefined external.
+extern int dos_find_first(const char *mask);
+extern int dos_find_next(void);
+extern const char *dos_dta_filename(void);
+
+static mp_obj_t mod_uc386dos_os_listdir(size_t n_args, const mp_obj_t *args) {
+    char mask[80];
+    if (n_args == 0) {
+        // Current directory.
+        mask[0] = '*'; mask[1] = '.'; mask[2] = '*'; mask[3] = '\0';
+    } else {
+        const char *path = get_path_str(args[0]);
+        size_t path_len = strlen(path);
+        if (path_len + 5 > sizeof(mask)) {
+            mp_raise_OSError(MP_E2BIG);
+        }
+        memcpy(mask, path, path_len);
+        // Append "\\*.*" if path doesn't already end with a separator.
+        size_t i = path_len;
+        if (i > 0 && mask[i - 1] != '\\' && mask[i - 1] != '/') {
+            mask[i++] = '\\';
+        }
+        mask[i++] = '*';
+        mask[i++] = '.';
+        mask[i++] = '*';
+        mask[i] = '\0';
+    }
+    mp_obj_t list = mp_obj_new_list(0, NULL);
+    int rc = dos_find_first(mask);
+    while (rc == 0) {
+        const char *fname = dos_dta_filename();
+        // Skip "." and ".." entries.
+        if (!(fname[0] == '.' && (fname[1] == '\0' ||
+                                  (fname[1] == '.' && fname[2] == '\0')))) {
+            mp_obj_list_append(list, mp_obj_new_str(fname, strlen(fname)));
+        }
+        rc = dos_find_next();
+    }
+    return list;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(mod_uc386dos_os_listdir_obj,
+    0, 1, mod_uc386dos_os_listdir);
+
 static const mp_rom_map_elem_t mp_module_os_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_os) },
     { MP_ROM_QSTR(MP_QSTR_mkdir),   MP_ROM_PTR(&mod_uc386dos_os_mkdir_obj) },
@@ -98,6 +153,7 @@ static const mp_rom_map_elem_t mp_module_os_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_rename),  MP_ROM_PTR(&mod_uc386dos_os_rename_obj) },
     { MP_ROM_QSTR(MP_QSTR_chdir),   MP_ROM_PTR(&mod_uc386dos_os_chdir_obj) },
     { MP_ROM_QSTR(MP_QSTR_getcwd),  MP_ROM_PTR(&mod_uc386dos_os_getcwd_obj) },
+    { MP_ROM_QSTR(MP_QSTR_listdir), MP_ROM_PTR(&mod_uc386dos_os_listdir_obj) },
     { MP_ROM_QSTR(MP_QSTR_sep),     MP_ROM_QSTR(MP_QSTR__slash_) },
 };
 static MP_DEFINE_CONST_DICT(mp_module_os_globals, mp_module_os_globals_table);

@@ -4370,6 +4370,76 @@ _getcwd:
         pop     ebp
         ret
 
+; ---- DOS find-first / find-next (DTA-based directory enumeration) -----------
+; The DTA (Disk Transfer Area) is a 43-byte buffer DOS fills on
+; AH=0x4E/0x4F. Layout:
+;   +0..20  reserved (DOS internal state for find-next)
+;   +21     file attribute byte
+;   +22..23 file time
+;   +24..25 file date
+;   +26..29 file size (uint32)
+;   +30..42 filename (8.3 + NUL — up to 13 bytes)
+;
+; We use a static DTA buffer in .bss. AH=0x1A sets the DTA pointer
+; before AH=0x4E.
+        section .bss
+__dta_buf:      resb 43
+        section .text
+
+; int _dos_find_first(const char *mask)
+;   mask: pattern like "*.*" or "*.txt". `0x10` attr requests
+;   normal files + directories.
+;   Returns 0 on success (DTA is filled), -1 on no match.
+_dos_find_first:
+        push    ebp
+        mov     ebp, esp
+        ; Set DTA address.
+        mov     ah, 0x1A
+        mov     edx, __dta_buf
+        int     21h
+        ; Find first matching entry.
+        mov     ah, 0x4E
+        mov     edx, [ebp + 8]
+        mov     cx, 0x10                ; attribute: include subdirs
+        int     21h
+        jc      .ff_err
+        xor     eax, eax
+        jmp     .ff_done
+.ff_err:
+        mov     eax, -1
+.ff_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int _dos_find_next(void)
+;   Continue an enumeration started by _dos_find_first. Returns 0
+;   on success (DTA is filled with the next match), -1 on no more.
+_dos_find_next:
+        mov     ah, 0x4F
+        mov     edx, __dta_buf          ; redundant (DTA already set)
+        int     21h
+        jc      .fn_err
+        xor     eax, eax
+        ret
+.fn_err:
+        mov     eax, -1
+        ret
+
+; const char *_dos_dta_filename(void)
+;   Pointer to the filename slot inside our DTA (offset +30,
+;   NUL-terminated, max 13 bytes).
+_dos_dta_filename:
+        mov     eax, __dta_buf + 30
+        ret
+
+; uint8_t _dos_dta_attr(void)
+;   Returns the attribute byte at DTA+21. Useful for distinguishing
+;   files vs directories. 0x10 = directory.
+_dos_dta_attr:
+        movzx   eax, byte [__dta_buf + 21]
+        ret
+
 ; ---- ungetc(c, stream): simple one-byte unget --------------------------------
         section .bss
 _ungetc_buf:    resd 1                      ; -1 = empty, else the byte

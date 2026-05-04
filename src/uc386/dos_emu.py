@@ -182,6 +182,13 @@ def run(
     # path resolution here — tests interact with the vfs by full
     # filename only.
     vcwd = [b"C:\\"]
+    # DTA address (set by INT 21h AH=0x1A); used by find-first/
+    # find-next to write filename matches into the caller's buffer.
+    vdta_addr = [0]
+    # find-first/find-next iteration state. List of (filename_bytes,
+    # is_dir_bool) entries left to enumerate after the initial
+    # find-first call.
+    vfind_state: list[tuple[bytes, bool]] = []
     # Open-file table: fd → {"name": bytes, "pos": int, "mode": str}.
     # Modes: "r" (read), "w" (write/truncate), "a" (append).
     vfd_table: dict[int, dict] = {}
@@ -829,6 +836,70 @@ def run(
                 actual = 0
             new_eax = (eax & ~0xFFFF) | (actual & 0xFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
+            return
+        if ah == 0x1A:
+            # set DTA address: DS:EDX = new DTA pointer.
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            vdta_addr[0] = edx & 0xFFFFFFFF
+            return
+        if ah == 0x4E:
+            # find-first(mask, attr): DS:EDX=mask, CX=attribute.
+            # On success: DTA filled with first match (offset +21
+            # attr, +30 8.3 filename + NUL); CF clear.
+            # On no match: CF set.
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            mask = bytes(_read_cstr_local(edx)).decode("ascii",
+                                                       errors="replace")
+            # Build candidate list from vfiles + vdirs. Match
+            # the mask trivially — support "*", "*.*", "*.ext",
+            # and exact names.
+            def _match(name: str) -> bool:
+                if mask in ("*", "*.*"):
+                    return True
+                if mask.startswith("*.") and "." in mask:
+                    ext = mask[2:].lower()
+                    return name.lower().endswith("." + ext)
+                # Strip trailing "\*.*" — caller wants dir contents.
+                if mask.endswith("\\*.*") or mask.endswith("/*.*"):
+                    return True
+                return name.lower() == mask.lower()
+            entries = []
+            for fname, _content in vfiles.items():
+                n = fname.decode("ascii", errors="replace")
+                if _match(n):
+                    entries.append((fname, False))
+            for dname in vdirs:
+                n = dname.decode("ascii", errors="replace")
+                if _match(n):
+                    entries.append((dname, True))
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            if not entries:
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
+                return
+            # Pop the first; queue the rest for find-next.
+            first, is_dir = entries[0]
+            vfind_state[:] = entries[1:]
+            # Write into DTA: attr at +21, name at +30 (max 13 bytes).
+            if vdta_addr[0]:
+                uc.mem_write(vdta_addr[0] + 21,
+                             bytes([0x10 if is_dir else 0x00]))
+                truncated = first[:12] + b"\x00"
+                uc.mem_write(vdta_addr[0] + 30, truncated)
+            uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
+            return
+        if ah == 0x4F:
+            # find-next: continue iteration. CF set on no more.
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            if not vfind_state:
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
+                return
+            next_name, is_dir = vfind_state.pop(0)
+            if vdta_addr[0]:
+                uc.mem_write(vdta_addr[0] + 21,
+                             bytes([0x10 if is_dir else 0x00]))
+                truncated = next_name[:12] + b"\x00"
+                uc.mem_write(vdta_addr[0] + 30, truncated)
+            uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
             return
         if ah == 0x39:
             # mkdir(path): DS:EDX=path. Set CF on error.
