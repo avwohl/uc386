@@ -361,6 +361,20 @@ extern const struct _mp_obj_module_t mp_module_heapq;
 #define UCDOS_MOD_ENTRY_HEAPQ
 #endif
 
+#if MICROPY_PY_DEFLATE
+extern const struct _mp_obj_module_t mp_module_deflate;
+#define UCDOS_MOD_ENTRY_DEFLATE { MP_ROM_QSTR(MP_QSTR_deflate), MP_ROM_PTR(&mp_module_deflate) },
+#else
+#define UCDOS_MOD_ENTRY_DEFLATE
+#endif
+
+#if MICROPY_PY_IO
+extern const struct _mp_obj_module_t mp_module_io;
+#define UCDOS_MOD_ENTRY_IO { MP_ROM_QSTR(MP_QSTR_io), MP_ROM_PTR(&mp_module_io) },
+#else
+#define UCDOS_MOD_ENTRY_IO
+#endif
+
 #define MICROPY_REGISTERED_MODULES \
     { MP_ROM_QSTR(MP_QSTR_builtins), MP_ROM_PTR(&mp_module_builtins) }, \
     { MP_ROM_QSTR(MP_QSTR_sys), MP_ROM_PTR(&mp_module_sys) }, \
@@ -380,7 +394,9 @@ extern const struct _mp_obj_module_t mp_module_heapq;
     UCDOS_MOD_ENTRY_RE \
     UCDOS_MOD_ENTRY_CMATH \
     UCDOS_MOD_ENTRY_OS \
-    UCDOS_MOD_ENTRY_HEAPQ
+    UCDOS_MOD_ENTRY_HEAPQ \
+    UCDOS_MOD_ENTRY_DEFLATE \
+    UCDOS_MOD_ENTRY_IO
 
 // Module attribute-access delegation table — modules whose attr
 // loads/stores need to dispatch through a port-supplied function.

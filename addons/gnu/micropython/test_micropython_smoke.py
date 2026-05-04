@@ -1325,6 +1325,62 @@ def test_micropython_os_mkdir_chdir_getcwd(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_deflate_inflate_roundtrip(micropython_bin: Path) -> None:
+    """`deflate.DeflateIO(buf, deflate.RAW)` reads from a buffer
+    of raw deflate bytes (no zlib header) and inflates them.
+    Validates upstream's tinflate.c works through uc386's
+    compiler. The hex blob is `zlib.compress(b'hello world')[2:-4]`
+    from CPython — strips the 2-byte zlib header and 4-byte
+    adler32 trailer."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import deflate\n"
+                  b"import io\n"
+                  b"import binascii\n"
+                  b"raw = binascii.unhexlify(b'cb48cdc9c95728cf2fca490100')\n"
+                  b"buf = io.BytesIO(raw)\n"
+                  b"d = deflate.DeflateIO(buf, deflate.RAW)\n"
+                  b"print(d.read())\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "b'hello world'" in res.stdout, (
+        f"expected `b'hello world'` from inflate, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_binascii_crc32(micropython_bin: Path) -> None:
+    """`binascii.crc32(b'hello world')` returns the canonical
+    CRC32 = 0x0d4a1185 = 222957957. Backed by uzlib's crc32.c
+    via moddeflate.c's inline include (the symbol is non-static
+    and binascii.c references it as an extern)."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import binascii\n"
+                  b"print(binascii.crc32(b'hello world'))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "222957957" in res.stdout, (
+        f"expected canonical CRC32 of 'hello world', got: "
+        f"{res.stdout!r}"
+    )
+
+
 def test_micropython_heapq(micropython_bin: Path) -> None:
     """`heapq.heappush` + `heappop` round-trip — pop returns
     elements in sorted order."""

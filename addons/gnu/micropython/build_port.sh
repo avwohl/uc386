@@ -98,6 +98,11 @@ SOURCES_FILE="build/_port_sources.txt"
     echo upstream/extmod/modhashlib.c
     echo upstream/extmod/modre.c
     echo upstream/extmod/modheapq.c
+    # moddeflate.c inline-#includes all the uzlib sources
+    # (tinflate.c, header.c, adler32.c, crc32.c, lz77.c → defl_static.c)
+    # so don't add them to the source list — that would duplicate
+    # symbols.
+    echo upstream/extmod/moddeflate.c
     echo upstream/ports/minimal/main.c
     echo upstream/ports/minimal/uart_core.c
     echo uc386-dos/mphal_uc386dos.c
@@ -119,6 +124,7 @@ tr '\n' '\0' < "$SOURCES_FILE" \
         -I uc386-dos \
         -I build \
         -D__linux__=1 \
+        -DNDEBUG=1 \
         -o build/micropython.asm
 rc=$?
 set -e

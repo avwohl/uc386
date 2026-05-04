@@ -214,11 +214,14 @@
 #define MICROPY_PY_RANDOM_SEED_INIT_FUNC  (bios_ticks())
 extern unsigned long bios_ticks(void);
 #define MICROPY_PY_BINASCII               (1)
-// CRC32 + DEFLATE default-on at EXTRA_FEATURES, but they pull in
-// uzlib (crc32.c + tinflate.c, ~700 lines). Disable for now —
-// can be re-enabled by adding the uzlib sources to build_port.sh.
-#define MICROPY_PY_BINASCII_CRC32         (0)
-#define MICROPY_PY_DEFLATE                (0)
+// CRC32 + DEFLATE — enabled now that build_port.sh includes the
+// uzlib sources (crc32.c, tinflate.c, lz77.c, defl_static.c,
+// adler32.c, header.c). DEFLATE_COMPRESS adds the encoder side
+// (defl_static.c + lz77.c) for `deflate.DeflateIO(buf, mode, ...)`
+// in write mode.
+#define MICROPY_PY_BINASCII_CRC32         (1)
+#define MICROPY_PY_DEFLATE                (1)
+#define MICROPY_PY_DEFLATE_COMPRESS       (1)
 #define MICROPY_PY_HASHLIB                (1)
 #define MICROPY_PY_HASHLIB_SHA256         (1)
 #define MICROPY_PY_RE                     (1)
