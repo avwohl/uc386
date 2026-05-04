@@ -1,11 +1,17 @@
-# MicroPython port — status: **full Python REPL @ EXTRA_FEATURES** (2026-05-03)
+# MicroPython port — status: **full Python REPL @ EXTRA_FEATURES** (2026-05-04)
 
 **Upstream**: https://github.com/micropython/micropython
 **License**: MIT
 
 **`addons/gnu/micropython/build_port.sh` produces a runnable
-`build/micropython.bin` (~263 KB at EXTRA_FEATURES, was ~169 KB at
-MINIMUM, ~199 KB at CORE_FEATURES).** Run under `uc386.dos_emu.run`,
+`build/micropython.bin` (~281 KB at EXTRA_FEATURES with the
+full surface — `os` (incl. listdir/stat) + `time` (incl.
+time_ns) + `random`/`binascii`/`hashlib`/`re`/`cmath`/`heapq`/
+`deflate`/`io`/`uctypes` modules + LONGINT_LONGLONG +
+MICROPY_STACK_CHECK + EXACT float formatter + `help()` +
+module `__file__`. Was ~169 KB at MINIMUM, ~199 KB at
+CORE_FEATURES, ~263 KB at the first EXTRA_FEATURES
+landing).** Run under `uc386.dos_emu.run`,
 it boots the MicroPython REPL and accepts essentially full Python:
 
 ```
@@ -29,7 +35,7 @@ Type "help()" for more information.
 caught
 ```
 
-What works (43 smoke tests pin the core wins):
+What works (70 smoke tests pin the core wins):
 
 - arithmetic + control flow (`if/else`, `for/range`, `while/break`)
 - function def + call (`def f(x): return x*2; f(7)` → `14`)
