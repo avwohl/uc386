@@ -2080,6 +2080,69 @@ def test_micropython_os_environ(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_sys_exc_info(micropython_bin: Path) -> None:
+    """`sys.exc_info()` returns the (type, value, tb) tuple inside
+    an except block, and (None, None, None) outside. Default OFF
+    in mpconfig.h — opted in via MICROPY_PY_SYS_EXC_INFO."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import sys\n"
+                  b"try:\n"
+                  b"    1/0\n"
+                  b"except ZeroDivisionError:\n"
+                  b"    info = sys.exc_info()\n"
+                  b"    print(info[0].__name__, str(info[1]))\n"
+                  b"\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "ZeroDivisionError divide by zero" in res.stdout, (
+        f"expected exc_info type+message, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_range_binop(micropython_bin: Path) -> None:
+    """`range(3) == range(3)` should return True now that
+    MICROPY_PY_BUILTINS_RANGE_BINOP is on (default-off below the
+    EVERYTHING ROM level). Without it ranges only compare equal
+    by identity — a frequent CPython-portability surprise."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"print(range(3) == range(3))\n"
+                  b"print(range(0, 3) == range(3))\n"
+                  b"print(range(3) == range(4))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # CPython behavior: equal-by-value, including normalized step.
+    # REPL echoes `>>> ` between each print so the True/False lines
+    # don't sit consecutively in stdout — split on prompts and pick
+    # the prints' immediate next lines.
+    assert "== range(3))\nTrue\n" in res.stdout, (
+        f"expected range(3) == range(3) → True, got: {res.stdout!r}"
+    )
+    assert "range(0, 3) == range(3))\nTrue\n" in res.stdout, (
+        f"expected range(0,3) == range(3) → True, got: {res.stdout!r}"
+    )
+    assert "== range(4))\nFalse\n" in res.stdout, (
+        f"expected range(3) == range(4) → False, got: {res.stdout!r}"
+    )
+
+
 def test_micropython_hashlib_md5(micropython_bin: Path) -> None:
     """`hashlib.md5(b"abc").hexdigest()` should equal RFC 1321's
     canonical test vector. Backed by B-Con's public-domain md5.c

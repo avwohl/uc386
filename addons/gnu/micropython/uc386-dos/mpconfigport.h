@@ -134,6 +134,21 @@
 #define MICROPY_PY_SYS_PATH               (1)
 #define MICROPY_PY_SYS_ARGV               (1)
 
+// Polish: introspection knobs default to off (or EVERYTHING-only) at
+// EXTRA_FEATURES — opt in explicitly. All live in modules we already
+// compile (modsys.c / objrange.c) so no new sources needed.
+//
+// `sys.exc_info()` returns the (type, value, tb) tuple for the
+// currently-handled exception inside an `except:` block. Useful for
+// generic logging / propagation.
+#define MICROPY_PY_SYS_EXC_INFO           (1)
+// `sys.tracebacklimit` lets user code cap traceback depth. Useful
+// in DOS where stdout is precious screen real-estate.
+#define MICROPY_PY_SYS_TRACEBACKLIMIT     (1)
+// `range(3) == range(3)` returns True (without this, ranges only
+// compare equal by identity). Tiny, but a frequent CPython surprise.
+#define MICROPY_PY_BUILTINS_RANGE_BINOP   (1)
+
 // errno requires:
 //  - build.sh to pre-emit the EPERM/ENOENT/... qstrs (the module's
 //    globals table uses `MP_QSTR_##e` token paste over its X-macro
@@ -157,6 +172,18 @@
 // ... which we don't have).
 #define MICROPY_FLOAT_IMPL                (MICROPY_FLOAT_IMPL_DOUBLE)
 #define MICROPY_PY_MATH_SPECIAL_FUNCTIONS (1)
+
+// Math edge-case fixes — defaults are 0 across all ROM levels
+// because they cost a few extra branches. We're not size-constrained
+// (the EXACT float formatter alone costs more), and matching CPython
+// behavior at infinity / NaN boundaries makes test code that relies
+// on `math.atan2(0, 0) == 0`-style assumptions actually portable.
+// See py/modmath.c for the wrappers each flag enables.
+#define MICROPY_PY_MATH_ATAN2_FIX_INFNAN  (1)
+#define MICROPY_PY_MATH_FMOD_FIX_INFNAN   (1)
+#define MICROPY_PY_MATH_MODF_FIX_NEGZERO  (1)
+#define MICROPY_PY_MATH_POW_FIX_NAN       (1)
+#define MICROPY_PY_MATH_GAMMA_FIX_NEGINF  (1)
 
 // Float formatter — opt into the EXACT formatter (vs the default
 // APPROX picked when long double has the same width as double).
