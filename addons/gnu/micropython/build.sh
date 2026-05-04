@@ -209,7 +209,8 @@ if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
         # gen_qstrdefs.py treats identically to a regular reference.
         {
             grep -rhoE "MP_QSTR_[A-Za-z_][A-Za-z0-9_]*" \
-                    upstream/py/ upstream/shared/ upstream/extmod/
+                    upstream/py/ upstream/shared/ upstream/extmod/ \
+                    uc386-dos/
             # POSIX `[[:space:]]` rather than `\s` — macOS's BSD
             # `sed -E` doesn't honor PCRE shorthand in BRE/ERE.
             grep -hoE "^[[:space:]]*X\([A-Z][A-Z0-9_]*\)" \

@@ -2019,3 +2019,86 @@ def test_micropython_import_array(micropython_bin: Path) -> None:
     assert "\n6\n" in res.stdout, (
         f"expected sum 6 from int array, got: {res.stdout!r}"
     )
+
+
+def test_micropython_os_getenv(micropython_bin: Path) -> None:
+    """`os.getenv(name, default)` walks the DOS env block via
+    libc's `_getenv` (INT 21h AH=0x62 → PSP[0x2C] → linear addr).
+    dos_emu populates a fake env block from the `env=` kwarg."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import os\n"
+                  b"print(os.getenv('PATH'))\n"
+                  b"print(os.getenv('MISSING'))\n"
+                  b"print(os.getenv('MISSING', 'fallback'))\n"
+                  b"\x04"
+              ),
+              env={"PATH": "C:\\DOS;C:\\TOOLS", "USER": "wohl"},
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "C:\\DOS;C:\\TOOLS" in res.stdout, (
+        f"expected PATH value, got: {res.stdout!r}"
+    )
+    assert "\nNone\n" in res.stdout, (
+        f"expected None for missing key (no default), got: {res.stdout!r}"
+    )
+    assert "fallback" in res.stdout, (
+        f"expected fallback default for missing key, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_os_environ(micropython_bin: Path) -> None:
+    """`os.environ()` snapshots the env block as a dict. Differs
+    from CPython where `os.environ` is a live dict — MicroPython
+    modules don't support attribute-getter delegation, so we expose
+    a function instead. Snapshot is built by walking
+    `dos_env_iter(0..)` and splitting on '='."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import os\n"
+                  b"e = os.environ()\n"
+                  b"print(sorted(e.items()))\n"
+                  b"\x04"
+              ),
+              env={"FOO": "bar", "BAZ": "qux"},
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "('BAZ', 'qux')" in res.stdout and "('FOO', 'bar')" in res.stdout, (
+        f"expected env tuples in dict, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_os_system_stub(micropython_bin: Path) -> None:
+    """`os.system(cmd)` calls libc `system()` which is currently a
+    stub returning -1 under dos_emu (no fork/exec). Test pins the
+    libc-side wiring; real DOS would route through INT 21h AH=0x4B
+    EXEC + COMMAND.COM /C in a follow-up slice."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import os\n"
+                  b"print(os.system('ECHO hi'))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "\n-1\n" in res.stdout, (
+        f"expected os.system stub return -1, got: {res.stdout!r}"
+    )

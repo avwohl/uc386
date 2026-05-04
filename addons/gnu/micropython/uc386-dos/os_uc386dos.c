@@ -106,6 +106,13 @@ extern int dos_find_first(const char *mask);
 extern int dos_find_next(void);
 extern const char *dos_dta_filename(void);
 
+// Env-block helpers — see lib/i386_dos_libc.asm for impls. They walk
+// the DOS PSP environment block (PSP[0x2C] = env_seg under PMODE/W's
+// flat addressing).
+extern const char *getenv(const char *name);
+extern const char *dos_env_iter(unsigned index);
+extern int system(const char *cmd);
+
 static mp_obj_t mod_uc386dos_os_listdir(size_t n_args, const mp_obj_t *args) {
     char mask[80];
     if (n_args == 0) {
@@ -171,6 +178,63 @@ static mp_obj_t mod_uc386dos_os_stat(mp_obj_t path_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(mod_uc386dos_os_stat_obj, mod_uc386dos_os_stat);
 
+// `os.system(cmd)` — invokes the DOS shell to run `cmd`. Backed by
+// libc's `system()` which currently returns -1 unconditionally on
+// dos_emu (no fork/exec). Real DOS would route through INT 21h
+// AH=0x4B (EXEC) calling COMMAND.COM /C; that's a separate slice.
+// Exposed now so user code can be portable across the eventual
+// real-DOS path.
+static mp_obj_t mod_uc386dos_os_system(mp_obj_t cmd_in) {
+    const char *cmd = get_path_str(cmd_in);
+    int rc = system(cmd);
+    return mp_obj_new_int(rc);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(mod_uc386dos_os_system_obj, mod_uc386dos_os_system);
+
+// `os.getenv(name, default=None)` — POSIX-style env lookup, case-
+// sensitive (DOS conventionally upper-cases names but we match
+// exactly what's in the env block).
+static mp_obj_t mod_uc386dos_os_getenv(size_t n_args, const mp_obj_t *args) {
+    const char *name = get_path_str(args[0]);
+    const char *val = getenv(name);
+    if (val) {
+        return mp_obj_new_str(val, strlen(val));
+    }
+    if (n_args >= 2) {
+        return args[1];
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(mod_uc386dos_os_getenv_obj,
+    1, 2, mod_uc386dos_os_getenv);
+
+// `os.environ()` — snapshot of the env block as a fresh `dict`.
+// Returns a function rather than a property because MicroPython
+// modules don't support attribute-getter delegation, and the env
+// block is fixed at program start so a snapshot is what we'd want
+// anyway. Differs from CPython, where `os.environ` is a live dict.
+static mp_obj_t mod_uc386dos_os_environ(void) {
+    mp_obj_t d = mp_obj_new_dict(0);
+    for (unsigned i = 0; ; i++) {
+        const char *entry = dos_env_iter(i);
+        if (!entry) {
+            break;
+        }
+        const char *eq = strchr(entry, '=');
+        if (!eq) {
+            // Malformed entry (no '='); skip.
+            continue;
+        }
+        size_t key_len = (size_t)(eq - entry);
+        size_t val_len = strlen(eq + 1);
+        mp_obj_dict_store(d,
+            mp_obj_new_str(entry, key_len),
+            mp_obj_new_str(eq + 1, val_len));
+    }
+    return d;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(mod_uc386dos_os_environ_obj, mod_uc386dos_os_environ);
+
 static const mp_rom_map_elem_t mp_module_os_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_os) },
     { MP_ROM_QSTR(MP_QSTR_mkdir),   MP_ROM_PTR(&mod_uc386dos_os_mkdir_obj) },
@@ -182,6 +246,9 @@ static const mp_rom_map_elem_t mp_module_os_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_getcwd),  MP_ROM_PTR(&mod_uc386dos_os_getcwd_obj) },
     { MP_ROM_QSTR(MP_QSTR_listdir), MP_ROM_PTR(&mod_uc386dos_os_listdir_obj) },
     { MP_ROM_QSTR(MP_QSTR_stat),    MP_ROM_PTR(&mod_uc386dos_os_stat_obj) },
+    { MP_ROM_QSTR(MP_QSTR_system),  MP_ROM_PTR(&mod_uc386dos_os_system_obj) },
+    { MP_ROM_QSTR(MP_QSTR_getenv),  MP_ROM_PTR(&mod_uc386dos_os_getenv_obj) },
+    { MP_ROM_QSTR(MP_QSTR_environ), MP_ROM_PTR(&mod_uc386dos_os_environ_obj) },
     { MP_ROM_QSTR(MP_QSTR_sep),     MP_ROM_QSTR(MP_QSTR__slash_) },
 };
 static MP_DEFINE_CONST_DICT(mp_module_os_globals, mp_module_os_globals_table);

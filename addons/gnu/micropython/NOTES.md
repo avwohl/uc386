@@ -5,9 +5,9 @@
 
 **`addons/gnu/micropython/build_port.sh` produces a runnable
 `build/micropython.bin` (~281 KB at EXTRA_FEATURES with the
-full surface — `os` (incl. listdir/stat) + `time` (incl.
-time_ns) + `random`/`binascii`/`hashlib`/`re`/`cmath`/`heapq`/
-`deflate`/`io`/`uctypes` modules + LONGINT_LONGLONG +
+full surface — `os` (incl. listdir/stat/system/getenv/environ)
++ `time` (incl. time_ns) + `random`/`binascii`/`hashlib`/`re`/
+`cmath`/`heapq`/`deflate`/`io`/`uctypes` modules + LONGINT_LONGLONG +
 MICROPY_STACK_CHECK + EXACT float formatter + `help()` +
 module `__file__`. Was ~169 KB at MINIMUM, ~199 KB at
 CORE_FEATURES, ~263 KB at the first EXTRA_FEATURES
@@ -158,6 +158,23 @@ What doesn't work yet (separate gates, pinned in mpconfigport.h):
   `mp_import_stat` / `mp_lexer_new_from_file` in
   `upstream/ports/minimal/main.c` are sed-patched out by build.sh
   so our real implementations link cleanly.
+
+- `os.system(cmd)` / `os.getenv(name, default=None)` /
+  `os.environ()` — env-block walk via INT 21h AH=0x62
+  (Get PSP) → PSP[0x2C] linear address. lib/i386_dos_libc.asm
+  provides `_dos_get_psp_seg`, `_dos_env_base`, `_getenv`,
+  `_dos_env_iter`, `_dos_argv0`. Under PMODE/W's flat 32-bit
+  selectors, `seg << 4` directly addresses the env block in
+  conventional memory. dos_emu builds a fake PSP at
+  0x000F0000 with PSP[0x2C] = env_seg and the env populated
+  from `run(env={...})`; `_dos_argv0` returns the trailing
+  program-path string DOS 3.0+ writes after the env terminator.
+  `os.environ()` is a function (not a property) — MicroPython
+  modules don't support attribute-getter delegation, so we
+  expose a fresh-snapshot dict on call. `os.system` calls libc
+  `system()` which is currently a -1 stub on dos_emu (no
+  fork/exec); real-DOS routing through INT 21h AH=0x4B EXEC
+  + COMMAND.COM /C is a future slice.
 
 - ~~Full `MICROPY_CONFIG_ROM_LEVEL = EXTRA_FEATURES`~~ — DONE
   (2026-05-03). The wholesale-EXTRA hang turned out to be
