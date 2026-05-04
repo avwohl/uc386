@@ -1294,6 +1294,73 @@ def test_micropython_hashlib_sha256(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_os_mkdir_chdir_getcwd(micropython_bin: Path) -> None:
+    """`os.mkdir` + `os.chdir` + `os.getcwd` round-trip backed by
+    INT 21h AH=0x39/0x3B/0x47 via uc386's libc.
+
+    dos_emu maintains a synthetic vdirs set + vcwd string that the
+    handlers read/write."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import os\n"
+                  b"print(os.getcwd())\n"
+                  b"os.mkdir('newdir')\n"
+                  b"os.chdir('newdir')\n"
+                  b"print(os.getcwd())\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "C:\\\n" in res.stdout, (
+        f"expected initial cwd 'C:\\', got: {res.stdout!r}"
+    )
+    assert "C:\\newdir" in res.stdout, (
+        f"expected cwd 'C:\\newdir' after chdir, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_os_rename_unlink(micropython_bin: Path) -> None:
+    """`os.rename` (INT 21h AH=0x56) + `os.unlink` (AH=0x41).
+    Create a file, rename it, read the new name, unlink, verify
+    gone."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import os\n"
+                  b"with open('a.txt', 'w') as f:\n"
+                  b"    f.write('hello')\n"
+                  b"\n"
+                  b"os.rename('a.txt', 'b.txt')\n"
+                  b"print(open('b.txt').read())\n"
+                  b"os.unlink('b.txt')\n"
+                  b"try:\n"
+                  b"    open('b.txt')\n"
+                  b"except OSError:\n"
+                  b"    print('gone')\n"
+                  b"\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "hello" in res.stdout, (
+        f"expected `hello` after rename round-trip, got: {res.stdout!r}"
+    )
+    assert "gone" in res.stdout, (
+        f"expected `gone` after unlink, got: {res.stdout!r}"
+    )
+
+
 def test_micropython_cmath_basic(micropython_bin: Path) -> None:
     """`import cmath` complex-number math. Validates abs(),
     cmath.exp on imaginary axis (Euler's formula:

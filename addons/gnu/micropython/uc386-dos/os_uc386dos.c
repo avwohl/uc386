@@ -1,0 +1,108 @@
+// uc386-dos custom `os` module — exposes the POSIX-style file/dir
+// ops backed by uc386's libc (which translates them to INT 21h DOS
+// calls). We don't use upstream's `extmod/modos.c` because that
+// gates everything behind the full VFS layer (extmod/vfs.c +
+// vfs_posix.c) which adds substantial code and complexity. This
+// shim provides the basic surface most user code needs:
+//
+//   os.mkdir(path)        - INT 21h AH=0x39
+//   os.rmdir(path)        - INT 21h AH=0x3A
+//   os.unlink(path)       - INT 21h AH=0x41
+//   os.remove(path)       - alias for unlink
+//   os.rename(old, new)   - INT 21h AH=0x56
+//   os.chdir(path)        - INT 21h AH=0x3B
+//   os.getcwd()           - INT 21h AH=0x47 (+ drive prefix)
+//
+// Errors raise OSError with the DOS error code.
+
+#include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <stdio.h>
+
+#include "py/runtime.h"
+#include "py/mperrno.h"
+
+#if defined(__has_include)
+#  if __has_include("py/objstr.h")
+#    include "py/objstr.h"
+#  endif
+#endif
+
+static const char *get_path_str(mp_obj_t arg) {
+    return mp_obj_str_get_str(arg);
+}
+
+static mp_obj_t mod_uc386dos_os_mkdir(mp_obj_t path_in) {
+    const char *path = get_path_str(path_in);
+    if (mkdir(path, 0777) != 0) {
+        mp_raise_OSError(MP_EIO);
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(mod_uc386dos_os_mkdir_obj, mod_uc386dos_os_mkdir);
+
+static mp_obj_t mod_uc386dos_os_rmdir(mp_obj_t path_in) {
+    extern int rmdir(const char *path);
+    const char *path = get_path_str(path_in);
+    if (rmdir(path) != 0) {
+        mp_raise_OSError(MP_EIO);
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(mod_uc386dos_os_rmdir_obj, mod_uc386dos_os_rmdir);
+
+static mp_obj_t mod_uc386dos_os_unlink(mp_obj_t path_in) {
+    const char *path = get_path_str(path_in);
+    if (unlink(path) != 0) {
+        mp_raise_OSError(MP_ENOENT);
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(mod_uc386dos_os_unlink_obj, mod_uc386dos_os_unlink);
+
+static mp_obj_t mod_uc386dos_os_rename(mp_obj_t old_in, mp_obj_t new_in) {
+    const char *old_path = get_path_str(old_in);
+    const char *new_path = get_path_str(new_in);
+    if (rename(old_path, new_path) != 0) {
+        mp_raise_OSError(MP_EIO);
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(mod_uc386dos_os_rename_obj, mod_uc386dos_os_rename);
+
+static mp_obj_t mod_uc386dos_os_chdir(mp_obj_t path_in) {
+    const char *path = get_path_str(path_in);
+    if (chdir(path) != 0) {
+        mp_raise_OSError(MP_ENOENT);
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(mod_uc386dos_os_chdir_obj, mod_uc386dos_os_chdir);
+
+static mp_obj_t mod_uc386dos_os_getcwd(void) {
+    char buf[80];
+    if (getcwd(buf, sizeof(buf)) == NULL) {
+        mp_raise_OSError(MP_EIO);
+    }
+    return mp_obj_new_str(buf, strlen(buf));
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(mod_uc386dos_os_getcwd_obj, mod_uc386dos_os_getcwd);
+
+static const mp_rom_map_elem_t mp_module_os_globals_table[] = {
+    { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_os) },
+    { MP_ROM_QSTR(MP_QSTR_mkdir),   MP_ROM_PTR(&mod_uc386dos_os_mkdir_obj) },
+    { MP_ROM_QSTR(MP_QSTR_rmdir),   MP_ROM_PTR(&mod_uc386dos_os_rmdir_obj) },
+    { MP_ROM_QSTR(MP_QSTR_unlink),  MP_ROM_PTR(&mod_uc386dos_os_unlink_obj) },
+    { MP_ROM_QSTR(MP_QSTR_remove),  MP_ROM_PTR(&mod_uc386dos_os_unlink_obj) },
+    { MP_ROM_QSTR(MP_QSTR_rename),  MP_ROM_PTR(&mod_uc386dos_os_rename_obj) },
+    { MP_ROM_QSTR(MP_QSTR_chdir),   MP_ROM_PTR(&mod_uc386dos_os_chdir_obj) },
+    { MP_ROM_QSTR(MP_QSTR_getcwd),  MP_ROM_PTR(&mod_uc386dos_os_getcwd_obj) },
+    { MP_ROM_QSTR(MP_QSTR_sep),     MP_ROM_QSTR(MP_QSTR__slash_) },
+};
+static MP_DEFINE_CONST_DICT(mp_module_os_globals, mp_module_os_globals_table);
+
+const mp_obj_module_t mp_module_os = {
+    .base = { &mp_type_module },
+    .globals = (mp_obj_dict_t *)&mp_module_os_globals,
+};

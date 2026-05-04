@@ -171,6 +171,17 @@ def run(
     if vfiles_init:
         for name, content in vfiles_init.items():
             vfiles[name] = bytearray(content)
+    # Virtual directory set. Stores directory names that mkdir
+    # has created (or that vfiles_init populated for tests). Used
+    # by INT 21h AH=0x39 (mkdir), 0x3A (rmdir), and 0x3B (chdir
+    # — chdir validates the dir exists). Always contains "." and
+    # the synthetic CWD's parents implicitly.
+    vdirs: set[bytes] = set()
+    # Synthetic current working directory. Reset to "C:\" at boot.
+    # chdir updates this; getcwd reads it. We don't enforce real
+    # path resolution here — tests interact with the vfs by full
+    # filename only.
+    vcwd = [b"C:\\"]
     # Open-file table: fd → {"name": bytes, "pos": int, "mode": str}.
     # Modes: "r" (read), "w" (write/truncate), "a" (append).
     vfd_table: dict[int, dict] = {}
@@ -819,6 +830,46 @@ def run(
             new_eax = (eax & ~0xFFFF) | (actual & 0xFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
             return
+        if ah == 0x39:
+            # mkdir(path): DS:EDX=path. Set CF on error.
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            name = bytes(_read_cstr_local(edx))
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            if name in vdirs or name in vfiles:
+                # Already exists — error.
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
+            else:
+                vdirs.add(name)
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
+            return
+        if ah == 0x3A:
+            # rmdir(path): DS:EDX=path. Set CF on error.
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            name = bytes(_read_cstr_local(edx))
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            if name in vdirs:
+                vdirs.discard(name)
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
+            else:
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
+            return
+        if ah == 0x3B:
+            # chdir(path): DS:EDX=path. Set CF on error.
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            name = bytes(_read_cstr_local(edx))
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            if name in vdirs or name == b"." or name == b"..":
+                # Trivial cwd update — store the requested path
+                # verbatim with a "C:\" prefix if it isn't drive-
+                # qualified yet.
+                if not (len(name) >= 2 and name[1:2] == b":"):
+                    vcwd[0] = b"C:\\" + name
+                else:
+                    vcwd[0] = name
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
+            else:
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
+            return
         if ah == 0x3C:
             # creat(name, mode): create or truncate. DS:EDX=name. Returns fd.
             edx = uc.reg_read(UC_X86_REG_EDX)
@@ -893,6 +944,45 @@ def run(
             uc.reg_write(UC_X86_REG_EAX, new_eax)
             new_edx = (edx & ~0xFFFF) | ((new_pos >> 16) & 0xFFFF)
             uc.reg_write(UC_X86_REG_EDX, new_edx)
+            return
+        if ah == 0x47:
+            # getcwd(drive, buf): DL=drive (0=current, 1=A, 2=B, ...),
+            # DS:ESI=buf. DOS writes the path WITHOUT the leading
+            # "X:\". Returns 0 on success, CF on error. Our libc's
+            # `getcwd()` wraps this with the drive prefix.
+            esi = uc.reg_read(UC_X86_REG_ESI)
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            # vcwd[0] is "C:\<rest>" — strip the "C:\" prefix to
+            # mirror DOS's no-prefix output.
+            cwd = vcwd[0]
+            if len(cwd) >= 3 and cwd[1:2] == b":" and cwd[2:3] == b"\\":
+                rest = cwd[3:]
+            else:
+                rest = cwd
+            uc.mem_write(esi, rest + b"\x00")
+            uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
+            return
+        if ah == 0x19:
+            # Get current drive: AL = 0 (A:), 1 (B:), 2 (C:), ...
+            new_eax = (eax & ~0xFF) | 2  # always C:
+            uc.reg_write(UC_X86_REG_EAX, new_eax)
+            return
+        if ah == 0x56:
+            # rename(old, new): DS:EDX=old, ES:EDI=new. Set CF on error.
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            edi = uc.reg_read(UC_X86_REG_EDI)
+            old_name = bytes(_read_cstr_local(edx))
+            new_name = bytes(_read_cstr_local(edi))
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            if old_name in vfiles:
+                vfiles[new_name] = vfiles.pop(old_name)
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
+            elif old_name in vdirs:
+                vdirs.discard(old_name)
+                vdirs.add(new_name)
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
+            else:
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
             return
         if ah == 0x5A:
             # tmpnam: DS:EDX=buf (output). Writes a unique name. Returns

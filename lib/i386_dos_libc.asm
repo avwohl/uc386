@@ -4222,6 +4222,154 @@ _dos_get_datetime:
         pop     ebp
         ret
 
+; ---- mkdir/rmdir/unlink/rename/chdir/getcwd ----------------------------------
+; All return 0 on success, -1 on error. DOS sets CF on error and returns
+; the error code in AX; we mirror that into errno via the same
+; sbb-based pattern the open/read/write/close wrappers use.
+
+; int mkdir(const char *path, mode_t mode)   ; mode unused on DOS
+;   INT 21h AH=0x39 DS:EDX=path
+_mkdir:
+        push    ebp
+        mov     ebp, esp
+        mov     ah, 0x39
+        mov     edx, [ebp + 8]
+        int     21h
+        jc      .mkdir_err
+        xor     eax, eax
+        jmp     .mkdir_done
+.mkdir_err:
+        mov     eax, -1
+.mkdir_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int rmdir(const char *path)
+;   INT 21h AH=0x3A DS:EDX=path
+_rmdir:
+        push    ebp
+        mov     ebp, esp
+        mov     ah, 0x3A
+        mov     edx, [ebp + 8]
+        int     21h
+        jc      .rmdir_err
+        xor     eax, eax
+        jmp     .rmdir_done
+.rmdir_err:
+        mov     eax, -1
+.rmdir_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int unlink(const char *path)
+;   INT 21h AH=0x41 DS:EDX=path
+_unlink:
+        push    ebp
+        mov     ebp, esp
+        mov     ah, 0x41
+        mov     edx, [ebp + 8]
+        int     21h
+        jc      .unlink_err
+        xor     eax, eax
+        jmp     .unlink_done
+.unlink_err:
+        mov     eax, -1
+.unlink_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int rename(const char *old, const char *new)
+;   INT 21h AH=0x56 DS:EDX=old, ES:EDI=new
+_rename:
+        push    ebp
+        mov     ebp, esp
+        push    edi
+        mov     ah, 0x56
+        mov     edx, [ebp + 8]
+        mov     edi, [ebp + 12]
+        int     21h
+        pop     edi
+        jc      .rename_err
+        xor     eax, eax
+        jmp     .rename_done
+.rename_err:
+        mov     eax, -1
+.rename_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int chdir(const char *path)
+;   INT 21h AH=0x3B DS:EDX=path
+_chdir:
+        push    ebp
+        mov     ebp, esp
+        mov     ah, 0x3B
+        mov     edx, [ebp + 8]
+        int     21h
+        jc      .chdir_err
+        xor     eax, eax
+        jmp     .chdir_done
+.chdir_err:
+        mov     eax, -1
+.chdir_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; char *getcwd(char *buf, size_t size)
+;   INT 21h AH=0x47 DL=0 (default drive) DS:ESI=64-byte buffer
+;   DOS writes a NUL-terminated path (without the leading "X:\")
+;   and we prepend "<drive>:\" to it. Returns buf on success, NULL
+;   on error.
+_getcwd:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        push    edi
+        push    ebx
+        mov     edi, [ebp + 8]            ; edi = caller buf
+        mov     ecx, [ebp + 12]           ; ecx = caller buf size
+        ; Need at least 4 bytes ("X:\<NUL>") even for empty cwd.
+        cmp     ecx, 4
+        jl      .getcwd_err
+        ; Get current drive (INT 21h AH=0x19 → AL = 0=A, 1=B, ...)
+        mov     ah, 0x19
+        int     21h
+        movzx   ebx, al                    ; ebx = drive index 0..25
+        ; Write "X:\" prefix
+        add     al, 'A'
+        mov     [edi], al
+        mov     byte [edi + 1], ':'
+        mov     byte [edi + 2], '\'
+        ; Now ask DOS to write the cwd string at edi+3 (no leading
+        ; backslash from DOS — adds names only, e.g. "MYDIR\SUB").
+        ; DOS requires a 64-byte buffer regardless of caller size,
+        ; so cap remaining at 64. If caller's buf is bigger, only
+        ; 64 bytes get used.
+        mov     ah, 0x47
+        mov     dl, bl                     ; drive: 0=current, 1=A, ...
+        inc     dl                         ; convert 0-based to 1-based
+        mov     esi, edi
+        add     esi, 3                     ; esi = where DOS writes
+        int     21h
+        jc      .getcwd_err
+        ; Success: return caller buf in eax
+        mov     eax, [ebp + 8]
+        jmp     .getcwd_done
+.getcwd_err:
+        xor     eax, eax
+.getcwd_done:
+        pop     ebx
+        pop     edi
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
 ; ---- ungetc(c, stream): simple one-byte unget --------------------------------
         section .bss
 _ungetc_buf:    resd 1                      ; -1 = empty, else the byte

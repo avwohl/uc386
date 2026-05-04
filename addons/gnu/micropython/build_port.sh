@@ -101,6 +101,7 @@ SOURCES_FILE="build/_port_sources.txt"
     echo upstream/ports/minimal/uart_core.c
     echo uc386-dos/mphal_uc386dos.c
     echo uc386-dos/file_uc386dos.c
+    echo uc386-dos/os_uc386dos.c
 } > "$SOURCES_FILE"
 
 n_sources="$(wc -l < "$SOURCES_FILE")"
