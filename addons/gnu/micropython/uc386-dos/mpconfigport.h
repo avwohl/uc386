@@ -224,6 +224,18 @@ extern unsigned long bios_ticks(void);
 #define MICROPY_PY_DEFLATE_COMPRESS       (1)
 #define MICROPY_PY_HASHLIB                (1)
 #define MICROPY_PY_HASHLIB_SHA256         (1)
+
+// MD5 + SHA1 — useful for verifying mTCP-downloaded files (most
+// FreeDOS distribution checksums are MD5/SHA1, not SHA256). The
+// upstream modhashlib.c gates these on MICROPY_SSL_AXTLS, but we
+// don't actually pull axtls — see uc386-dos/lib/axtls/crypto/
+// crypto.h for the shim that routes the AXTLS API to B-Con's
+// public-domain reference impls. MICROPY_SSL=0 stays (no actual
+// SSL/TLS), MICROPY_SSL_AXTLS=1 just selects the axtls branch of
+// the modhashlib.c #if cascade.
+#define MICROPY_PY_HASHLIB_SHA1           (1)
+#define MICROPY_PY_HASHLIB_MD5            (1)
+#define MICROPY_SSL_AXTLS                 (1)
 #define MICROPY_PY_RE                     (1)
 #define MICROPY_PY_RE_SUB                 (1)
 #define MICROPY_PY_RE_MATCH_GROUPS        (1)

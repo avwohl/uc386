@@ -2080,6 +2080,60 @@ def test_micropython_os_environ(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_hashlib_md5(micropython_bin: Path) -> None:
+    """`hashlib.md5(b"abc").hexdigest()` should equal RFC 1321's
+    canonical test vector. Backed by B-Con's public-domain md5.c
+    (fetched into upstream/lib/crypto-algorithms/) routed through
+    uc386-dos/lib/axtls/crypto/crypto.h's AXTLS-shaped shim."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import hashlib\n"
+                  b"print(hashlib.md5(b'abc').digest().hex())\n"
+                  b"print(hashlib.md5(b'').digest().hex())\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # md5("abc") = 900150983cd24fb0d6963f7d28e17f72 (RFC 1321 test).
+    assert "900150983cd24fb0d6963f7d28e17f72" in res.stdout, (
+        f"expected RFC 1321 md5(b'abc') vector, got: {res.stdout!r}"
+    )
+    # md5("") = d41d8cd98f00b204e9800998ecf8427e.
+    assert "d41d8cd98f00b204e9800998ecf8427e" in res.stdout, (
+        f"expected md5('') canonical vector, got: {res.stdout!r}"
+    )
+
+
+def test_micropython_hashlib_sha1(micropython_bin: Path) -> None:
+    """`hashlib.sha1(b"abc").hexdigest()` should equal FIPS 180-1's
+    canonical test vector. Same path as md5 — B-Con's sha1.c routed
+    via the AXTLS-shaped crypto.h shim."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import hashlib\n"
+                  b"print(hashlib.sha1(b'abc').digest().hex())\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # sha1("abc") = a9993e364706816aba3e25717850c26c9cd0d89d (FIPS 180-1).
+    assert "a9993e364706816aba3e25717850c26c9cd0d89d" in res.stdout, (
+        f"expected FIPS 180-1 sha1(b'abc') vector, got: {res.stdout!r}"
+    )
+
+
 def test_micropython_json_roundtrip(micropython_bin: Path) -> None:
     """`json.loads` + `json.dumps` round-trip. Backed by upstream's
     `extmod/modjson.c`, gated on MICROPY_PY_JSON (default 1 at
