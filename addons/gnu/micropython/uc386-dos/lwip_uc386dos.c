@@ -60,16 +60,16 @@ char mod_network_hostname_data[16 + 1] = "uc386-dos";
 
 // Loopback packet pump. With LWIP_NETIF_LOOPBACK=1 + NO_SYS=1, lwIP
 // queues outgoing-to-127.0.0.1 packets in netif->loop_first/last and
-// only delivers them when netif_poll(netif) is called. modlwip.c's
-// poll-list hook (driven by `lwip.callback()`) is the natural place
-// to drive this. Registered from mod_lwip_reset (patched in fetch.sh)
-// so each `lwip.reset()` re-arms the loopback pump alongside the
-// usual sys_check_timeouts() cadence.
+// only delivers them when netif_poll(netif) is called. The loopback
+// netif (`loop_netif`) is created by netif_init() but isn't promoted
+// to `netif_default`, so use netif_poll_all() — it walks every netif
+// on `netif_list` and is provided when LWIP_NETIF_LOOPBACK_MULTITHREADING
+// is 0 (our case). Registered from mod_lwip_reset (patched in
+// fetch.sh) so each `lwip.reset()` re-arms the loopback pump
+// alongside the usual sys_check_timeouts() cadence.
 void uc386dos_loopback_poll(void *arg) {
     (void)arg;
-    if (netif_default != NULL) {
-        netif_poll(netif_default);
-    }
+    netif_poll_all();
 }
 
 // Expose `mp_module_lwip` as `socket` too. modlwip.c registers
