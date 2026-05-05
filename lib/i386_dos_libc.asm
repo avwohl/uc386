@@ -5931,6 +5931,80 @@ _erfc:
 ; come from the C TU.
 
 ; -----------------------------------------------------------------
+; Crynwr packet-driver thunk.
+;
+; uint8_t pktdrv_int_invoke(unsigned int int_num,
+;                           unsigned int regs[8]);
+;
+; Invokes `INT int_num` after loading the eight registers from the
+; caller's regs[] array (EAX/EBX/ECX/EDX/ESI/EDI/DS/ES) and writes
+; the post-INT register values back. Returns the carry flag in AL
+; (Crynwr success/failure indicator).
+;
+; The INT immediate byte is patched at runtime — Crynwr drivers can
+; install on any INT 0x60–0x7F slot, and there's no flat 32-bit
+; "INT register" instruction. Self-modification is cheap: the .text
+; section is RWX in our flat layout (uc386 emits a single PT_LOAD
+; with no separate read-only code segment).
+;
+; DS/ES handling: this thunk doesn't touch the segment registers —
+; flat 32-bit code keeps a single 4 GB descriptor in all of them.
+; dos_emu's INT 0x60 handler treats ESI/EDI as flat linear pointers
+; so the call shape works directly. On real DOS under PMODE/W the
+; packet driver expects DS:SI, which means the caller has to stage
+; the send buffer in DPMI-allocated low memory and pass the real-
+; mode segment in the DS field; that low-memory plumbing is a TODO
+; alongside the DPMI int 31h fn 0x0303 receiver thunk.
+_pktdrv_int_invoke:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        push    edi
+        push    ebx
+        ; Patch the INT immediate byte from int_num.
+        mov     eax, [ebp + 8]
+        mov     [.int_imm], al
+        ; Load EAX..EDX, EDI, ESI from regs[]. ESI loaded last
+        ; because it's our index register here — once we overwrite
+        ; ESI we lose the regs pointer, which we'll re-read from
+        ; [ebp + 12] later for the storeback.
+        mov     esi, [ebp + 12]
+        mov     eax, [esi + 0]
+        mov     ebx, [esi + 4]
+        mov     ecx, [esi + 8]
+        mov     edx, [esi + 12]
+        mov     edi, [esi + 20]
+        mov     esi, [esi + 16]
+        db      0xCD                ; INT n — n patched at runtime
+.int_imm:
+        db      0x00
+        pushfd                      ; capture EFLAGS for the CF read
+        ; Save the post-INT register snapshot to the stack so we
+        ; can refill the regs[] array without clobbering it mid-
+        ; storeback. Order pushed: ESI, EDI, EAX, EBX, ECX, EDX,
+        ; with EFLAGS already on top from pushfd.
+        push    esi
+        push    edi
+        push    eax
+        push    ebx
+        push    ecx
+        push    edx
+        mov     esi, [ebp + 12]
+        pop     dword [esi + 12]
+        pop     dword [esi + 8]
+        pop     dword [esi + 4]
+        pop     dword [esi + 0]
+        pop     dword [esi + 20]
+        pop     dword [esi + 16]
+        pop     eax                 ; EFLAGS
+        and     eax, 1              ; → just the CF
+        pop     ebx
+        pop     edi
+        pop     esi
+        pop     ebp
+        ret
+
+; -----------------------------------------------------------------
 ; uc386-dos virtual ethernet — INT 0x83 packet driver shim.
 ;
 ; INT 0x83 is a private uc386 trap (alongside INT 0x80 for 64-bit

@@ -154,6 +154,23 @@ def run(
     # Load the program at address 0 (matches NASM `-f bin` default org 0).
     mu.mem_write(CODE_BASE, binary)
 
+    # When a NetworkSimulator is wired with Crynwr enabled, plant a
+    # "PKT DRVR" signature in low memory so the binary's IVT scan
+    # via DPMI INT 31h fn 0x0200 lands a real-looking handler. The
+    # signature is just data — the actual INT is handled by the
+    # Python-side hooks below, so the seg:offset returned from
+    # 0x0200 doesn't need to point to executable code.
+    pktdrv_int = (
+        getattr(net, "crynwr_int_num", None)
+        if net is not None else None
+    )
+    if pktdrv_int is not None:
+        from .dos_emu_netsim import PKTDRV_HANDLER_LINEAR
+        # `EB 09 90` = JMP SHORT +9 + NOP padding so the 8-byte
+        # signature lands at offset +3 (per the Crynwr spec).
+        mu.mem_write(PKTDRV_HANDLER_LINEAR,
+                     b"\xeb\x09\x90PKT DRVR")
+
     # Build argv: a contiguous region with [argc+1 dwords of pointers]
     # followed by the null-terminated argv strings. argc lands in EAX
     # and the address of the pointer array lands in EBX before _start
@@ -727,6 +744,86 @@ def run(
                 return
             # Unknown AH — flag error in AL, leave ECX/etc unchanged.
             uc.reg_write(UC_X86_REG_EAX, (eax & ~0xFF) | 1)
+            return
+        if intno == 0x31:
+            # DPMI services. Only fn 0x0200 (Get Real Mode Interrupt
+            # Vector) is implemented — that's what pktdrv_uc386dos.c
+            # uses to find a Crynwr packet driver in the IVT. Always
+            # handled (even without a NetworkSimulator) so the
+            # binary's IVT scan can probe cleanly; we return success
+            # only for the slot the active simulator advertises.
+            ax = eax & 0xFFFF
+            flags = uc.reg_read(UC_X86_REG_EFLAGS)
+            if ax == 0x0200 and pktdrv_int is not None:
+                from .dos_emu_netsim import PKTDRV_HANDLER_LINEAR
+                ebx = uc.reg_read(UC_X86_REG_EBX)
+                bl = ebx & 0xFF
+                if bl == pktdrv_int:
+                    seg = (PKTDRV_HANDLER_LINEAR >> 4) & 0xFFFF
+                    off = PKTDRV_HANDLER_LINEAR & 0xF
+                    ecx_new = (uc.reg_read(UC_X86_REG_ECX) & 0xFFFF0000) | seg
+                    edx_new = (uc.reg_read(UC_X86_REG_EDX) & 0xFFFF0000) | off
+                    uc.reg_write(UC_X86_REG_ECX, ecx_new)
+                    uc.reg_write(UC_X86_REG_EDX, edx_new)
+                    uc.reg_write(UC_X86_REG_EFLAGS, flags & ~0x1)
+                    return
+            # Unimplemented fn or unmatched int_num → CF=1, AX=0.
+            # That's how DPMI signals "not handled" to the caller.
+            uc.reg_write(UC_X86_REG_EFLAGS, flags | 0x1)
+            return
+        if intno == pktdrv_int and net is not None and pktdrv_int is not None:
+            # Crynwr packet driver — see the Phase-3 plan in
+            # addons/gnu/micropython/uc386-dos/pktdrv_uc386dos.c.
+            # Only the calls used by `pktdrv_init` + `pktdrv_send`
+            # are implemented. Receive callback support (AH=0x02
+            # invocation by sim of the registered handler) is not
+            # yet wired — we keep INT 0x83 as the RX path under
+            # dos_emu and document a DPMI INT 31h fn 0x0303 thunk
+            # as the real-DOS follow-up.
+            flags = uc.reg_read(UC_X86_REG_EFLAGS)
+            if ah == 0x01:
+                # driver_info — return any valid handle's metadata.
+                # AL=basic class, BX=version, CH=class, DS:SI=name,
+                # CX=type, DL=number. Caller (pktdrv probe) only
+                # checks CF.
+                uc.reg_write(UC_X86_REG_EFLAGS, flags & ~0x1)
+                return
+            if ah == 0x02:
+                # access_type — register receiver. EAX low byte set
+                # to 0, AX (16-bit) set to handle. Save EDI as the
+                # receiver address for the future RX bridge.
+                edi = uc.reg_read(UC_X86_REG_EDI)
+                net.pktdrv_receiver_addr = edi
+                handle = net.pktdrv_handle
+                uc.reg_write(UC_X86_REG_EAX,
+                             (eax & ~0xFFFF) | (handle & 0xFFFF))
+                uc.reg_write(UC_X86_REG_EFLAGS, flags & ~0x1)
+                return
+            if ah == 0x04:
+                # send_pkt — DS:SI = buf, CX = len.
+                esi = uc.reg_read(UC_X86_REG_ESI)
+                ecx = uc.reg_read(UC_X86_REG_ECX)
+                length = ecx & 0xFFFF
+                frame = bytes(uc.mem_read(esi, length)) if length else b""
+                rc = net.send_frame(frame)
+                if rc != 0:
+                    uc.reg_write(UC_X86_REG_EFLAGS, flags | 0x1)
+                else:
+                    uc.reg_write(UC_X86_REG_EFLAGS, flags & ~0x1)
+                return
+            if ah == 0x06:
+                # get_address — ES:DI = buf, CX = max len. CX
+                # returned = actual.
+                edi = uc.reg_read(UC_X86_REG_EDI)
+                mac = net.init_mac()
+                uc.mem_write(edi, mac)
+                ecx = uc.reg_read(UC_X86_REG_ECX)
+                uc.reg_write(UC_X86_REG_ECX,
+                             (ecx & ~0xFFFF) | len(mac))
+                uc.reg_write(UC_X86_REG_EFLAGS, flags & ~0x1)
+                return
+            # Unsupported subfunction — CF=1, AL=undefined.
+            uc.reg_write(UC_X86_REG_EFLAGS, flags | 0x1)
             return
         if intno == 0:
             # x86 #DE (divide error). Map to SIGFPE (signum=2 per our

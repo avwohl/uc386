@@ -26,11 +26,18 @@
 #endif
 
 // INT 0x83 packet-driver shim — see lib/i386_dos_libc.asm. dos_emu
-// intercepts and routes to a NetworkSimulator; on real DOS we'll
-// stack a Crynwr packet-driver adapter under these same symbols.
+// intercepts and routes to a NetworkSimulator (sim mode).
 extern int ethdrv_init(unsigned char mac[6]);
 extern int ethdrv_send(const unsigned char *buf, unsigned int len);
 extern unsigned int ethdrv_recv(unsigned char *buf, unsigned int maxlen);
+
+// Crynwr packet-driver bindings (real-DOS path) — pktdrv_uc386dos.c.
+// Returns 0 on success when a "PKT DRVR" signature is found in the
+// IVT 0x60–0x7F range; otherwise we fall back to the INT 0x83 sim.
+extern int pktdrv_init(unsigned char mac[6]);
+extern int pktdrv_send(const unsigned char *buf, unsigned int len);
+extern unsigned int pktdrv_recv(unsigned char *buf, unsigned int maxlen);
+extern int pktdrv_is_active(void);
 
 // `bios_ticks()` from lib/i386_dos_libc.asm — INT 1Ah AH=0 read of
 // the BIOS tick counter (~18.2 Hz). Multiply by 55 for an
@@ -100,10 +107,13 @@ static err_t uc386dos_eth_linkoutput(struct netif *netif, struct pbuf *p) {
         return ERR_IF;
     }
     pbuf_copy_partial(p, uc386dos_eth_tx_buf, p->tot_len, 0);
-    if (ethdrv_send(uc386dos_eth_tx_buf, p->tot_len) != 0) {
-        return ERR_IF;
+    int rc;
+    if (pktdrv_is_active()) {
+        rc = pktdrv_send(uc386dos_eth_tx_buf, p->tot_len);
+    } else {
+        rc = ethdrv_send(uc386dos_eth_tx_buf, p->tot_len);
     }
-    return ERR_OK;
+    return (rc != 0) ? ERR_IF : ERR_OK;
 }
 
 static err_t uc386dos_eth_netif_init_cb(struct netif *netif) {
@@ -119,15 +129,33 @@ static err_t uc386dos_eth_netif_init_cb(struct netif *netif) {
     return ERR_OK;
 }
 
-// Pull queued frames from the INT 0x83 RX queue and feed them into
-// lwIP. Drains in a tight loop so a callback() pumps everything.
+// Pull queued frames from the RX path and feed them into lwIP.
+//
+// Crynwr's receive side is callback-driven from real mode and
+// requires a DPMI INT 31h fn 0x0303 thunk to bridge into our
+// 32-bit code. That thunk isn't built yet, so when the Crynwr
+// driver is active we still poll INT 0x83 (`ethdrv_recv`) — under
+// dos_emu both paths funnel through the same NetworkSimulator, so
+// the test exercises Crynwr SEND + MAC + IVT-detect against a
+// loopback-via-INT-0x83 receive queue. Real DOS will need the
+// thunk wired in for receive; until then `pktdrv_recv` is a stub
+// that returns 0.
 static void uc386dos_eth_pump_rx(void) {
     if (!uc386dos_eth_active) {
         return;
     }
     for (;;) {
-        unsigned int len = ethdrv_recv(uc386dos_eth_rx_buf,
-                                       sizeof(uc386dos_eth_rx_buf));
+        unsigned int len = pktdrv_is_active()
+            ? pktdrv_recv(uc386dos_eth_rx_buf,
+                          sizeof(uc386dos_eth_rx_buf))
+            : 0;
+        if (len == 0) {
+            // Try the INT 0x83 sim path as the Crynwr-recv
+            // standin. Returns 0 on real DOS where INT 0x83 isn't
+            // hooked.
+            len = ethdrv_recv(uc386dos_eth_rx_buf,
+                              sizeof(uc386dos_eth_rx_buf));
+        }
         if (len == 0) {
             break;
         }
@@ -151,7 +179,10 @@ int uc386dos_eth_start(int dhcp_start_now) {
         return 0;
     }
     unsigned char mac[6];
-    if (ethdrv_init(mac) != 0) {
+    // Try a real Crynwr packet driver first (so the same binary
+    // lights up on hardware when one's loaded). Fall back to the
+    // INT 0x83 sim — what dos_emu provides without a fake Crynwr.
+    if (pktdrv_init(mac) != 0 && ethdrv_init(mac) != 0) {
         return -1;
     }
     ip4_addr_t ip0, nm0, gw0;
@@ -180,6 +211,12 @@ unsigned int uc386dos_eth_ip(void)      { return uc386dos_eth_netif.ip_addr.addr
 unsigned int uc386dos_eth_netmask(void) { return uc386dos_eth_netif.netmask.addr; }
 unsigned int uc386dos_eth_gateway(void) { return uc386dos_eth_netif.gw.addr; }
 int uc386dos_eth_is_up(void)            { return uc386dos_eth_active && netif_is_up(&uc386dos_eth_netif); }
+
+// 0 = no eth init yet, 1 = INT 0x83 sim, 2 = Crynwr packet driver.
+int uc386dos_eth_driver(void) {
+    if (!uc386dos_eth_active) return 0;
+    return pktdrv_is_active() ? 2 : 1;
+}
 
 // Loopback packet pump. With LWIP_NETIF_LOOPBACK=1 + NO_SYS=1, lwIP
 // queues outgoing-to-127.0.0.1 packets in netif->loop_first/last and

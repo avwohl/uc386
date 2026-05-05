@@ -1,4 +1,4 @@
-# MicroPython port — status: **full REPL @ EXTRA_FEATURES + lwIP DHCP + eth netif via INT 0x83** (2026-05-05)
+# MicroPython port — status: **full REPL @ EXTRA_FEATURES + lwIP DHCP + Crynwr packet-driver path** (2026-05-05)
 
 **Upstream**: https://github.com/micropython/micropython
 **License**: MIT

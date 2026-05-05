@@ -56,6 +56,12 @@ DEFAULT_DNS_IP       = bytes([10, 0, 2, 3])
 DEFAULT_NETMASK      = bytes([255, 255, 255, 0])
 DHCP_MAGIC = bytes([99, 130, 83, 99])
 
+# Where in low memory we plant the fake Crynwr "PKT DRVR" signature.
+# Far enough past the PSP (0xF1000 end) and well past any address
+# the smoke-test heap touches that the binary won't trample it.
+PKTDRV_HANDLER_LINEAR = 0x000FE000
+PKTDRV_INT_NUM        = 0x60
+
 
 class NetworkSimulator:
     """Single-client virtual NIC. Plug into `dos_emu.run(net=...)`."""
@@ -68,6 +74,7 @@ class NetworkSimulator:
         gateway_ip: bytes = DEFAULT_GATEWAY_IP,
         dns_ip: bytes = DEFAULT_DNS_IP,
         netmask: bytes = DEFAULT_NETMASK,
+        crynwr_int_num: Optional[int] = PKTDRV_INT_NUM,
     ) -> None:
         assert len(our_mac) == 6 and len(host_mac) == 6
         for b in (offered_ip, gateway_ip, dns_ip, netmask):
@@ -80,6 +87,16 @@ class NetworkSimulator:
         self.netmask = netmask
         self.rx_queue: list[bytes] = []
         self.tx_log: list[bytes] = []
+        # When set, dos_emu plants a "PKT DRVR" signature in low
+        # memory and answers DPMI INT 0x31 fn 0x0200 + Crynwr INT
+        # 0x60 calls so the binary's pktdrv_init() succeeds. Set
+        # to None to force the binary onto the INT 0x83 sim path.
+        self.crynwr_int_num: Optional[int] = crynwr_int_num
+        # Filled in after access_type — the linear address of the
+        # binary's receiver. Reserved for the DPMI-thunk-based RX
+        # path that lives behind a TODO today.
+        self.pktdrv_receiver_addr: int = 0
+        self.pktdrv_handle: int = 1
 
     # ---- INT 0x83 entry points ------------------------------------
 

@@ -2628,26 +2628,13 @@ def test_micropython_lwip_loopback_tcp(micropython_bin: Path) -> None:
     )
 
 
-def test_micropython_lwip_dhcp(micropython_bin: Path) -> None:
-    """`uc386_net.eth_init()` brings up the eth netif, kicks DHCP. The
-    `dos_emu.NetworkSimulator` plays a tiny DHCP server (DISCOVER →
-    OFFER, REQUEST → ACK) and an ARP responder. After a handful of
-    `lwip.callback()` ticks the lease should land and `eth_status()`
-    reports the offered IP / netmask / gateway.
-
-    Pins three things together:
-    1. uc386's INT 0x83 packet-driver shim (lib/i386_dos_libc.asm
-       ethdrv_init/send/recv) actually reaches Python.
-    2. lwIP's eth netif (etharp_output + ethernet_input) round-trips
-       Layer-2 frames through the shim end-to-end.
-    3. lwIP's DHCP client (LWIP_DHCP=1, dhcp_start in
-       uc386dos_eth_start) negotiates a lease against the sim server.
-    """
+def _run_dhcp(micropython_bin: Path, *, crynwr_int_num):
+    """Shared driver: bring up eth, run DHCP discovery, return Result + sim."""
     sys.path.insert(0, str(REPO_ROOT / "src"))
     from uc386.dos_emu import run
     from uc386.dos_emu_netsim import NetworkSimulator
 
-    net = NetworkSimulator()
+    net = NetworkSimulator(crynwr_int_num=crynwr_int_num)
     res = run(micropython_bin,
               stdin_bytes=(
                   b"import lwip, uc386_net\n"
@@ -2662,6 +2649,20 @@ def test_micropython_lwip_dhcp(micropython_bin: Path) -> None:
               net=net,
               timeout_seconds=30.0,
               instruction_limit=8_000_000_000)
+    return res, net
+
+
+def test_micropython_lwip_dhcp(micropython_bin: Path) -> None:
+    """End-to-end DHCP over the Crynwr packet-driver path. With the
+    simulator's default `crynwr_int_num=0x60`, dos_emu plants the
+    "PKT DRVR" signature in low memory and answers DPMI INT 0x31
+    fn 0x0200 + the AH=01/02/04/06 Crynwr server functions, so the
+    binary's `pktdrv_init` succeeds and the eth netif uses the
+    Crynwr send path. Receive still rides on INT 0x83 (the DPMI
+    receiver thunk for real DOS is a documented follow-up); both
+    paths funnel through the same NetworkSimulator under emulation.
+    """
+    res, net = _run_dhcp(micropython_bin, crynwr_int_num=0x60)
     assert not res.timed_out, "REPL didn't exit"
     assert res.error is None, f"dos_emu reported error: {res.error}"
     assert res.exit_code == 0
@@ -2673,6 +2674,12 @@ def test_micropython_lwip_dhcp(micropython_bin: Path) -> None:
     )
     assert "10.0.2.2" in res.stdout, (
         f"DHCP gateway 10.0.2.2 not visible in status: {res.stdout!r}"
+    )
+    assert "'pktdrv'" in res.stdout, (
+        f"Driver should report 'pktdrv' under Crynwr mode: {res.stdout!r}"
+    )
+    assert net.pktdrv_receiver_addr != 0, (
+        "pktdrv access_type didn't register the receiver address"
     )
     # Sanity on the simulator side: at least one DHCP DISCOVER must
     # have been transmitted (op=1 BOOTREQUEST in a UDP 68->67 frame).
@@ -2692,4 +2699,24 @@ def test_micropython_lwip_dhcp(micropython_bin: Path) -> None:
     assert saw_discover, (
         "no DHCP client packet (UDP 68->67) was transmitted: "
         f"{len(net.tx_log)} frames in tx_log"
+    )
+
+
+def test_micropython_lwip_dhcp_int83_fallback(micropython_bin: Path) -> None:
+    """Same DHCP flow but with the simulator's Crynwr support disabled
+    (`crynwr_int_num=None`). The IVT scan should fail (no signature
+    planted, DPMI fn 0x0200 returns CF=1), `pktdrv_init` falls back
+    to the INT 0x83 sim, and `eth_status()` reports `int83-sim` as
+    the active driver. Confirms the autodetect ladder doesn't lock
+    us into Crynwr-only on environments where it isn't wired."""
+    res, _net = _run_dhcp(micropython_bin, crynwr_int_num=None)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "10.0.2.15" in res.stdout, (
+        f"DHCP-offered IP 10.0.2.15 not visible in status: {res.stdout!r}"
+    )
+    assert "'int83-sim'" in res.stdout, (
+        f"Driver should fall back to 'int83-sim' "
+        f"when Crynwr is absent: {res.stdout!r}"
     )

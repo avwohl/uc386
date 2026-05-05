@@ -153,6 +153,7 @@ SOURCES_FILE="build/_port_sources.txt"
     echo uc386-dos/urllib_parse_uc386dos.c
     echo uc386-dos/urllib_uc386dos.c
     echo uc386-dos/uc386_net_uc386dos.c
+    echo uc386-dos/pktdrv_uc386dos.c
     echo uc386-dos/math_gamma.c
 } > "$SOURCES_FILE"
 

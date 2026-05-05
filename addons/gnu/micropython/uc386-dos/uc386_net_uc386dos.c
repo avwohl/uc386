@@ -22,6 +22,7 @@ extern unsigned int uc386dos_eth_ip(void);
 extern unsigned int uc386dos_eth_netmask(void);
 extern unsigned int uc386dos_eth_gateway(void);
 extern int uc386dos_eth_is_up(void);
+extern int uc386dos_eth_driver(void);
 
 static mp_obj_t mod_uc386_net_ip4_to_str(unsigned int addr) {
     char buf[16];
@@ -48,12 +49,18 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(
     mod_uc386_net_eth_init_obj, 0, 1, mod_uc386_net_eth_init);
 
 static mp_obj_t mod_uc386_net_eth_status(void) {
-    mp_obj_t items[4];
+    mp_obj_t items[5];
     items[0] = mod_uc386_net_ip4_to_str(uc386dos_eth_ip());
     items[1] = mod_uc386_net_ip4_to_str(uc386dos_eth_netmask());
     items[2] = mod_uc386_net_ip4_to_str(uc386dos_eth_gateway());
     items[3] = uc386dos_eth_is_up() ? mp_const_true : mp_const_false;
-    return mp_obj_new_tuple(4, items);
+    // 0=none, 1="int83-sim", 2="pktdrv"
+    int drv = uc386dos_eth_driver();
+    const char *drv_name =
+        (drv == 2) ? "pktdrv" :
+        (drv == 1) ? "int83-sim" : "none";
+    items[4] = mp_obj_new_str(drv_name, strlen(drv_name));
+    return mp_obj_new_tuple(5, items);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(
     mod_uc386_net_eth_status_obj, mod_uc386_net_eth_status);
