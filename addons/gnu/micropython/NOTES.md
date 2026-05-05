@@ -1,4 +1,4 @@
-# MicroPython port — status: **full Python REPL @ EXTRA_FEATURES** (2026-05-04)
+# MicroPython port — status: **full REPL @ EXTRA_FEATURES + lwIP loopback TCP/IP** (2026-05-05)
 
 **Upstream**: https://github.com/micropython/micropython
 **License**: MIT
