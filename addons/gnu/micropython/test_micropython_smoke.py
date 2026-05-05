@@ -2548,3 +2548,81 @@ def test_micropython_os_system_exec(micropython_bin: Path) -> None:
     assert "exit rc= 7" in res.stdout, (
         f"expected EXIT 7 to return 7, got: {res.stdout!r}"
     )
+
+
+def test_micropython_lwip_loopback_tcp(micropython_bin: Path) -> None:
+    """`import lwip; lwip.reset()` initializes lwIP's IPv4 stack.
+    Then a server `socket(AF_INET, SOCK_STREAM)` binds 127.0.0.1:8080
+    and listens, a client socket connects (EINPROGRESS on
+    non-blocking), `lwip.callback()` drives `uc386dos_loopback_poll`
+    + `sys_check_timeouts` to drain the SYN/SYN-ACK/ACK on the
+    `loop_netif` queue, accept returns the new conn, send writes
+    10 bytes, and after another callback round-trip, the server's
+    recv reads back exactly `b'hello lwip'`. End-to-end TCP/IP
+    round-trip on FreeDOS via lwIP STABLE-2_2_1, no real net.
+
+    Guards against three regressions:
+    1. `lwip-arch-cc.h` PACK_STRUCT_STRUCT must expand to
+       `__attribute__((packed))` — otherwise lwIP's init.c
+       boot-time `LWIP_ASSERT(sizeof(packed_struct_test) == 5)`
+       aborts on a u8+u32 layout that comes out 8 bytes unpacked.
+    2. `mod_lwip_reset` must register `uc386dos_loopback_poll`
+       (the netif_poll_all driver) — fetch.sh's idempotent patch
+       to upstream/extmod/modlwip.c.
+    3. `uc386dos_loopback_poll` must call `netif_poll_all()` not
+       `netif_poll(netif_default)` — `netif_default` stays NULL
+       because netif_init doesn't promote `loop_netif`."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import lwip\n"
+                  b"lwip.reset()\n"
+                  b"import socket\n"
+                  b"srv = socket.socket()\n"
+                  b"srv.bind((\"127.0.0.1\", 8080))\n"
+                  b"srv.listen(1)\n"
+                  b"srv.setblocking(False)\n"
+                  b"cli = socket.socket()\n"
+                  b"cli.setblocking(False)\n"
+                  b"try:\n"
+                  b"    cli.connect((\"127.0.0.1\", 8080))\n"
+                  b"except OSError:\n"
+                  b"    pass\n"
+                  b"\n"
+                  b"for _ in range(5):\n"
+                  b"    lwip.callback()\n"
+                  b"\n"
+                  b"conn, addr = srv.accept()\n"
+                  b"conn.setblocking(False)\n"
+                  b"print('accepted')\n"
+                  b"n = cli.send(b'hello lwip')\n"
+                  b"print('sent', n)\n"
+                  b"\n"
+                  b"for _ in range(5):\n"
+                  b"    lwip.callback()\n"
+                  b"\n"
+                  b"data = conn.recv(64)\n"
+                  b"print('recv:', data)\n"
+                  b"\x04"
+              ),
+              timeout_seconds=30.0,
+              instruction_limit=8_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # No abort-on-assert means the packing fix held.
+    assert "lwIP assert:" not in res.stdout, (
+        f"lwIP assertion fired during init: {res.stdout!r}"
+    )
+    assert "accepted" in res.stdout, (
+        f"server accept didn't complete (handshake stalled?): "
+        f"{res.stdout!r}"
+    )
+    assert "sent 10" in res.stdout, (
+        f"client send didn't ship 10 bytes: {res.stdout!r}"
+    )
+    assert "recv: b'hello lwip'" in res.stdout, (
+        f"server recv didn't see the payload: {res.stdout!r}"
+    )
