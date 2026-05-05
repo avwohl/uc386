@@ -390,6 +390,16 @@ extern const struct _mp_obj_module_t mp_module_platform;
 #define UCDOS_MOD_ENTRY_PLATFORM
 #endif
 
+// `base64`, `shutil`, `tempfile` — port-supplied modules in
+// uc386-dos/{base64,shutil,tempfile}_uc386dos.c. No upstream
+// gates; always registered.
+extern const struct _mp_obj_module_t mp_module_base64;
+extern const struct _mp_obj_module_t mp_module_shutil;
+extern const struct _mp_obj_module_t mp_module_tempfile;
+#define UCDOS_MOD_ENTRY_BASE64   { MP_ROM_QSTR(MP_QSTR_base64),   MP_ROM_PTR(&mp_module_base64) },
+#define UCDOS_MOD_ENTRY_SHUTIL   { MP_ROM_QSTR(MP_QSTR_shutil),   MP_ROM_PTR(&mp_module_shutil) },
+#define UCDOS_MOD_ENTRY_TEMPFILE { MP_ROM_QSTR(MP_QSTR_tempfile), MP_ROM_PTR(&mp_module_tempfile) },
+
 #define MICROPY_REGISTERED_MODULES \
     { MP_ROM_QSTR(MP_QSTR_builtins), MP_ROM_PTR(&mp_module_builtins) }, \
     { MP_ROM_QSTR(MP_QSTR_sys), MP_ROM_PTR(&mp_module_sys) }, \
@@ -413,7 +423,10 @@ extern const struct _mp_obj_module_t mp_module_platform;
     UCDOS_MOD_ENTRY_DEFLATE \
     UCDOS_MOD_ENTRY_IO \
     UCDOS_MOD_ENTRY_JSON \
-    UCDOS_MOD_ENTRY_PLATFORM
+    UCDOS_MOD_ENTRY_PLATFORM \
+    UCDOS_MOD_ENTRY_BASE64 \
+    UCDOS_MOD_ENTRY_SHUTIL \
+    UCDOS_MOD_ENTRY_TEMPFILE
 
 // Module attribute-access delegation table — modules whose attr
 // loads/stores need to dispatch through a port-supplied function.

@@ -2080,6 +2080,117 @@ def test_micropython_os_environ(micropython_bin: Path) -> None:
     )
 
 
+def test_micropython_base64(micropython_bin: Path) -> None:
+    """`base64.b64encode` / `b64decode` / `b16encode` / `b16decode`
+    — port-supplied module (uc386-dos/base64_uc386dos.c) implementing
+    RFC 4648 base64 + base16 directly. Pin RFC 4648 test vectors so
+    encoder/decoder don't drift."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import base64\n"
+                  b"print(base64.b64encode(b'foobar'))\n"  # RFC 4648
+                  b"print(base64.b64decode(b'Zm9vYmFy'))\n"
+                  b"print(base64.b64encode(b''))\n"
+                  b"print(base64.b64encode(b'f'))\n"
+                  b"print(base64.b64encode(b'fo'))\n"
+                  b"print(base64.b16encode(b'\\xde\\xad'))\n"
+                  b"print(base64.b16decode(b'DEADBEEF'))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # RFC 4648 §10 vectors.
+    assert "b'Zm9vYmFy'" in res.stdout, f"foobar→: {res.stdout!r}"
+    assert "b'foobar'" in res.stdout, f"decode foobar: {res.stdout!r}"
+    assert "b''" in res.stdout, f"empty: {res.stdout!r}"
+    assert "b'Zg=='" in res.stdout, f"f→Zg==: {res.stdout!r}"
+    assert "b'Zm8='" in res.stdout, f"fo→Zm8=: {res.stdout!r}"
+    assert "b'DEAD'" in res.stdout, f"b16 dead: {res.stdout!r}"
+    assert "b'\\xde\\xad\\xbe\\xef'" in res.stdout, (
+        f"b16 decode: {res.stdout!r}"
+    )
+
+
+def test_micropython_shutil_copy_move(micropython_bin: Path) -> None:
+    """`shutil.copy` reads src → writes dst (open/read/write loop
+    in 4 KB chunks). `shutil.move` tries os.rename first (atomic
+    same-volume) and falls back to copy+unlink."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import shutil\n"
+                  b"shutil.copy('src.txt', 'dst.txt')\n"
+                  b"print(open('dst.txt').read())\n"
+                  b"shutil.move('dst.txt', 'moved.txt')\n"
+                  b"print(open('moved.txt').read())\n"
+                  b"try:\n"
+                  b"    open('dst.txt')\n"
+                  b"except OSError:\n"
+                  b"    print('original gone')\n"
+                  b"\n"
+                  b"\x04"
+              ),
+              vfiles_init={b"src.txt": b"copied bytes"},
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    # copy + read-back yields the source bytes.
+    assert "copied bytes" in res.stdout, f"copy content: {res.stdout!r}"
+    # move + read-back via the new name still works.
+    assert res.stdout.count("copied bytes") >= 2, (
+        f"move read-back: {res.stdout!r}"
+    )
+    # Original name is gone after rename.
+    assert "original gone" in res.stdout, (
+        f"move removes src: {res.stdout!r}"
+    )
+
+
+def test_micropython_tempfile(micropython_bin: Path) -> None:
+    """`tempfile.gettempdir()` reads TEMP/TMP env vars or falls
+    back to "C:\\". `tempfile.mktemp()` returns a path that doesn't
+    exist (probed via libc stat), with a counter that increments
+    across calls so consecutive mktemp results never collide."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import tempfile\n"
+                  b"print('td=', tempfile.gettempdir())\n"
+                  b"a = tempfile.mktemp(suffix='.txt')\n"
+                  b"b = tempfile.mktemp(suffix='.txt')\n"
+                  b"print('a=', a)\n"
+                  b"print('b=', b)\n"
+                  b"print('distinct=', a != b)\n"
+                  b"\x04"
+              ),
+              env={"TEMP": "C:\\TEMP"},
+              timeout_seconds=15.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "td= C:\\TEMP" in res.stdout, f"gettempdir env: {res.stdout!r}"
+    assert "C:\\TEMP\\tmp" in res.stdout, (
+        f"mktemp uses tempdir: {res.stdout!r}"
+    )
+    assert ".txt" in res.stdout, f"mktemp uses suffix: {res.stdout!r}"
+    assert "distinct= True" in res.stdout, (
+        f"consecutive mktemp differ: {res.stdout!r}"
+    )
+
+
 def test_micropython_os_path_join_split(micropython_bin: Path) -> None:
     """`os.path.join` / `split` / `splitext` / `basename` / `dirname`
     — port-supplied submodule (uc386-dos/path_uc386dos.c). Backslash
