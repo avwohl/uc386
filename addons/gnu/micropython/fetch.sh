@@ -19,9 +19,33 @@ fetch_b_con_crypto() {
     done
 }
 
+# lwIP — submodule in upstream/.gitmodules but not pulled by the
+# tarball. Fetch a pinned release tarball into upstream/lib/lwip/
+# alongside the existing crypto-algorithms stash. STABLE-2_2_1 is
+# the latest tagged release as of mid-2026 and is what our port
+# integration targets.
+fetch_lwip() {
+    LWIP_TAG="STABLE-2_2_1_RELEASE"
+    LWIP_DIR="upstream/lib/lwip"
+    if [ -d "$LWIP_DIR/src/core" ]; then
+        return 0
+    fi
+    echo "micropython: fetching lwIP $LWIP_TAG …"
+    LWIP_TMP="$(mktemp -d)"
+    trap 'rm -rf "$LWIP_TMP"' RETURN 2>/dev/null || true
+    curl -fsSL \
+        "https://github.com/lwip-tcpip/lwip/archive/refs/tags/${LWIP_TAG}.tar.gz" \
+        -o "$LWIP_TMP/lwip.tgz"
+    tar -xzf "$LWIP_TMP/lwip.tgz" -C "$LWIP_TMP"
+    mkdir -p "$LWIP_DIR"
+    cp -r "$LWIP_TMP"/lwip-*/src "$LWIP_DIR/"
+    rm -rf "$LWIP_TMP"
+}
+
 if [ -d upstream ]; then
     echo "micropython: upstream/ already present — skipping main fetch."
     fetch_b_con_crypto
+    fetch_lwip
     exit 0
 fi
 
@@ -42,3 +66,4 @@ mv "$TMP"/micropython-* upstream
 echo "micropython: upstream tree at addons/gnu/micropython/upstream/"
 
 fetch_b_con_crypto
+fetch_lwip

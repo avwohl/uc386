@@ -400,6 +400,31 @@ extern const struct _mp_obj_module_t mp_module_tempfile;
 #define UCDOS_MOD_ENTRY_SHUTIL   { MP_ROM_QSTR(MP_QSTR_shutil),   MP_ROM_PTR(&mp_module_shutil) },
 #define UCDOS_MOD_ENTRY_TEMPFILE { MP_ROM_QSTR(MP_QSTR_tempfile), MP_ROM_PTR(&mp_module_tempfile) },
 
+// `lwip` + `socket` — both back the same `mp_module_lwip` from
+// upstream's extmod/modlwip.c. The Python-level `socket` API uses
+// the lwIP raw API via that module.
+#if MICROPY_PY_LWIP
+extern const struct _mp_obj_module_t mp_module_lwip;
+#define UCDOS_MOD_ENTRY_LWIP   { MP_ROM_QSTR(MP_QSTR_lwip),   MP_ROM_PTR(&mp_module_lwip) },
+#define UCDOS_MOD_ENTRY_SOCKET { MP_ROM_QSTR(MP_QSTR_socket), MP_ROM_PTR(&mp_module_lwip) },
+#else
+#define UCDOS_MOD_ENTRY_LWIP
+#define UCDOS_MOD_ENTRY_SOCKET
+#endif
+
+// `urllib` + `urllib_parse` — port-supplied. Registered as a
+// `urllib` package shim (with `parse` as an attribute, so
+// `from urllib import parse` works) and a top-level `urllib_parse`
+// (so `import urllib_parse` works). `import urllib.parse` resolves
+// via MP's dotted-import path: it imports `urllib`, then reads the
+// `parse` attribute. We don't register a dotted name in the
+// builtin-modules table — the qstr-grep doesn't see the dotted
+// form anyway since `.` can't appear in a C identifier.
+extern const struct _mp_obj_module_t mp_module_urllib;
+extern const struct _mp_obj_module_t mp_module_urllib_parse;
+#define UCDOS_MOD_ENTRY_URLLIB        { MP_ROM_QSTR(MP_QSTR_urllib),       MP_ROM_PTR(&mp_module_urllib) },
+#define UCDOS_MOD_ENTRY_URLLIB_PARSE  { MP_ROM_QSTR(MP_QSTR_urllib_parse), MP_ROM_PTR(&mp_module_urllib_parse) },
+
 #define MICROPY_REGISTERED_MODULES \
     { MP_ROM_QSTR(MP_QSTR_builtins), MP_ROM_PTR(&mp_module_builtins) }, \
     { MP_ROM_QSTR(MP_QSTR_sys), MP_ROM_PTR(&mp_module_sys) }, \
@@ -426,7 +451,11 @@ extern const struct _mp_obj_module_t mp_module_tempfile;
     UCDOS_MOD_ENTRY_PLATFORM \
     UCDOS_MOD_ENTRY_BASE64 \
     UCDOS_MOD_ENTRY_SHUTIL \
-    UCDOS_MOD_ENTRY_TEMPFILE
+    UCDOS_MOD_ENTRY_TEMPFILE \
+    UCDOS_MOD_ENTRY_URLLIB \
+    UCDOS_MOD_ENTRY_URLLIB_PARSE \
+    UCDOS_MOD_ENTRY_LWIP \
+    UCDOS_MOD_ENTRY_SOCKET
 
 // Module attribute-access delegation table — modules whose attr
 // loads/stores need to dispatch through a port-supplied function.
@@ -460,7 +489,7 @@ if [ ! -f build/genhdr/root_pointers.h ]; then
     {
         echo "// Triage stub. Real build emits MP_REGISTER_ROOT_POINTER entries here."
         grep -rhE "^MP_REGISTER_ROOT_POINTER\(.*\);" \
-                upstream/py/ upstream/shared/ \
+                upstream/py/ upstream/shared/ upstream/extmod/ \
             | sed -E 's#^MP_REGISTER_ROOT_POINTER\((.*)\);#    \1;#' \
             | sort -u
     } > build/genhdr/root_pointers.h

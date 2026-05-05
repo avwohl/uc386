@@ -111,6 +111,35 @@ SOURCES_FILE="build/_port_sources.txt"
     # expects is provided by uc386-dos/lib/axtls/crypto/crypto.h.
     echo upstream/lib/crypto-algorithms/md5.c
     echo upstream/lib/crypto-algorithms/sha1.c
+    # lwIP — IPv4-only TCP/UDP/DNS stack with loopback for testing.
+    # Phase 1: just core + ipv4 + netif/ethernet. DHCP / IPv6 / SLIP /
+    # PPP are off in lwipopts.h so their sources don't pull in.
+    echo upstream/extmod/modlwip.c
+    echo upstream/lib/lwip/src/core/init.c
+    echo upstream/lib/lwip/src/core/def.c
+    echo upstream/lib/lwip/src/core/dns.c
+    echo upstream/lib/lwip/src/core/inet_chksum.c
+    echo upstream/lib/lwip/src/core/ip.c
+    echo upstream/lib/lwip/src/core/mem.c
+    echo upstream/lib/lwip/src/core/memp.c
+    echo upstream/lib/lwip/src/core/netif.c
+    echo upstream/lib/lwip/src/core/pbuf.c
+    echo upstream/lib/lwip/src/core/raw.c
+    echo upstream/lib/lwip/src/core/stats.c
+    echo upstream/lib/lwip/src/core/sys.c
+    echo upstream/lib/lwip/src/core/tcp.c
+    echo upstream/lib/lwip/src/core/tcp_in.c
+    echo upstream/lib/lwip/src/core/tcp_out.c
+    echo upstream/lib/lwip/src/core/timeouts.c
+    echo upstream/lib/lwip/src/core/udp.c
+    echo upstream/lib/lwip/src/core/ipv4/etharp.c
+    echo upstream/lib/lwip/src/core/ipv4/icmp.c
+    echo upstream/lib/lwip/src/core/ipv4/igmp.c
+    echo upstream/lib/lwip/src/core/ipv4/ip4.c
+    echo upstream/lib/lwip/src/core/ipv4/ip4_addr.c
+    echo upstream/lib/lwip/src/core/ipv4/ip4_frag.c
+    echo upstream/lib/lwip/src/netif/ethernet.c
+    echo uc386-dos/lwip_uc386dos.c
     echo upstream/ports/minimal/main.c
     echo upstream/ports/minimal/uart_core.c
     echo uc386-dos/mphal_uc386dos.c
@@ -120,6 +149,8 @@ SOURCES_FILE="build/_port_sources.txt"
     echo uc386-dos/base64_uc386dos.c
     echo uc386-dos/shutil_uc386dos.c
     echo uc386-dos/tempfile_uc386dos.c
+    echo uc386-dos/urllib_parse_uc386dos.c
+    echo uc386-dos/urllib_uc386dos.c
     echo uc386-dos/math_gamma.c
 } > "$SOURCES_FILE"
 
@@ -133,6 +164,8 @@ tr '\n' '\0' < "$SOURCES_FILE" \
     | xargs -0 "$PYTHON" -m uc386.main \
         -I "$INCLUDE" \
         -I upstream \
+        -I upstream/lib/lwip/src/include \
+        -I upstream/extmod/lwip-include \
         -I uc386-dos \
         -I build \
         -D__linux__=1 \

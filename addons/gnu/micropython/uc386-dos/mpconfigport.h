@@ -263,6 +263,20 @@ extern unsigned long bios_ticks(void);
 #define MICROPY_PY_HASHLIB_SHA1           (1)
 #define MICROPY_PY_HASHLIB_MD5            (1)
 #define MICROPY_SSL_AXTLS                 (1)
+
+// lwIP — IPv4-only TCP/UDP/DNS stack. Phase 1 is loopback-only
+// (no packet driver yet), so socket(AF_INET, SOCK_STREAM) can
+// bind/listen/connect against 127.0.0.1 within a single REPL.
+// MICROPY_PY_SOCKET turns on the BSD-style surface modlwip.c
+// exposes; MICROPY_PY_LWIP itself just exposes the raw `lwip`
+// module which we don't bother with separately. The hostname
+// default is required by extmod/modnetwork.c — we don't actually
+// build modnetwork.c (no MICROPY_PY_NETWORK), but modlwip.c
+// references the hostname for DNS, so set it here.
+#define MICROPY_PY_LWIP                   (1)
+#define MICROPY_PY_SOCKET                 (1)
+#define MICROPY_PY_NETWORK_HOSTNAME_DEFAULT  "uc386-dos"
+#define MICROPY_PY_NETWORK_HOSTNAME_MAX_LEN  16
 #define MICROPY_PY_RE                     (1)
 #define MICROPY_PY_RE_SUB                 (1)
 #define MICROPY_PY_RE_MATCH_GROUPS        (1)
