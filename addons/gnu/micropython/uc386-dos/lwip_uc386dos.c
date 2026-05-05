@@ -17,9 +17,20 @@
 #include "lwip/init.h"
 #include "lwip/timeouts.h"
 #include "lwip/netif.h"
+#include "lwip/dhcp.h"
+#include "lwip/etharp.h"
+#include "lwip/pbuf.h"
+#include "netif/ethernet.h"
 #if LWIP_HAVE_LOOPIF
 #include "lwip/sys.h"
 #endif
+
+// INT 0x83 packet-driver shim — see lib/i386_dos_libc.asm. dos_emu
+// intercepts and routes to a NetworkSimulator; on real DOS we'll
+// stack a Crynwr packet-driver adapter under these same symbols.
+extern int ethdrv_init(unsigned char mac[6]);
+extern int ethdrv_send(const unsigned char *buf, unsigned int len);
+extern unsigned int ethdrv_recv(unsigned char *buf, unsigned int maxlen);
 
 // `bios_ticks()` from lib/i386_dos_libc.asm — INT 1Ah AH=0 read of
 // the BIOS tick counter (~18.2 Hz). Multiply by 55 for an
@@ -58,6 +69,118 @@ int mp_mod_network_prefer_dns_use_ip_version = 4;
 // otherwise owns. Provide a stub matching the symbol shape.
 char mod_network_hostname_data[16 + 1] = "uc386-dos";
 
+// ---- Virtual ethernet netif (uc386dos_eth) ---------------------
+//
+// A second netif on top of the INT 0x83 packet-driver shim. Used
+// for DHCP discovery and any non-loopback IPv4 traffic the program
+// wants. Stays separate from the loopback netif so 127.0.0.1 traffic
+// doesn't bounce off the wire.
+//
+// Frame path:
+//   TX: lwIP → etharp_output → ethdrv_send → INT 0x83 AH=1
+//                                          → dos_emu hook
+//                                          → NetworkSimulator
+//   RX: ethdrv_recv (INT 0x83 AH=2) → pbuf_alloc + take
+//                                   → ethernet_input → ip_input
+// Pumped from `uc386dos_loopback_poll` (which is wired in as
+// modlwip's poll-list hook), so `lwip.callback()` drives both
+// loopback delivery and eth RX in one shot.
+
+static struct netif uc386dos_eth_netif;
+static int uc386dos_eth_active = 0;
+
+// Static TX scratch — one outgoing frame at a time, no concurrency
+// since NO_SYS=1 + single-threaded REPL. Sized to lwIP MTU + eth hdr.
+static unsigned char uc386dos_eth_tx_buf[1500 + 14];
+static unsigned char uc386dos_eth_rx_buf[1500 + 14];
+
+static err_t uc386dos_eth_linkoutput(struct netif *netif, struct pbuf *p) {
+    (void)netif;
+    if (p->tot_len > sizeof(uc386dos_eth_tx_buf)) {
+        return ERR_IF;
+    }
+    pbuf_copy_partial(p, uc386dos_eth_tx_buf, p->tot_len, 0);
+    if (ethdrv_send(uc386dos_eth_tx_buf, p->tot_len) != 0) {
+        return ERR_IF;
+    }
+    return ERR_OK;
+}
+
+static err_t uc386dos_eth_netif_init_cb(struct netif *netif) {
+    netif->name[0] = 'e';
+    netif->name[1] = 'n';
+    netif->output = etharp_output;
+    netif->linkoutput = uc386dos_eth_linkoutput;
+    netif->mtu = 1500;
+    netif->hwaddr_len = 6;
+    netif->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP
+                 | NETIF_FLAG_ETHERNET;
+    // hwaddr is filled in by uc386dos_eth_start() before netif_add.
+    return ERR_OK;
+}
+
+// Pull queued frames from the INT 0x83 RX queue and feed them into
+// lwIP. Drains in a tight loop so a callback() pumps everything.
+static void uc386dos_eth_pump_rx(void) {
+    if (!uc386dos_eth_active) {
+        return;
+    }
+    for (;;) {
+        unsigned int len = ethdrv_recv(uc386dos_eth_rx_buf,
+                                       sizeof(uc386dos_eth_rx_buf));
+        if (len == 0) {
+            break;
+        }
+        struct pbuf *p = pbuf_alloc(PBUF_RAW, (u16_t)len, PBUF_POOL);
+        if (p == NULL) {
+            // Drop the frame; lwIP will time out and retransmit.
+            continue;
+        }
+        pbuf_take(p, uc386dos_eth_rx_buf, (u16_t)len);
+        if (uc386dos_eth_netif.input(p, &uc386dos_eth_netif) != ERR_OK) {
+            pbuf_free(p);
+        }
+    }
+}
+
+// Bring the eth netif up. Calls INT 0x83 to fetch the host-assigned
+// MAC, registers the netif, and (if dhcp_start_now) kicks off DHCP
+// discovery. Idempotent — second call is a no-op.
+int uc386dos_eth_start(int dhcp_start_now) {
+    if (uc386dos_eth_active) {
+        return 0;
+    }
+    unsigned char mac[6];
+    if (ethdrv_init(mac) != 0) {
+        return -1;
+    }
+    ip4_addr_t ip0, nm0, gw0;
+    ip0.addr = 0;
+    nm0.addr = 0;
+    gw0.addr = 0;
+    if (netif_add(&uc386dos_eth_netif, &ip0, &nm0, &gw0, NULL,
+                  uc386dos_eth_netif_init_cb, ethernet_input) == NULL) {
+        return -2;
+    }
+    memcpy(uc386dos_eth_netif.hwaddr, mac, 6);
+    netif_set_default(&uc386dos_eth_netif);
+    netif_set_up(&uc386dos_eth_netif);
+    netif_set_link_up(&uc386dos_eth_netif);
+    uc386dos_eth_active = 1;
+    if (dhcp_start_now) {
+        if (dhcp_start(&uc386dos_eth_netif) != ERR_OK) {
+            return -3;
+        }
+    }
+    return 0;
+}
+
+// Read-back helpers for the Python-facing module to inspect state.
+unsigned int uc386dos_eth_ip(void)      { return uc386dos_eth_netif.ip_addr.addr; }
+unsigned int uc386dos_eth_netmask(void) { return uc386dos_eth_netif.netmask.addr; }
+unsigned int uc386dos_eth_gateway(void) { return uc386dos_eth_netif.gw.addr; }
+int uc386dos_eth_is_up(void)            { return uc386dos_eth_active && netif_is_up(&uc386dos_eth_netif); }
+
 // Loopback packet pump. With LWIP_NETIF_LOOPBACK=1 + NO_SYS=1, lwIP
 // queues outgoing-to-127.0.0.1 packets in netif->loop_first/last and
 // only delivers them when netif_poll(netif) is called. The loopback
@@ -66,10 +189,12 @@ char mod_network_hostname_data[16 + 1] = "uc386-dos";
 // on `netif_list` and is provided when LWIP_NETIF_LOOPBACK_MULTITHREADING
 // is 0 (our case). Registered from mod_lwip_reset (patched in
 // fetch.sh) so each `lwip.reset()` re-arms the loopback pump
-// alongside the usual sys_check_timeouts() cadence.
+// alongside the usual sys_check_timeouts() cadence. Also drains the
+// virtual-eth RX queue so DHCP responses + ARP replies land.
 void uc386dos_loopback_poll(void *arg) {
     (void)arg;
     netif_poll_all();
+    uc386dos_eth_pump_rx();
 }
 
 // Expose `mp_module_lwip` as `socket` too. modlwip.c registers

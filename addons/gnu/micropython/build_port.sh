@@ -132,6 +132,7 @@ SOURCES_FILE="build/_port_sources.txt"
     echo upstream/lib/lwip/src/core/tcp_out.c
     echo upstream/lib/lwip/src/core/timeouts.c
     echo upstream/lib/lwip/src/core/udp.c
+    echo upstream/lib/lwip/src/core/ipv4/dhcp.c
     echo upstream/lib/lwip/src/core/ipv4/etharp.c
     echo upstream/lib/lwip/src/core/ipv4/icmp.c
     echo upstream/lib/lwip/src/core/ipv4/igmp.c
@@ -151,6 +152,7 @@ SOURCES_FILE="build/_port_sources.txt"
     echo uc386-dos/tempfile_uc386dos.c
     echo uc386-dos/urllib_parse_uc386dos.c
     echo uc386-dos/urllib_uc386dos.c
+    echo uc386-dos/uc386_net_uc386dos.c
     echo uc386-dos/math_gamma.c
 } > "$SOURCES_FILE"
 

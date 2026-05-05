@@ -117,6 +117,7 @@ def run(
     env: dict[str, str] | None = None,
     program_path: str | None = None,
     vfiles_init: dict[bytes, bytes] | None = None,
+    net=None,
 ) -> Result:
     """Emulate a flat-binary i386 program; return its stdout + exit code.
 
@@ -129,6 +130,13 @@ def run(
     sets the trailing argv[0] string DOS 3.0+ writes after the env
     block — used by libc's `_dos_argv0()` helper. Defaults to the
     first element of `argv` (or "PROGRAM.EXE" if argv is empty).
+
+    `net` is an optional `dos_emu_netsim.NetworkSimulator` (or any
+    object with `init_mac() -> bytes`, `send_frame(bytes) -> int`,
+    and `recv_frame(int) -> bytes|None`). When provided, the program's
+    INT 0x83 packet-driver calls (lib/i386_dos_libc.asm:`ethdrv_*`)
+    are routed to it. Without one, INT 0x83 returns AL=1 (error) so
+    `ethdrv_init` cleanly fails and the program can detect "no NIC".
     """
     if not _UNICORN_AVAILABLE:
         raise RuntimeError(
@@ -678,6 +686,47 @@ def run(
             result_64 = result & 0xFFFFFFFFFFFFFFFF
             uc.reg_write(UC_X86_REG_EAX, result_64 & 0xFFFFFFFF)
             uc.reg_write(UC_X86_REG_EDX, (result_64 >> 32) & 0xFFFFFFFF)
+            return
+        if intno == 0x83:
+            # uc386 virtual ethernet. AH=0/1/2 = init/send/recv. With
+            # no NetworkSimulator wired, return AL=1 so ethdrv_init
+            # fails cleanly and the program treats the NIC as absent.
+            if net is None:
+                uc.reg_write(UC_X86_REG_EAX, (eax & ~0xFF) | 1)
+                return
+            if ah == 0x00:
+                # AH=0 init: write 6 MAC bytes to [EDI].
+                edi = uc.reg_read(UC_X86_REG_EDI)
+                uc.mem_write(edi, net.init_mac())
+                uc.reg_write(UC_X86_REG_EAX, eax & ~0xFF)
+                return
+            if ah == 0x01:
+                # AH=1 send: ESI=buf, ECX=len. Read from guest memory,
+                # hand to the simulator, return its rc in AL.
+                esi = uc.reg_read(UC_X86_REG_ESI)
+                ecx = uc.reg_read(UC_X86_REG_ECX)
+                length = ecx & 0xFFFF
+                frame = bytes(uc.mem_read(esi, length)) if length else b""
+                rc = net.send_frame(frame)
+                uc.reg_write(UC_X86_REG_EAX,
+                             (eax & ~0xFF) | (rc & 0xFF))
+                return
+            if ah == 0x02:
+                # AH=2 recv: EDI=buf, ECX=maxlen. Pop next sim frame
+                # (if any), copy to buf, return actual length in ECX.
+                edi = uc.reg_read(UC_X86_REG_EDI)
+                ecx = uc.reg_read(UC_X86_REG_ECX)
+                maxlen = ecx & 0xFFFF
+                frame = net.recv_frame(maxlen)
+                if frame is None:
+                    uc.reg_write(UC_X86_REG_ECX, ecx & ~0xFFFF)
+                    return
+                uc.mem_write(edi, frame)
+                uc.reg_write(UC_X86_REG_ECX,
+                             (ecx & ~0xFFFF) | (len(frame) & 0xFFFF))
+                return
+            # Unknown AH — flag error in AL, leave ECX/etc unchanged.
+            uc.reg_write(UC_X86_REG_EAX, (eax & ~0xFF) | 1)
             return
         if intno == 0:
             # x86 #DE (divide error). Map to SIGFPE (signum=2 per our

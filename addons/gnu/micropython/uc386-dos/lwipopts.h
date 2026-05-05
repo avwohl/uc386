@@ -33,9 +33,17 @@
 #define LWIP_TCP                        1
 #define LWIP_UDP                        1
 #define LWIP_DNS                        1
-#define LWIP_DHCP                       0   // Phase 2 — needs real packet I/O
+#define LWIP_DHCP                       1
 #define LWIP_AUTOIP                     0
 #define LWIP_ACD                        0
+#define LWIP_DHCP_DOES_ACD_CHECK        0  // ACD off → don't probe
+#define LWIP_DHCP_BOOTP_FILE            0
+#define LWIP_DHCP_GET_NTP_SRV           0
+#define LWIP_DHCP_PROVIDE_DNS_SERVERS   1  // accept DNS from option 6
+// dhcp.c includes <stddef.h> via lwIP's def.h, then time.h via
+// timeouts.h's chain — both typedef size_t under _SIZE_T_DEFINED.
+// stddef.h's separate _PTRDIFF_T_DEFINED guard (fixed in lib/include)
+// keeps ptrdiff_t reachable.
 
 // Loopback — lets unit tests bind/connect 127.0.0.1 to itself
 // without any real netif driver. Phase 1 testing relies entirely

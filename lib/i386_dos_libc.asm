@@ -5930,3 +5930,68 @@ _erfc:
 ; MicroPython port sources). No asm stubs here so the symbols
 ; come from the C TU.
 
+; -----------------------------------------------------------------
+; uc386-dos virtual ethernet — INT 0x83 packet driver shim.
+;
+; INT 0x83 is a private uc386 trap (alongside INT 0x80 for 64-bit
+; divide). Real DOS doesn't define it; dos_emu.py intercepts it
+; and routes to a NetworkSimulator. On real hardware we'll later
+; layer a Crynwr packet-driver adapter over the same C-level
+; ethdrv_* API so lwip_uc386dos.c stays target-agnostic.
+;
+; Calling convention for INT 0x83:
+;   AH = subfunction
+;   AH=0 init   : EDI -> 6-byte MAC out buffer.
+;                 AL=0 ok, AL!=0 err.
+;   AH=1 send   : ESI -> frame bytes, ECX = frame length.
+;                 AL=0 ok, AL!=0 err.
+;   AH=2 recv   : EDI -> dest buffer, ECX = max length on input.
+;                 ECX = actual length on output (0 if no frame).
+; All param regs preserved by the dos_emu hook (only EAX/ECX/EFLAGS
+; clobber per subfunction). Caller-saved here; the wrappers below
+; preserve EBX/ESI/EDI/EBP per cdecl.
+
+; int ethdrv_init(uint8_t mac[6]);
+;   Returns 0 on success, nonzero on error. Writes 6 MAC bytes
+;   into the caller-supplied buffer.
+_ethdrv_init:
+        push    ebp
+        mov     ebp, esp
+        push    edi
+        mov     edi, [ebp + 8]
+        mov     ah, 0
+        int     0x83
+        movzx   eax, al
+        pop     edi
+        pop     ebp
+        ret
+
+; int ethdrv_send(const uint8_t *buf, uint32_t len);
+;   Returns 0 on success, nonzero on error.
+_ethdrv_send:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        mov     esi, [ebp + 8]
+        mov     ecx, [ebp + 12]
+        mov     ah, 1
+        int     0x83
+        movzx   eax, al
+        pop     esi
+        pop     ebp
+        ret
+
+; uint32_t ethdrv_recv(uint8_t *buf, uint32_t maxlen);
+;   Returns actual frame length consumed, or 0 if no frame.
+_ethdrv_recv:
+        push    ebp
+        mov     ebp, esp
+        push    edi
+        mov     edi, [ebp + 8]
+        mov     ecx, [ebp + 12]
+        mov     ah, 2
+        int     0x83
+        mov     eax, ecx
+        pop     edi
+        pop     ebp
+        ret

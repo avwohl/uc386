@@ -2626,3 +2626,70 @@ def test_micropython_lwip_loopback_tcp(micropython_bin: Path) -> None:
     assert "recv: b'hello lwip'" in res.stdout, (
         f"server recv didn't see the payload: {res.stdout!r}"
     )
+
+
+def test_micropython_lwip_dhcp(micropython_bin: Path) -> None:
+    """`uc386_net.eth_init()` brings up the eth netif, kicks DHCP. The
+    `dos_emu.NetworkSimulator` plays a tiny DHCP server (DISCOVER →
+    OFFER, REQUEST → ACK) and an ARP responder. After a handful of
+    `lwip.callback()` ticks the lease should land and `eth_status()`
+    reports the offered IP / netmask / gateway.
+
+    Pins three things together:
+    1. uc386's INT 0x83 packet-driver shim (lib/i386_dos_libc.asm
+       ethdrv_init/send/recv) actually reaches Python.
+    2. lwIP's eth netif (etharp_output + ethernet_input) round-trips
+       Layer-2 frames through the shim end-to-end.
+    3. lwIP's DHCP client (LWIP_DHCP=1, dhcp_start in
+       uc386dos_eth_start) negotiates a lease against the sim server.
+    """
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+    from uc386.dos_emu_netsim import NetworkSimulator
+
+    net = NetworkSimulator()
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import lwip, uc386_net\n"
+                  b"lwip.reset()\n"
+                  b"print('init rc:', uc386_net.eth_init(True))\n"
+                  b"for _ in range(40):\n"
+                  b"    lwip.callback()\n"
+                  b"\n"
+                  b"print('status:', uc386_net.eth_status())\n"
+                  b"\x04"
+              ),
+              net=net,
+              timeout_seconds=30.0,
+              instruction_limit=8_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "init rc: 0" in res.stdout, (
+        f"eth_init didn't succeed (return 0): {res.stdout!r}"
+    )
+    assert "10.0.2.15" in res.stdout, (
+        f"DHCP-offered IP 10.0.2.15 not visible in status: {res.stdout!r}"
+    )
+    assert "10.0.2.2" in res.stdout, (
+        f"DHCP gateway 10.0.2.2 not visible in status: {res.stdout!r}"
+    )
+    # Sanity on the simulator side: at least one DHCP DISCOVER must
+    # have been transmitted (op=1 BOOTREQUEST in a UDP 68->67 frame).
+    saw_discover = False
+    for f in net.tx_log:
+        if len(f) < 14 + 20 + 8 + 240:
+            continue
+        if f[12:14] != b"\x08\x00":  # not IPv4
+            continue
+        if f[14 + 9] != 17:  # not UDP
+            continue
+        sport = (f[14 + 20] << 8) | f[14 + 20 + 1]
+        dport = (f[14 + 20 + 2] << 8) | f[14 + 20 + 3]
+        if sport == 68 and dport == 67:
+            saw_discover = True
+            break
+    assert saw_discover, (
+        "no DHCP client packet (UDP 68->67) was transmitted: "
+        f"{len(net.tx_log)} frames in tx_log"
+    )

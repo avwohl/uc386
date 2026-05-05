@@ -219,7 +219,11 @@ if [ ! -f build/genhdr/qstrdefs.generated.h ]; then
         } | "$PYTHON" gen_qstrdefs.py --bytes-hash 2
     } > build/genhdr/qstrdefs.generated.h
 fi
-[ -f build/genhdr/moduledefs.h ] || cat > build/genhdr/moduledefs.h <<'EOF'
+# Always regenerate moduledefs.h — it's small and the cache turned
+# stealth-stale when we added new UCDOS_MOD_ENTRY_* entries below
+# without touching the file's mtime, so the new module didn't
+# register and its `import` raised at runtime.
+cat > build/genhdr/moduledefs.h <<'EOF'
 // Hand-rolled equivalent of `upstream/py/makemoduledefs.py`'s output,
 // covering the modules our uc386-dos port supports at the
 // CORE_FEATURES ROM level. A real upstream build runs
@@ -425,6 +429,16 @@ extern const struct _mp_obj_module_t mp_module_urllib_parse;
 #define UCDOS_MOD_ENTRY_URLLIB        { MP_ROM_QSTR(MP_QSTR_urllib),       MP_ROM_PTR(&mp_module_urllib) },
 #define UCDOS_MOD_ENTRY_URLLIB_PARSE  { MP_ROM_QSTR(MP_QSTR_urllib_parse), MP_ROM_PTR(&mp_module_urllib_parse) },
 
+// `uc386_net` — port-supplied. Control surface for the lwIP eth
+// netif sitting on the INT 0x83 packet-driver shim. Always
+// registered when LWIP is on (no separate config gate yet).
+#if MICROPY_PY_LWIP
+extern const struct _mp_obj_module_t mp_module_uc386_net;
+#define UCDOS_MOD_ENTRY_UC386_NET { MP_ROM_QSTR(MP_QSTR_uc386_net), MP_ROM_PTR(&mp_module_uc386_net) },
+#else
+#define UCDOS_MOD_ENTRY_UC386_NET
+#endif
+
 #define MICROPY_REGISTERED_MODULES \
     { MP_ROM_QSTR(MP_QSTR_builtins), MP_ROM_PTR(&mp_module_builtins) }, \
     { MP_ROM_QSTR(MP_QSTR_sys), MP_ROM_PTR(&mp_module_sys) }, \
@@ -455,7 +469,8 @@ extern const struct _mp_obj_module_t mp_module_urllib_parse;
     UCDOS_MOD_ENTRY_URLLIB \
     UCDOS_MOD_ENTRY_URLLIB_PARSE \
     UCDOS_MOD_ENTRY_LWIP \
-    UCDOS_MOD_ENTRY_SOCKET
+    UCDOS_MOD_ENTRY_SOCKET \
+    UCDOS_MOD_ENTRY_UC386_NET
 
 // Module attribute-access delegation table — modules whose attr
 // loads/stores need to dispatch through a port-supplied function.
