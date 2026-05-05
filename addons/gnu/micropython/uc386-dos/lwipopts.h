@@ -86,10 +86,13 @@
 #define sys_arch_protect()           ((sys_prot_t)0)
 #define sys_arch_unprotect(lev)      do { (void)(lev); } while (0)
 
-// We don't have an OS to call. Disable assertion failures from
-// halting forever; just abort.
+// We don't have an OS to call. Print the assert message + abort()
+// so the dos_emu test path surfaces which assertion tripped (the
+// message + filename + line make it down to stdout before exit).
+#include <stdio.h>
 #define LWIP_PLATFORM_ASSERT(x) \
-    do { abort(); } while (0)
+    do { printf("lwIP assert: %s at %s:%d\n", (x), __FILE__, __LINE__); \
+         abort(); } while (0)
 
 // Use the standard lwip_htons/lwip_htonl from def.c — uc386 doesn't
 // ship a system byteorder.h.

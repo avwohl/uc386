@@ -58,6 +58,20 @@ int mp_mod_network_prefer_dns_use_ip_version = 4;
 // otherwise owns. Provide a stub matching the symbol shape.
 char mod_network_hostname_data[16 + 1] = "uc386-dos";
 
+// Loopback packet pump. With LWIP_NETIF_LOOPBACK=1 + NO_SYS=1, lwIP
+// queues outgoing-to-127.0.0.1 packets in netif->loop_first/last and
+// only delivers them when netif_poll(netif) is called. modlwip.c's
+// poll-list hook (driven by `lwip.callback()`) is the natural place
+// to drive this. Registered from mod_lwip_reset (patched in fetch.sh)
+// so each `lwip.reset()` re-arms the loopback pump alongside the
+// usual sys_check_timeouts() cadence.
+void uc386dos_loopback_poll(void *arg) {
+    (void)arg;
+    if (netif_default != NULL) {
+        netif_poll(netif_default);
+    }
+}
+
 // Expose `mp_module_lwip` as `socket` too. modlwip.c registers
 // itself under MP_QSTR_lwip and MP_QSTR_socket via `MP_REGISTER_*`
 // markers — but our hand-rolled moduledefs.h doesn't process those.

@@ -42,10 +42,39 @@ fetch_lwip() {
     rm -rf "$LWIP_TMP"
 }
 
+# Patch upstream's `mod_lwip_reset` to register our loopback packet
+# pump as the poll callback (instead of nulling it). LWIP_NETIF_LOOPBACK=1
+# with NO_SYS=1 needs manual netif_poll(netif_default) per tick to
+# deliver packets; uc386dos_loopback_poll (in uc386-dos/lwip_uc386dos.c)
+# does that. Idempotent: skips when the patched line is already present.
+patch_modlwip_loopback_poll() {
+    F="upstream/extmod/modlwip.c"
+    if [ ! -f "$F" ]; then return 0; fi
+    if grep -q "uc386dos_loopback_poll" "$F"; then return 0; fi
+    if ! grep -q "lwip_poll_list.poll = NULL;" "$F"; then
+        echo "micropython: warn: modlwip.c reset shape changed — skipping loopback patch." >&2
+        return 0
+    fi
+    echo "micropython: patching modlwip.c mod_lwip_reset for loopback poll …"
+    awk '
+        /static mp_obj_t mod_lwip_reset/ { in_reset = 1 }
+        in_reset && /lwip_poll_list\.poll = NULL;/ {
+            print "    extern void uc386dos_loopback_poll(void *arg);"
+            print "    lwip_poll_list.poll = uc386dos_loopback_poll;"
+            print "    lwip_poll_list.poll_arg = NULL;"
+            in_reset = 0
+            next
+        }
+        in_reset && /^}/ { in_reset = 0 }
+        { print }
+    ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
+}
+
 if [ -d upstream ]; then
     echo "micropython: upstream/ already present — skipping main fetch."
     fetch_b_con_crypto
     fetch_lwip
+    patch_modlwip_loopback_poll
     exit 0
 fi
 
@@ -67,3 +96,4 @@ echo "micropython: upstream tree at addons/gnu/micropython/upstream/"
 
 fetch_b_con_crypto
 fetch_lwip
+patch_modlwip_loopback_poll

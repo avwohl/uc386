@@ -19,17 +19,16 @@
 #define BIG_ENDIAN    4321
 #endif
 
-// Packed structs — uc386's struct layout doesn't pack by default.
-// We emit fields at their natural alignment, which matches lwIP's
-// over-the-wire layout for IPv4 headers (no holes between byte
-// fields). For now ignore the packing markers; if a downstream
-// alignment issue surfaces we'll add explicit packing support to
-// uc_core.
+// Packed structs — uc386 honors `__attribute__((packed))` (member
+// byte-alignment, struct alignment 1). lwIP's init.c self-tests the
+// layout via `sizeof(struct { u8; u32; } __packed) == 5` at boot;
+// without real packing this fails because u32 lands at offset 4.
+// The other PACK_STRUCT_* slots (BEGIN/END/FIELD) remain empty —
+// upstream's lwip/arch.h defines them that way for GCC/clang.
 #define PACK_STRUCT_FIELD(x) x
-#define PACK_STRUCT_STRUCT
+#define PACK_STRUCT_STRUCT __attribute__((packed))
 #define PACK_STRUCT_BEGIN
 #define PACK_STRUCT_END
-#define PACK_STRUCT_USE_INCLUDES
 
 // Diagnostics — route lwIP's debug printf through the regular
 // printf chain. LWIP_DEBUG=0 in lwipopts.h makes these no-ops in
