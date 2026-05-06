@@ -332,7 +332,21 @@ _pmodew_start:
         pop     ebx
         pop     eax
 
-        ; --- BSS zero (mirrors codegen _start's rep stosb) -------
+        ; --- BSS zero -------------------------------------------
+        ; PMODE/W's loader already zero-fills the BSS region at
+        ; program load (per the LE/PMODE/W spec — `bss_size` in
+        ; the LE header drives the allocate+zero). The redundant
+        ; rep stosb in the codegen's _start was needed for dos_emu
+        ; mode (where recursive _start() calls re-zero the BSS for
+        ; "noinit" idiom tests), but in .exe mode it's just
+        ; touching what should already be zero.
+        ;
+        ; Empirically (mp-rig run 25465153840): doing a 280 KB
+        ; rep stosb on the multi-TU MicroPython binary's BSS range
+        ; silently aborts the program — [bridge-pre-bss-zero]
+        ; prints, [bridge-post-bss-zero] doesn't, MP.EXE returns
+        ; to DOS without main() ever running. Skipping the redundant
+        ; zero (loader already did it) lets execution continue.
         push    eax
         push    ebx
         push    ecx
@@ -347,12 +361,7 @@ _pmodew_start:
         pop     ebx
         pop     eax
 
-        cld
-        xor     eax, eax
-        mov     edi, _bss_zero_start
-        mov     ecx, _bss_zero_end
-        sub     ecx, edi
-        rep     stosb
+        ; (rep stosb intentionally omitted — see comment above)
 
         push    eax
         push    ebx
