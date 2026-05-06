@@ -107,25 +107,40 @@ _bridge_marker_postmain: db "[bridge-post-main]", 10
         extern _bss_zero_start
         extern _bss_zero_end
 
+; _bridge_emit(EDX=msg ptr, ECX=byte count): write to fd 1 + commit.
+; Caller saves EDX/ECX if needed across the call. We save EAX/EBX
+; internally. The commit-file (AH=0x68) forces DOS to flush its file
+; buffer for handle 1 to disk — without it, DOSBox-X can buffer the
+; bridge's marker writes in DOS's internal cache and they never make
+; it to RIG.LOG before dosbox-x is killed by the rig's timeout.
+_bridge_emit:
+        push    eax
+        push    ebx
+        mov     ah, 0x40
+        mov     bx, 1
+        int     0x21
+        mov     ah, 0x68
+        mov     bx, 1
+        int     0x21
+        pop     ebx
+        pop     eax
+        ret
+
+; _bridge_marker(label addr, byte count): syntactic sugar shorthand.
+; NASM doesn't have proper "function" macros that can be reused
+; per-site without name collisions, so each site does the explicit
+; mov + call. Keeping the helper out-of-band lets us share the
+; inner write+commit logic without per-site stack churn.
+
 _pmodew_start:
         ; Marker 1: PMODE/W reached our stub at all. If this doesn't
         ; print, the LE binary isn't loading (extender bailed before
         ; transferring control). If it does, the bridge runs but a
         ; later step (argv tokenization, BSS init, main, write())
         ; is the one that aborts.
-        push    eax
-        push    ebx
-        push    ecx
-        push    edx
-        mov     ah, 0x40
-        mov     bx, 1
         mov     edx, _bridge_marker_entered
         mov     ecx, 17
-        int     0x21
-        pop     edx
-        pop     ecx
-        pop     ebx
-        pop     eax
+        call    _bridge_emit
 
         ; OpenWatcom's cstrt386.asm (the standard 32-bit CRT for
         ; DOS/4GW + PMODE/W + generic DPMI hosts) uses `mov esi,es`
@@ -277,60 +292,25 @@ _pmodew_start:
 .argv0_done:
 
         ; Marker 2: argv tokenization + env walk completed.
-        push    eax
-        push    ebx
-        push    ecx
-        push    edx
-        mov     ah, 0x40
-        mov     bx, 1
         mov     edx, _bridge_marker_argv
         mov     ecx, 19
-        int     0x21
-        pop     edx
-        pop     ecx
-        pop     ebx
-        pop     eax
-
-        ; Hand off to the codegen-emitted _start. dos_emu convention:
-        ; EAX=argc, EBX=&argv[0].
-        mov     eax, [_pmodew_argc]
-        mov     ebx, _pmodew_argv_array
+        call    _bridge_emit
 
         ; Marker 3: about to begin the codegen-style startup
         ; (FPU init → BSS zero → call _main → exit). Each step
         ; below has a paired marker so we can pin the silent step.
-        push    eax
-        push    ebx
-        push    ecx
-        push    edx
-        mov     ah, 0x40
-        mov     bx, 1
         mov     edx, _bridge_marker_jump
         mov     ecx, 18
-        int     0x21
-        pop     edx
-        pop     ecx
-        pop     ebx
-        pop     eax
+        call    _bridge_emit
 
         ; --- FPU init (mirrors codegen _start's fldcw) -----------
         sub     esp, 4
         mov     word [esp], 0x027F
         fldcw   [esp]
         add     esp, 4
-        push    eax
-        push    ebx
-        push    ecx
-        push    edx
-        mov     ah, 0x40
-        mov     bx, 1
         mov     edx, _bridge_marker_postfpu
         mov     ecx, 18
-        int     0x21
-        pop     edx
-        pop     ecx
-        pop     ebx
-        pop     eax
+        call    _bridge_emit
 
         ; --- BSS zero -------------------------------------------
         ; PMODE/W's loader already zero-fills the BSS region at
@@ -347,50 +327,20 @@ _pmodew_start:
         ; prints, [bridge-post-bss-zero] doesn't, MP.EXE returns
         ; to DOS without main() ever running. Skipping the redundant
         ; zero (loader already did it) lets execution continue.
-        push    eax
-        push    ebx
-        push    ecx
-        push    edx
-        mov     ah, 0x40
-        mov     bx, 1
         mov     edx, _bridge_marker_prebss
         mov     ecx, 22
-        int     0x21
-        pop     edx
-        pop     ecx
-        pop     ebx
-        pop     eax
+        call    _bridge_emit
 
         ; (rep stosb intentionally omitted — see comment above)
 
-        push    eax
-        push    ebx
-        push    ecx
-        push    edx
-        mov     ah, 0x40
-        mov     bx, 1
         mov     edx, _bridge_marker_postbss
         mov     ecx, 23
-        int     0x21
-        pop     edx
-        pop     ecx
-        pop     ebx
-        pop     eax
+        call    _bridge_emit
 
         ; --- Call _main (mirrors codegen _start's call _main) ----
-        push    eax
-        push    ebx
-        push    ecx
-        push    edx
-        mov     ah, 0x40
-        mov     bx, 1
         mov     edx, _bridge_marker_premain
         mov     ecx, 23
-        int     0x21
-        pop     edx
-        pop     ecx
-        pop     ebx
-        pop     eax
+        call    _bridge_emit
 
         ; cdecl: argc/argv on stack at [ebp+8]/[ebp+12] in main.
         push    dword [_pmodew_argv]
@@ -398,18 +348,13 @@ _pmodew_start:
         call    _main
         add     esp, 8
 
-        push    eax                  ; preserve main's return code
-        push    ebx
-        push    ecx
-        push    edx
-        mov     ah, 0x40
-        mov     bx, 1
+        ; Preserve main's return code through the marker call —
+        ; _bridge_emit only saves EAX/EBX internally so EAX is
+        ; safe across it, but the AH=4Ch exit needs AL=return.
+        push    eax
         mov     edx, _bridge_marker_postmain
         mov     ecx, 19
-        int     0x21
-        pop     edx
-        pop     ecx
-        pop     ebx
+        call    _bridge_emit
         pop     eax
 
         ; Exit DOS via INT 21h AH=4Ch with AL = main's return code.
