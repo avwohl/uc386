@@ -6,3 +6,6 @@ mp.exe
 # DOSBox-X session output.
 RIG.LOG
 *.tmp
+
+# CI-generated test script.
+SCRIPT.PY

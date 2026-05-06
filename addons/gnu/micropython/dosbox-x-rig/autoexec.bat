@@ -27,8 +27,14 @@ goto :run_mp
 
 :run_mp
 if not exist MP.EXE goto :no_exe
-echo Running MP.EXE ... >> RIG.LOG
+if exist SCRIPT.PY goto :run_scripted
+echo Running MP.EXE interactively ... >> RIG.LOG
 MP.EXE >> RIG.LOG
+goto :done
+
+:run_scripted
+echo Running MP.EXE with SCRIPT.PY ... >> RIG.LOG
+MP.EXE < SCRIPT.PY >> RIG.LOG
 goto :done
 
 :no_exe
