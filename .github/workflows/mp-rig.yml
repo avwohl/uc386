@@ -41,7 +41,11 @@ on:
 jobs:
   mp-rig:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # build_port.sh on a Mac M1 is ~14 min wall-clock; ubuntu-latest
+    # runners are noticeably slower for this multi-TU uc386 pass
+    # (each TU re-runs uc_core's preprocessor). Earlier 30-min cap
+    # was tripping during the build step. 60 gives headroom.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
       - name: Set up Python
