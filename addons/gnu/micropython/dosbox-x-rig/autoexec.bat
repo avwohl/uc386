@@ -27,14 +27,23 @@ goto :run_mp
 
 :run_mp
 if not exist MP.EXE goto :no_exe
+echo --- before-mp marker --- >> RIG.LOG
 if exist SCRIPT.PY goto :run_scripted
 echo Running MP.EXE interactively ... >> RIG.LOG
 MP.EXE >> RIG.LOG
-goto :done
+goto :after_mp
 
 :run_scripted
 echo Running MP.EXE with SCRIPT.PY ... >> RIG.LOG
-MP.EXE < SCRIPT.PY >> RIG.LOG
+rem Capture mp.exe stdout into a separate file so a partial
+rem (truncated mid-write) RIG.LOG still shows the "after-mp"
+rem marker — tells us whether MP.EXE returned at all vs. hung.
+MP.EXE < SCRIPT.PY > MP_OUT.TXT
+type MP_OUT.TXT >> RIG.LOG
+goto :after_mp
+
+:after_mp
+echo --- after-mp marker --- >> RIG.LOG
 goto :done
 
 :no_exe

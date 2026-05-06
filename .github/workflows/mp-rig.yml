@@ -184,7 +184,7 @@ jobs:
           rm -f RIG.LOG
           export SDL_VIDEODRIVER=dummy
           export SDL_AUDIODRIVER=dummy
-          timeout -k 10 60 dosbox-x -silent -conf dosbox-x.conf \
+          timeout -k 10 180 dosbox-x -silent -conf dosbox-x.conf \
             > /tmp/dosbox-x.stderr 2>&1 || echo "(timeout fired or dosbox-x non-zero exit)"
           echo "=== RIG.LOG ==="
           if [ -s RIG.LOG ]; then
