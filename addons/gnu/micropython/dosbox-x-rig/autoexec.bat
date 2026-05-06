@@ -45,11 +45,16 @@ goto :after_mp
 
 :run_scripted
 echo Running MP.EXE with SCRIPT.PY ... >> RIG.LOG
-rem Capture mp.exe stdout into a separate file so a partial
-rem (truncated mid-write) RIG.LOG still shows the "after-mp"
-rem marker — tells us whether MP.EXE returned at all vs. hung.
-MP.EXE < SCRIPT.PY > MP_OUT.TXT
-type MP_OUT.TXT >> RIG.LOG
+rem Append MP.EXE's stdout directly to RIG.LOG so its output is
+rem visible even when MP.EXE hangs and dosbox-x gets SIGKILLed
+rem before the autoexec can run a `type` step. The previous
+rem "MP.EXE > MP_OUT.TXT; type MP_OUT.TXT >> RIG.LOG" pattern
+rem hid all of MP's output when the timeout fired (which is
+rem exactly the case we need diagnostics for). The trade-off is
+rem that the "after-mp marker" line appears only when MP.EXE
+rem actually returns; if it doesn't, RIG.LOG ends with whatever
+rem bytes MP printed last before the kill.
+MP.EXE < SCRIPT.PY >> RIG.LOG
 goto :after_mp
 
 :after_mp
