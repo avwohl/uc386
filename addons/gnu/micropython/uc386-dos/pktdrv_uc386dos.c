@@ -174,6 +174,25 @@ unsigned char *uc386dos_pktdrv_receiver(int phase, unsigned int len) {
     return NULL;
 }
 
+// AH=0x99 (uc386dos extension): hand the dos_emu harness pointers
+// to pktdrv_rx_buf / pktdrv_rx_len / pktdrv_rx_pending so it can
+// post inbound frames directly without going through the
+// receiver-callback dance. Bypasses Crynwr's two-phase callback
+// semantics — those need a real-mode trampoline that we'd allocate
+// via DPMI INT 31h fn 0x0303 on hardware. Until that lands, this
+// extension keeps the dos_emu test path strictly on the Crynwr INT
+// number while still delivering RX frames. Real DOS Crynwr drivers
+// don't implement AH=0x99; pktdrv_recv simply returns 0 there until
+// the DPMI trampoline replaces this.
+static void pktdrv_register_polling_rx(void) {
+    unsigned int regs[8] = {0};
+    regs[R_EAX] = 0x9900;
+    regs[R_EDI] = (unsigned int)(unsigned long)pktdrv_rx_buf;
+    regs[R_ESI] = (unsigned int)(unsigned long)&pktdrv_rx_pending;
+    regs[R_ECX] = (unsigned int)(unsigned long)&pktdrv_rx_len;
+    (void)pktdrv_int_invoke((unsigned int)pktdrv_int_num, regs);
+}
+
 // Public init: detect, register, fetch MAC. Returns 0 on success.
 int pktdrv_init(unsigned char mac[6]) {
     if (pktdrv_detect() == 0) {
@@ -188,6 +207,7 @@ int pktdrv_init(unsigned char mac[6]) {
         pktdrv_int_num = 0;
         return -3;
     }
+    pktdrv_register_polling_rx();
     return 0;
 }
 

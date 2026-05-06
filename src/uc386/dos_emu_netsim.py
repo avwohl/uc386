@@ -97,6 +97,14 @@ class NetworkSimulator:
         # path that lives behind a TODO today.
         self.pktdrv_receiver_addr: int = 0
         self.pktdrv_handle: int = 1
+        # Filled in by AH=0x99 (uc386dos extension): linear addrs of
+        # pktdrv_rx_buf / pktdrv_rx_pending / pktdrv_rx_len. Lets the
+        # harness post inbound frames straight into the binary's RX
+        # slot. Replaced by a real-mode-callback DPMI thunk on real
+        # hardware.
+        self.pktdrv_rx_buf_addr: int = 0
+        self.pktdrv_rx_pending_addr: int = 0
+        self.pktdrv_rx_len_addr: int = 0
 
     # ---- INT 0x83 entry points ------------------------------------
 

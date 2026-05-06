@@ -130,26 +130,22 @@ static err_t uc386dos_eth_netif_init_cb(struct netif *netif) {
 }
 
 // Pull queued frames from the RX path and feed them into lwIP.
-//
-// Crynwr's receive side is callback-driven from real mode and
-// requires a DPMI INT 31h fn 0x0303 trampoline — see the TODO at
-// the bottom of pktdrv_uc386dos.c. Until that's wired we keep the
-// INT 0x83 sim path as the dos_emu RX (so `ethdrv_recv` always
-// gets first crack), and `pktdrv_recv` polls the receiver-buffer
-// flag for the day the trampoline lands. Both lookups are cheap
-// (a memory read each), so keeping both live in the loop adds no
-// real cost.
+// When Crynwr is the active driver, drain `pktdrv_recv` — under
+// dos_emu the harness fills the buffer through AH=0x99 polling
+// registration; on real DOS this requires a DPMI INT 31h fn 0x0303
+// trampoline (see pktdrv_uc386dos.c) that's still TODO. With INT
+// 0x83 sim active, drain `ethdrv_recv` instead. The two never
+// coexist in a single boot.
 static void uc386dos_eth_pump_rx(void) {
     if (!uc386dos_eth_active) {
         return;
     }
     for (;;) {
-        unsigned int len = ethdrv_recv(uc386dos_eth_rx_buf,
-                                       sizeof(uc386dos_eth_rx_buf));
-        if (len == 0 && pktdrv_is_active()) {
-            len = pktdrv_recv(uc386dos_eth_rx_buf,
-                              sizeof(uc386dos_eth_rx_buf));
-        }
+        unsigned int len = pktdrv_is_active()
+            ? pktdrv_recv(uc386dos_eth_rx_buf,
+                          sizeof(uc386dos_eth_rx_buf))
+            : ethdrv_recv(uc386dos_eth_rx_buf,
+                          sizeof(uc386dos_eth_rx_buf));
         if (len == 0) {
             break;
         }

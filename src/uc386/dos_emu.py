@@ -809,6 +809,25 @@ def run(
                 if rc != 0:
                     uc.reg_write(UC_X86_REG_EFLAGS, flags | 0x1)
                 else:
+                    # Drain inbound frames into the binary's RX slot
+                    # if it registered the polling triple via
+                    # AH=0x99. Single-slot — the binary's pump_rx
+                    # clears `pending` between deliveries, so we
+                    # only post when the slot is free.
+                    if net.pktdrv_rx_buf_addr:
+                        while net.rx_queue:
+                            pending = struct.unpack(
+                                "<I",
+                                uc.mem_read(net.pktdrv_rx_pending_addr, 4),
+                            )[0]
+                            if pending:
+                                break
+                            f = net.rx_queue.pop(0)
+                            uc.mem_write(net.pktdrv_rx_buf_addr, f)
+                            uc.mem_write(net.pktdrv_rx_len_addr,
+                                         struct.pack("<I", len(f)))
+                            uc.mem_write(net.pktdrv_rx_pending_addr,
+                                         struct.pack("<I", 1))
                     uc.reg_write(UC_X86_REG_EFLAGS, flags & ~0x1)
                 return
             if ah == 0x06:
@@ -820,6 +839,19 @@ def run(
                 ecx = uc.reg_read(UC_X86_REG_ECX)
                 uc.reg_write(UC_X86_REG_ECX,
                              (ecx & ~0xFFFF) | len(mac))
+                uc.reg_write(UC_X86_REG_EFLAGS, flags & ~0x1)
+                return
+            if ah == 0x99:
+                # uc386dos polling-mode RX registration. The binary
+                # hands us pointers to its RX buffer + pending flag
+                # + length slot; we post frames there directly,
+                # bypassing the real-mode receiver-callback dance
+                # that real DOS Crynwr drivers require. Real DOS
+                # would never see this AH — pktdrv_recv on hardware
+                # waits for the DPMI-thunk receiver to land.
+                net.pktdrv_rx_buf_addr     = uc.reg_read(UC_X86_REG_EDI)
+                net.pktdrv_rx_pending_addr = uc.reg_read(UC_X86_REG_ESI)
+                net.pktdrv_rx_len_addr     = uc.reg_read(UC_X86_REG_ECX)
                 uc.reg_write(UC_X86_REG_EFLAGS, flags & ~0x1)
                 return
             # Unsupported subfunction — CF=1, AL=undefined.
