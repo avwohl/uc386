@@ -132,28 +132,22 @@ static err_t uc386dos_eth_netif_init_cb(struct netif *netif) {
 // Pull queued frames from the RX path and feed them into lwIP.
 //
 // Crynwr's receive side is callback-driven from real mode and
-// requires a DPMI INT 31h fn 0x0303 thunk to bridge into our
-// 32-bit code. That thunk isn't built yet, so when the Crynwr
-// driver is active we still poll INT 0x83 (`ethdrv_recv`) — under
-// dos_emu both paths funnel through the same NetworkSimulator, so
-// the test exercises Crynwr SEND + MAC + IVT-detect against a
-// loopback-via-INT-0x83 receive queue. Real DOS will need the
-// thunk wired in for receive; until then `pktdrv_recv` is a stub
-// that returns 0.
+// requires a DPMI INT 31h fn 0x0303 trampoline — see the TODO at
+// the bottom of pktdrv_uc386dos.c. Until that's wired we keep the
+// INT 0x83 sim path as the dos_emu RX (so `ethdrv_recv` always
+// gets first crack), and `pktdrv_recv` polls the receiver-buffer
+// flag for the day the trampoline lands. Both lookups are cheap
+// (a memory read each), so keeping both live in the loop adds no
+// real cost.
 static void uc386dos_eth_pump_rx(void) {
     if (!uc386dos_eth_active) {
         return;
     }
     for (;;) {
-        unsigned int len = pktdrv_is_active()
-            ? pktdrv_recv(uc386dos_eth_rx_buf,
-                          sizeof(uc386dos_eth_rx_buf))
-            : 0;
-        if (len == 0) {
-            // Try the INT 0x83 sim path as the Crynwr-recv
-            // standin. Returns 0 on real DOS where INT 0x83 isn't
-            // hooked.
-            len = ethdrv_recv(uc386dos_eth_rx_buf,
+        unsigned int len = ethdrv_recv(uc386dos_eth_rx_buf,
+                                       sizeof(uc386dos_eth_rx_buf));
+        if (len == 0 && pktdrv_is_active()) {
+            len = pktdrv_recv(uc386dos_eth_rx_buf,
                               sizeof(uc386dos_eth_rx_buf));
         }
         if (len == 0) {
