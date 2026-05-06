@@ -86,11 +86,40 @@ _pmodew_argv_buffer: times 128 db 0
 _pmodew_argv0_buffer: times 128 db 0
 _pmodew_argv0_placeholder: db "program", 0
 
+        ; Diagnostic markers — raw INT 21h AH=0x40 BX=1 (write to
+        ; fd 1) so they respect DOS file-handle redirection in the
+        ; rig's `MP.EXE > MP_OUT.TXT`. printf() can't be used here
+        ; because libc's _printf goes through INT 21h AH=02h
+        ; (console output), which under `dosbox-x -silent` lands on
+        ; the suppressed console rather than in MP_OUT.TXT.
+_bridge_marker_entered: db "[bridge-entered]", 10
+_bridge_marker_argv:    db "[bridge-argv-done]", 10
+_bridge_marker_jump:    db "[bridge-pre-jump]", 10
+
         section _TEXT use32 class=CODE
         global _pmodew_start
         extern _start
 
 _pmodew_start:
+        ; Marker 1: PMODE/W reached our stub at all. If this doesn't
+        ; print, the LE binary isn't loading (extender bailed before
+        ; transferring control). If it does, the bridge runs but a
+        ; later step (argv tokenization, BSS init, main, write())
+        ; is the one that aborts.
+        push    eax
+        push    ebx
+        push    ecx
+        push    edx
+        mov     ah, 0x40
+        mov     bx, 1
+        mov     edx, _bridge_marker_entered
+        mov     ecx, 17
+        int     0x21
+        pop     edx
+        pop     ecx
+        pop     ebx
+        pop     eax
+
         ; OpenWatcom's cstrt386.asm (the standard 32-bit CRT for
         ; DOS/4GW + PMODE/W + generic DPMI hosts) uses `mov esi,es`
         ; to reach the PSP under generic-DOS — at entry, ES holds the
@@ -240,10 +269,46 @@ _pmodew_start:
         pop     eax
 .argv0_done:
 
+        ; Marker 2: argv tokenization + env walk completed.
+        push    eax
+        push    ebx
+        push    ecx
+        push    edx
+        mov     ah, 0x40
+        mov     bx, 1
+        mov     edx, _bridge_marker_argv
+        mov     ecx, 19
+        int     0x21
+        pop     edx
+        pop     ecx
+        pop     ebx
+        pop     eax
+
         ; Hand off to the codegen-emitted _start. dos_emu convention:
         ; EAX=argc, EBX=&argv[0].
         mov     eax, [_pmodew_argc]
         mov     ebx, _pmodew_argv_array
+
+        ; Marker 3: about to jump into _start (FPU init, BSS zero,
+        ; call _main, exit). If [bridge-argv-done] prints but
+        ; [bridge-pre-jump] doesn't, the issue is between those two
+        ; lines (unlikely — straight-line moves). If both print but
+        ; [mp-main-entered] doesn't, the codegen-emitted _start's
+        ; FPU/BSS-init loop is the failing step.
+        push    eax
+        push    ebx
+        push    ecx
+        push    edx
+        mov     ah, 0x40
+        mov     bx, 1
+        mov     edx, _bridge_marker_jump
+        mov     ecx, 18
+        int     0x21
+        pop     edx
+        pop     ecx
+        pop     ebx
+        pop     eax
+
         jmp     _start
 """
 

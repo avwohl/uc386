@@ -267,6 +267,9 @@ jobs:
           LOG=addons/gnu/micropython/dosbox-x-rig/RIG.LOG
           missing=0
           for sig in \
+              "[bridge-entered]" \
+              "[bridge-argv-done]" \
+              "[bridge-pre-jump]" \
               "[mp-main-entered]" \
               "[mp-before-stack-ctrl]" \
               "[mp-before-mp-init]" \
