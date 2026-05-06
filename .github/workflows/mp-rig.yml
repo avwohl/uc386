@@ -86,13 +86,15 @@ jobs:
           cd addons/gnu/micropython
           ./fetch.sh
 
-      - name: Cache micropython build
+      - name: Restore micropython build cache
+        # Restore-only step. Saving happens explicitly via
+        # actions/cache/save below — that way the cache populates
+        # as soon as build_port.sh succeeds, even if a later step
+        # (binding, the rig, ...) fails. Otherwise every rig-side
+        # iteration re-pays the cold ~85-min build.
         id: mp-build-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
-          # The asm is what exe.py turns into MP.EXE; the bin is
-          # what dos_emu / smoke tests use; the genhdr/ files are
-          # build-time artifacts we don't want to regenerate.
           path: |
             addons/gnu/micropython/build/micropython.asm
             addons/gnu/micropython/build/micropython.bin
@@ -108,6 +110,20 @@ jobs:
         run: |
           cd addons/gnu/micropython
           ./build_port.sh
+
+      - name: Save micropython build cache
+        # Save right after the build, before any step that might
+        # legitimately fail (binding edge case, dosbox-x signal
+        # handling). This keeps subsequent iterations on a fast
+        # warm path.
+        if: steps.mp-build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            addons/gnu/micropython/build/micropython.asm
+            addons/gnu/micropython/build/micropython.bin
+            addons/gnu/micropython/build/genhdr/
+          key: ${{ steps.mp-build-cache.outputs.cache-primary-key }}
 
       - name: Verify build output
         run: |
@@ -154,21 +170,31 @@ jobs:
           cat addons/gnu/micropython/dosbox-x-rig/SCRIPT.PY
 
       - name: Run the DOSBox-X rig
-        # `-silent` skips the SDL window. SDL_VIDEODRIVER=dummy is
-        # the GitHub-Actions-friendly "no display" setting (matches
-        # the headless trick exe-smoke.yml uses for plain dosbox).
+        # `-silent` skips the SDL window. SDL_VIDEODRIVER=dummy +
+        # SDL_AUDIODRIVER=dummy are the headless settings GHA needs
+        # so nothing tries to open a real device.
+        #
+        # `timeout -k 10 60` escalates to SIGKILL 10s after SIGTERM,
+        # which DOSBox-X's signal handler ignores in -silent mode
+        # under SDL dummy drivers. Without -k the previous run hit
+        # the job-level 120-min cap because plain SIGTERM left the
+        # process running indefinitely.
         run: |
           cd addons/gnu/micropython/dosbox-x-rig
           rm -f RIG.LOG
           export SDL_VIDEODRIVER=dummy
-          timeout 90 dosbox-x -silent -conf dosbox-x.conf \
-            > /tmp/dosbox-x.stderr 2>&1 || true
+          export SDL_AUDIODRIVER=dummy
+          timeout -k 10 60 dosbox-x -silent -conf dosbox-x.conf \
+            > /tmp/dosbox-x.stderr 2>&1 || echo "(timeout fired or dosbox-x non-zero exit)"
           echo "=== RIG.LOG ==="
-          cat RIG.LOG
+          if [ -s RIG.LOG ]; then
+            cat RIG.LOG
+          else
+            echo "(empty or missing — dosbox-x didn't get to autoexec)"
+          fi
           echo
-          echo "=== dosbox-x stderr (filtered) ==="
-          grep -v '^LOG:.*\(SDL\|MIDI\|MIXER\|DOSBox\)' \
-            /tmp/dosbox-x.stderr | head -30 || true
+          echo "=== dosbox-x stderr (last 60 lines) ==="
+          tail -60 /tmp/dosbox-x.stderr || true
 
       - name: Assert the binary booted, DHCPed, and Crynwr is active
         run: |
