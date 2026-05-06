@@ -95,10 +95,17 @@ _pmodew_argv0_placeholder: db "program", 0
 _bridge_marker_entered: db "[bridge-entered]", 10
 _bridge_marker_argv:    db "[bridge-argv-done]", 10
 _bridge_marker_jump:    db "[bridge-pre-jump]", 10
+_bridge_marker_postfpu: db "[bridge-post-fpu]", 10
+_bridge_marker_prebss:  db "[bridge-pre-bss-zero]", 10
+_bridge_marker_postbss: db "[bridge-post-bss-zero]", 10
+_bridge_marker_premain: db "[bridge-pre-call-main]", 10
+_bridge_marker_postmain: db "[bridge-post-main]", 10
 
         section _TEXT use32 class=CODE
         global _pmodew_start
-        extern _start
+        extern _main
+        extern _bss_zero_start
+        extern _bss_zero_end
 
 _pmodew_start:
         ; Marker 1: PMODE/W reached our stub at all. If this doesn't
@@ -289,12 +296,9 @@ _pmodew_start:
         mov     eax, [_pmodew_argc]
         mov     ebx, _pmodew_argv_array
 
-        ; Marker 3: about to jump into _start (FPU init, BSS zero,
-        ; call _main, exit). If [bridge-argv-done] prints but
-        ; [bridge-pre-jump] doesn't, the issue is between those two
-        ; lines (unlikely — straight-line moves). If both print but
-        ; [mp-main-entered] doesn't, the codegen-emitted _start's
-        ; FPU/BSS-init loop is the failing step.
+        ; Marker 3: about to begin the codegen-style startup
+        ; (FPU init → BSS zero → call _main → exit). Each step
+        ; below has a paired marker so we can pin the silent step.
         push    eax
         push    ebx
         push    ecx
@@ -309,7 +313,99 @@ _pmodew_start:
         pop     ebx
         pop     eax
 
-        jmp     _start
+        ; --- FPU init (mirrors codegen _start's fldcw) -----------
+        sub     esp, 4
+        mov     word [esp], 0x027F
+        fldcw   [esp]
+        add     esp, 4
+        push    eax
+        push    ebx
+        push    ecx
+        push    edx
+        mov     ah, 0x40
+        mov     bx, 1
+        mov     edx, _bridge_marker_postfpu
+        mov     ecx, 18
+        int     0x21
+        pop     edx
+        pop     ecx
+        pop     ebx
+        pop     eax
+
+        ; --- BSS zero (mirrors codegen _start's rep stosb) -------
+        push    eax
+        push    ebx
+        push    ecx
+        push    edx
+        mov     ah, 0x40
+        mov     bx, 1
+        mov     edx, _bridge_marker_prebss
+        mov     ecx, 22
+        int     0x21
+        pop     edx
+        pop     ecx
+        pop     ebx
+        pop     eax
+
+        cld
+        xor     eax, eax
+        mov     edi, _bss_zero_start
+        mov     ecx, _bss_zero_end
+        sub     ecx, edi
+        rep     stosb
+
+        push    eax
+        push    ebx
+        push    ecx
+        push    edx
+        mov     ah, 0x40
+        mov     bx, 1
+        mov     edx, _bridge_marker_postbss
+        mov     ecx, 23
+        int     0x21
+        pop     edx
+        pop     ecx
+        pop     ebx
+        pop     eax
+
+        ; --- Call _main (mirrors codegen _start's call _main) ----
+        push    eax
+        push    ebx
+        push    ecx
+        push    edx
+        mov     ah, 0x40
+        mov     bx, 1
+        mov     edx, _bridge_marker_premain
+        mov     ecx, 23
+        int     0x21
+        pop     edx
+        pop     ecx
+        pop     ebx
+        pop     eax
+
+        ; cdecl: argc/argv on stack at [ebp+8]/[ebp+12] in main.
+        push    dword [_pmodew_argv]
+        push    dword [_pmodew_argc]
+        call    _main
+        add     esp, 8
+
+        push    eax                  ; preserve main's return code
+        push    ebx
+        push    ecx
+        push    edx
+        mov     ah, 0x40
+        mov     bx, 1
+        mov     edx, _bridge_marker_postmain
+        mov     ecx, 19
+        int     0x21
+        pop     edx
+        pop     ecx
+        pop     ebx
+        pop     eax
+
+        ; Exit DOS via INT 21h AH=4Ch with AL = main's return code.
+        mov     ah, 0x4C
+        int     0x21
 """
 
 

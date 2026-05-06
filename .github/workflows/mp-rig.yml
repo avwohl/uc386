@@ -270,6 +270,10 @@ jobs:
               "[bridge-entered]" \
               "[bridge-argv-done]" \
               "[bridge-pre-jump]" \
+              "[bridge-post-fpu]" \
+              "[bridge-pre-bss-zero]" \
+              "[bridge-post-bss-zero]" \
+              "[bridge-pre-call-main]" \
               "[mp-main-entered]" \
               "[mp-before-stack-ctrl]" \
               "[mp-before-mp-init]" \
@@ -277,6 +281,7 @@ jobs:
               "[mp-before-repl]" \
               "[mp-after-repl]" \
               "[mp-before-deinit]" \
+              "[bridge-post-main]" \
               "after-mp marker" \
               "MicroPython" \
               "10.0.2.15" \
