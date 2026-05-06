@@ -273,6 +273,8 @@ jobs:
               "[bridge-post-fpu]" \
               "[bridge-pre-bss-zero]" \
               "[bridge-post-bss-zero]" \
+              "[bridge-diag-stub]" \
+              "[bridge-post-diag]" \
               "[bridge-pre-call-main]" \
               "[mp-main-entered]" \
               "[mp-before-stack-ctrl]" \

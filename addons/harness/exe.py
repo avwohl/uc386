@@ -100,6 +100,8 @@ _bridge_marker_prebss:  db "[bridge-pre-bss-zero]", 10
 _bridge_marker_postbss: db "[bridge-post-bss-zero]", 10
 _bridge_marker_premain: db "[bridge-pre-call-main]", 10
 _bridge_marker_postmain: db "[bridge-post-main]", 10
+_bridge_marker_diag:    db "[bridge-diag-stub]", 10
+_bridge_marker_postdiag: db "[bridge-post-diag]", 10
 
         section _TEXT use32 class=CODE
         global _pmodew_start
@@ -124,6 +126,23 @@ _bridge_emit:
         int     0x21
         pop     ebx
         pop     eax
+        ret
+
+; _diag_main(): in-bridge stub that mimics what main() should do
+; (write a marker, return). Called from the bridge BEFORE the real
+; _main so we can verify "call → enter-style prolog → write+commit →
+; ret" works at all from inside this binary's text segment. If
+; [bridge-diag-stub] prints but [mp-main-entered] doesn't, the
+; failure is specific to the codegen-emitted _main (its prolog,
+; argv plumbing, or first call into libc — not the bridge → main
+; plumbing itself).
+_diag_main:
+        enter   4, 0
+        mov     edx, _bridge_marker_diag
+        mov     ecx, 19
+        call    _bridge_emit
+        xor     eax, eax
+        leave
         ret
 
 ; _bridge_marker(label addr, byte count): syntactic sugar shorthand.
@@ -335,6 +354,16 @@ _pmodew_start:
 
         mov     edx, _bridge_marker_postbss
         mov     ecx, 23
+        call    _bridge_emit
+
+        ; --- Diagnostic stub: verify call mechanism BEFORE _main --
+        ; If [bridge-diag-stub] prints but [mp-main-entered] doesn't,
+        ; the bridge → C-style-function-with-enter-prolog-and-libc-
+        ; INT-21h plumbing works. The failure is then specific to
+        ; the codegen-emitted _main's body, not the call mechanism.
+        call    _diag_main
+        mov     edx, _bridge_marker_postdiag
+        mov     ecx, 19
         call    _bridge_emit
 
         ; --- Call _main (mirrors codegen _start's call _main) ----
