@@ -1,0 +1,8 @@
+# Third-party binaries fetched on demand.
+NE2000.COM
+MP.EXE
+mp.exe
+
+# DOSBox-X session output.
+RIG.LOG
+*.tmp

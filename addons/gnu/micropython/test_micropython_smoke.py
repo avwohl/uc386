@@ -2989,3 +2989,55 @@ def test_micropython_lwip_http_loopback(micropython_bin: Path) -> None:
     assert b'{"ok":true}'.decode() in res.stdout, (
         f"client didn't see the JSON body: {res.stdout!r}"
     )
+
+
+def test_dosbox_x_rig_loads_ne2000(tmp_path: Path) -> None:
+    """The dosbox-x-rig should boot DOSBox-X cleanly with our config
+    and load the Crynwr NE2000 packet driver at INT 0x60. Skipped
+    when dosbox-x isn't on PATH (no `brew install dosbox-x`).
+
+    Runs in `-silent` mode (no SDL window) and parses RIG.LOG to
+    confirm the packet driver reports the expected install banner.
+    """
+    import os
+    import shutil
+    import subprocess
+
+    if shutil.which("dosbox-x") is None:
+        pytest.skip("dosbox-x not on PATH; install via `brew install dosbox-x`")
+    rig_dir = _HERE / "dosbox-x-rig"
+    if not rig_dir.is_dir():
+        pytest.skip(f"rig directory missing: {rig_dir}")
+    if not (rig_dir / "NE2000.COM").is_file():
+        # fetch.sh idempotently retrieves the packet driver from
+        # archive.org. Do it inline so a CI runner without a
+        # pre-fetched binary still passes.
+        rc = subprocess.run([str(rig_dir / "fetch.sh")],
+                            capture_output=True, text=True)
+        assert rc.returncode == 0, (
+            f"fetch.sh failed: {rc.stderr}"
+        )
+    log_path = rig_dir / "RIG.LOG"
+    if log_path.exists():
+        log_path.unlink()
+    # Drop into the rig dir so DOSBox-X resolves dosbox-x.conf and
+    # the autoexec's `mount C .` lands on the right directory.
+    res = subprocess.run(
+        ["dosbox-x", "-silent", "-conf", "dosbox-x.conf"],
+        cwd=str(rig_dir),
+        capture_output=True, text=True,
+        timeout=60,
+    )
+    assert log_path.exists(), (
+        f"RIG.LOG not produced. dosbox-x stderr: {res.stderr[-500:]}"
+    )
+    log = log_path.read_text(errors="replace")
+    assert "Packet driver for NE2000" in log, (
+        f"NE2000 driver didn't load: {log}"
+    )
+    assert "software interrupt is 0x60" in log, (
+        f"NE2000 didn't install at INT 0x60: {log}"
+    )
+    assert "I/O port 0x300" in log, (
+        f"NE2000 didn't bind I/O 0x300: {log}"
+    )
