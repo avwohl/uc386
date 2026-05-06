@@ -525,6 +525,16 @@ def build_exe(
     rewritten.insert(0, "        extern _stderr")
     rewritten.insert(0, "        extern _stdout")
     rewritten.insert(0, "        extern _stdin")
+    # The bridge stub now drives the full startup (FPU init, BSS
+    # zero, call _main, exit) so it can place diagnostic markers
+    # between each step. That requires the linker to resolve
+    # _main, _bss_zero_start, _bss_zero_end across object-file
+    # boundaries — codegen defines them as labels but doesn't
+    # export them. Inject the globals here so wlink can wire the
+    # references from the bridge to the codegen-emitted bodies.
+    rewritten.insert(0, "        global _bss_zero_end")
+    rewritten.insert(0, "        global _bss_zero_start")
+    rewritten.insert(0, "        global _main")
     asm_for_omf = out_path.with_suffix(".omf.asm")
     asm_for_omf.write_text("\n".join(rewritten) + "\n")
 
