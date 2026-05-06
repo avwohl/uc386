@@ -2868,3 +2868,124 @@ def test_micropython_select_poll(micropython_bin: Path) -> None:
     assert "payload: b'ping'" in res.stdout, (
         f"recv didn't return the payload: {res.stdout!r}"
     )
+
+
+def test_micropython_lwip_udp_socket(micropython_bin: Path) -> None:
+    """`socket(AF_INET, SOCK_DGRAM)` end-to-end on loopback.
+
+    Two UDP sockets bind to different ports on 127.0.0.1; the
+    client `sendto`s a datagram, lwIP routes it through the loopback
+    netif (which we drain via `lwip.callback()`), and the server
+    `recvfrom` returns the payload + source address.
+
+    Pins the UDP path through the public Python `socket` API
+    (DHCP and DNS go through internal lwIP code, so this is the
+    first SOCK_DGRAM exercise via modlwip's send/recv glue).
+    """
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import lwip, socket\n"
+                  b"lwip.reset()\n"
+                  b"a = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+                  b"a.bind(('127.0.0.1', 9201))\n"
+                  b"a.setblocking(False)\n"
+                  b"b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+                  b"b.bind(('127.0.0.1', 9202))\n"
+                  b"b.setblocking(False)\n"
+                  b"\n"
+                  b"sent = b.sendto(b'hello-udp', ('127.0.0.1', 9201))\n"
+                  b"print('sent:', sent)\n"
+                  b"\n"
+                  b"for _ in range(5):\n"
+                  b"    lwip.callback()\n"
+                  b"\n"
+                  b"data, src = a.recvfrom(64)\n"
+                  b"print('got:', data, 'from', src)\n"
+                  b"\x04"
+              ),
+              timeout_seconds=20.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "sent: 9" in res.stdout, (
+        f"sendto didn't return the payload length: {res.stdout!r}"
+    )
+    assert "got: b'hello-udp'" in res.stdout, (
+        f"recvfrom didn't return the payload: {res.stdout!r}"
+    )
+    assert "from ('127.0.0.1', 9202)" in res.stdout, (
+        f"recvfrom didn't surface the source address: {res.stdout!r}"
+    )
+
+
+def test_micropython_lwip_http_loopback(micropython_bin: Path) -> None:
+    """An HTTP-shaped TCP exchange on loopback. Client GETs `/`, server
+    accepts, reads the request line + headers, writes back an HTTP/1.0
+    200 with a JSON body. Client reads, parses status + body.
+
+    Real-world workload shape: HTTP request lines, header parsing,
+    multi-pbuf payloads. Exercises that lwIP's TCP delivers more than
+    one segment per direction and that the recv buffer assembly is
+    correct under non-blocking I/O.
+    """
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import lwip, socket\n"
+                  b"lwip.reset()\n"
+                  b"srv = socket.socket()\n"
+                  b"srv.bind(('127.0.0.1', 8000))\n"
+                  b"srv.listen(1)\n"
+                  b"srv.setblocking(False)\n"
+                  b"cli = socket.socket()\n"
+                  b"cli.setblocking(False)\n"
+                  b"try:\n"
+                  b"    cli.connect(('127.0.0.1', 8000))\n"
+                  b"except OSError:\n"
+                  b"    pass\n"
+                  b"\n"
+                  b"for _ in range(5):\n"
+                  b"    lwip.callback()\n"
+                  b"\n"
+                  b"conn, _ = srv.accept()\n"
+                  b"conn.setblocking(False)\n"
+                  b"req = b'GET / HTTP/1.0\\r\\nHost: 127.0.0.1\\r\\n\\r\\n'\n"
+                  b"cli.send(req)\n"
+                  b"for _ in range(5):\n"
+                  b"    lwip.callback()\n"
+                  b"\n"
+                  b"got = conn.recv(256)\n"
+                  b"print('req-len:', len(got))\n"
+                  b"print('verb:', got.split(b' ')[0])\n"
+                  b"\n"
+                  b"resp = b'HTTP/1.0 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: 13\\r\\n\\r\\n{\"ok\":true}\\r\\n'\n"
+                  b"conn.send(resp)\n"
+                  b"for _ in range(5):\n"
+                  b"    lwip.callback()\n"
+                  b"\n"
+                  b"reply = cli.recv(512)\n"
+                  b"head, _, body = reply.partition(b'\\r\\n\\r\\n')\n"
+                  b"print('status:', head.split(b'\\r\\n')[0])\n"
+                  b"print('body:', body.strip())\n"
+                  b"\x04"
+              ),
+              timeout_seconds=20.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "verb: b'GET'" in res.stdout, (
+        f"server didn't see the GET verb: {res.stdout!r}"
+    )
+    assert "status: b'HTTP/1.0 200 OK'" in res.stdout, (
+        f"client didn't parse the status line: {res.stdout!r}"
+    )
+    assert b'{"ok":true}'.decode() in res.stdout, (
+        f"client didn't see the JSON body: {res.stdout!r}"
+    )
