@@ -256,15 +256,30 @@ jobs:
 
       - name: Best-effort MP.EXE runtime checks
         # Diagnostic — reports which signals are present so we can
-        # see how far MP.EXE got without failing the gate. Tracking
-        # real-DOS MP.EXE runtime as a follow-up in the rig README.
+        # see how far MP.EXE got without failing the gate. The
+        # [mp-*] markers come from fetch.sh's startup-marker patch;
+        # they bisect which step in port main() goes silent.
+        # Whichever marker is the LAST-SEEN one identifies the
+        # statement that aborted/looped/silenced. Tracking real-DOS
+        # MP.EXE runtime as a follow-up in the rig README.
         continue-on-error: true
         run: |
           LOG=addons/gnu/micropython/dosbox-x-rig/RIG.LOG
           missing=0
-          for sig in "after-mp marker" "MicroPython" "10.0.2.15" "'pktdrv'"; do
+          for sig in \
+              "[mp-main-entered]" \
+              "[mp-before-stack-ctrl]" \
+              "[mp-before-mp-init]" \
+              "[mp-after-mp-init]" \
+              "[mp-before-repl]" \
+              "[mp-after-repl]" \
+              "[mp-before-deinit]" \
+              "after-mp marker" \
+              "MicroPython" \
+              "10.0.2.15" \
+              "'pktdrv'"; do
             if grep -qF "$sig" "$LOG"; then
-              echo "FOUND: $sig"
+              echo "FOUND:   $sig"
             else
               echo "MISSING: $sig"
               missing=$((missing + 1))
@@ -272,8 +287,8 @@ jobs:
           done
           if [ "$missing" -ne 0 ]; then
             echo
-            echo "($missing of 4 MP.EXE-side signals absent — "
-            echo " runtime work tracked separately, not gating CI)"
+            echo "($missing MP.EXE-side signals absent — runtime work"
+            echo " tracked separately, not gating CI)"
           fi
 
       - name: Upload artifacts on failure

@@ -70,11 +70,58 @@ patch_modlwip_loopback_poll() {
     ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
 }
 
+# Inject printf checkpoints into ports/minimal/main.c so the rig
+# can see how far MP startup gets when stdout is redirected through
+# PMODE/W INT 21h AH=40 → file. The DOSBox-X rig runs a known-good
+# echo.exe baseline that prints fine; MP.EXE produces no observable
+# bytes despite returning. This bisects which startup step is the
+# silent one. Idempotent: skip if the markers are already in place.
+patch_main_startup_markers() {
+    F="upstream/ports/minimal/main.c"
+    if [ ! -f "$F" ]; then return 0; fi
+    if grep -q "mp-startup-marker" "$F"; then return 0; fi
+    echo "micropython: patching ports/minimal/main.c with startup markers …"
+    awk '
+        /^int main\(int argc, char \*\*argv\) \{/ {
+            print
+            print "    /* mp-startup-marker injected by addons/gnu/micropython/fetch.sh */"
+            print "    printf(\"[mp-main-entered]\\n\"); fflush(stdout);"
+            in_main = 1
+            next
+        }
+        in_main && /mp_stack_ctrl_init\(\);/ {
+            print "    printf(\"[mp-before-stack-ctrl]\\n\"); fflush(stdout);"
+            print
+            next
+        }
+        in_main && /mp_init\(\);/ {
+            print "    printf(\"[mp-before-mp-init]\\n\"); fflush(stdout);"
+            print
+            print "    printf(\"[mp-after-mp-init]\\n\"); fflush(stdout);"
+            next
+        }
+        in_main && /pyexec_friendly_repl\(\);/ {
+            print "    printf(\"[mp-before-repl]\\n\"); fflush(stdout);"
+            print
+            print "    printf(\"[mp-after-repl]\\n\"); fflush(stdout);"
+            next
+        }
+        in_main && /mp_deinit\(\);/ {
+            print "    printf(\"[mp-before-deinit]\\n\"); fflush(stdout);"
+            print
+            in_main = 0
+            next
+        }
+        { print }
+    ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
+}
+
 if [ -d upstream ]; then
     echo "micropython: upstream/ already present — skipping main fetch."
     fetch_b_con_crypto
     fetch_lwip
     patch_modlwip_loopback_poll
+    patch_main_startup_markers
     exit 0
 fi
 
@@ -97,3 +144,4 @@ echo "micropython: upstream tree at addons/gnu/micropython/upstream/"
 fetch_b_con_crypto
 fetch_lwip
 patch_modlwip_loopback_poll
+patch_main_startup_markers
