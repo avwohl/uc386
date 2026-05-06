@@ -2731,3 +2731,74 @@ def test_micropython_lwip_dhcp_int83_fallback(micropython_bin: Path) -> None:
         f"Driver should fall back to 'int83-sim' "
         f"when Crynwr is absent: {res.stdout!r}"
     )
+
+
+def test_micropython_lwip_dns_query(micropython_bin: Path) -> None:
+    """`socket.getaddrinfo("echo.test", 80)` should resolve through
+    lwIP's DNS client against the simulator's DNS responder.
+
+    Path under test:
+      uc386_net.eth_init(True) → DHCP gives DNS=10.0.2.3
+      socket.getaddrinfo  → modlwip → lwIP dns_gethostbyname
+                          → UDP 53 query to 10.0.2.3
+                          → NetworkSimulator._handle_dns
+                          → A-record response with `echo.test` IP
+      lwIP DNS client    → callback fires → state.status=1
+      modlwip            → returns [(AF_INET, ..., (ip, port))]
+      uc386 binary       → prints the resolved address
+
+    Pins three pieces:
+    1. mpconfigport.h `MICROPY_PY_LWIP_POLL_HOOK` actually drives
+       `uc386dos_loopback_poll` + `sys_check_timeouts` so blocking
+       calls (the DNS resolution loop in modlwip's poll_sockets())
+       can drain inbound UDP responses.
+    2. NetworkSimulator's ARP responder answers for `dns_ip`, not
+       just the gateway, so lwIP's DNS query reaches the sim.
+    3. The DNS handler decodes the question, looks up the A record,
+       and builds a spec-shaped reply that lwIP's resolver accepts.
+    """
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+    from uc386.dos_emu_netsim import NetworkSimulator
+
+    net = NetworkSimulator()
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import lwip, uc386_net, socket\n"
+                  b"lwip.reset()\n"
+                  b"uc386_net.eth_init(True)\n"
+                  b"for _ in range(40):\n"
+                  b"    lwip.callback()\n"
+                  b"\n"
+                  b"info = socket.getaddrinfo('echo.test', 80)\n"
+                  b"print('addr:', info[0][4])\n"
+                  b"\x04"
+              ),
+              net=net,
+              timeout_seconds=30.0,
+              instruction_limit=8_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "10.0.2.50" in res.stdout, (
+        f"DNS resolution didn't return 10.0.2.50 for echo.test: "
+        f"{res.stdout!r}"
+    )
+    # The simulator should have observed at least one UDP packet
+    # to port 53 (DNS query).
+    saw_dns = False
+    for f in net.tx_log:
+        if len(f) < 14 + 20 + 8 + 12:
+            continue
+        if f[12:14] != b"\x08\x00":  # not IPv4
+            continue
+        if f[14 + 9] != 17:  # not UDP
+            continue
+        dport = (f[14 + 20 + 2] << 8) | f[14 + 20 + 3]
+        if dport == 53:
+            saw_dns = True
+            break
+    assert saw_dns, (
+        "no DNS query (UDP dport=53) was transmitted: "
+        f"{len(net.tx_log)} frames in tx_log"
+    )

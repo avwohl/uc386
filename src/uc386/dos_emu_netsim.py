@@ -75,6 +75,7 @@ class NetworkSimulator:
         dns_ip: bytes = DEFAULT_DNS_IP,
         netmask: bytes = DEFAULT_NETMASK,
         crynwr_int_num: Optional[int] = PKTDRV_INT_NUM,
+        dns_records: Optional[dict[str, bytes]] = None,
     ) -> None:
         assert len(our_mac) == 6 and len(host_mac) == 6
         for b in (offered_ip, gateway_ip, dns_ip, netmask):
@@ -87,6 +88,18 @@ class NetworkSimulator:
         self.netmask = netmask
         self.rx_queue: list[bytes] = []
         self.tx_log: list[bytes] = []
+        # Hardcoded A-record table for the DNS responder. Keys are
+        # lowercase host names; values are 4-byte big-endian IPv4
+        # addresses. Defaults exercise the test fabric without
+        # leaking any real-world hostnames.
+        self.dns_records: dict[str, bytes] = (
+            dns_records if dns_records is not None
+            else {
+                "echo.test":   bytes([10, 0, 2, 50]),
+                "host.test":   bytes([10, 0, 2, 51]),
+                "router.test": gateway_ip,
+            }
+        )
         # When set, dos_emu plants a "PKT DRVR" signature in low
         # memory and answers DPMI INT 0x31 fn 0x0200 + Crynwr INT
         # 0x60 calls so the binary's pktdrv_init() succeeds. Set
@@ -158,12 +171,14 @@ class NetworkSimulator:
         spa = payload[14:18]
         # tha = payload[18:24]  # unused on requests
         tpa = payload[24:28]
-        if tpa != self.gateway_ip:
-            # We only own the gateway IP; ignore queries for other addrs.
+        if tpa not in (self.gateway_ip, self.dns_ip):
+            # We only own gateway + DNS IPs; ignore other queries.
             return
-        # Build ARP reply.
+        # Build ARP reply. Source IP echoes whichever of our IPs the
+        # client asked for, so lwIP's ARP cache binds the correct
+        # (IP, MAC) pair for both the gateway and the DNS host.
         reply = struct.pack(">HHBBH", 1, 0x0800, 6, 4, 2)
-        reply += self.host_mac + self.gateway_ip + sha + spa
+        reply += self.host_mac + tpa + sha + spa
         self._enqueue_eth(dst=sha, src=self.host_mac,
                           ethertype=0x0806, payload=reply)
 
@@ -199,6 +214,71 @@ class NetworkSimulator:
         # DHCP client → server: dport=67. We're the server.
         if dport == 67 and sport == 68:
             self._handle_dhcp(body)
+        elif dport == 53 and dst_ip == self.dns_ip:
+            self._handle_dns(src_ip, sport, body)
+
+    # ---- DNS --------------------------------------------------------
+    #
+    # Minimal RFC 1035 responder. Parses one question, walks the
+    # `dns_records` table, builds an A-record reply with a
+    # back-pointer to the question name (compression). Anything we
+    # can't answer (NXDOMAIN, non-A queries, multi-question packets)
+    # falls through to a SERVFAIL — lwIP retries on its own cadence,
+    # so the failure mode is "DNS test times out", easy to spot.
+    def _handle_dns(self, client_ip: bytes, client_port: int,
+                    msg: bytes) -> None:
+        if len(msg) < 12:
+            return
+        (txid, flags, qdcount, _ancount, _nscount, _arcount) = (
+            struct.unpack(">HHHHHH", msg[:12])
+        )
+        if (flags & 0x8000) != 0 or qdcount != 1:
+            return  # responses or multi-Q queries not handled
+        i = 12
+        # Decode the question name: sequence of length-prefixed
+        # labels, terminated by a zero-length label.
+        labels: list[bytes] = []
+        while i < len(msg):
+            n = msg[i]
+            if n == 0:
+                i += 1
+                break
+            if n & 0xC0:  # compression pointer in question — bail.
+                return
+            i += 1
+            if i + n > len(msg):
+                return
+            labels.append(msg[i:i + n])
+            i += n
+        else:
+            return
+        if i + 4 > len(msg):
+            return
+        qtype, qclass = struct.unpack(">HH", msg[i:i + 4])
+        i += 4
+        host = b".".join(labels).decode("ascii", errors="replace").lower()
+        rcode = 0
+        rdata = b""
+        if qtype == 1 and qclass == 1 and host in self.dns_records:
+            rdata = self.dns_records[host]
+        else:
+            rcode = 3  # NXDOMAIN
+        # Build response. QR=1, RA=1, RD copied from query, RCODE.
+        resp_flags = 0x8180 | rcode
+        ancount = 1 if rdata else 0
+        out = struct.pack(">HHHHHH",
+                          txid, resp_flags, 1, ancount, 0, 0)
+        out += msg[12:i]  # echo question
+        if rdata:
+            out += b"\xc0\x0c"                        # name = ptr to qname
+            out += struct.pack(">HHIH", 1, 1, 60, len(rdata))
+            out += rdata
+        # UDP back to the client.
+        udp_len = 8 + len(out)
+        udp_hdr_pre = struct.pack(">HHHH", 53, client_port, udp_len, 0)
+        chk = _udp_checksum(self.dns_ip, client_ip, udp_hdr_pre + out)
+        udp = struct.pack(">HHHH", 53, client_port, udp_len, chk) + out
+        self._send_ipv4(self.dns_ip, client_ip, 17, udp)
 
     def _handle_dhcp(self, msg: bytes) -> None:
         if len(msg) < 240:

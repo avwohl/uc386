@@ -277,6 +277,23 @@ extern unsigned long bios_ticks(void);
 #define MICROPY_PY_SOCKET                 (1)
 #define MICROPY_PY_NETWORK_HOSTNAME_DEFAULT  "uc386-dos"
 #define MICROPY_PY_NETWORK_HOSTNAME_MAX_LEN  16
+
+// modlwip.c's poll_sockets() drives this hook between events. With
+// no real OS scheduler it's how blocking calls (DNS resolution,
+// non-blocking-with-timeout connect, the udp_recv wait loop) drive
+// netif RX / sys_check_timeouts forward. Empty default would deadlock
+// any blocking lwIP call — `getaddrinfo` would never see its DNS
+// response because the netif input loop never runs.
+extern void uc386dos_loopback_poll(void *arg);
+extern void sys_check_timeouts(void);
+// Plain-statements form (no `do{}while(0)`): modlwip.c's call site
+// is `MICROPY_PY_LWIP_POLL_HOOK\n  next_stmt;` with no trailing
+// semicolon after the macro, so a `do{}while(0)` body would fall
+// directly into the next statement and parse-error.
+#define MICROPY_PY_LWIP_POLL_HOOK \
+    uc386dos_loopback_poll(0); \
+    sys_check_timeouts();
+
 #define MICROPY_PY_RE                     (1)
 #define MICROPY_PY_RE_SUB                 (1)
 #define MICROPY_PY_RE_MATCH_GROUPS        (1)
