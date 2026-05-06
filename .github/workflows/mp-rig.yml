@@ -41,13 +41,15 @@ on:
 jobs:
   mp-rig:
     runs-on: ubuntu-latest
-    # build_port.sh on a Mac M1 is ~14 min wall-clock; ubuntu-latest
-    # runners are ~4x slower for this multi-TU uc386 pass — each TU
-    # re-runs uc_core's preprocessor in pure Python, and the runner
-    # CPU is meaningfully slower per-core than M1. The 60-min cap
-    # tripped on a 55-min build (run 25434667264). 90 min gives
-    # headroom.
-    timeout-minutes: 90
+    # First run is the long pole — needs to build micropython.bin
+    # from scratch (~14 min on Mac M1 but ~85 min on a CI runner;
+    # the all-196-TU pure-Python uc386 pass is CPU-bound and the
+    # runner is meaningfully slower per-core). After that, the
+    # actions/cache step keeps the bin warm — subsequent runs that
+    # don't touch source skip the build entirely and finish in
+    # ~5-10 min. 120 min cap covers the cold-cache first run with
+    # margin for the binding + DOSBox-X session.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
       - name: Set up Python
@@ -84,11 +86,33 @@ jobs:
           cd addons/gnu/micropython
           ./fetch.sh
 
-      - name: Build micropython.bin (~14 min)
+      - name: Cache micropython build
+        id: mp-build-cache
+        uses: actions/cache@v4
+        with:
+          # The asm is what exe.py turns into MP.EXE; the bin is
+          # what dos_emu / smoke tests use; the genhdr/ files are
+          # build-time artifacts we don't want to regenerate.
+          path: |
+            addons/gnu/micropython/build/micropython.asm
+            addons/gnu/micropython/build/micropython.bin
+            addons/gnu/micropython/build/genhdr/
+          key: mp-build-${{ runner.os }}-${{ hashFiles('addons/gnu/micropython/uc386-dos/**', 'addons/gnu/micropython/build_port.sh', 'addons/gnu/micropython/build.sh', 'addons/gnu/micropython/gen_qstrdefs.py', 'addons/gnu/micropython/fetch.sh', 'src/uc386/**', 'lib/include/**', 'lib/i386_dos_libc.asm', 'pyproject.toml') }}
+
+      - name: Build micropython.bin (~14 min on M1, ~85 on CI)
+        # Only re-run if no cache hit. The build is the long pole;
+        # CI runners take ~85 min for the all-196-TU pure-Python
+        # uc386 pass. With a cache hit, this is skipped entirely
+        # and CI runs in 5-10 min total.
+        if: steps.mp-build-cache.outputs.cache-hit != 'true'
         run: |
           cd addons/gnu/micropython
           ./build_port.sh
-          ls -la build/micropython.bin
+
+      - name: Verify build output
+        run: |
+          ls -la addons/gnu/micropython/build/micropython.bin
+          ls -la addons/gnu/micropython/build/micropython.asm
 
       - name: Bind MP.EXE via PMODE/W
         run: |
