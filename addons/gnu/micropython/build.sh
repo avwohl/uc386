@@ -439,6 +439,17 @@ extern const struct _mp_obj_module_t mp_module_uc386_net;
 #define UCDOS_MOD_ENTRY_UC386_NET
 #endif
 
+// `select` — extmod/modselect.c. Provides `select.select()` and
+// `select.poll()` over the stream-protocol's poll hook (which
+// modlwip.c's socket type implements). Useful for non-blocking
+// I/O multiplexing.
+#if MICROPY_PY_SELECT
+extern const struct _mp_obj_module_t mp_module_select;
+#define UCDOS_MOD_ENTRY_SELECT { MP_ROM_QSTR(MP_QSTR_select), MP_ROM_PTR(&mp_module_select) },
+#else
+#define UCDOS_MOD_ENTRY_SELECT
+#endif
+
 #define MICROPY_REGISTERED_MODULES \
     { MP_ROM_QSTR(MP_QSTR_builtins), MP_ROM_PTR(&mp_module_builtins) }, \
     { MP_ROM_QSTR(MP_QSTR_sys), MP_ROM_PTR(&mp_module_sys) }, \
@@ -470,7 +481,8 @@ extern const struct _mp_obj_module_t mp_module_uc386_net;
     UCDOS_MOD_ENTRY_URLLIB_PARSE \
     UCDOS_MOD_ENTRY_LWIP \
     UCDOS_MOD_ENTRY_SOCKET \
-    UCDOS_MOD_ENTRY_UC386_NET
+    UCDOS_MOD_ENTRY_UC386_NET \
+    UCDOS_MOD_ENTRY_SELECT
 
 // Module attribute-access delegation table — modules whose attr
 // loads/stores need to dispatch through a port-supplied function.

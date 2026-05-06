@@ -105,6 +105,7 @@ SOURCES_FILE="build/_port_sources.txt"
     echo upstream/extmod/moddeflate.c
     echo upstream/extmod/modjson.c
     echo upstream/extmod/modplatform.c
+    echo upstream/extmod/modselect.c
     # B-Con public-domain MD5 + SHA1 reference impls. Pulled into
     # upstream/lib/crypto-algorithms/ alongside sha256.c by fetch.sh's
     # post-fetch hook; the AXTLS-shaped API the upstream modhashlib.c

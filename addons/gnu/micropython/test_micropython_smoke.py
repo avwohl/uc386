@@ -2802,3 +2802,69 @@ def test_micropython_lwip_dns_query(micropython_bin: Path) -> None:
         "no DNS query (UDP dport=53) was transmitted: "
         f"{len(net.tx_log)} frames in tx_log"
     )
+
+
+def test_micropython_select_poll(micropython_bin: Path) -> None:
+    """`select.poll()` should multiplex non-blocking sockets and pick
+    out the one that's readable.
+
+    Sets up a loopback server, creates a poller registered for read
+    events on it, drives `lwip.callback()` to advance the loopback
+    handshake while a client connects + sends payload bytes, then
+    asserts the poller fires for the accepted connection's socket.
+
+    Pins:
+    1. select.poll() builds and `register/unregister` work.
+    2. modlwip's socket implements the stream poll protocol so
+       MP_STREAM_POLL_RD fires when data lands.
+    3. POLL_HOOK keeps draining loop_netif during poll waits.
+    """
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    res = run(micropython_bin,
+              stdin_bytes=(
+                  b"import lwip, select, socket\n"
+                  b"lwip.reset()\n"
+                  b"srv = socket.socket()\n"
+                  b"srv.bind(('127.0.0.1', 9100))\n"
+                  b"srv.listen(1)\n"
+                  b"srv.setblocking(False)\n"
+                  b"cli = socket.socket()\n"
+                  b"cli.setblocking(False)\n"
+                  b"try:\n"
+                  b"    cli.connect(('127.0.0.1', 9100))\n"
+                  b"except OSError:\n"
+                  b"    pass\n"
+                  b"\n"
+                  b"for _ in range(5):\n"
+                  b"    lwip.callback()\n"
+                  b"\n"
+                  b"conn, _ = srv.accept()\n"
+                  b"conn.setblocking(False)\n"
+                  b"poller = select.poll()\n"
+                  b"poller.register(conn, select.POLLIN)\n"
+                  b"print('idle:', poller.poll(0))\n"
+                  b"cli.send(b'ping')\n"
+                  b"for _ in range(5):\n"
+                  b"    lwip.callback()\n"
+                  b"\n"
+                  b"events = poller.poll(0)\n"
+                  b"print('ready:', len(events), 'flags=', events[0][1] if events else None)\n"
+                  b"print('payload:', conn.recv(16))\n"
+                  b"\x04"
+              ),
+              timeout_seconds=20.0,
+              instruction_limit=4_000_000_000)
+    assert not res.timed_out
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert res.exit_code == 0
+    assert "idle: []" in res.stdout, (
+        f"poll(0) on idle conn should be empty: {res.stdout!r}"
+    )
+    assert "ready: 1" in res.stdout, (
+        f"poll(0) didn't fire after data arrived: {res.stdout!r}"
+    )
+    assert "payload: b'ping'" in res.stdout, (
+        f"recv didn't return the payload: {res.stdout!r}"
+    )
