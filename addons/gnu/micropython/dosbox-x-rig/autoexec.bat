@@ -25,6 +25,18 @@ goto :run_mp
 echo NE2000.COM not found in C: >> RIG.LOG
 goto :run_mp
 
+:baseline
+rem ECHOTEST.EXE is a minimal printf-only smoke (built from
+rem addons/gnu/echo via exe.py). Establishes "PMODE/W INT 21h
+rem AH=40 passthrough reaches RIG.LOG" before we try MP.EXE.
+rem If this baseline doesn't print, the issue is the rig itself
+rem (DOSBox-X config, autoexec redirect, PMODE/W bridge); if it
+rem does print, MP.EXE-specific runtime is the next thing to dig.
+if not exist ECHOTEST.EXE goto :run_mp
+echo --- before-echo-baseline --- >> RIG.LOG
+ECHOTEST.EXE hello dos rig >> RIG.LOG
+echo --- after-echo-baseline --- >> RIG.LOG
+
 :run_mp
 if not exist MP.EXE goto :no_exe
 echo --- before-mp marker --- >> RIG.LOG

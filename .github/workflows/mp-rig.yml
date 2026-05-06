@@ -148,6 +148,22 @@ jobs:
           ./fetch.sh
           ls -la NE2000.COM
 
+      - name: Build ECHOTEST.EXE baseline
+        # Known-good printf-only smoke. addons/gnu/echo prints its
+        # argv joined by spaces via fputs/putchar, then returns 0.
+        # exe-smoke.yml already validates that this path
+        # (uc386 → nasm → wlink → PMODE/W bind) prints under
+        # DOSBox 0.74-3, so dropping the resulting binary into the
+        # rig isolates whether MP.EXE-produces-no-output is a
+        # rig-wide PMODE/W INT 21h AH=40 issue or specific to the
+        # 1.4 MB BSS / multi-TU MicroPython build.
+        run: |
+          python -m addons.harness.exe \
+            addons/gnu/echo/main.c \
+            -o addons/gnu/micropython/dosbox-x-rig/ECHOTEST.EXE
+          ls -la addons/gnu/micropython/dosbox-x-rig/ECHOTEST.EXE
+          file addons/gnu/micropython/dosbox-x-rig/ECHOTEST.EXE
+
       - name: Generate the REPL script for the rig
         # SCRIPT.PY drives the REPL through eth_init + DHCP +
         # eth_status print. EOF (end-of-file from redirected stdin)
@@ -198,11 +214,14 @@ jobs:
 
       - name: Assert rig infrastructure (must pass)
         # Required signals for the CI gate: build+bind+rig boot all
-        # work and the Crynwr packet driver loaded under DOSBox-X.
-        # MP.EXE's actual runtime behavior is checked separately
-        # below as best-effort — the binary produces no observable
-        # output today via PMODE/W's INT 21h passthrough, which is
-        # a known limitation we're tracking but not gating CI on.
+        # work, Crynwr packet driver loaded under DOSBox-X, and the
+        # printf-only baseline (echo.exe) prints — which proves the
+        # PMODE/W INT 21h AH=40 → redirected RIG.LOG bridge works
+        # under this DOSBox-X config. MP.EXE's actual runtime is
+        # checked best-effort below; today the 1.4 MB binary
+        # produces no observable bytes despite the baseline working,
+        # which we're tracking as a known limitation in the rig
+        # README rather than gating CI on.
         run: |
           LOG=addons/gnu/micropython/dosbox-x-rig/RIG.LOG
           fail=0
@@ -212,6 +231,15 @@ jobs:
           fi
           if ! grep -q "software interrupt is 0x60" "$LOG"; then
             echo "FAIL: NE2000 didn't install at INT 0x60"
+            fail=1
+          fi
+          if ! grep -q "before-echo-baseline" "$LOG"; then
+            echo "FAIL: autoexec.bat didn't reach the echo baseline"
+            fail=1
+          fi
+          if ! grep -qF "hello dos rig" "$LOG"; then
+            echo "FAIL: ECHOTEST.EXE produced no observable output"
+            echo "      (PMODE/W INT 21h AH=40 → RIG.LOG bridge broken)"
             fail=1
           fi
           if ! grep -q "before-mp marker" "$LOG"; then
@@ -224,7 +252,7 @@ jobs:
             cat "$LOG"
             exit 1
           fi
-          echo "PASS: build + bind + Crynwr NE2000 load all green"
+          echo "PASS: build + bind + Crynwr NE2000 + printf baseline all green"
 
       - name: Best-effort MP.EXE runtime checks
         # Diagnostic — reports which signals are present so we can
@@ -257,6 +285,8 @@ jobs:
             addons/gnu/micropython/dosbox-x-rig/RIG.LOG
             addons/gnu/micropython/dosbox-x-rig/SCRIPT.PY
             addons/gnu/micropython/dosbox-x-rig/MP.EXE
+            addons/gnu/micropython/dosbox-x-rig/ECHOTEST.EXE
+            addons/gnu/micropython/dosbox-x-rig/MP_OUT.TXT
             addons/gnu/micropython/build/micropython.bin
             /tmp/dosbox-x.stderr
           if-no-files-found: warn

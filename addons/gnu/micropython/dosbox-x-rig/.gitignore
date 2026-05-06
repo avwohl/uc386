@@ -3,8 +3,12 @@ NE2000.COM
 MP.EXE
 mp.exe
 
+# CI-generated baseline (built from addons/gnu/echo via exe.py).
+ECHOTEST.EXE
+
 # DOSBox-X session output.
 RIG.LOG
+MP_OUT.TXT
 *.tmp
 
 # CI-generated test script.

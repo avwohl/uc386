@@ -17,10 +17,11 @@ real-DOS path:
 | File             | Role                                                  |
 |------------------|-------------------------------------------------------|
 | `dosbox-x.conf`  | DOSBox-X config: NE2000 at I/O 0x300 IRQ 9 + SLIRP    |
-| `autoexec.bat`   | Loads `NE2000.COM` at INT 0x60, runs `MP.EXE`         |
+| `autoexec.bat`   | Loads `NE2000.COM` at INT 0x60, runs baseline + `MP.EXE` |
 | `fetch.sh`       | Downloads `NE2000.COM` from archive.org (idempotent)  |
 | `run.sh`         | Launches DOSBox-X with the config                     |
 | `NE2000.COM`     | Crynwr 11.4.3 packet driver (fetched on first run)    |
+| `ECHOTEST.EXE`   | Printf-only baseline (built from `addons/gnu/echo`)   |
 | `MP.EXE`         | Watcom-bound MicroPython (must be built on Linux)     |
 | `RIG.LOG`        | DOSBox-X session output (created on each run)         |
 
@@ -109,6 +110,18 @@ Suspected root causes (in priority order):
    binary expects.
 3. Some libc symbol the multi-TU MicroPython build references
    isn't provided by exe.py's bridge.
+
+To distinguish (1) — a rig-wide bridge regression — from (2)/(3),
+the CI workflow now drops `ECHOTEST.EXE` (a printf-only build of
+`addons/gnu/echo`) into this directory and runs it as a baseline
+before `MP.EXE`. If `hello dos rig` lands in `RIG.LOG` between
+the `before-echo-baseline` / `after-echo-baseline` markers, the
+INT 21h AH=40 passthrough works under this DOSBox-X config and
+the issue is MP.EXE-specific (suspect 2 or 3). If it doesn't,
+the problem is the rig itself (suspect 1) and `MP.EXE` was never
+going to print regardless of its internals. The CI gate now
+requires the baseline to print — without it, MP.EXE-runtime
+diagnostics are meaningless.
 
 Until that's diagnosed, dos_emu's emulator (the existing
 `test_micropython_smoke.py` suite — 94/94 passing) remains the
