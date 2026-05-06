@@ -81,6 +81,40 @@ So a binary that DHCPs to 10.0.2.15 against the dos_emu sim should
 DHCP to the same address against DOSBox-X — useful for "same code,
 two environments" sanity.
 
+## Known limitation: MP.EXE runtime under PMODE/W
+
+The `.github/workflows/mp-rig.yml` CI run currently gates on:
+
+- `build_port.sh` produces `micropython.bin`
+- `addons/harness/exe.py` binds `MP.EXE` cleanly
+- DOSBox-X boots the rig and `NE2000.COM` reports its install
+  banner with INT 0x60
+
+What's *not* yet validated end-to-end: MP.EXE's actual runtime
+output. With cycles=max + 180s timeout under DOSBox-X 2024.03,
+MP.EXE produces no observable bytes on stdout — neither the REPL
+banner nor any post-`eth_init` print. The autoexec markers
+(`before-mp`, `after-mp`) confirm execution stops between them,
+but whether MP.EXE crashes silently in startup or hangs on stdin
+parsing isn't pinned down yet.
+
+Suspected root causes (in priority order):
+
+1. PMODE/W INT 21h passthrough for AH=0x40 (write) doesn't
+   reach the redirected `RIG.LOG` even though smaller test
+   programs (`echo.exe`, `factor.exe`) work via the same
+   bridge under DOSBox 0.74-3.
+2. `_pmodew_start` bridge doesn't initialize MP.EXE's 1.4 MB
+   BSS (libc heap + MP static heap + globals) in a way the
+   binary expects.
+3. Some libc symbol the multi-TU MicroPython build references
+   isn't provided by exe.py's bridge.
+
+Until that's diagnosed, dos_emu's emulator (the existing
+`test_micropython_smoke.py` suite — 94/94 passing) remains the
+authoritative validation that the binary works. The DOSBox-X
+rig is shipped as the on-ramp to real-hardware testing.
+
 ## Source attribution
 
 `NE2000.COM` is the Crynwr 11.4.3 NE2000 packet driver, MIT-style
