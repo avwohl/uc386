@@ -14,16 +14,14 @@ rem DOSBox-X exits in -silent mode.
 rem ============================================================
 
 echo --- DOSBox-X test rig --- > RIG.LOG
-mem /c | find "available" >> RIG.LOG
 
-if not exist NE2000.COM goto :no_pktdrv
+if not exist NE2000.COM goto :baseline
 echo Loading Crynwr ne2000 packet driver at INT 0x60 ... >> RIG.LOG
 NE2000 0x60 9 0x300 >> RIG.LOG
-goto :run_mp
+goto :baseline
 
 :no_pktdrv
 echo NE2000.COM not found in C: >> RIG.LOG
-goto :run_mp
 
 :baseline
 rem ECHOTEST.EXE is a minimal printf-only smoke (built from
