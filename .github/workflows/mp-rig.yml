@@ -301,8 +301,14 @@ jobs:
             echo " tracked separately, not gating CI)"
           fi
 
-      - name: Upload artifacts on failure
-        if: failure()
+      - name: Upload artifacts (always — for triage)
+        # Switched from `if: failure()` to always-upload so the
+        # triage iterations can grab MP.EXE + micropython.asm
+        # even when the CI gate is green. The hang in MP.EXE's
+        # _main body needs disassembly inspection, not just log
+        # bisection. Switch back to failure-only once the runtime
+        # is debugged.
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mp-rig-artifacts
@@ -312,6 +318,7 @@ jobs:
             addons/gnu/micropython/dosbox-x-rig/MP.EXE
             addons/gnu/micropython/dosbox-x-rig/ECHOTEST.EXE
             addons/gnu/micropython/dosbox-x-rig/MP_OUT.TXT
+            addons/gnu/micropython/build/micropython.asm
             addons/gnu/micropython/build/micropython.bin
             /tmp/dosbox-x.stderr
           if-no-files-found: warn
