@@ -532,9 +532,27 @@ def build_exe(
     # boundaries — codegen defines them as labels but doesn't
     # export them. Inject the globals here so wlink can wire the
     # references from the bridge to the codegen-emitted bodies.
-    rewritten.insert(0, "        global _bss_zero_end")
-    rewritten.insert(0, "        global _bss_zero_start")
+    #
+    # Codegen drops the BSS labels entirely when a TU has no
+    # uninitialized non-noinit globals (the rep stosb is also
+    # skipped via _needs_bss_init). For those small TUs (e.g.
+    # echo.exe) we have to emit a degenerate stub here so the
+    # bridge's `extern` references still resolve — _start ==
+    # _end means the rep stosb loop counts to zero.
+    has_bss_labels = any(
+        line.lstrip().startswith("_bss_zero_start:")
+        for line in rewritten
+    )
     rewritten.insert(0, "        global _main")
+    if has_bss_labels:
+        rewritten.insert(0, "        global _bss_zero_end")
+        rewritten.insert(0, "        global _bss_zero_start")
+    else:
+        rewritten.append("        section _BSS use32 class=BSS")
+        rewritten.append("        global _bss_zero_start")
+        rewritten.append("        global _bss_zero_end")
+        rewritten.append("_bss_zero_start:")
+        rewritten.append("_bss_zero_end:")
     asm_for_omf = out_path.with_suffix(".omf.asm")
     asm_for_omf.write_text("\n".join(rewritten) + "\n")
 
