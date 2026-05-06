@@ -70,44 +70,63 @@ patch_modlwip_loopback_poll() {
     ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
 }
 
-# Inject printf checkpoints into ports/minimal/main.c so the rig
-# can see how far MP startup gets when stdout is redirected through
-# PMODE/W INT 21h AH=40 → file. The DOSBox-X rig runs a known-good
-# echo.exe baseline that prints fine; MP.EXE produces no observable
-# bytes despite returning. This bisects which startup step is the
-# silent one. Idempotent: skip if the markers are already in place.
+# Inject write(1, ...) checkpoints into ports/minimal/main.c so the
+# rig can see how far MP startup gets. write() goes through libc's
+# INT 21h AH=0x40 BX=1 — which respects DOS file-handle redirection
+# (the > MP_OUT.TXT in autoexec.bat). printf() uses INT 21h AH=02h
+# which writes to the console regardless of redirect, so under
+# `dosbox-x -silent` it lands in /dev/null. The MP REPL itself uses
+# mp_hal_stdout_tx_strn -> write(STDOUT_FILENO, ...), so these
+# markers exercise the same redirect path as the MP banner. The
+# last-seen marker in RIG.LOG identifies the statement that
+# silently aborts. Idempotent: skip if the markers are already in
+# place.
 patch_main_startup_markers() {
     F="upstream/ports/minimal/main.c"
     if [ ! -f "$F" ]; then return 0; fi
-    if grep -q "mp-startup-marker" "$F"; then return 0; fi
-    echo "micropython: patching ports/minimal/main.c with startup markers …"
+    if grep -q "mp-startup-marker" "$F"; then
+        # Old printf-based markers from a prior fetch.sh? Strip them
+        # so the new write()-based markers are what gets compiled.
+        if grep -q "printf(\"\[mp-" "$F"; then
+            echo "micropython: stripping stale printf startup markers from ports/minimal/main.c …"
+            grep -v "mp-startup-marker\|printf(\"\[mp-\|fflush(stdout)" "$F" > "$F.tmp" && mv "$F.tmp" "$F"
+        else
+            return 0
+        fi
+    fi
+    echo "micropython: patching ports/minimal/main.c with write() startup markers …"
     awk '
+        /^#include "shared\/runtime\/pyexec.h"/ {
+            print
+            print "#include <unistd.h>  /* mp-startup-marker: write() */"
+            next
+        }
         /^int main\(int argc, char \*\*argv\) \{/ {
             print
             print "    /* mp-startup-marker injected by addons/gnu/micropython/fetch.sh */"
-            print "    printf(\"[mp-main-entered]\\n\"); fflush(stdout);"
+            print "    write(1, \"[mp-main-entered]\\n\", 18);"
             in_main = 1
             next
         }
         in_main && /mp_stack_ctrl_init\(\);/ {
-            print "    printf(\"[mp-before-stack-ctrl]\\n\"); fflush(stdout);"
+            print "    write(1, \"[mp-before-stack-ctrl]\\n\", 23);"
             print
             next
         }
         in_main && /mp_init\(\);/ {
-            print "    printf(\"[mp-before-mp-init]\\n\"); fflush(stdout);"
+            print "    write(1, \"[mp-before-mp-init]\\n\", 20);"
             print
-            print "    printf(\"[mp-after-mp-init]\\n\"); fflush(stdout);"
+            print "    write(1, \"[mp-after-mp-init]\\n\", 19);"
             next
         }
         in_main && /pyexec_friendly_repl\(\);/ {
-            print "    printf(\"[mp-before-repl]\\n\"); fflush(stdout);"
+            print "    write(1, \"[mp-before-repl]\\n\", 17);"
             print
-            print "    printf(\"[mp-after-repl]\\n\"); fflush(stdout);"
+            print "    write(1, \"[mp-after-repl]\\n\", 16);"
             next
         }
         in_main && /mp_deinit\(\);/ {
-            print "    printf(\"[mp-before-deinit]\\n\"); fflush(stdout);"
+            print "    write(1, \"[mp-before-deinit]\\n\", 19);"
             print
             in_main = 0
             next
