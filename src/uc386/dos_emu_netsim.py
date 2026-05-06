@@ -105,6 +105,15 @@ class NetworkSimulator:
         self.pktdrv_rx_buf_addr: int = 0
         self.pktdrv_rx_pending_addr: int = 0
         self.pktdrv_rx_len_addr: int = 0
+        # Track DPMI fn 0x0303 (Allocate Real Mode Callback) calls
+        # so a test can verify the real-DOS-style registration ran
+        # alongside the dos_emu polling path. Each entry:
+        #   (handler_linear, rmcs_linear, fake_seg, fake_off)
+        # We hand out fake real-mode trampoline addresses starting
+        # at 0x0FFE0000 (well above conventional memory but inside a
+        # legal real-mode-encodable range) and bump per allocation.
+        self.dpmi_callbacks: list[tuple[int, int, int, int]] = []
+        self._next_dpmi_real_seg = 0xFFE0
 
     # ---- INT 0x83 entry points ------------------------------------
 

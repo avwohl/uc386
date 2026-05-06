@@ -746,12 +746,18 @@ def run(
             uc.reg_write(UC_X86_REG_EAX, (eax & ~0xFF) | 1)
             return
         if intno == 0x31:
-            # DPMI services. Only fn 0x0200 (Get Real Mode Interrupt
-            # Vector) is implemented — that's what pktdrv_uc386dos.c
-            # uses to find a Crynwr packet driver in the IVT. Always
-            # handled (even without a NetworkSimulator) so the
-            # binary's IVT scan can probe cleanly; we return success
-            # only for the slot the active simulator advertises.
+            # DPMI services. Two fns implemented:
+            #   0x0200 — Get Real Mode Interrupt Vector. Used by
+            #            pktdrv_detect() to find Crynwr in the IVT.
+            #   0x0303 — Allocate Real Mode Callback. Used by
+            #            pktdrv_init() to register a DPMI trampoline
+            #            so real-mode Crynwr drivers can call back
+            #            into our 32-bit receiver. Under emulation
+            #            we record the registration but never invoke
+            #            it (AH=0x99 polling drives RX instead);
+            #            real DOS hardware does the real call.
+            # Always handled (even without a NetworkSimulator) so
+            # the binary's probes don't trip the unhandled-INT trap.
             ax = eax & 0xFFFF
             flags = uc.reg_read(UC_X86_REG_EFLAGS)
             if ax == 0x0200 and pktdrv_int is not None:
@@ -767,6 +773,20 @@ def run(
                     uc.reg_write(UC_X86_REG_EDX, edx_new)
                     uc.reg_write(UC_X86_REG_EFLAGS, flags & ~0x1)
                     return
+            if ax == 0x0303 and net is not None:
+                handler_linear = uc.reg_read(UC_X86_REG_ESI)
+                rmcs_linear    = uc.reg_read(UC_X86_REG_EDI)
+                fake_seg = net._next_dpmi_real_seg
+                net._next_dpmi_real_seg = (fake_seg + 0x10) & 0xFFFF
+                fake_off = 0
+                net.dpmi_callbacks.append(
+                    (handler_linear, rmcs_linear, fake_seg, fake_off))
+                ecx_new = (uc.reg_read(UC_X86_REG_ECX) & 0xFFFF0000) | fake_seg
+                edx_new = (uc.reg_read(UC_X86_REG_EDX) & 0xFFFF0000) | fake_off
+                uc.reg_write(UC_X86_REG_ECX, ecx_new)
+                uc.reg_write(UC_X86_REG_EDX, edx_new)
+                uc.reg_write(UC_X86_REG_EFLAGS, flags & ~0x1)
+                return
             # Unimplemented fn or unmatched int_num → CF=1, AX=0.
             # That's how DPMI signals "not handled" to the caller.
             uc.reg_write(UC_X86_REG_EFLAGS, flags | 0x1)

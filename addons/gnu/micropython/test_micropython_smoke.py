@@ -2700,6 +2700,17 @@ def test_micropython_lwip_dhcp(micropython_bin: Path) -> None:
         "no DHCP client packet (UDP 68->67) was transmitted: "
         f"{len(net.tx_log)} frames in tx_log"
     )
+    # The binary should have exercised DPMI INT 31h fn 0x0303 to
+    # register a real-mode callback for the Crynwr receiver — even
+    # though under emulation the actual delivery rides AH=0x99
+    # polling, the registration call itself is the real-DOS shape
+    # we want to keep wired and tested.
+    assert len(net.dpmi_callbacks) >= 1, (
+        "DPMI fn 0x0303 (Allocate Real Mode Callback) wasn't called"
+    )
+    handler_linear, rmcs_linear, _seg, _off = net.dpmi_callbacks[0]
+    assert handler_linear != 0, "DPMI handler address was zero"
+    assert rmcs_linear != 0, "DPMI RMCS address was zero"
 
 
 def test_micropython_lwip_dhcp_int83_fallback(micropython_bin: Path) -> None:

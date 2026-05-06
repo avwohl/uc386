@@ -56,9 +56,39 @@ static unsigned char pktdrv_mac_cache[6];
 // because lwip.callback() pumps after every TX and dos_emu is
 // single-threaded so packets land one at a time.
 #define PKTDRV_MAX_FRAME 1518
-static unsigned char pktdrv_rx_buf[PKTDRV_MAX_FRAME];
+unsigned char pktdrv_rx_buf[PKTDRV_MAX_FRAME];
 volatile int          pktdrv_rx_pending  = 0;
 volatile unsigned int pktdrv_rx_len      = 0;
+
+// DPMI 0.9 "Real Mode Call Structure" — what fn 0x0303 saves the
+// real-mode register state into when the trampoline fires. Field
+// order is fixed by the DPMI spec; total size is 0x32 (50 bytes).
+// __attribute__((packed)) keeps the 16-bit segment fields adjacent
+// to their dword neighbors; uc386 honors packed (verified via the
+// lwIP packed_struct_test self-check).
+typedef struct {
+    unsigned int   edi;        // 0x00
+    unsigned int   esi;        // 0x04
+    unsigned int   ebp;        // 0x08
+    unsigned int   reserved;   // 0x0C
+    unsigned int   ebx;        // 0x10
+    unsigned int   edx;        // 0x14
+    unsigned int   ecx;        // 0x18
+    unsigned int   eax;        // 0x1C
+    unsigned short flags;      // 0x20
+    unsigned short es;         // 0x22
+    unsigned short ds;         // 0x24
+    unsigned short fs;         // 0x26
+    unsigned short gs;         // 0x28
+    unsigned short ip;         // 0x2A
+    unsigned short cs;         // 0x2C
+    unsigned short sp;         // 0x2E
+    unsigned short ss;         // 0x30
+} __attribute__((packed)) pktdrv_rmcs_t;
+
+pktdrv_rmcs_t pktdrv_rmcs;
+unsigned int  pktdrv_dpmi_seg = 0;   // real-mode trampoline segment
+unsigned int  pktdrv_dpmi_off = 0;   // real-mode trampoline offset
 
 // DPMI INT 0x31 fn 0x0200 — Get Real Mode Interrupt Vector.
 // On entry: AX=0x0200, BL=int_num.
@@ -155,9 +185,10 @@ static int pktdrv_access(unsigned int linear_receiver) {
     return 0;
 }
 
-// 32-bit receiver. Crynwr semantics on real DOS go through a DPMI
-// real-mode-callback thunk that maps AX/CX/ES:DI to/from this cdecl
-// signature; dos_emu calls us directly with the same convention.
+// 32-bit receiver. cdecl signature; dos_emu's AH=0x99 polling path
+// writes directly to pktdrv_rx_buf without ever calling this, but
+// the DPMI thunk below DOES call it from real-mode-context after
+// the packet driver has bounced through DPMI.
 //   phase==0: caller wants a buffer for `len` bytes. Return a flat
 //             pointer into pktdrv_rx_buf or NULL to drop.
 //   phase==1: caller has finished the copy. Mark the slot full.
@@ -172,6 +203,61 @@ unsigned char *uc386dos_pktdrv_receiver(int phase, unsigned int len) {
     // phase == 1: packet has been copied.
     pktdrv_rx_pending = 1;
     return NULL;
+}
+
+// DPMI fn 0x0303 callback target — the 32-bit handler the DPMI
+// host invokes when the real-mode trampoline fires. On entry:
+//   DS:ESI = ES:EDI = pointer to our pktdrv_rmcs (DPMI fills it
+//   from the saved real-mode register frame).
+// Crynwr's calling convention puts phase in AX and length in CX,
+// expects ES:DI = buffer on phase=0 return. We translate from
+// the RMCS, drive the existing receiver, and write the buffer's
+// real-mode seg:offset back into RMCS so DPMI can hand it to
+// real mode on its way out.
+//
+// Cdecl signature so we can call it directly under emulation as
+// well — dos_emu's DPMI fn 0x0303 emulation invokes this through
+// the same path. (No-op under hardware DPMI; the host calls it.)
+void uc386dos_pktdrv_dpmi_thunk(void) {
+    unsigned int phase  = pktdrv_rmcs.eax & 0xFFFF;
+    unsigned int length = pktdrv_rmcs.ecx & 0xFFFF;
+    unsigned char *buf = uc386dos_pktdrv_receiver((int)phase, length);
+    if (phase == 0 && buf != NULL) {
+        unsigned int linear = (unsigned int)(unsigned long)buf;
+        // Real-mode seg:off encoding. The buffer must live in
+        // <1 MB conventional memory for this to be reachable;
+        // pktdrv_rx_buf is a static in our flat 32-bit BSS, so
+        // its linear address satisfies that on any reasonable
+        // PMODE/W layout (BSS lands well below 1 MB in our binary).
+        pktdrv_rmcs.es  = (unsigned short)((linear >> 4) & 0xFFFF);
+        pktdrv_rmcs.edi = (linear & 0xF) | (pktdrv_rmcs.edi & 0xFFFF0000);
+    }
+}
+
+// Allocate a real-mode callback via DPMI INT 0x31 fn 0x0303.
+// Inputs (per spec):
+//   DS:ESI = address of our 32-bit handler
+//   ES:EDI = address of the RMCS buffer DPMI should populate
+// Returns:
+//   CX:DX = real-mode segment:offset of the trampoline
+//   CF clear on success.
+// On a host without DPMI (raw real-mode DOS), this returns CF=1
+// and we leave pktdrv_dpmi_{seg,off} at 0; pktdrv_init then falls
+// back to passing the flat receiver address to access_type, which
+// works under dos_emu (with AH=0x99 polling) but not on real DOS.
+static int pktdrv_alloc_dpmi_callback(void) {
+    unsigned int regs[8] = {0};
+    regs[R_EAX] = 0x0303;
+    regs[R_ESI] = (unsigned int)(unsigned long)
+                  &uc386dos_pktdrv_dpmi_thunk;
+    regs[R_EDI] = (unsigned int)(unsigned long)&pktdrv_rmcs;
+    unsigned char carry = pktdrv_int_invoke(0x31, regs);
+    if (carry) {
+        return -1;
+    }
+    pktdrv_dpmi_seg = regs[R_ECX] & 0xFFFF;
+    pktdrv_dpmi_off = regs[R_EDX] & 0xFFFF;
+    return 0;
 }
 
 // AH=0x99 (uc386dos extension): hand the dos_emu harness pointers
@@ -194,13 +280,39 @@ static void pktdrv_register_polling_rx(void) {
 }
 
 // Public init: detect, register, fetch MAC. Returns 0 on success.
+//
+// Order matters:
+//   1. pktdrv_detect — find the Crynwr driver in the IVT.
+//   2. pktdrv_alloc_dpmi_callback — get a real-mode trampoline
+//      address. On hardware that's required for AH=02 to register a
+//      callable receiver. On dos_emu we emulate fn 0x0303 too so
+//      the same code path runs uniformly.
+//   3. pktdrv_access — register the trampoline (or, with DPMI
+//      missing, the flat receiver address — works under emulator,
+//      garbage on real DOS).
+//   4. pktdrv_get_addr — read the MAC.
+//   5. pktdrv_register_polling_rx — AH=0x99, the dos_emu RX
+//      bypass. No-op on real DOS where AH=0x99 isn't implemented.
 int pktdrv_init(unsigned char mac[6]) {
     if (pktdrv_detect() == 0) {
         return -1;
     }
-    if (pktdrv_access((unsigned int)(unsigned long)
-                      &uc386dos_pktdrv_receiver) != 0) {
-        pktdrv_int_num = 0;  // fall through to alt path
+    unsigned int receiver_linear;
+    if (pktdrv_alloc_dpmi_callback() == 0) {
+        // Pack the real-mode seg:offset as a single linear value
+        // for access_type. Crynwr expects ES:DI of the receiver
+        // — under DPMI that's the trampoline, not the flat C
+        // function. We thread it through pktdrv_access's `linear`
+        // arg by encoding seg in the high word, offset in the low.
+        // dos_emu's AH=02 hook unpacks it back; PMODE/W's INT-bridge
+        // forwards the regs as-is to the packet driver.
+        receiver_linear = (pktdrv_dpmi_seg << 16) | (pktdrv_dpmi_off & 0xFFFF);
+    } else {
+        receiver_linear = (unsigned int)(unsigned long)
+                          &uc386dos_pktdrv_receiver;
+    }
+    if (pktdrv_access(receiver_linear) != 0) {
+        pktdrv_int_num = 0;
         return -2;
     }
     if (pktdrv_get_addr(mac) != 0) {
