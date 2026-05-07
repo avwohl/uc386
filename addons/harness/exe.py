@@ -104,7 +104,7 @@ _bridge_marker_diag:    db "[bridge-diag-stub]", 10
 _bridge_marker_postdiag: db "[bridge-post-diag]", 10
 _bridge_marker_dump_main7: db "[main+7]=", 0
 _bridge_marker_dump_str:   db "[str@7c7a3]=", 0
-_bridge_hex_buf:           times 12 db 0    ; "XXXXXXXX\n\0\0"
+_bridge_hex_buf:           times 12 db 0    ; 8 hex chars + LF + slack
 
         section _TEXT use32 class=CODE
         global _pmodew_start
@@ -131,8 +131,8 @@ _bridge_emit:
         pop     eax
         ret
 
-; _bridge_emit_hex32(EAX=value): write "XXXXXXXX\n" hex to fd 1.
-; Trashes EAX, EBX, ECX, EDX. Format: 8 lowercase hex digits + LF.
+; _bridge_emit_hex32(EAX=value): write 8 lowercase hex chars + LF
+; to fd 1. Trashes EAX, EBX, ECX, EDX.
 _bridge_emit_hex32:
         push    edi
         mov     edi, _bridge_hex_buf
@@ -176,8 +176,8 @@ _bridge_emit_str0:
 
 ; _diag_main(): in-bridge stub that mimics what main() should do
 ; (write a marker, return). Called from the bridge BEFORE the real
-; _main so we can verify "call → enter-style prolog → write+commit →
-; ret" works at all from inside this binary's text segment. If
+; _main so we can verify the call-prolog-write-ret plumbing works
+; at all from inside this binary's text segment. If
 ; [bridge-diag-stub] prints but [mp-main-entered] doesn't, the
 ; failure is specific to the codegen-emitted _main (its prolog,
 ; argv plumbing, or first call into libc — not the bridge → main
