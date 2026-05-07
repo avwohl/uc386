@@ -1,0 +1,87 @@
+From: uc386 / Aaron Wohl <aawohl@gmail.com>
+Subject: [PATCH] silent-mode: skip quit confirmation; LocalFile::Write: fflush
+
+Two-part fix for a silent-mode + redirected-output truncation bug.
+
+Symptom: under `-silent` (no GUI), a DOS program that writes to a
+redirected file via `INT 21h AH=0x40` and then runs `exit` from
+`[autoexec]` loses its trailing output. Specifically: the bytes
+written via AH=40 between the program's last `INT 21h AH=0x68`
+(commit-file) call and its termination are silently dropped from
+the redirect file.
+
+Root cause:
+
+  1. `LocalFile::Write` uses `fwrite` (buffered stdio), so AH=40
+     bytes only hit disk when the buffer fills, AH=68 fires, or the
+     file is `fclose`d. Programs that use `AH=40` without `AH=68`
+     accumulate bytes in the host stdio buffer.
+
+  2. When `exit` runs in `[autoexec]` after the program returns,
+     DOSBox-X tries to quit. If the program's name remains in
+     `RunningProgram` (typical for crashes / Ctrl+C terminations),
+     `CheckQuit()` calls `systemmessagebox(..., "yesno", ...)` which,
+     under headless `-silent`, falls through to
+     `tinyfd_messageBox`'s `printf("y/n: ")` + `_getch()` loop. With
+     no stdin, `_getch()` returns the same non-{y,n} character
+     repeatedly, so the loop spins forever. The host `timeout`
+     eventually `SIGKILL`s DOSBox-X, skipping the stdio-buffer flush
+     of the still-open redirect file. The buffered AH=40 bytes are
+     lost.
+
+Patch 1 (`src/gui/sdlmain.cpp`): in `-silent` mode, skip the y/n
+confirmation in `CheckQuit()` and just allow the quit. The clean
+shutdown path then closes all DOS file handles, which `fclose`s the
+redirect file, which flushes its stdio buffer.
+
+Patch 2 (`src/dos/drive_local.cpp`): `fflush` after every successful
+non-Windows `LocalFile::Write`. This guarantees that the bytes
+written by a program via `INT 21h AH=0x40` are visible on disk even
+if DOSBox-X is `SIGKILL`ed for any other reason. (The Windows
+branch already uses unbuffered `WriteFile`, so this only affects
+the POSIX path.) Negligible perf impact for redirected-output
+workloads — typical bursts are well under one buffer-fill cycle, so
+the flush is the path that was going to happen anyway just slightly
+sooner.
+
+Verified: applying both patches and running our reproducer
+(`uc386-MicroPython MP.EXE` redirected to `MPOUT.TXT` via `[autoexec]`
+ending in `exit`) under DOSBox-X with `-silent` now produces the
+full 657 bytes, matching classic DOSBox 0.74-3 and QEMU+FreeDOS.
+Without the patches the same run produces only 481 bytes (the
+bytes that happened to be flushed by AH=68 calls in the program's
+diagnostic prelude before its main work began).
+
+---
+ src/dos/drive_local.cpp | 1 +
+ src/gui/sdlmain.cpp     | 6 ++++++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/src/dos/drive_local.cpp b/src/dos/drive_local.cpp
+index XXXXXXX..XXXXXXX 100644
+--- a/src/dos/drive_local.cpp
++++ b/src/dos/drive_local.cpp
+@@ -2860,6 +2860,7 @@ bool LocalFile::Write(const uint8_t * data,uint16_t * size) {
+ 		return !ftruncate(fileno(fhandle),pos);
+ 	} else {
+ 		*size=file_access_tries>0?(uint16_t)write(fileno(fhandle),data,*size):(uint16_t)fwrite(data,1,*size,fhandle);
++		fflush(fhandle); /* So buffered bytes aren't lost on SIGKILL. */
+ 		return true;
+ 	}
+ }
+diff --git a/src/gui/sdlmain.cpp b/src/gui/sdlmain.cpp
+index XXXXXXX..XXXXXXX 100644
+--- a/src/gui/sdlmain.cpp
++++ b/src/gui/sdlmain.cpp
+@@ -1340,6 +1340,12 @@ static int reflectmenu_state = 0;
+ bool CheckQuit(void) {
+ #if !defined(HX_DOS)
++    /* In -silent mode there is no UI to answer the y/n confirmation;
++     * tinyfd_messageBox falls back to printf+_getch which loops
++     * forever waiting for stdin. Auto-confirm so DOSBox-X exits
++     * cleanly (closing all open files in the process, flushing any
++     * stdio buffers held by LocalFile fwrite). */
++    if (control && control->opt_silent) return true;
+     Section_prop *section = static_cast<Section_prop *>(control->GetSection("dosbox"));
+     std::string warn = section->Get_string("quit warning");
+     bool quit = section->Get_bool("allow quit after warning");

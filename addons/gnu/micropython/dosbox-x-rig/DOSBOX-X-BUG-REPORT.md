@@ -134,11 +134,14 @@ SIGKILL skips all atexit handlers and host-process shutdown
 flushing, so the in-buffer 176 bytes from the unflushed `_write`
 calls are discarded by the kernel.
 
-## Suggested fix
+## Verified fix
 
-Two-part patch (verified end-to-end via instrumented CI build at
-[`dosbox-x-instrument.yml`](https://github.com/avwohl/uc386/actions/workflows/dosbox-x-instrument.yml);
-the "silent + fflush" run produces the full 657 bytes).
+Two-part patch in
+[`dosbox-x-fix.patch`](https://github.com/avwohl/uc386/blob/main/addons/gnu/micropython/dosbox-x-rig/dosbox-x-fix.patch)
+in this repo. Verified end-to-end via the
+[instrumented CI build](https://github.com/avwohl/uc386/actions/runs/25501135864):
+applying both patches and re-running the reproducer produces the
+full 657 bytes (instead of the pre-fix 481).
 
 **Patch 1 — skip the quit confirmation in `-silent` mode**
 (`src/gui/sdlmain.cpp` near the start of `CheckQuit()`):
