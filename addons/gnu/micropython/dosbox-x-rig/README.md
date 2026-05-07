@@ -135,29 +135,85 @@ the failure to a specific layer:
    binaries or to some asm pattern uc386 emits for MicroPython
    that NASM/wlink mishandles.
 
-### Where the trail ends
+### What we ruled out (further refinement)
 
-The bug lives somewhere in: NASM's OMF FIXUP record generation
-for the multi-TU MicroPython asm, OR wlink's LE FIXUP packaging,
-OR PMODE/W's LE loader fixup application for objects > 256 KB.
+A second wave of progressive runtime diagnostics (commits
+04cdc50..f2faf76) added byte-level dumps and direct-call experiments
+from the bridge stub. They proved:
+
+- **LE FIXUP records ARE applied correctly.** The runtime
+  imm32 in `_main`'s `push <str>` instruction is 0x000227a3
+  (= obj2's runtime base 0x16000 + offset 0xc7a3), confirmed
+  by reading memory at `_main + 7`.
+- **The data section IS correctly loaded.** Bytes at runtime VA
+  0x227a3 are "[mp-main-entered]\n" (`[str-bytes]=2d706d5b` =
+  little-endian "[mp-").
+- **`_main`'s instruction stream is intact at runtime.**
+  `[main+0]=000004c8` = `enter 4, 0`; `[main+4]=a368126a` =
+  push 18 + push opcode; `[main+11]=bde8016a` = push 1 +
+  call rel32; `[main+14]=00002ebd` = the rel32 imm.
+- **The call rel32 lands at the correct `_write`.** Computed
+  target = `_main + 18 + 0x2ebd = 0x1c6573`; bytes at that
+  address are `55 89 e5 8b 5d 08 8b 55 0c 8b 4d 10 b4 40 cd 21`
+  — the literal _write prologue + INT 21h.
+- **Direct INT 21h AH=0x40 from the bridge with the SAME args
+  works.** `[direct-write]=[mp-main-entered]` proves DOS handles
+  the redirect correctly for fd 1, EDX=0x227a3, ECX=18, BX=1.
+- **A bridge-side clone of `_write` (`_bridge_write_stack`)
+  with cdecl args from the bridge works.** `[stack-write]=`
+  proves stack-based arg passing isn't the issue.
+- **A bridge-side `_main` clone (`_diag_main_writelike`) doing
+  the EXACT same enter/push/push/push/call sequence works.**
+  `[mainlike]=` proves the instruction sequence itself isn't
+  the issue.
+- **Calling user.obj's `_write` DIRECTLY from the bridge (via
+  indirect call to its runtime address) works.** `[user-write]=`
+  proves user.obj's `_write` is reachable AND functional with
+  the right register state. The runtime bytes are correct.
+
+### Where the trail ends — the irreducible mystery
+
+After all that, ONE single difference remains between a working
+bridge-side call to `_write` and the failing `_main` → `_write`
+call:
+
+  **The runtime address of the CALLER.**
+
+When the call to user.obj's `_write` originates from the bridge
+(low VA, ~0x171xxx), it works.
+When it originates from `_main` (high VA, ~0x1c36b3), the same
+INT 21h with the same EBX/EDX/ECX produces only NUL bytes.
+
+This suggests one of:
+
+1. **PMODE/W's INT 21h reflector has caller-EIP-dependent
+   behavior** — perhaps a scratch-buffer collision when
+   the protected-mode caller is at a particular page.
+2. **Stack mapping under PMODE/W isn't fully flat** — ESP at
+   the failing call is 0x2d00 (low memory, near where DOS
+   structures live). Maybe DOS overwrites the user's stack
+   data when calling INT 21h from a high-VA caller.
+3. **DOSBox-X has a code-fetch / TLB bug** that affects code
+   at high VAs in a >256KB code object.
+
 Diagnostic next steps:
 
-- Compare ECHOTEST.EXE's FIXUP records to MP.EXE's at the same
-  patterns (e.g. `push <data-symbol>` and `mov [<data-symbol>], eax`).
-  Both should generate `src=07 flags=00` (32-bit offset, internal,
-  non-additive) records pointing to obj 2 (data) with appropriate
-  target_off.
-- Try the `dos4g` extender (`exe.py --extender dos4g`) instead of
-  PMODE/W to isolate whether the issue is loader-specific.
-- Try `wdump MP.EXE` (Linux Watcom binary) to inspect FIXUP
-  records authoritatively.
-- Audit uc386's codegen for any pattern that would generate asm
-  NASM can't represent in OMF (e.g. unusual section-relative
-  addressing modes).
+- Run MP.EXE under DOSBox-X's interactive debugger and
+  step through `call _write` from `_main`. See exactly what
+  args reach INT 21h (registers + stack) at the int instruction.
+- Try `dos4g` extender (`exe.py --extender dos4g`) — uses
+  a different INT 21h reflector. If MP.EXE works under
+  dos4g, the bug is PMODE/W-specific.
+- Move the stack to high memory (some way to nudge wlink to
+  put stack above 64KB) and see if the result changes.
+- Compare ECHOTEST.EXE's `[esp]` at the same point — if it's
+  much higher than MP.EXE's 0x2d00, the low-stack hypothesis
+  gains weight.
 
 The CI's "Best-effort MP.EXE runtime checks" step lists every
-expected marker so each iteration shows exactly how far execution
-got — a definitive "is this still the same bug" oracle.
+expected marker so each iteration shows exactly how far
+execution got — a definitive "is this still the same bug"
+oracle.
 
 ### Earlier hypothesis log (rejected/superseded)
 

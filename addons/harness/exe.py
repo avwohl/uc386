@@ -591,24 +591,20 @@ _pmodew_start:
         call    _diag_main_writelike
         add     esp, 8
 
-        ; --- User-write test: call user.obj's _write DIRECTLY
-        ; from the bridge, via indirect call (we don't have it
-        ; as extern). If this prints, user.obj's _write IS callable
-        ; and produces correct output — the bug is then specific
-        ; to call _main → call _write (something about the call
-        ; chain depth/state). If this fails too, the bug is in
-        ; user.obj's _write itself when called from any location.
-        mov     edx, _bridge_marker_dump_userwrite
-        call    _bridge_emit_str0
-        ; Compute _write address from _main's rel32 fixup.
-        mov     eax, [_main + 14]        ; rel32 imm
-        add     eax, _main
-        add     eax, 18                   ; eax = user._write VA
-        push    18
-        push    dword [_main + 7]        ; str_addr
-        push    1
-        call    eax                       ; user.obj's _write
-        add     esp, 12
+        ; --- User-write test: REMOVED ---------------------------
+        ; Run 25477796902 confirmed: calling user.obj's _write
+        ; DIRECTLY from the bridge (via indirect call to address
+        ; computed from _main's rel32) DOES produce
+        ; "[mp-main-entered]" correctly. So user.obj's _write IS
+        ; reachable and works when called from any caller. The
+        ; bug is therefore specific to _main → _write — same _write,
+        ; same args, different result based on the CALLER's runtime
+        ; address.
+        ;
+        ; The test was incompatible with echo (its _main+14 doesn't
+        ; contain a valid rel32 → call landed at garbage and faulted).
+        ; Removed; the [user-write] datum is preserved in commit
+        ; f2faf76's run logs.
 
         ; --- Call _main (mirrors codegen _start's call _main) ----
         mov     edx, _bridge_marker_premain
