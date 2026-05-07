@@ -54,26 +54,41 @@ jobs:
           import re, pathlib
           p = pathlib.Path("/tmp/dosbox-x/src/dos/dos.cpp")
           src = p.read_text()
-          # Insert log after the MEM_BlockRead call in case 0x40.
-          marker = "MEM_BlockRead(SegPhys(ds)+reg_dx,dos_copybuf,towrite);\n"
+          # Insert log after the DOS_WriteFile call in case 0x40
+          # (and one before MEM_BlockRead). Logs:
+          #   - Buffer source / first 16 bytes / towrite (pre-write)
+          #   - Resolved handle / file name / fWritten / final towrite (post)
+          marker = "if((fWritten = DOS_WriteFile(reg_bx, dos_copybuf, &towrite))) {"
           insertion = (
-              "MEM_BlockRead(SegPhys(ds)+reg_dx,dos_copybuf,towrite);\n"
-              "                LOG_MSG(\"AH=40 BX=%04x DX=%04x ECX=%08x DS=%04x SS=%04x SP=%04x \"\n"
-              "                    \"DS_lin=%08x DX_lin=%08x dos_copybuf[0..15]=\"\n"
-              "                    \"%02x %02x %02x %02x %02x %02x %02x %02x \"\n"
-              "                    \"%02x %02x %02x %02x %02x %02x %02x %02x towrite=%u\",\n"
-              "                    reg_bx, reg_dx, reg_ecx,\n"
-              "                    SegValue(ds), SegValue(ss), reg_sp,\n"
-              "                    SegPhys(ds), SegPhys(ds)+reg_dx,\n"
-              "                    dos_copybuf[0], dos_copybuf[1], dos_copybuf[2], dos_copybuf[3],\n"
-              "                    dos_copybuf[4], dos_copybuf[5], dos_copybuf[6], dos_copybuf[7],\n"
-              "                    dos_copybuf[8], dos_copybuf[9], dos_copybuf[10], dos_copybuf[11],\n"
-              "                    dos_copybuf[12], dos_copybuf[13], dos_copybuf[14], dos_copybuf[15],\n"
-              "                    (unsigned)towrite);\n"
+              "{ uint32_t _h = RealHandle(reg_bx); const char *_fn = \"<bad>\";\n"
+              "  if (_h < DOS_FILES && Files[_h]) _fn = Files[_h]->name.c_str();\n"
+              "  uint16_t _pre_towrite = towrite;\n"
+              "  fWritten = DOS_WriteFile(reg_bx, dos_copybuf, &towrite);\n"
+              "  LOG_MSG(\"AH=40 POST: BX=%04x handle=%u file=%s pre_towrite=%u post_towrite=%u fWritten=%d errcode=%u\",\n"
+              "      reg_bx, (unsigned)_h, _fn, (unsigned)_pre_towrite,\n"
+              "      (unsigned)towrite, (int)fWritten, (unsigned)dos.errorcode);\n"
+              "}\n"
+              "                        if (fWritten) {"
           )
           if marker not in src:
               raise SystemExit("marker not found — dos.cpp shape changed?")
           new_src = src.replace(marker, insertion, 1)
+
+          # Also insert pre-write log after MEM_BlockRead.
+          pre_marker = "MEM_BlockRead(SegPhys(ds)+reg_dx,dos_copybuf,towrite);\n"
+          pre_insertion = (
+              "MEM_BlockRead(SegPhys(ds)+reg_dx,dos_copybuf,towrite);\n"
+              "                LOG_MSG(\"AH=40 PRE: BX=%04x DX=%04x ECX=%08x DS=%04x SS=%04x SP=%04x \"\n"
+              "                    \"DS_lin=%08x dos_copybuf[0..7]=\"\n"
+              "                    \"%02x %02x %02x %02x %02x %02x %02x %02x towrite=%u\",\n"
+              "                    reg_bx, reg_dx, reg_ecx,\n"
+              "                    SegValue(ds), SegValue(ss), reg_sp,\n"
+              "                    SegPhys(ds),\n"
+              "                    dos_copybuf[0], dos_copybuf[1], dos_copybuf[2], dos_copybuf[3],\n"
+              "                    dos_copybuf[4], dos_copybuf[5], dos_copybuf[6], dos_copybuf[7],\n"
+              "                    (unsigned)towrite);\n"
+          )
+          new_src = new_src.replace(pre_marker, pre_insertion, 1)
           p.write_text(new_src)
           PYEOF
           # Show the patched section
