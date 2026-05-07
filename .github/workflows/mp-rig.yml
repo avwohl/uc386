@@ -149,6 +149,8 @@ jobs:
         # EIP-dependent behavior at high VAs). Best-effort — if
         # dos4gw.exe stub isn't available in this Watcom install,
         # the binding can fail and we just skip the comparison.
+        # Also copy dos4gw.exe alongside in case the bundled MZ
+        # stub just loads it from disk (some Watcom installs).
         continue-on-error: true
         run: |
           ls "$WATCOM/binw/" | grep -iE "dos4g|cwstub|pmodew" || true
@@ -156,8 +158,19 @@ jobs:
             addons/gnu/micropython/build/micropython.asm \
             -o addons/gnu/micropython/dosbox-x-rig/MP_DOS4G.EXE \
             --extender dos4g
+          # Drop dos4gw.exe in the rig dir in case the .exe needs it.
+          cp "$WATCOM/binw/dos4gw.exe" addons/gnu/micropython/dosbox-x-rig/
           ls -la addons/gnu/micropython/dosbox-x-rig/MP_DOS4G.EXE
+          ls -la addons/gnu/micropython/dosbox-x-rig/dos4gw.exe
           file addons/gnu/micropython/dosbox-x-rig/MP_DOS4G.EXE
+          # Also build echo with dos4g to verify dos4g works at all
+          # under the rig — if ECHO_DOS4G.EXE doesn't print "hello"
+          # then dos4g itself isn't viable here.
+          python -m addons.harness.exe \
+            addons/gnu/echo/main.c \
+            -o addons/gnu/micropython/dosbox-x-rig/ECHO_DOS4G.EXE \
+            --extender dos4g
+          ls -la addons/gnu/micropython/dosbox-x-rig/ECHO_DOS4G.EXE
 
       - name: Fetch NE2000.COM
         run: |
@@ -304,6 +317,8 @@ jobs:
               "after-mp marker" \
               "before-mp-dos4g marker" \
               "after-mp-dos4g marker" \
+              "before-echo-dos4g" \
+              "hello dos4g rig" \
               "MicroPython" \
               "10.0.2.15" \
               "'pktdrv'"; do

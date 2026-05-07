@@ -30,10 +30,21 @@ rem AH=40 passthrough reaches RIG.LOG" before we try MP.EXE.
 rem If this baseline doesn't print, the issue is the rig itself
 rem (DOSBox-X config, autoexec redirect, PMODE/W bridge); if it
 rem does print, MP.EXE-specific runtime is the next thing to dig.
-if not exist ECHOTEST.EXE goto :run_mp
+if not exist ECHOTEST.EXE goto :baseline_dos4g
 echo --- before-echo-baseline --- >> RIG.LOG
 ECHOTEST.EXE hello dos rig >> RIG.LOG
 echo --- after-echo-baseline --- >> RIG.LOG
+
+:baseline_dos4g
+rem Same printf-only smoke, but built with dos4g extender.
+rem If ECHO_DOS4G.EXE prints "hello dos4g rig", dos4g works under
+rem this rig. If not, dos4g isn't viable and the MP_DOS4G test
+rem below is meaningless (failure of MP_DOS4G could just be the
+rem extender, not the _main → _write bug).
+if not exist ECHO_DOS4G.EXE goto :run_mp
+echo --- before-echo-dos4g --- >> RIG.LOG
+ECHO_DOS4G.EXE hello dos4g rig >> RIG.LOG
+echo --- after-echo-dos4g --- >> RIG.LOG
 
 :run_mp
 rem Run MP_DOS4G.EXE FIRST (if it exists) so its result is visible
