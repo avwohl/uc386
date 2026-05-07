@@ -137,13 +137,16 @@ def _mangle_static_globals(unit, prefix: str) -> None:
     and rewrite intra-TU references to match. Walks the AST generically
     via dataclasses.fields to avoid maintaining a per-node-type table.
 
-    Lexical (no scope analysis): a nested local that shadows a static
-    global will get rewritten too. In practice this is rare in the
-    period codebases we care about (Doom, Duke3D, BWK awk) and the
-    rewrite is still semantics-preserving — the local just keeps the
-    same shadowing relationship to the renamed global. The scenario
-    that would break is a nested local with the static's name being
-    referenced elsewhere as a different symbol — not a thing in C."""
+    Scope-aware: when a function parameter or block-local variable
+    shadows a file-scope static, references within that scope refer
+    to the local, not the static — so we skip the rename. The
+    scenario that surfaced this requirement: crypto_misc.c declares
+    `static const uint8_t map[128]` (a base64 lookup table) and
+    includes py/obj.h's `static inline mp_map_slot_is_filled(const
+    mp_map_t *map, ...)` whose body references parameter `map`. A
+    naive lexical rewrite turns those parameter refs into the
+    file-scope byte array, breaking the inline at the type level.
+    """
     import dataclasses
 
     statics: set[str] = set()
@@ -154,30 +157,74 @@ def _mangle_static_globals(unit, prefix: str) -> None:
     if not statics:
         return
 
-    def rename(name: str) -> str:
-        return prefix + name if name in statics else name
+    def rename_in_scope(name: str, shadowed: frozenset[str]) -> str:
+        if name in statics and name not in shadowed:
+            return prefix + name
+        return name
 
-    def walk(node):
+    def walk(node, shadowed: frozenset[str]):
         if node is None:
             return
         if isinstance(node, list):
             for child in node:
-                walk(child)
+                walk(child, shadowed)
             return
         if not dataclasses.is_dataclass(node):
             return
-        # Identifier nodes: rewrite the .name field.
+
+        # FunctionDecl: rewrite the function's own name (rename
+        # respects shadowing, but at file scope nothing shadows yet),
+        # then push parameter names as shadow-set for the body.
+        if isinstance(node, ast_module.FunctionDecl):
+            node.name = rename_in_scope(node.name, shadowed)
+            param_names: set[str] = set()
+            params = getattr(node, "params", None) or []
+            for p in params:
+                pname = getattr(p, "name", None)
+                if pname:
+                    param_names.add(pname)
+                # Param's own type may reference statics (e.g.
+                # array-bound expr); walk it under the outer shadow set.
+                ptype = getattr(p, "type", None)
+                if ptype is not None:
+                    walk(ptype, shadowed)
+            new_shadowed = shadowed | frozenset(param_names)
+            body = getattr(node, "body", None)
+            if body is not None:
+                walk(body, new_shadowed)
+            return
+
+        # CompoundStmt / Block: collect VarDecls in this scope to
+        # extend the shadow set for siblings + nested scopes.
+        items = getattr(node, "items", None)
+        if items is not None and isinstance(node, ast_module.CompoundStmt):
+            local_shadow = set(shadowed)
+            for item in items:
+                if isinstance(item, ast_module.VarDecl) and item.name:
+                    # The decl itself is processed first under the
+                    # current shadow (so its initializer can still
+                    # reference the static if the local hasn't yet
+                    # been declared in source order).
+                    walk(item, frozenset(local_shadow))
+                    local_shadow.add(item.name)
+                else:
+                    walk(item, frozenset(local_shadow))
+            return
+
+        # Identifier: rewrite if it names a static and isn't shadowed.
         if isinstance(node, ast_module.Identifier):
-            node.name = rename(node.name)
-        # Top-level decls: rewrite their .name (Identifiers inside
-        # their bodies are handled by the generic recursion below).
-        if isinstance(node, (ast_module.VarDecl, ast_module.FunctionDecl)):
-            node.name = rename(node.name)
+            node.name = rename_in_scope(node.name, shadowed)
+
+        # Top-level VarDecl: rewrite its own name; recurse into
+        # initializer / type as usual.
+        if isinstance(node, ast_module.VarDecl):
+            node.name = rename_in_scope(node.name, shadowed)
+
         for f in dataclasses.fields(node):
-            walk(getattr(node, f.name, None))
+            walk(getattr(node, f.name, None), shadowed)
 
     for d in unit.declarations:
-        walk(d)
+        walk(d, frozenset())
 
 
 def main() -> int:

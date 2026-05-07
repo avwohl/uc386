@@ -3082,8 +3082,7 @@ def test_micropython_import_ssl(micropython_bin: Path) -> None:
 
 def test_micropython_ssl_context_construct(micropython_bin: Path) -> None:
     """SSLContext(PROTOCOL_TLS_CLIENT) should construct without
-    raising; verify_mode reads back as CERT_NONE (only supported
-    value in the axtls-backed implementation)."""
+    raising; verify_mode defaults to CERT_NONE."""
     sys.path.insert(0, str(REPO_ROOT / "src"))
     from uc386.dos_emu import run
 
@@ -3101,4 +3100,130 @@ def test_micropython_ssl_context_construct(micropython_bin: Path) -> None:
     assert res.error is None, f"dos_emu reported error: {res.error}"
     assert "CTX_MARK True" in res.stdout, (
         f"SSLContext construction failed: {res.stdout!r}"
+    )
+
+
+def test_micropython_ssl_verify_mode_settable(micropython_bin: Path) -> None:
+    """verify_mode is settable to CERT_REQUIRED; reads back the
+    stored value. Regression for the upstream-divergence in our
+    vendored modtls_axtls_uc386dos.c (upstream hard-codes the read
+    to CERT_NONE; we honor the field)."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    program = (
+        b"import ssl\n"
+        b"ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)\n"
+        b"ctx.verify_mode = ssl.CERT_REQUIRED\n"
+        b"print('VFY_MARK', ctx.verify_mode == ssl.CERT_REQUIRED)\n"
+        b"\x04"
+    )
+    res = run(micropython_bin,
+              stdin_bytes=program,
+              timeout_seconds=20.0,
+              instruction_limit=8_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert "VFY_MARK True" in res.stdout, (
+        f"verify_mode round-trip failed: {res.stdout!r}"
+    )
+
+
+# Mozilla CA root: ISRG Root X1 (Let's Encrypt). Small, well-known,
+# expires 2035 — long-lived enough that this test won't decay quickly.
+# axtls parses PEM by stripping the BEGIN/END markers and base64-decoding
+# the body; the inner DER must be valid X.509.
+ISRG_ROOT_X1_PEM = b"""\
+-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+"""
+
+
+def test_micropython_ssl_load_verify_locations(micropython_bin: Path) -> None:
+    """load_verify_locations(cadata=...) should accept a real
+    PEM-encoded CA root (ISRG Root X1). Exercises axtls's
+    ssl_obj_memory_load(SSL_OBJ_X509_CACERT, ...) — gated on
+    CONFIG_SSL_HAS_PEM=1 + CONFIG_SSL_CERT_VERIFICATION=1, both
+    flipped by fetch.sh's patch_axtls_config_verify hook."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    pem_bytes = ISRG_ROOT_X1_PEM
+    program = (
+        b"import ssl\n"
+        b"ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)\n"
+        b"ctx.verify_mode = ssl.CERT_REQUIRED\n"
+        b"pem = " + repr(pem_bytes).encode("ascii") + b"\n"
+        b"ctx.load_verify_locations(cadata=pem)\n"
+        b"print('CA_MARK', ctx.verify_mode == ssl.CERT_REQUIRED)\n"
+        b"\x04"
+    )
+    res = run(micropython_bin,
+              stdin_bytes=program,
+              timeout_seconds=30.0,
+              instruction_limit=20_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert "CA_MARK True" in res.stdout, (
+        f"load_verify_locations failed: {res.stdout!r}"
+    )
+
+
+def test_micropython_ssl_load_verify_locations_requires_cadata(micropython_bin: Path) -> None:
+    """load_verify_locations() with no cadata raises TypeError — our
+    modtls glue requires explicit data (cafile= isn't supported in
+    DOS without a VFS bridge to axtls). Exercises the parameter
+    validation path before any axtls call.
+    """
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    program = (
+        b"import ssl\n"
+        b"ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)\n"
+        b"try:\n"
+        b"    ctx.load_verify_locations()\n"
+        b"    print('NO_RAISE')\n"
+        b"except (TypeError, OSError):\n"
+        b"    print('RAISED_OK')\n"
+        b"\n"
+        b"\x04\x04"
+    )
+    res = run(micropython_bin,
+              stdin_bytes=program,
+              timeout_seconds=20.0,
+              instruction_limit=8_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert "RAISED_OK" in res.stdout, (
+        f"missing-cadata didn't raise: {res.stdout!r}"
     )

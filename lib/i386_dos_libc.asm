@@ -577,6 +577,30 @@ _strlen:
         pop     ebp
         ret
 
+; ---- strnlen ---------------------------------------------------------------
+; size_t strnlen(const char *s, size_t maxlen)
+;   Length of s but capped at maxlen. Used by axtls's x509.c when
+;   CONFIG_SSL_CERT_VERIFICATION is on (DNS-name SAN extraction).
+_strnlen:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        mov     esi, [ebp + 8]              ; s
+        mov     ecx, [ebp + 12]             ; maxlen
+        xor     eax, eax
+.l:
+        cmp     eax, ecx
+        je      .d                          ; hit cap
+        cmp     byte [esi + eax], 0
+        je      .d                          ; hit NUL
+        inc     eax
+        jmp     .l
+.d:
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
 ; ---- strcmp ----------------------------------------------------------------
 _strcmp:
         push    ebp
@@ -4274,81 +4298,19 @@ _access:
         pop     ebp
         ret
 
-; ---- time / clock: return a counter that increments per call ----------------
+; clock(): coarse counter that increments per call. Used by stdlib
+; benchmarks; not tied to wall time. Real time() / mktime() /
+; gettimeofday() live in addons/gnu/micropython/uc386-dos/
+; time_real_uc386dos.c, which reads INT 21h AH=0x2A/0x2C via
+; _dos_get_datetime and converts via Howard Hinnant's days-from-civil
+; algorithm. axtls's cert-verification path needs real epoch math,
+; which is more than makes sense in asm.
         section .data
-_time_counter:  dd 0
+_clock_counter: dd 0
         section .text
-_time:
-        mov     eax, [_time_counter]
-        inc     dword [_time_counter]
-        ; If t is non-null, write counter there.
-        mov     ecx, [esp + 4]
-        test    ecx, ecx
-        jz      .skip
-        mov     [ecx], eax
-.skip:
-        ret
 _clock:
-        mov     eax, [_time_counter]
-        inc     dword [_time_counter]
-        ret
-
-; time_t mktime(struct tm *tm)
-;   Calendar time → epoch seconds. Real ports want real conversion;
-;   uc386's libc returns a deterministic-but-not-meaningful 0 because
-;   the only callers we ship are axtls's asn1_get_utc_time (cert
-;   notBefore/notAfter parsing — unused with CONFIG_SSL_CERT_VERIFICATION
-;   off) and modtime's time.mktime (which actually goes through
-;   shared/timeutils/timeutils_mktime, not this libc function). When
-;   real cert validation lands, replace this with a Howard Hinnant
-;   "days from civil" algorithm.
-_mktime:
-        xor     eax, eax
-        ret
-
-; int gettimeofday(struct timeval *tv, void *tz)
-;   Fills tv->tv_sec / tv->tv_usec from the BIOS tick counter
-;   (INT 1Ah AH=0). Each tick is ~54.925 ms (PIT 1193180 / 65536).
-;   tv_sec  = ticks * 65536 / 1193180   (≈ ticks / 18)
-;   tv_usec = (ticks % 18) * 54925
-;   Used by axtls for RNG seeding; precision doesn't matter — the
-;   only requirement is that successive calls return different
-;   values, which the BIOS counter guarantees. tz is ignored.
-;   Returns 0 always.
-_gettimeofday:
-        push    ebp
-        mov     ebp, esp
-        push    ebx
-        push    esi
-        push    edi
-        ; Read BIOS ticks → EAX
-        xor     eax, eax
-        int     0x1A
-        movzx   esi, cx
-        shl     esi, 16
-        movzx   edi, dx
-        or      esi, edi              ; ESI = ticks (32-bit)
-        mov     edi, [ebp + 8]        ; tv pointer
-        test    edi, edi
-        jz      .done
-        ; tv_sec = ticks / 18  (close enough to the real ~18.20649)
-        mov     eax, esi
-        xor     edx, edx
-        mov     ecx, 18
-        div     ecx                   ; EAX=quot, EDX=rem
-        mov     [edi], eax            ; tv_sec
-        ; tv_usec = rem * 54925       (54.925 ms = 54925 us)
-        mov     eax, edx
-        mov     ecx, 54925
-        mul     ecx                   ; EAX = rem * 54925 (fits in 32 bits)
-        mov     [edi + 4], eax        ; tv_usec
-.done:
-        xor     eax, eax              ; return 0
-        pop     edi
-        pop     esi
-        pop     ebx
-        mov     esp, ebp
-        pop     ebp
+        mov     eax, [_clock_counter]
+        inc     dword [_clock_counter]
         ret
 
 ; uint32_t bios_ticks(void) — INT 1Ah AH=00h, returns the BIOS

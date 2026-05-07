@@ -160,6 +160,48 @@ patch_main_startup_markers() {
     ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
 }
 
+# Patch upstream/extmod/axtls-include/config.h to flip CONFIG_SSL_HAS_PEM
+# and CONFIG_SSL_CERT_VERIFICATION from undef to defined. Upstream MP
+# ports compile axtls in skeleton mode without verification because
+# CA bundles don't fit on most embedded targets; uc386-dos has the
+# room and wants real authentication. The flips engage axtls's
+# x509_dn_compare / signature checking / notBefore-notAfter window
+# checks and make `ssl.SSLContext.load_verify_locations` meaningful.
+# Idempotent: leaves the flips in place once applied.
+patch_axtls_config_verify() {
+    F="upstream/extmod/axtls-include/config.h"
+    if [ ! -f "$F" ]; then return 0; fi
+    if grep -q "^#define CONFIG_SSL_CERT_VERIFICATION 1$" "$F"; then
+        return 0
+    fi
+    echo "micropython: enabling axtls cert verification + PEM in $F …"
+    sed -i.bak \
+        -e 's|^#undef CONFIG_SSL_HAS_PEM$|#define CONFIG_SSL_HAS_PEM 1|' \
+        -e 's|^#undef CONFIG_SSL_CERT_VERIFICATION$|#define CONFIG_SSL_CERT_VERIFICATION 1|' \
+        "$F"
+    rm -f "$F.bak"
+}
+
+# Add `#include <endian.h>` at the top of upstream/extmod/axtls-include/
+# axtls_os_port.h. axtls's sha512.c uses be64toh() but doesn't include
+# the header itself — on Linux glibc's <sys/time.h> transitively pulls
+# in endian.h, on uc386's libc it doesn't. Adding the include via
+# axtls_os_port.h (which every axtls TU pulls through os_port.h) is
+# the minimal-blast-radius fix. Idempotent.
+patch_axtls_endian_include() {
+    F="upstream/extmod/axtls-include/axtls_os_port.h"
+    if [ ! -f "$F" ]; then return 0; fi
+    if grep -q "<endian.h>" "$F"; then
+        return 0
+    fi
+    echo "micropython: adding endian.h include to $F …"
+    sed -i.bak \
+        's|^#include <errno.h>$|#include <errno.h>\
+#include <endian.h>|' \
+        "$F"
+    rm -f "$F.bak"
+}
+
 if [ -d upstream ]; then
     echo "micropython: upstream/ already present — skipping main fetch."
     fetch_b_con_crypto
@@ -167,6 +209,8 @@ if [ -d upstream ]; then
     fetch_axtls
     patch_modlwip_loopback_poll
     patch_main_startup_markers
+    patch_axtls_config_verify
+    patch_axtls_endian_include
     exit 0
 fi
 
@@ -191,3 +235,4 @@ fetch_lwip
 fetch_axtls
 patch_modlwip_loopback_poll
 patch_main_startup_markers
+patch_axtls_config_verify

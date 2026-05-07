@@ -1,4 +1,4 @@
-# MicroPython port — status: **full REPL @ EXTRA_FEATURES + lwIP DHCP + Crynwr packet-driver path + axtls TLS** (2026-05-07)
+# MicroPython port — status: **full REPL @ EXTRA_FEATURES + lwIP DHCP + Crynwr packet-driver path + axtls TLS w/ cert verification** (2026-05-07)
 
 **Upstream**: https://github.com/micropython/micropython
 **License**: MIT
@@ -141,47 +141,62 @@ What works (70 smoke tests pin the core wins):
 
 - `import ssl` (and `import tls` — same module under both names)
   — full TLSv1 client + server via axtls (upstream/lib/axtls/,
-  pinned to micropython/axtls @ 531cab9c). 13 axtls source files
+  pinned to micropython/axtls @ 531cab9c). 15 axtls source files
   compile clean through uc386 (ssl/{asn1,loader,tls1,tls1_svr,
-  tls1_clnt,x509}.c + crypto/{aes,bigint,crypto_misc,hmac,md5,rsa,
-  sha1}.c). Library size: +36 KB on top of pre-SSL. The MP glue is
-  upstream's `extmod/modtls_axtls.c` — exposes `ssl.SSLContext`,
-  `ssl.PROTOCOL_TLS_CLIENT`, `ssl.CERT_NONE`, `SSLContext.wrap_socket`,
-  `load_cert_chain`. Import + SSLContext construction smoke-tested
-  in `test_micropython_smoke.py::test_micropython_import_ssl` and
-  `::test_micropython_ssl_context_construct`.
+  tls1_clnt,x509}.c + crypto/{aes,bigint,crypto_misc,hmac,md5,sha1,
+  sha384,sha512,rsa}.c). Library size: ~+50 KB on top of pre-SSL.
+  The MP glue is `uc386-dos/modtls_axtls_uc386dos.c` — a fork of
+  upstream's `extmod/modtls_axtls.c` that adds **real cert
+  verification**: settable `verify_mode`, `SSLContext.load_verify_locations`,
+  drop of `SSL_SERVER_VERIFY_LATER` when `CERT_REQUIRED`. Exposes
+  `ssl.SSLContext`, `ssl.PROTOCOL_TLS_CLIENT/SERVER`, `ssl.CERT_NONE`,
+  `ssl.CERT_REQUIRED`, `SSLContext.wrap_socket`, `.load_cert_chain`,
+  `.load_verify_locations(cadata=...)`, `.verify_mode` (read+write).
 
   axtls's I/O is wired through `extmod/axtls-include/axtls_os_port.h`
   to `mp_stream_posix_read/write` (gated on `MICROPY_STREAMS_POSIX_API=1`,
   flipped in `uc386-dos/mpconfigport.h`), so reads/writes traverse
   the underlying lwIP socket via the standard stream protocol — no
-  separate BIO needed. Required additions to support the build:
-    - `lib/include/arpa/inet.h` (htonl/ntohl/htons/ntohs)
-    - `lib/include/sys/time.h` (struct timeval, gettimeofday decl)
-    - `lib/i386_dos_libc.asm`: `_gettimeofday` (BIOS-tick-derived
-      tv_sec/tv_usec for axtls's RNG seeding), `_rand_r` (POSIX
-      reentrant LCG that axtls's RNG_initialize uses to stir the
-      entropy pool when /dev/urandom is unavailable), and `_mktime`
-      (stub returning 0 — axtls's `asn1_get_utc_time` calls it for
-      cert notBefore/notAfter parsing, but with
-      `CONFIG_SSL_CERT_VERIFICATION` off the result is unused).
-    - `EWOULDBLOCK` alias to `EAGAIN` in `lib/include/errno.h`.
+  separate BIO needed.
 
-  Cert verification is **off** (CONFIG_SSL_CERT_VERIFICATION undef
-  in `extmod/axtls-include/config.h`): a TLS handshake against any
-  server will succeed regardless of certificate identity. This
-  matches upstream MP's posture on resource-constrained ports
-  (esp32 etc. where a CA bundle won't fit). Enabling verification
-  needs (a) opting in via the flag, (b) real `time()` from the DOS
-  RTC, (c) a CA bundle baked into the image, (d) real `mktime()`.
-  All four are mechanical; not blockers.
+  Cert verification is **on** —
+  `CONFIG_SSL_CERT_VERIFICATION=1` and `CONFIG_SSL_HAS_PEM=1` are
+  flipped by `fetch.sh`'s `patch_axtls_config_verify` post-fetch
+  hook (idempotent sed against `upstream/extmod/axtls-include/
+  config.h`). With `verify_mode=CERT_REQUIRED`, axtls's
+  `x509_verify` runs during the handshake and fails it on chain
+  validation errors. Required additions:
+    - `lib/include/arpa/inet.h` (htonl/ntohl/htons/ntohs).
+    - `lib/include/sys/time.h` (struct timeval).
+    - `lib/i386_dos_libc.asm`: `_rand_r` (POSIX reentrant LCG —
+      axtls's RNG_initialize stirs the entropy pool with it),
+      `_strnlen` (axtls's x509.c uses it for SAN DNS-name length
+      capping). `_time`, `_mktime`, `_gettimeofday` are now in
+      `uc386-dos/time_real_uc386dos.c` (real DOS RTC + Howard
+      Hinnant days-from-civil epoch math) — the libc stubs were
+      removed because cert verification needs real epoch values
+      to compare against the parsed notBefore/notAfter window.
+    - `EWOULDBLOCK` alias in `lib/include/errno.h`.
+    - **uc386 fix in `_mangle_static_globals`**: the multi-TU
+      static-globals mangler was lexical-only, so a header's
+      static inline parameter named `map` got rewritten to point
+      at crypto_misc.c's `static const uint8_t map[128]` (the
+      base64 decode table), turning a `mp_map_t *` arg into a
+      `char[]`. Now scope-aware: parameter names and block-locals
+      shield references from the rename.
+
+  CA bundle: shipped per-context via Python (`load_verify_locations(
+  cadata=PEM_BYTES)`). No system-wide bundle is baked in — pass the
+  bytes you trust. The `test_micropython_ssl_load_verify_locations`
+  smoke test exercises this with the ISRG Root X1 PEM as a known-good
+  example.
 
   End-to-end TLS handshake (the actual cipher exchange + record
-  stream) needs lwIP routed to the network — the QEMU+FreeDOS rig
-  with NE2000+SLIRP is the closest local proxy for that. The
-  REPL itself can `import ssl; ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)`
-  cleanly today; the wire-level test is a runtime task tied to the
-  FreeDOS-in-VMware milestone, not the library bringup.
+  stream) still needs lwIP routed to the network — the QEMU+FreeDOS
+  rig with NE2000+SLIRP is the closest local proxy for that. Library-
+  level tests (import, SSLContext construction, verify_mode
+  round-trip, load_verify_locations parse-success and parse-failure)
+  pass under dos_emu without a network rig.
 
 What doesn't work yet (separate gates, pinned in mpconfigport.h):
 

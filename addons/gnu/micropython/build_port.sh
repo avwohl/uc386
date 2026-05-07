@@ -116,10 +116,12 @@ SOURCES_FILE="build/_port_sources.txt"
     # lwIP — IPv4-only TCP/UDP/DNS stack with loopback for testing.
     # Phase 1: just core + ipv4 + netif/ethernet. DHCP / IPv6 / SLIP /
     # PPP are off in lwipopts.h so their sources don't pull in.
-    # axtls — real TLS via upstream/lib/axtls/. modtls_axtls.c is
-    # the MP glue (gated on MICROPY_PY_SSL && MICROPY_SSL_AXTLS).
-    # Sources mirror upstream/extmod/extmod.mk's AXTLS_DIR list.
-    echo upstream/extmod/modtls_axtls.c
+    # axtls — real TLS via upstream/lib/axtls/. The MP glue is our
+    # vendored fork at uc386-dos/modtls_axtls_uc386dos.c (which adds
+    # real verify_mode + load_verify_locations on top of upstream's
+    # minimal version). axtls library sources mirror upstream/extmod/
+    # extmod.mk's AXTLS_DIR list.
+    echo uc386-dos/modtls_axtls_uc386dos.c
     echo upstream/lib/axtls/ssl/asn1.c
     echo upstream/lib/axtls/ssl/loader.c
     echo upstream/lib/axtls/ssl/tls1.c
@@ -132,6 +134,13 @@ SOURCES_FILE="build/_port_sources.txt"
     echo upstream/lib/axtls/crypto/hmac.c
     echo upstream/lib/axtls/crypto/md5.c
     echo upstream/lib/axtls/crypto/sha1.c
+    # SHA384/SHA512 — needed for cert chain verification when the CA
+    # signs with those algorithms (RSA-SHA384 / RSA-SHA512 are common
+    # on modern X.509 chains). Upstream MP's extmod.mk doesn't pull
+    # these because their config has CONFIG_SSL_CERT_VERIFICATION
+    # off; we have it on (uc386-dos has the room) so we need them.
+    echo upstream/lib/axtls/crypto/sha384.c
+    echo upstream/lib/axtls/crypto/sha512.c
     echo upstream/lib/axtls/crypto/rsa.c
     echo upstream/extmod/modlwip.c
     echo upstream/lib/lwip/src/core/init.c
@@ -174,6 +183,10 @@ SOURCES_FILE="build/_port_sources.txt"
     echo uc386-dos/uc386_net_uc386dos.c
     echo uc386-dos/pktdrv_uc386dos.c
     echo uc386-dos/math_gamma.c
+    # Real time(), mktime(), gettimeofday() backed by the DOS RTC —
+    # replaces the libc.asm stubs (now removed). Required by axtls
+    # cert verification (notBefore/notAfter window check).
+    echo uc386-dos/time_real_uc386dos.c
 } > "$SOURCES_FILE"
 
 n_sources="$(wc -l < "$SOURCES_FILE")"
