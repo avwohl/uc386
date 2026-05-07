@@ -114,6 +114,7 @@ _bridge_marker_dump_writeaddr: db "[write_addr]=", 0
 _bridge_marker_dump_write0: db "[write+0]=", 0
 _bridge_marker_dump_write4: db "[write+4]=", 0
 _bridge_marker_dump_stackwrite: db "[stack-write]=", 0
+_bridge_marker_dump_esp: db "[esp]=", 0
 _bridge_hex_buf:           times 12 db 0    ; 8 hex chars + LF + slack
 
         section _TEXT use32 class=CODE
@@ -548,6 +549,13 @@ _pmodew_start:
         push    1
         call    _bridge_write_stack
         add     esp, 12
+
+        ; Dump ESP (after all the diagnostic pushes/pops finished)
+        ; so we know where main's stack will land.
+        mov     edx, _bridge_marker_dump_esp
+        call    _bridge_emit_str0
+        mov     eax, esp
+        call    _bridge_emit_hex32
 
         ; --- Call _main (mirrors codegen _start's call _main) ----
         mov     edx, _bridge_marker_premain
