@@ -1,18 +1,32 @@
 name: dosbox-x-bug
 
-# Standalone end-to-end demo of the DOSBox-X PMODE/W INT 21h
-# AH=0x40 caller-EIP-dependent bug. Builds a tiny PMWBUG.EXE
-# (no uc386, no MicroPython, no exe.py bridge — just nasm +
-# wlink + the bundled PMODE/W stub), runs it under both
-# DOSBox-X and QEMU+FreeDOS, and diffs the captured stdout.
+# End-to-end demo of the DOSBox-X PMODE/W INT 21h AH=0x40
+# caller-state-dependent bug. Builds MP.EXE (the canonical
+# reproducer — minimal NASM-only repros so far don't trigger
+# the bug; see addons/gnu/micropython/dosbox-x-rig/pmwbug/
+# README.md for the bisect log) and runs it under DOSBox-X
+# vs classic DOSBox 0.74-3 vs QEMU+FreeDOS.
 #
-# The diff IS the proof: same binary, same input, same DOS
-# call, two different outputs. Under DOSBox-X the high-CS:EIP
-# call writes NUL bytes; under QEMU+FreeDOS (the actual
-# production target — FreeDOS in VMware on Windows) it works.
+# Trigger conditions (bisected on macOS DOSBox-X 2026.05.02):
+#   - DOSBox-X config drives MP.EXE via [autoexec] section
+#   - autoexec ends with `exit` immediately after MP.EXE (or
+#     a single non-echo command + exit)
+#   - core=normal cputype=pentium memsize=16
 #
-# Designed to be the artifact attached to the upstream
-# joncampbell123/dosbox-x bug report.
+# When triggered: MP.EXE's `_main → _write` (a normal cdecl
+# call to a wrapper around `INT 21h AH=0x40 BX=1`) writes
+# zero bytes to the redirected file. Earlier `INT 21h AH=0x40`
+# calls from the bridge stub (low CS:EIP) work correctly with
+# the SAME args.
+#
+# When NOT triggered (e.g., autoexec has more commands, no
+# exit, or different shell context): MP.EXE runs to its REPL.
+#
+# Same MP.EXE under classic DOSBox 0.74-3 or QEMU+FreeDOS
+# always works, regardless of autoexec layout.
+#
+# This workflow is independent of mp-rig.yml (which has full
+# NE2000+SLIRP rig). Here we just need the bug — no networking.
 
 on:
   push:
@@ -30,7 +44,7 @@ on:
 jobs:
   bug-demo:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - name: Set up Python
@@ -72,152 +86,146 @@ jobs:
           file PMWBUG.EXE
           ls -la PMWBUG.EXE
 
-      - name: Build PMWBUG2.EXE (MP.EXE-shaped, exe.py bridge)
-        # Build a 2-obj LE that mirrors MP.EXE's structure:
-        # bridge.obj (with diagnostic markers) + user.obj
-        # (minimal _main + _write at high VA). This is the
-        # SHAPE that triggers the bug in MP.EXE.
+      - name: Fetch MP.EXE from latest mp-rig artifact
+        # MP.EXE reliably triggers the bug with the right
+        # autoexec; minimal NASM repros don't (yet — open
+        # question what specifically about MP.EXE makes it
+        # fire). Pull the binary from mp-rig.yml's most-recent
+        # successful run so we don't have to rebuild it
+        # (rebuild = ~85 min on CI).
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          python -m addons.harness.exe \
-              addons/gnu/micropython/dosbox-x-rig/pmwbug/pmwbug_user.asm \
-              -o addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG2.EXE
-          ls -la addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG2.EXE
-          file addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG2.EXE
+          # Find latest mp-rig run that uploaded mp-rig-artifacts.
+          run_id=$(gh run list --workflow=mp-rig.yml \
+              --status=completed \
+              --limit=10 \
+              --json databaseId,conclusion \
+              --jq 'map(select(.conclusion=="success" or .conclusion=="failure")) | .[0].databaseId')
+          if [ -z "$run_id" ]; then
+              echo "No mp-rig run found — skipping MP.EXE bug demo"
+              exit 0
+          fi
+          echo "Pulling MP.EXE from mp-rig run $run_id"
+          mkdir -p /tmp/mp-rig-artifacts
+          gh run download "$run_id" \
+              --name mp-rig-artifacts \
+              --dir /tmp/mp-rig-artifacts || \
+              { echo "Artifact pull failed; skipping"; exit 0; }
+          find /tmp/mp-rig-artifacts -name "MP.EXE" -exec cp {} /tmp/MP.EXE \;
+          ls -la /tmp/MP.EXE
+          file /tmp/MP.EXE
 
-      - name: Run PMWBUG.EXE under DOSBox-X
-        # Expected: only the low-CS:EIP line prints; high-CS:EIP
-        # call produces NUL bytes (or simply nothing visible).
+      - name: Run MP.EXE under DOSBox-X (bug-triggering config)
+        # The exact bisected trigger: autoexec runs MP.EXE then
+        # exits. With a redirect, `MP.EXE > OUT.TXT` is followed
+        # ONLY by `exit` — no other commands.
         run: |
-          mkdir -p /tmp/dosbox-x-rig
-          cp addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG.EXE \
-              /tmp/dosbox-x-rig/PMWBUG.EXE
-          cp addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG2.EXE \
-              /tmp/dosbox-x-rig/PMWBUG2.EXE
-          cat > /tmp/dosbox-x-rig/dosbox-x.conf << 'EOF'
+          if [ ! -f /tmp/MP.EXE ]; then
+              echo "MP.EXE not available — skipping"
+              exit 0
+          fi
+          mkdir -p /tmp/dx
+          cp /tmp/MP.EXE /tmp/dx/MP.EXE
+          cat > /tmp/dx/dosbox-x.conf << 'EOF'
           [cpu]
           cputype = pentium
           core    = normal
           cycles  = max
           [dosbox]
           memsize = 16
-          [sdl]
-          autolock = false
-          waitonerror = false
+
+          [autoexec]
+          mount C /tmp/dx
+          C:
+          MP.EXE > MPOUT.TXT
+          exit
           EOF
-          cat > /tmp/dosbox-x-rig/autoexec.bat << 'EOF'
-          @echo off
-          echo === DOSBox-X bug demo ===
-          PMWBUG.EXE > OUT.TXT
-          echo --- captured PMWBUG.EXE output (xxd-style) ---
-          DEBUG OUT.TXT > NUL
-          type OUT.TXT
-          echo === finished ===
-          EOF
-          # Note: DOSBox-X has a -silent option but its output
-          # path differs across versions; -silent + -fastlaunch
-          # is the safest combination on apt-installed builds.
-          timeout 60 dosbox-x \
+          # SDL_VIDEODRIVER=dummy keeps headless runners happy.
+          SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+              timeout 60 dosbox-x \
               -silent \
-              -fastlaunch \
-              -conf /tmp/dosbox-x-rig/dosbox-x.conf \
-              -c "mount c /tmp/dosbox-x-rig" \
-              -c "c:" \
-              -c "PMWBUG.EXE > OUT.TXT" \
-              -c "PMWBUG2.EXE > OUT2.TXT" \
-              -c "exit" \
+              -conf /tmp/dx/dosbox-x.conf \
               > /tmp/dosbox-x-stdout.log 2>&1 || true
-          echo "--- DOSBox-X stdout ---"
-          cat /tmp/dosbox-x-stdout.log || true
-          echo
-          echo "--- captured PMWBUG.EXE OUT.TXT (xxd) ---"
-          if [ -f /tmp/dosbox-x-rig/OUT.TXT ]; then
-              xxd /tmp/dosbox-x-rig/OUT.TXT
-              cp /tmp/dosbox-x-rig/OUT.TXT /tmp/dosbox-x-OUT.TXT
+          echo "=== MPOUT.TXT (DOSBox-X) — bytes & xxd dump ==="
+          if [ -f /tmp/dx/MPOUT.TXT ]; then
+              wc -c /tmp/dx/MPOUT.TXT
+              xxd /tmp/dx/MPOUT.TXT
+              cp /tmp/dx/MPOUT.TXT /tmp/dosbox-x-MPOUT.TXT
           else
-              echo "(OUT.TXT not produced)"
-          fi
-          echo
-          echo "--- captured PMWBUG2.EXE OUT2.TXT (xxd) ---"
-          if [ -f /tmp/dosbox-x-rig/OUT2.TXT ]; then
-              xxd /tmp/dosbox-x-rig/OUT2.TXT
-              cp /tmp/dosbox-x-rig/OUT2.TXT /tmp/dosbox-x-OUT2.TXT
-          else
-              echo "(OUT2.TXT not produced)"
+              echo "(MPOUT.TXT not produced)"
           fi
 
-      - name: Run PMWBUG.EXE under classic DOSBox 0.74-3
-        # Expected: BOTH lines print correctly.
+      - name: Run MP.EXE under classic DOSBox 0.74-3
+        # Same autoexec, same MP.EXE. Classic DOSBox should
+        # produce the full output through the REPL banner.
         run: |
-          mkdir -p /tmp/dosbox-classic
-          cp addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG.EXE \
-              /tmp/dosbox-classic/PMWBUG.EXE
-          cp addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG2.EXE \
-              /tmp/dosbox-classic/PMWBUG2.EXE
-          cat > /tmp/dosbox-classic.conf << 'EOF'
+          if [ ! -f /tmp/MP.EXE ]; then
+              echo "MP.EXE not available — skipping"
+              exit 0
+          fi
+          mkdir -p /tmp/dc
+          cp /tmp/MP.EXE /tmp/dc/MP.EXE
+          cat > /tmp/dc/dosbox.conf << 'EOF'
           [cpu]
           cputype = pentium
           core    = normal
           cycles  = max
           [dosbox]
           memsize = 16
+
+          [autoexec]
+          mount C /tmp/dc
+          C:
+          MP.EXE > MPOUT.TXT
+          exit
           EOF
-          timeout 60 dosbox \
-              -conf /tmp/dosbox-classic.conf \
-              -c "mount c /tmp/dosbox-classic" \
-              -c "c:" \
-              -c "PMWBUG.EXE > OUT.TXT" \
-              -c "PMWBUG2.EXE > OUT2.TXT" \
-              -c "exit" \
+          SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+              timeout 60 dosbox \
+              -conf /tmp/dc/dosbox.conf \
               > /tmp/dosbox-classic-stdout.log 2>&1 || true
-          echo "--- captured PMWBUG.EXE OUT.TXT (xxd) ---"
-          if [ -f /tmp/dosbox-classic/OUT.TXT ]; then
-              xxd /tmp/dosbox-classic/OUT.TXT
-              cp /tmp/dosbox-classic/OUT.TXT /tmp/dosbox-classic-OUT.TXT
+          echo "=== MPOUT.TXT (classic DOSBox) — bytes & xxd dump ==="
+          if [ -f /tmp/dc/MPOUT.TXT ]; then
+              wc -c /tmp/dc/MPOUT.TXT
+              xxd /tmp/dc/MPOUT.TXT | head -50
+              cp /tmp/dc/MPOUT.TXT /tmp/dosbox-classic-MPOUT.TXT
           else
-              echo "(OUT.TXT not produced)"
-          fi
-          echo
-          echo "--- captured PMWBUG2.EXE OUT2.TXT (xxd) ---"
-          if [ -f /tmp/dosbox-classic/OUT2.TXT ]; then
-              xxd /tmp/dosbox-classic/OUT2.TXT
-              cp /tmp/dosbox-classic/OUT2.TXT /tmp/dosbox-classic-OUT2.TXT
-          else
-              echo "(OUT2.TXT not produced)"
+              echo "(MPOUT.TXT not produced)"
           fi
 
-      - name: Run PMWBUG.EXE under QEMU+FreeDOS
-        # Expected: BOTH lines print correctly. Same as classic
-        # DOSBox but with a real FreeDOS kernel — closer to the
-        # production target.
+      - name: Run MP.EXE under QEMU+FreeDOS
+        # The actual production target. Should also produce
+        # the full REPL banner.
         run: |
-          # Fetch FreeDOS minimal boot floppy.
+          if [ ! -f /tmp/MP.EXE ]; then
+              echo "MP.EXE not available — skipping"
+              exit 0
+          fi
           wget -q "https://raw.githubusercontent.com/codercowboy/freedosbootdisks/master/bootdisks/freedos.boot.disk.1.4MB.img" \
               -O /tmp/freedos.img
-          cp /tmp/freedos.img /tmp/pmwbug.img
-          mcopy -i /tmp/pmwbug.img -o \
-              addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG.EXE ::PMWBUG.EXE
+          cp /tmp/freedos.img /tmp/qd.img
+          mcopy -i /tmp/qd.img -o /tmp/MP.EXE ::MP.EXE
           {
               printf '@echo off\r\n'
               printf 'CTTY COM1\r\n'
-              printf 'echo === QEMU+FreeDOS bug demo ===\r\n'
-              printf 'PMWBUG.EXE\r\n'
+              printf 'echo === before MP.EXE ===\r\n'
+              printf 'MP.EXE\r\n'
               printf 'echo === finished ===\r\n'
           } > /tmp/AUTOEXEC.BAT
-          mcopy -i /tmp/pmwbug.img -o /tmp/AUTOEXEC.BAT ::AUTOEXEC.BAT
-          mdir -i /tmp/pmwbug.img ::
+          mcopy -i /tmp/qd.img -o /tmp/AUTOEXEC.BAT ::AUTOEXEC.BAT
 
           qemu-system-i386 \
               -display none \
               -serial stdio \
-              -fda /tmp/pmwbug.img \
+              -fda /tmp/qd.img \
               -boot a \
               -m 16 \
               -no-reboot \
               < /dev/null > /tmp/qemu-OUT.txt 2>&1 &
           QEMU_PID=$!
-          for i in $(seq 1 60); do
+          for i in $(seq 1 90); do
               sleep 1
-              if grep -q "=== finished ===" /tmp/qemu-OUT.txt 2>/dev/null; then
+              if grep -q "MicroPython" /tmp/qemu-OUT.txt 2>/dev/null; then
                   break
               fi
               if ! kill -0 $QEMU_PID 2>/dev/null; then
@@ -228,61 +236,50 @@ jobs:
           sleep 1
           kill -KILL $QEMU_PID 2>/dev/null || true
           wait $QEMU_PID 2>/dev/null || true
+          echo "=== qemu-OUT.txt — head & MicroPython grep ==="
+          wc -c /tmp/qemu-OUT.txt
+          head -60 /tmp/qemu-OUT.txt | tail -40
+          echo
+          if grep -q "MicroPython" /tmp/qemu-OUT.txt; then
+              echo "QEMU+FreeDOS: PASS — MicroPython REPL reached"
+          else
+              echo "QEMU+FreeDOS: MISS — REPL banner not found"
+          fi
 
-          echo "--- QEMU stdout (xxd) ---"
-          xxd /tmp/qemu-OUT.txt | head -40
-
-      - name: Compare outputs (the diff IS the proof)
+      - name: Verdict
         run: |
-          echo "=============================="
-          echo "DOSBox-X output:"
-          echo "=============================="
-          if [ -f /tmp/dosbox-x-OUT.TXT ]; then
-              xxd /tmp/dosbox-x-OUT.TXT
+          echo "==========================="
+          echo "DOSBox-X output size:"
+          if [ -f /tmp/dosbox-x-MPOUT.TXT ]; then
+              wc -c /tmp/dosbox-x-MPOUT.TXT
+              if grep -q "mp-main-entered" /tmp/dosbox-x-MPOUT.TXT; then
+                  echo "  '[mp-main-entered]' present — bug NOT reproduced"
+              else
+                  echo "  '[mp-main-entered]' MISSING — BUG REPRODUCED"
+              fi
           else
-              echo "(no output file produced)"
+              echo "  (no output)"
           fi
+
           echo
-          echo "=============================="
-          echo "Classic DOSBox 0.74-3 output:"
-          echo "=============================="
-          if [ -f /tmp/dosbox-classic-OUT.TXT ]; then
-              xxd /tmp/dosbox-classic-OUT.TXT
+          echo "Classic DOSBox 0.74-3 output size:"
+          if [ -f /tmp/dosbox-classic-MPOUT.TXT ]; then
+              wc -c /tmp/dosbox-classic-MPOUT.TXT
+              if grep -q "MicroPython" /tmp/dosbox-classic-MPOUT.TXT; then
+                  echo "  REPL banner present — works as expected"
+              else
+                  echo "  REPL banner MISSING — unexpected"
+              fi
           else
-              echo "(no output file produced)"
+              echo "  (no output)"
           fi
+
           echo
-          echo "=============================="
           echo "QEMU+FreeDOS output:"
-          echo "=============================="
-          xxd /tmp/qemu-OUT.txt | head -30
-          echo
-          echo "=============================="
-          echo "Verdict"
-          echo "=============================="
-          # Bug confirmed iff:
-          #   - DOSBox-X produces "[low CS:EIP" but NOT "[high CS:EIP"
-          #   - classic DOSBox produces both
-          #   - QEMU+FreeDOS produces both
-          if [ -f /tmp/dosbox-x-OUT.TXT ] && grep -q "low CS:EIP" /tmp/dosbox-x-OUT.TXT; then
-              echo "DOSBox-X: low-EIP call OK"
+          if grep -q "MicroPython" /tmp/qemu-OUT.txt; then
+              echo "  REPL banner present — works as expected"
           else
-              echo "DOSBox-X: low-EIP call MISSING (unexpected)"
-          fi
-          if [ -f /tmp/dosbox-x-OUT.TXT ] && grep -q "high CS:EIP" /tmp/dosbox-x-OUT.TXT; then
-              echo "DOSBox-X: high-EIP call OK (bug NOT reproduced)"
-          else
-              echo "DOSBox-X: high-EIP call FAILED (bug reproduced)"
-          fi
-          if [ -f /tmp/dosbox-classic-OUT.TXT ] && grep -q "high CS:EIP" /tmp/dosbox-classic-OUT.TXT; then
-              echo "classic DOSBox: high-EIP call OK"
-          else
-              echo "classic DOSBox: high-EIP call MISSING"
-          fi
-          if grep -q "high CS:EIP" /tmp/qemu-OUT.txt; then
-              echo "QEMU+FreeDOS: high-EIP call OK"
-          else
-              echo "QEMU+FreeDOS: high-EIP call MISSING"
+              echo "  REPL banner MISSING — unexpected"
           fi
 
       - name: Upload artifacts
@@ -291,10 +288,11 @@ jobs:
         with:
           name: dosbox-x-bug-artifacts
           path: |
-            addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG.EXE
-            /tmp/dosbox-x-OUT.TXT
-            /tmp/dosbox-classic-OUT.TXT
+            /tmp/MP.EXE
+            /tmp/dosbox-x-MPOUT.TXT
+            /tmp/dosbox-classic-MPOUT.TXT
             /tmp/qemu-OUT.txt
             /tmp/dosbox-x-stdout.log
             /tmp/dosbox-classic-stdout.log
+            addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG.EXE
           if-no-files-found: warn
