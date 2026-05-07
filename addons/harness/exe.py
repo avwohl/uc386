@@ -113,6 +113,7 @@ _bridge_marker_dump_writetest: db "[direct-write]=", 0
 _bridge_marker_dump_writeaddr: db "[write_addr]=", 0
 _bridge_marker_dump_write0: db "[write+0]=", 0
 _bridge_marker_dump_write4: db "[write+4]=", 0
+_bridge_marker_dump_stackwrite: db "[stack-write]=", 0
 _bridge_hex_buf:           times 12 db 0    ; 8 hex chars + LF + slack
 
         section _TEXT use32 class=CODE
@@ -164,6 +165,23 @@ _bridge_emit_hex32:
         mov     edx, _bridge_hex_buf
         mov     ecx, 9
         call    _bridge_emit
+        ret
+
+; _bridge_write_stack(fd, buf, count) cdecl: literal copy of _write's
+; body — push ebp / mov ebp, esp / read args from stack / INT 21h.
+; Used to test whether _main's failure is intrinsic to stack-based
+; arg passing OR specific to the codegen-emitted _write in the user
+; .obj.
+_bridge_write_stack:
+        push    ebp
+        mov     ebp, esp
+        mov     ebx, [ebp + 8]
+        mov     edx, [ebp + 12]
+        mov     ecx, [ebp + 16]
+        mov     ah, 0x40
+        int     0x21
+        movzx   eax, ax
+        leave
         ret
 
 ; _bridge_emit_str0(EDX=ptr to NUL-terminated string): writes string
@@ -514,6 +532,22 @@ _pmodew_start:
         pop     eax                       ; recover target
         mov     eax, [eax + 4]            ; next 4 bytes
         call    _bridge_emit_hex32       ; expected: 5d 8b ... (mov ebx, [ebp+8])
+
+        ; --- Stack-arg write test --------------------------------
+        ; _bridge_write_stack does the same INT 21h AH=0x40 BX=fd
+        ; that _write does, with args taken from the stack via
+        ; cdecl frame pointer. If _main's call _write produces
+        ; NULs but this DOES print "[mp-main-entered]", the bug
+        ; isn't in stack-based arg passing — it's something even
+        ; more specific to _main's call site or to the user-obj's
+        ; _write at runtime.
+        mov     edx, _bridge_marker_dump_stackwrite
+        call    _bridge_emit_str0
+        push    18
+        push    dword [_main + 7]        ; str_addr
+        push    1
+        call    _bridge_write_stack
+        add     esp, 12
 
         ; --- Call _main (mirrors codegen _start's call _main) ----
         mov     edx, _bridge_marker_premain
