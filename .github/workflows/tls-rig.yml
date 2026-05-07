@@ -1,0 +1,139 @@
+name: tls-rig
+
+# End-to-end TLS handshake validation for the uc386 MicroPython port.
+#
+# 1. Build micropython.bin via uc386 (cached across runs).
+# 2. Bind it into MP.EXE with PMODE/W (Open Watcom — Linux only).
+# 3. Boot FreeDOS in QEMU with NE2000 + SLIRP user-mode networking.
+# 4. Run a Python TLS server on the runner (host:8443).
+# 5. The guest's MP.EXE runs TLSTEST.PY, which:
+#      - eth_init() — Crynwr packet driver + lwIP DHCP
+#      - socket.connect(('10.0.2.2', 8443))
+#      - SSLContext + load_verify_locations(cadata=test cert)
+#      - wrap_socket() with verify_mode=CERT_REQUIRED
+#      - read TLS_RIG_OK from the server, print PASS
+# 6. Pull TLSOUT.TXT off the floppy after QEMU exits, grep for PASS.
+#
+# This is the wire-level analogue of dos_emu's library smoke tests
+# — proves the axtls integration not only parses certs but actually
+# completes an authenticated handshake against a peer.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'addons/gnu/micropython/**'
+      - 'addons/harness/exe.py'
+      - 'lib/i386_dos_libc.asm'
+      - 'lib/include/**'
+      - 'src/uc386/**'
+      - '.github/workflows/tls-rig.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'addons/gnu/micropython/**'
+      - 'addons/harness/exe.py'
+      - 'lib/i386_dos_libc.asm'
+      - 'lib/include/**'
+      - 'src/uc386/**'
+      - '.github/workflows/tls-rig.yml'
+  workflow_dispatch:
+
+jobs:
+  tls-rig:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y nasm curl unzip qemu-system-x86 mtools openssl
+          qemu-system-i386 --version | head -1
+
+      - name: Install Open Watcom V2
+        run: |
+          mkdir -p ~/.local/opt/watcom
+          curl -sL -o /tmp/watcom.bin \
+            https://github.com/open-watcom/open-watcom-v2/releases/download/Current-build/open-watcom-2_0-c-linux-x64
+          unzip -q /tmp/watcom.bin -d ~/.local/opt/watcom
+          chmod +x ~/.local/opt/watcom/binl64/wlink || true
+          echo "WATCOM=$HOME/.local/opt/watcom" >> $GITHUB_ENV
+          echo "$HOME/.local/opt/watcom/binl64" >> $GITHUB_PATH
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install "uc_core @ git+https://github.com/avwohl/uc_core@main"
+          pip install -e .
+
+      - name: Fetch MicroPython upstream + axtls
+        run: |
+          cd addons/gnu/micropython
+          ./fetch.sh
+
+      - name: Restore micropython build cache
+        # Same cache key as mp-rig.yml so the two workflows share
+        # the (very expensive) micropython.bin build.
+        id: mp-build-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            addons/gnu/micropython/build/micropython.asm
+            addons/gnu/micropython/build/micropython.bin
+            addons/gnu/micropython/build/genhdr/
+          key: mp-build-${{ runner.os }}-${{ hashFiles('addons/gnu/micropython/uc386-dos/**', 'addons/gnu/micropython/build_port.sh', 'addons/gnu/micropython/build.sh', 'addons/gnu/micropython/gen_qstrdefs.py', 'addons/gnu/micropython/fetch.sh', 'src/uc386/**', 'lib/include/**', 'lib/i386_dos_libc.asm', 'pyproject.toml') }}
+
+      - name: Build micropython.bin
+        if: steps.mp-build-cache.outputs.cache-hit != 'true'
+        run: |
+          cd addons/gnu/micropython
+          ./build_port.sh
+
+      - name: Save micropython build cache
+        if: steps.mp-build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            addons/gnu/micropython/build/micropython.asm
+            addons/gnu/micropython/build/micropython.bin
+            addons/gnu/micropython/build/genhdr/
+          key: ${{ steps.mp-build-cache.outputs.cache-primary-key }}
+
+      - name: Bind MP.EXE via PMODE/W
+        run: |
+          python -m addons.harness.exe \
+            addons/gnu/micropython/build/micropython.asm \
+            -o addons/gnu/micropython/dosbox-x-rig/MP.EXE
+          ls -la addons/gnu/micropython/dosbox-x-rig/MP.EXE
+
+      - name: Fetch NE2000.COM
+        run: |
+          cd addons/gnu/micropython/dosbox-x-rig
+          ./fetch.sh
+          ls -la NE2000.COM
+
+      - name: Run end-to-end TLS rig
+        run: |
+          cd addons/gnu/micropython/tls-rig
+          ./run-tls-rig.sh ../dosbox-x-rig/MP.EXE
+
+      - name: Upload artifacts (always — for triage)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tls-rig-artifacts
+          path: |
+            addons/gnu/micropython/tls-rig/qemu-tls.log
+            addons/gnu/micropython/tls-rig/tls-out.txt
+            addons/gnu/micropython/tls-rig/tls-server.log
+            addons/gnu/micropython/tls-rig/freedos-tls.img
+            addons/gnu/micropython/tls-rig/test-server.crt
+            addons/gnu/micropython/dosbox-x-rig/MP.EXE
+            addons/gnu/micropython/build/micropython.asm
+          if-no-files-found: warn
