@@ -236,3 +236,4 @@ fetch_axtls
 patch_modlwip_loopback_poll
 patch_main_startup_markers
 patch_axtls_config_verify
+patch_axtls_endian_include
