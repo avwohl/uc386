@@ -13,21 +13,29 @@ import time
 
 print('TLSTEST: start')
 
+import lwip
 import uc386_net
+lwip.reset()
 print('TLSTEST: eth_init')
 uc386_net.eth_init()  # DHCP via SLIRP — gives us 10.0.2.15
 
-# Wait for DHCP to give us an IP. SLIRP responds quickly but the
-# lwIP DHCP state machine has its own pacing.
+# Wait for DHCP. lwIP runs NO_SYS=1, so we have to drive its state
+# machine forward by calling lwip.callback() which pumps the poll
+# hook (NE2000 RX -> netif input) and sys_check_timeouts (DHCP retry
+# pacing). Without this, blocking lwIP calls work because they pump
+# internally, but a sleep+poll loop like the one we want here does
+# not — DHCP would never complete.
 ip = ''
-for tick in range(60):
+for tick in range(200):
+    lwip.callback()
     info = uc386_net.eth_status()
     ip = info[0]
     up = info[3]
     if up and ip and ip != '0.0.0.0':
         print('TLSTEST: ip', ip, 'gw', info[2])
         break
-    time.sleep(0.5)
+    # Tiny sleep so we don't spin too tight; the BIOS tick is ~55ms.
+    time.sleep_ms(50)
 else:
     print('TLSTEST: dhcp_failed')
     sys.exit(1)
