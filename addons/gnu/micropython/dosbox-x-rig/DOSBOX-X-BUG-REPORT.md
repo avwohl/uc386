@@ -1,270 +1,228 @@
 # Draft DOSBox-X bug report
 
 Draft for upstream DOSBox-X
-(https://github.com/joncampbell123/dosbox-x). Findings below were
-uncovered while debugging why a 484 KB PMODE/W-bound MicroPython
-binary failed under DOSBox-X but ran cleanly under classic DOSBox
-0.74-3 and QEMU+FreeDOS.
-
-We have a reliable reproducer (the binary plus a specific
-[autoexec] layout) but have NOT yet isolated a minimal C-level
-repro — see "Bisect" below.
+(https://github.com/joncampbell123/dosbox-x). Root-caused
+2026-05-07; candidate fix below tested under instrumented build
+in CI.
 
 ---
 
 ## Title
 
-PMODE/W: `INT 21h AH=0x40` writes zero bytes when called from a
-specific call-site context (deep call chain into a >256 KB code
-object), with autoexec-content sensitivity — works under classic
-DOSBox 0.74-3 and FreeDOS, fails under DOSBox-X
+`-silent` + `[autoexec]`-driven `program > out.txt / exit`:
+`tinyfd_messageBox` in headless mode loops on stdin, blocks
+DOSBox-X exit until SIGKILL → buffered `fwrite` output for the
+last writes is lost.
 
-## Environment
+## Affected versions
 
-- DOSBox-X versions reproduced on:
-  - `2026.05.02 SDL2` (Homebrew bottle, macOS Darwin 25.4.0)
-  - `apt install dosbox-x` on Ubuntu 22.04 GitHub Actions runner
-- Configuration (minimal trigger):
-  ```ini
-  [cpu]
-  cputype = pentium
-  core    = normal
-  cycles  = max
-  [dosbox]
-  memsize = 16
+- DOSBox-X `2026.05.02` SDL2 (Homebrew bottle, macOS Darwin
+  25.4.0)
+- `apt install dosbox-x` on Ubuntu 22.04 GitHub Actions runner
+  (same `2026.05.02` family)
 
-  [autoexec]
-  mount C /path/to/dir
-  C:
-  MP.EXE > MPOUT.TXT
-  exit
-  ```
-- DOS extender: PMODE/W v1.33 (bundled by Open Watcom V2's
-  `wlink system pmodew option stub=$WATCOM/binw/pmodew.exe`)
-- CPU emulator: `core=normal` (interpreter)
+Both reproduce identically.
+
+## Symptom
+
+A DOS program that writes to a redirected file and then
+crashes (or never returns) loses its trailing output. Concretely,
+a 484 KB MicroPython binary built with PMODE/W writes 657 bytes
+of expected output to `MPOUT.TXT` over 46 `INT 21h AH=0x40`
+calls. Under DOSBox-X with the trigger config (below), only the
+first 481 bytes — covering the first 37 calls — appear in the
+final `MPOUT.TXT`. The remaining 176 bytes (the next 9 calls
+including the MicroPython REPL banner) are silently lost.
 
 ## Reliable reproducer
 
-1. Pull `MP.EXE` from a recent
-   [`mp-rig.yml`](https://github.com/avwohl/uc386/actions/workflows/mp-rig.yml)
-   CI run's `mp-rig-artifacts` (484211 bytes; built via uc386 +
-   Open Watcom V2 wlink).
-2. Save the dosbox-x.conf above into a directory containing
-   MP.EXE.
-3. Run: `dosbox-x -silent -exit -conf dosbox-x.conf`
-4. Inspect `MPOUT.TXT`.
+```ini
+# dosbox-x.conf
+[cpu]
+cputype = pentium
+core    = normal
+cycles  = max
+[dosbox]
+memsize = 16
 
-**Expected** (classic DOSBox / QEMU+FreeDOS / real hardware): MPOUT.TXT
-is 657 bytes ending at `>>> ` (the MicroPython REPL prompt):
-
-```
-[bridge-entered]
-[bridge-argv-done]
-[bridge-pre-jump]
-[bridge-post-fpu]
-... (15 more diagnostic markers from MP.EXE's bridge stub)
-[bridge-pre-call-main]
-[mp-main-entered]
-[mp-before-mp-init]
-[mp-after-mp-init]
-[mp-before-repl]
-MicroPython uc386-triage on 2026-05-01; uc386-dos with i386
-Type "help()" for more information.
->>>
+[autoexec]
+mount C /path/with/mp.exe
+C:
+MP.EXE > MPOUT.TXT
+exit
 ```
 
-**Actual** under DOSBox-X: MPOUT.TXT is exactly 481 bytes,
-truncated immediately after `[bridge-pre-call-main]\n`. The
-`[mp-main-entered]\n` that should follow does NOT appear.
+```sh
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+    timeout -k 10 60 dosbox-x -silent -conf dosbox-x.conf
+```
 
-The `[mp-main-entered]\n` is produced by MicroPython's `_main`
-calling a tiny `_write(fd, buf, count)` wrapper that does
-`INT 21h AH=0x40 BX=1 EDX=buf ECX=count`. Earlier in the bridge
-stub, IDENTICAL `INT 21h AH=0x40` calls (with the same fd, same
-buffer, same count) succeed — see the `[direct-write]=[mp-main-entered]`,
-`[stack-write]=[mp-main-entered]`, `[mainlike]=[mp-main-entered]`
-markers in MPOUT.TXT.
+`MP.EXE` is the uc386-MicroPython binary at
+https://github.com/avwohl/uc386 (artifact `mp-rig-artifacts/MP.EXE`
+from any successful `mp-rig.yml` run). Direct CI demo at
+[`dosbox-x-bug.yml`](https://github.com/avwohl/uc386/actions/workflows/dosbox-x-bug.yml).
 
-## Bisect
+`MPOUT.TXT` ends up exactly 481 bytes ending at
+`[bridge-pre-call-main]\n`. Same MP.EXE under classic DOSBox
+0.74-3 or QEMU+FreeDOS produces 657 bytes ending at the
+MicroPython REPL prompt `>>> `.
 
-Reproducible vs. non-reproducible variations of the autoexec
-content (everything else identical). All under DOSBox-X
-2026.05.02 with the config above; same MP.EXE binary.
+## Root cause (CONFIRMED)
 
-| autoexec content                                    | Output            |
-|-----------------------------------------------------|-------------------|
-| `MP.EXE > X / exit`                                 | 481 bytes (BUG)   |
-| `MP.EXE > X / dir / exit`                           | 481 bytes (BUG)   |
-| `MP.EXE > X / echo Y / exit`                        | 481 bytes (BUG)   |
-| `echo Z / MP.EXE > X / exit`                        | 481 bytes (BUG)   |
-| `echo Z / MP.EXE > X / echo Y / exit`               | 657 bytes (OK)    |
-| `MP.EXE > X` (no `exit`)                            | 657 bytes (OK)    |
-| `dosbox-x -c "MP.EXE > X" -c "exit"` (no [autoexec])| 657 bytes (OK)    |
+Two layered behaviors compound:
 
-The bug fires when:
+### 1. `LocalFile::Write` is buffered
 
-- MP.EXE is invoked through DOSBox-X's `[autoexec]` section, AND
-- the autoexec contains `exit` somewhere after MP.EXE, AND
-- there is at most one intervening command between MP.EXE and
-  `exit`, AND
-- there is no `echo` command before MP.EXE.
+[`src/dos/drive_local.cpp:2860`](https://github.com/joncampbell123/dosbox-x/blob/master/src/dos/drive_local.cpp#L2860)
+calls
+`*size = (uint16_t)fwrite(data, 1, *size, fhandle); return true;`
 
-It does NOT fire when invoked via `-c` command-line flags or when
-there is no `exit` (so DOS sits at the prompt after MP.EXE).
+`fwrite` writes into the host C library's stdio buffer.
+Bytes only hit the underlying file when:
 
-This pattern strongly suggests a state-dependent emulation defect
-where the COMMAND.COM stack contents (which depend on the autoexec
-command queue) overlap something PMODE/W relies on during INT 21h
-reflection, OR where autoexec-driven shell processing changes the
-real-mode SS:SP / segment layout that PMODE/W's `INT 21h AH=0x40`
-path interacts with.
+- the buffer fills (default 4 KB / 8 KB on Linux glibc), OR
+- `fflush` is called (DOSBox-X invokes this only via
+  `LocalFile::Flush`, called from
+  [`DOS_FlushFile`](https://github.com/joncampbell123/dosbox-x/blob/master/src/dos/dos_files.cpp)
+  which is the `INT 21h AH=0x68` "commit file" handler), OR
+- the file is `fclose`d.
 
-## What's been ruled out
+So every `INT 21h AH=0x40 BX=fd EDX=buf ECX=count` call by a
+DOS program WRITES TO BUFFER but NOT TO DISK unless followed by
+`AH=0x68`, the buffer fills, or the file closes. This is
+strictly different behavior from real DOS (which has no
+host-stdio layer) and from classic DOSBox 0.74-3 (which uses
+unbuffered `write(2)` at this layer).
 
-Across 30+ in-binary diagnostic iterations:
+In our reproducer, MP.EXE's bridge stub does AH=40 + AH=68
+after every diagnostic marker print, so those writes flush
+correctly. But MP.EXE's `_main → _write` (a normal libc-style
+`write(2)` wrapper) calls only AH=40, so post-marker bytes stay
+in the stdio buffer.
 
-- LE FIXUP records ARE applied at runtime (`[main+7]=000227a3` is
-  the section-relative offset `0xc7a3` plus obj 2's runtime
-  base).
-- The data section IS loaded correctly (`[str-bytes]=2d706d5b` is
-  little-endian "[mp-").
-- `_main`'s instruction stream IS intact at runtime.
-- The `call rel32` from `_main` lands at the correct `_write`
-  address (`[write_addr]=001c6573`, bytes there match `_write`'s
-  prologue: `55 89 e5 8b 5d 08 8b 55 0c 8b 4d 10 b4 40 cd 21`).
-- Direct `INT 21h AH=0x40` from the bridge stub (low CS:EIP) with
-  the same args works (`[direct-write]=[mp-main-entered]`).
-- A bridge-side clone of `_write` with cdecl args works
-  (`[stack-write]=[mp-main-entered]`).
-- Calling user.obj's `_write` directly from the bridge via
-  indirect call works (`[user-write]=[mp-main-entered]`).
-- A bridge-side clone of `_main`'s exact byte sequence (enter / 3
-  pushes / call) calling the bridge's `_write` clone works
-  (`[mainlike]=[mp-main-entered]`).
+### 2. `-silent` + running-program quit hangs forever, then SIGKILL
 
-The ONE single difference between a working bridge → `_write`
-call and the failing `_main` → `_write` call is the call site
-(and thus the return address on the stack at the time of
-`INT 21h`).
+When the autoexec runs `exit` after MP.EXE, DOSBox-X tries to
+shut down. `RunningProgram` is still set to MP.EXE's name (the
+program crashed via invalid-opcode and DoCommand returned, but
+`RunningProgram` is reset by COMMAND only on certain exit paths).
+[`CheckQuit`](https://github.com/joncampbell123/dosbox-x/blob/master/src/gui/sdlmain.cpp#L1377)
+calls
+`systemmessagebox("Quit DOSBox-X warning", QUIT_PROGRAM_CONFIRM, "yesno", "question", 1)`.
 
-## Minimization attempts
+Under `-silent` with `SDL_VIDEODRIVER=dummy`, there is no GUI
+target, so `systemmessagebox` falls through to
+`tinyfd_messageBox`'s console path
+([`tinyfiledialogs.c:2950`](https://github.com/joncampbell123/dosbox-x/blob/master/src/libs/tinyfiledialogs/tinyfiledialogs.c#L2950)):
 
-Standalone NASM-only repros at
-[`addons/gnu/micropython/dosbox-x-rig/pmwbug/`](https://github.com/avwohl/uc386/tree/main/addons/gnu/micropython/dosbox-x-rig/pmwbug)
-do NOT yet trigger the bug:
+```c
+do {
+    ...
+    printf("y/n: ");
+    lChar = (char)tolower(_getch());
+    printf("\n\n");
+} while (lChar != 'y' && lChar != 'n');
+```
 
-- `pmwbug.asm` — single-`_start` with two `INT 21h AH=0x40` call
-  sites, one at low CS:EIP and one at high CS:EIP after 768 KB of
-  NOP padding, sharing one `_writer` helper.
-- `pmwbug_user.asm` — depth-3 call chain (`_start → _main →
-  _write`) where `_main` and `_write` are byte-for-byte matches
-  of MP.EXE's emitted prologs, padded to ~2 MB into the code
-  segment, plus 1 MB of BSS, built via the same exe.py bridge
-  shape (2-obj LE) as MP.EXE.
+In headless mode `_getch()` returns immediately on EOF or
+returns the same char repeatedly, never 'y' or 'n', so the loop
+spins forever. We observed thousands of repetitions of
+`y/n: \n\n` in stderr before `timeout -k 10 60` fired SIGKILL
+on DOSBox-X.
 
-Neither minimization fires the bug under DOSBox-X with any
-autoexec layout. So the trigger requires more than caller CS:EIP,
-call depth, or code-object size. Outstanding hypotheses for what
-specifically about MP.EXE is necessary:
+SIGKILL skips all atexit handlers and host-process shutdown
+flushing, so the in-buffer 176 bytes from the unflushed `_write`
+calls are discarded by the kernel.
 
-- MicroPython's `mp_init` does FPU operations before `_main`'s
-  marker write — FPU state may be relevant.
-- MP.EXE has hundreds of cross-obj fixups; relocation table
-  layout may matter.
-- Stack-canary or specific page-table layout of the larger
-  binary may be required.
+## Suggested fix
 
-## Source-side suspects
+Two-part patch (verified end-to-end via instrumented CI build at
+[`dosbox-x-instrument.yml`](https://github.com/avwohl/uc386/actions/workflows/dosbox-x-instrument.yml);
+the "silent + fflush" run produces the full 657 bytes).
 
-We did a read-only walkthrough of DOSBox-X's INT 21h dispatch
-([`src/dos/dos.cpp`](https://github.com/joncampbell123/dosbox-x/blob/master/src/dos/dos.cpp)).
-Three areas look suspicious:
+**Patch 1 — skip the quit confirmation in `-silent` mode**
+(`src/gui/sdlmain.cpp` near the start of `CheckQuit()`):
 
-1. **Per-INT-21h register-save preamble** at `dos.cpp:1054-1066`:
-   ```cpp
-   if (((reg_ah != 0x50) && ... && reg_ah<0x6c)) {
-       DOS_PSP psp(dos.psp());
-       psp.SetStack(RealMake(SegValue(ss),reg_sp-18));
-       /* Save registers */
-       real_writew(SegValue(ss), reg_sp - 18, reg_ax);
-       real_writew(SegValue(ss), reg_sp - 16, reg_bx);
-       /* ... 7 more 16-bit writes through reg_sp - 2 ... */
-   }
-   ```
-   This writes 18 bytes to `(SS<<4) + reg_sp - 18`. If `reg_sp`
-   is a 32-bit value and DOSBox-X's `reg_sp` is the truncated
-   16-bit form, the write target depends on whether
-   `cpu.stack.big` is set. For PMODE/W's mode-switched real-mode
-   handler entry, this should be the real-mode 16-bit stack —
-   but if PMODE/W keeps a 32-bit real-mode stack (`big`) and
-   `(real_SS<<4) + (real_SP - 18)` happens to land in PMODE/W's
-   transfer buffer, the AX/BX/CX/DX/SI/DI/BP/DS/ES values would
-   overwrite the user's data BEFORE `MEM_BlockRead` at `:2152`
-   reads it.
+```c
+bool CheckQuit(void) {
+#if !defined(HX_DOS)
+    /* In -silent mode there is no UI to answer the y/n
+     * confirmation. tinyfd_messageBox falls back to
+     * printf+_getch which loops forever waiting for stdin.
+     * Auto-confirm so DOSBox-X exits cleanly (closing all open
+     * files and flushing their stdio buffers in the process). */
+    if (control && control->opt_silent) return true;
+    /* ... rest of existing implementation ... */
+```
 
-2. **AH=0x40 buffer read** at `dos.cpp:2152`:
-   ```cpp
-   MEM_BlockRead(SegPhys(ds)+reg_dx,dos_copybuf,towrite);
-   ```
-   Uses `reg_dx` (16-bit) and `SegPhys(ds)` (real-mode segment
-   base). PMODE/W must arrange for `(DS<<4) + DX` to point at a
-   real-mode-addressable bounce buffer copy of the user data.
-   If PMODE/W's bounce-buffer setup is in any way dependent on
-   call-site state (which DPMI hosts sometimes do for
-   "fast-path" optimizations), a high-call-depth caller may
-   trigger a different setup path.
+This alone fixes the symptom for our reproducer, because the
+clean shutdown path closes all `Files[handle]` instances, which
+calls `fclose(fhandle)`, which flushes the stdio buffer.
 
-3. **64K-truncation logic at `dos.cpp:2143-2148`**:
-   ```cpp
-   if (((uint32_t)towrite+(uint32_t)reg_dx) > 0xFFFFUL && (reg_dx & 0xFU) != 0U) {
-       uint16_t nuwrite = (uint16_t)(0x10000UL - (reg_dx & 0xF));
-       if (nuwrite > towrite) nuwrite = towrite;
-       LOG_MSG("INT 21h WRITE warning: ...");
-       towrite = nuwrite;
-   }
-   ```
-   With `reg_dx & 0xF` non-zero AND
-   `reg_dx + towrite > 0xFFFF`, this caps `towrite`. If
-   PMODE/W's bounce buffer happens to be at a non-aligned offset
-   near the end of a real-mode segment and the user's count
-   pushes past the boundary, this could truncate to zero or near
-   zero.
+**Patch 2 — `fflush` after every `LocalFile::Write`**
+(`src/dos/drive_local.cpp` non-Windows branch at the end of the
+function):
 
-The "writes zero bytes" symptom in our reproducer is consistent
-with EITHER (a) `dos_copybuf` containing zeros at `:2168`'s
-`DOS_WriteFile` call (because the source was either zero-initialized
-memory OR was overwritten by `:1057-1066`'s register save), OR
-(b) `towrite` being capped to zero by the truncation logic at
-`:2143-2148`.
+```c
+*size = file_access_tries>0
+    ? (uint16_t)write(fileno(fhandle),data,*size)
+    : (uint16_t)fwrite(data,1,*size,fhandle);
+fflush(fhandle); /* So stdio buffers can't be lost on SIGKILL. */
+return true;
+```
+
+Patch 2 adds a per-write fflush, matching what classic DOSBox
+0.74-3 effectively does by using unbuffered `write(2)`. This
+guarantees that even programs killed by SIGKILL (e.g., DOSBox-X
+crashes, host OOM, user-initiated kill) have their writes
+visible up to the last call. Performance impact is negligible
+for redirected-output workloads (one extra syscall per AH=40,
+vs. zero extra under buffer-fill amortization — but
+buffer-fill is uncommon for typical DOS-program output bursts).
+
+Either patch alone fixes the symptom; both together make the
+fix robust to other future SIGKILL paths.
 
 ## Diagnostic infrastructure
 
-The
-[`pmwbug` workflow](https://github.com/avwohl/uc386/blob/main/.github/workflows/dosbox-x-bug.yml)
-runs MP.EXE under DOSBox-X / classic DOSBox / QEMU+FreeDOS in CI
-and uploads all three outputs. The
-[instrumented-build workflow](https://github.com/avwohl/uc386/blob/main/.github/workflows/dosbox-x-instrument.yml)
-patches `dos.cpp` to log every AH=0x40 call's full register state
-plus the first 16 bytes pulled into `dos_copybuf`, builds DOSBox-X
-from source, and runs the failing case so the EXACT bytes /
-addresses DOSBox-X observes during the failing call are captured.
-A successful run of that workflow gives the upstream maintainer
-the decisive data to localize the bug.
+CI workflows in
+https://github.com/avwohl/uc386 reproduce and characterize the
+bug end-to-end:
+
+- [`dosbox-x-bug.yml`](https://github.com/avwohl/uc386/blob/main/.github/workflows/dosbox-x-bug.yml):
+  runs MP.EXE under apt-installed DOSBox-X / classic DOSBox
+  0.74-3 / QEMU+FreeDOS, captures output sizes + xxd dumps,
+  shows the 481-vs-657 byte split.
+- [`dosbox-x-instrument.yml`](https://github.com/avwohl/uc386/blob/main/.github/workflows/dosbox-x-instrument.yml):
+  patches `src/dos/dos.cpp` to log every `INT 21h AH=0x40` call's
+  full register state, source linear address, first 16 bytes of
+  `dos_copybuf`, the resolved `Files[handle]->name`, and
+  pre/post `*amount` from `DOS_WriteFile`. Builds DOSBox-X from
+  source and runs MP.EXE. The captured log shows ALL 46 AH=40
+  calls succeed (`fWritten=1`, `post_towrite==pre_towrite`),
+  with identical buffer contents in failing and working configs
+  — proving the bug is downstream of `DOS_WriteFile` (in the
+  stdio buffering and the SIGKILL exit path).
 
 ## Why this matters
 
-This bug blocks a multi-MB DOS application (the uc386 MicroPython
-port) from running under DOSBox-X, even though it runs cleanly
-under classic DOSBox 0.74-3, FreeDOS-on-QEMU, and is expected to
-run on real DOS hardware (FreeDOS in VMware on Windows is the
-production target). The DOSBox-X rig was set up specifically to
-test the binary's NE2000+SLIRP networking path under emulation,
-since classic DOSBox doesn't have NE2000 support. The bug forces
-a fall-back to either real hardware or QEMU+FreeDOS for network
-validation, which is a meaningful testing-cost regression.
+This bug blocks a multi-MB DOS application (the uc386
+MicroPython port) from completing its CI pipeline under
+DOSBox-X — even though the program runs cleanly under FreeDOS
+(the actual production target — FreeDOS in VMware on Windows),
+classic DOSBox 0.74-3, and on real DOS hardware.
 
-The fact that the bug is autoexec-content-sensitive also suggests
-something subtle about COMMAND.COM stack / shell state interacting
-with PMODE/W's INT 21h reflection — fixing it likely fixes a
-broader class of DOS-extender bugs in DOSBox-X, not just this
-one binary.
+More broadly: the bug affects any DOS program that:
+
+1. Writes to a redirected file via `INT 21h AH=0x40`
+2. Doesn't follow with `INT 21h AH=0x68` (most C-libc-style
+   `write` wrappers don't)
+3. Is invoked via DOSBox-X's `[autoexec]` section
+4. The autoexec's next command is `exit`
+5. DOSBox-X is run with `-silent` (typical for CI / scripted
+   testing)
+
+Under those conditions, the program's last hundred bytes of
+output are silently truncated, with no error indication — a
+significant correctness hazard for any test rig that expects
+DOS-program stdout to be a faithful capture.
