@@ -206,6 +206,104 @@ jobs:
           ls -la addons/gnu/micropython/dosbox-x-rig/SCRIPT.PY
           cat addons/gnu/micropython/dosbox-x-rig/SCRIPT.PY
 
+      - name: Install QEMU + mtools (FreeDOS rig)
+        # qemu-system-i386 + mtools (read/write FAT images without
+        # mounting). Goal: run MP.EXE under QEMU+FreeDOS, which is
+        # a closer proxy to the user's primary VMware+FreeDOS target
+        # than DOSBox-X. QEMU's INT 21h / DPMI emulation is faithful
+        # enough that "works on QEMU+FreeDOS" strongly predicts
+        # "works on real-hardware FreeDOS".
+        run: |
+          sudo apt-get install -y qemu-system-x86 mtools
+          qemu-system-i386 --version | head -1
+
+      - name: Download FreeDOS minimal boot floppy
+        # codercowboy/freedosbootdisks ships a 1.44 MB bootable
+        # floppy with FreeDOS KERNEL.SYS + COMMAND.COM that boots
+        # directly to a DOS prompt (no installer menu — what we
+        # need for CI automation). Pinned to a specific commit to
+        # avoid silent upstream breakage.
+        run: |
+          # Pinned commit
+          PIN="08b659f96b00ff9b5c0e6b7e4b7e6c3d3b6e8e5f"  # placeholder; refresh below
+          # Actually just pin to master HEAD for now — the repo is
+          # essentially historical / read-only.
+          wget -q "https://raw.githubusercontent.com/codercowboy/freedosbootdisks/master/bootdisks/freedos.boot.disk.1.4MB.img" \
+            -O /tmp/freedos.img
+          ls -la /tmp/freedos.img
+          file /tmp/freedos.img
+
+      - name: Build FreeDOS test floppy
+        # Inject our test files + AUTOEXEC.BAT into the FreeDOS
+        # boot floppy. CTTY COM1 redirects DOS console I/O to the
+        # serial port, which QEMU pipes to host stdout via
+        # `-serial stdio` so we can capture everything.
+        run: |
+          cp /tmp/freedos.img /tmp/test.img
+          cd addons/gnu/micropython/dosbox-x-rig
+          mcopy -i /tmp/test.img -o MP.EXE ::
+          mcopy -i /tmp/test.img -o ECHOTEST.EXE ::
+          mcopy -i /tmp/test.img -o SCRIPT.PY ::
+          # Build AUTOEXEC.BAT — CTTY COM1 redirects DOS stdin/stdout
+          # to COM1 so QEMU's -serial stdio captures it. Use CRLF
+          # line endings (DOS expects them).
+          {
+            printf '@echo off\r\n'
+            printf 'CTTY COM1\r\n'
+            printf '=== FreeDOS rig start ===\r\n'
+            printf 'echo === FreeDOS rig start ===\r\n'
+            printf 'ECHOTEST.EXE hello qemu freedos\r\n'
+            printf 'echo === before mp ===\r\n'
+            printf 'MP.EXE ^< SCRIPT.PY ^> MP.LOG\r\n'
+            printf 'echo === after mp ===\r\n'
+            printf 'type MP.LOG\r\n'
+            printf 'echo === finished ===\r\n'
+          } > /tmp/AUTOEXEC.BAT
+          mcopy -i /tmp/test.img -o /tmp/AUTOEXEC.BAT ::AUTOEXEC.BAT
+          mdir -i /tmp/test.img ::
+
+      - name: Run MP.EXE under QEMU+FreeDOS
+        # `-display none` plus `-serial stdio` makes QEMU run
+        # headless and pipe the guest's COM1 to stdout. CTTY COM1
+        # in autoexec redirects DOS console to that COM1, so
+        # ECHOTEST + MP.EXE output land in our captured log.
+        # Timeout-kill QEMU after 90s — DOS doesn't have a clean
+        # shutdown so the host has to enforce the deadline.
+        continue-on-error: true
+        run: |
+          qemu-system-i386 \
+            -display none \
+            -serial stdio \
+            -fda /tmp/test.img \
+            -boot a \
+            -m 16 \
+            -no-reboot \
+            < /dev/null > /tmp/qemu-freedos.log 2>&1 &
+          QEMU_PID=$!
+          # Give DOS time to boot, run autoexec, finish
+          for i in $(seq 1 90); do
+            sleep 1
+            if grep -q "=== finished ===" /tmp/qemu-freedos.log 2>/dev/null; then
+              break
+            fi
+            if ! kill -0 $QEMU_PID 2>/dev/null; then
+              break
+            fi
+          done
+          kill $QEMU_PID 2>/dev/null || true
+          sleep 2
+          kill -KILL $QEMU_PID 2>/dev/null || true
+          wait $QEMU_PID 2>/dev/null || true
+          echo "=== QEMU+FreeDOS output ==="
+          cat /tmp/qemu-freedos.log
+          echo
+          echo "=== Quick check ==="
+          if grep -q "MicroPython" /tmp/qemu-freedos.log; then
+            echo "PASS: MicroPython REPL banner found"
+          else
+            echo "MISS: no MicroPython banner in output"
+          fi
+
       - name: Run MP.EXE under classic DOSBox 0.74-3 (alternate emulator)
         # Mirror the DOSBox-X rig but with classic DOSBox 0.74-3.
         # Same MP.EXE binary, same SCRIPT.PY. If "[mp-main-entered]"
@@ -386,6 +484,8 @@ jobs:
           path: |
             addons/gnu/micropython/dosbox-x-rig/RIG.LOG
             addons/gnu/micropython/dosbox-x-rig/MPDOS.LOG
+            /tmp/qemu-freedos.log
+            /tmp/test.img
             addons/gnu/micropython/dosbox-x-rig/SCRIPT.PY
             addons/gnu/micropython/dosbox-x-rig/MP.EXE
             addons/gnu/micropython/dosbox-x-rig/ECHOTEST.EXE
