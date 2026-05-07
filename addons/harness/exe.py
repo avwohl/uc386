@@ -521,9 +521,18 @@ _pmodew_start:
         call    _bridge_emit
 
         ; cdecl: argc/argv on stack at [ebp+8]/[ebp+12] in main.
+        ; Use an INDIRECT call (call eax with eax=_main) instead of
+        ; `call _main` (rel32). Last run showed rel32 target lands
+        ; at the right address with the right bytes, yet _main's
+        ; behavior differs from a direct INT 21h with same args.
+        ; If indirect-call produces "[mp-main-entered]" but direct
+        ; doesn't, rel32 has some subtle issue. If both hang, the
+        ; issue is downstream of the call (something in _main's
+        ; runtime state that differs from the bridge's).
         push    dword [_pmodew_argv]
         push    dword [_pmodew_argc]
-        call    _main
+        mov     eax, _main
+        call    eax
         add     esp, 8
 
         ; Preserve main's return code through the marker call —
