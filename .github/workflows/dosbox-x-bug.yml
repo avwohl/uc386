@@ -1,0 +1,255 @@
+name: dosbox-x-bug
+
+# Standalone end-to-end demo of the DOSBox-X PMODE/W INT 21h
+# AH=0x40 caller-EIP-dependent bug. Builds a tiny PMWBUG.EXE
+# (no uc386, no MicroPython, no exe.py bridge — just nasm +
+# wlink + the bundled PMODE/W stub), runs it under both
+# DOSBox-X and QEMU+FreeDOS, and diffs the captured stdout.
+#
+# The diff IS the proof: same binary, same input, same DOS
+# call, two different outputs. Under DOSBox-X the high-CS:EIP
+# call writes NUL bytes; under QEMU+FreeDOS (the actual
+# production target — FreeDOS in VMware on Windows) it works.
+#
+# Designed to be the artifact attached to the upstream
+# joncampbell123/dosbox-x bug report.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'addons/gnu/micropython/dosbox-x-rig/pmwbug/**'
+      - '.github/workflows/dosbox-x-bug.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'addons/gnu/micropython/dosbox-x-rig/pmwbug/**'
+      - '.github/workflows/dosbox-x-bug.yml'
+  workflow_dispatch:
+
+jobs:
+  bug-demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install nasm + DOSBox-X + DOSBox 0.74-3 + QEMU + mtools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+              nasm dosbox-x dosbox \
+              qemu-system-x86 mtools \
+              curl unzip
+          dosbox-x --version 2>&1 | head -3
+          dosbox --version 2>&1 | head -3
+          qemu-system-i386 --version | head -1
+
+      - name: Install Open Watcom V2
+        run: |
+          mkdir -p ~/.local/opt/watcom
+          curl -sL -o /tmp/watcom.bin \
+            https://github.com/open-watcom/open-watcom-v2/releases/download/Current-build/open-watcom-2_0-c-linux-x64
+          unzip -q /tmp/watcom.bin -d ~/.local/opt/watcom
+          chmod +x ~/.local/opt/watcom/binl64/wlink || true
+          echo "WATCOM=$HOME/.local/opt/watcom" >> $GITHUB_ENV
+          echo "$HOME/.local/opt/watcom/binl64" >> $GITHUB_PATH
+
+      - name: Build PMWBUG.EXE
+        run: |
+          cd addons/gnu/micropython/dosbox-x-rig/pmwbug
+          ./build.sh
+          file PMWBUG.EXE
+
+      - name: Run PMWBUG.EXE under DOSBox-X
+        # Expected: only the low-CS:EIP line prints; high-CS:EIP
+        # call produces NUL bytes (or simply nothing visible).
+        run: |
+          mkdir -p /tmp/dosbox-x-rig
+          cp addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG.EXE \
+              /tmp/dosbox-x-rig/PMWBUG.EXE
+          cat > /tmp/dosbox-x-rig/dosbox-x.conf << 'EOF'
+          [cpu]
+          cputype = pentium
+          core    = normal
+          cycles  = max
+          [dosbox]
+          memsize = 16
+          [sdl]
+          autolock = false
+          waitonerror = false
+          EOF
+          cat > /tmp/dosbox-x-rig/autoexec.bat << 'EOF'
+          @echo off
+          echo === DOSBox-X bug demo ===
+          PMWBUG.EXE > OUT.TXT
+          echo --- captured PMWBUG.EXE output (xxd-style) ---
+          DEBUG OUT.TXT > NUL
+          type OUT.TXT
+          echo === finished ===
+          EOF
+          # Note: DOSBox-X has a -silent option but its output
+          # path differs across versions; -silent + -fastlaunch
+          # is the safest combination on apt-installed builds.
+          timeout 60 dosbox-x \
+              -silent \
+              -fastlaunch \
+              -conf /tmp/dosbox-x-rig/dosbox-x.conf \
+              -c "mount c /tmp/dosbox-x-rig" \
+              -c "c:" \
+              -c "PMWBUG.EXE > OUT.TXT" \
+              -c "exit" \
+              > /tmp/dosbox-x-stdout.log 2>&1 || true
+          echo "--- DOSBox-X stdout ---"
+          cat /tmp/dosbox-x-stdout.log || true
+          echo
+          echo "--- captured OUT.TXT (xxd) ---"
+          if [ -f /tmp/dosbox-x-rig/OUT.TXT ]; then
+              xxd /tmp/dosbox-x-rig/OUT.TXT
+              cp /tmp/dosbox-x-rig/OUT.TXT /tmp/dosbox-x-OUT.TXT
+          else
+              echo "(OUT.TXT not produced)"
+          fi
+
+      - name: Run PMWBUG.EXE under classic DOSBox 0.74-3
+        # Expected: BOTH lines print correctly.
+        run: |
+          mkdir -p /tmp/dosbox-classic
+          cp addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG.EXE \
+              /tmp/dosbox-classic/PMWBUG.EXE
+          cat > /tmp/dosbox-classic.conf << 'EOF'
+          [cpu]
+          cputype = pentium
+          core    = normal
+          cycles  = max
+          [dosbox]
+          memsize = 16
+          EOF
+          timeout 60 dosbox \
+              -conf /tmp/dosbox-classic.conf \
+              -c "mount c /tmp/dosbox-classic" \
+              -c "c:" \
+              -c "PMWBUG.EXE > OUT.TXT" \
+              -c "exit" \
+              > /tmp/dosbox-classic-stdout.log 2>&1 || true
+          echo "--- captured OUT.TXT (xxd) ---"
+          if [ -f /tmp/dosbox-classic/OUT.TXT ]; then
+              xxd /tmp/dosbox-classic/OUT.TXT
+              cp /tmp/dosbox-classic/OUT.TXT /tmp/dosbox-classic-OUT.TXT
+          else
+              echo "(OUT.TXT not produced)"
+          fi
+
+      - name: Run PMWBUG.EXE under QEMU+FreeDOS
+        # Expected: BOTH lines print correctly. Same as classic
+        # DOSBox but with a real FreeDOS kernel — closer to the
+        # production target.
+        run: |
+          # Fetch FreeDOS minimal boot floppy.
+          wget -q "https://raw.githubusercontent.com/codercowboy/freedosbootdisks/master/bootdisks/freedos.boot.disk.1.4MB.img" \
+              -O /tmp/freedos.img
+          cp /tmp/freedos.img /tmp/pmwbug.img
+          mcopy -i /tmp/pmwbug.img -o \
+              addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG.EXE ::PMWBUG.EXE
+          {
+              printf '@echo off\r\n'
+              printf 'CTTY COM1\r\n'
+              printf 'echo === QEMU+FreeDOS bug demo ===\r\n'
+              printf 'PMWBUG.EXE\r\n'
+              printf 'echo === finished ===\r\n'
+          } > /tmp/AUTOEXEC.BAT
+          mcopy -i /tmp/pmwbug.img -o /tmp/AUTOEXEC.BAT ::AUTOEXEC.BAT
+          mdir -i /tmp/pmwbug.img ::
+
+          qemu-system-i386 \
+              -display none \
+              -serial stdio \
+              -fda /tmp/pmwbug.img \
+              -boot a \
+              -m 16 \
+              -no-reboot \
+              < /dev/null > /tmp/qemu-OUT.txt 2>&1 &
+          QEMU_PID=$!
+          for i in $(seq 1 60); do
+              sleep 1
+              if grep -q "=== finished ===" /tmp/qemu-OUT.txt 2>/dev/null; then
+                  break
+              fi
+              if ! kill -0 $QEMU_PID 2>/dev/null; then
+                  break
+              fi
+          done
+          kill $QEMU_PID 2>/dev/null || true
+          sleep 1
+          kill -KILL $QEMU_PID 2>/dev/null || true
+          wait $QEMU_PID 2>/dev/null || true
+
+          echo "--- QEMU stdout (xxd) ---"
+          xxd /tmp/qemu-OUT.txt | head -40
+
+      - name: Compare outputs (the diff IS the proof)
+        run: |
+          echo "=============================="
+          echo "DOSBox-X output:"
+          echo "=============================="
+          if [ -f /tmp/dosbox-x-OUT.TXT ]; then
+              xxd /tmp/dosbox-x-OUT.TXT
+          else
+              echo "(no output file produced)"
+          fi
+          echo
+          echo "=============================="
+          echo "Classic DOSBox 0.74-3 output:"
+          echo "=============================="
+          if [ -f /tmp/dosbox-classic-OUT.TXT ]; then
+              xxd /tmp/dosbox-classic-OUT.TXT
+          else
+              echo "(no output file produced)"
+          fi
+          echo
+          echo "=============================="
+          echo "QEMU+FreeDOS output:"
+          echo "=============================="
+          xxd /tmp/qemu-OUT.txt | head -30
+          echo
+          echo "=============================="
+          echo "Verdict"
+          echo "=============================="
+          # Bug confirmed iff:
+          #   - DOSBox-X produces "[low CS:EIP" but NOT "[high CS:EIP"
+          #   - classic DOSBox produces both
+          #   - QEMU+FreeDOS produces both
+          if [ -f /tmp/dosbox-x-OUT.TXT ] && grep -q "low CS:EIP" /tmp/dosbox-x-OUT.TXT; then
+              echo "DOSBox-X: low-EIP call OK"
+          else
+              echo "DOSBox-X: low-EIP call MISSING (unexpected)"
+          fi
+          if [ -f /tmp/dosbox-x-OUT.TXT ] && grep -q "high CS:EIP" /tmp/dosbox-x-OUT.TXT; then
+              echo "DOSBox-X: high-EIP call OK (bug NOT reproduced)"
+          else
+              echo "DOSBox-X: high-EIP call FAILED (bug reproduced)"
+          fi
+          if [ -f /tmp/dosbox-classic-OUT.TXT ] && grep -q "high CS:EIP" /tmp/dosbox-classic-OUT.TXT; then
+              echo "classic DOSBox: high-EIP call OK"
+          else
+              echo "classic DOSBox: high-EIP call MISSING"
+          fi
+          if grep -q "high CS:EIP" /tmp/qemu-OUT.txt; then
+              echo "QEMU+FreeDOS: high-EIP call OK"
+          else
+              echo "QEMU+FreeDOS: high-EIP call MISSING"
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dosbox-x-bug-artifacts
+          path: |
+            addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG.EXE
+            /tmp/dosbox-x-OUT.TXT
+            /tmp/dosbox-classic-OUT.TXT
+            /tmp/qemu-OUT.txt
+            /tmp/dosbox-x-stdout.log
+            /tmp/dosbox-classic-stdout.log
+          if-no-files-found: warn
