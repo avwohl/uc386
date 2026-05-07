@@ -116,6 +116,7 @@ _bridge_marker_dump_write4: db "[write+4]=", 0
 _bridge_marker_dump_stackwrite: db "[stack-write]=", 0
 _bridge_marker_dump_esp: db "[esp]=", 0
 _bridge_marker_dump_likemain: db "[mainlike]=", 0
+_bridge_marker_dump_userwrite: db "[user-write]=", 0
 _bridge_hex_buf:           times 12 db 0    ; 8 hex chars + LF + slack
 
         section _TEXT use32 class=CODE
@@ -589,6 +590,25 @@ _pmodew_start:
         push    dword [_pmodew_argc]
         call    _diag_main_writelike
         add     esp, 8
+
+        ; --- User-write test: call user.obj's _write DIRECTLY
+        ; from the bridge, via indirect call (we don't have it
+        ; as extern). If this prints, user.obj's _write IS callable
+        ; and produces correct output — the bug is then specific
+        ; to call _main → call _write (something about the call
+        ; chain depth/state). If this fails too, the bug is in
+        ; user.obj's _write itself when called from any location.
+        mov     edx, _bridge_marker_dump_userwrite
+        call    _bridge_emit_str0
+        ; Compute _write address from _main's rel32 fixup.
+        mov     eax, [_main + 14]        ; rel32 imm
+        add     eax, _main
+        add     eax, 18                   ; eax = user._write VA
+        push    18
+        push    dword [_main + 7]        ; str_addr
+        push    1
+        call    eax                       ; user.obj's _write
+        add     esp, 12
 
         ; --- Call _main (mirrors codegen _start's call _main) ----
         mov     edx, _bridge_marker_premain
