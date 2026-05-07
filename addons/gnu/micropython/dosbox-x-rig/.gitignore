@@ -11,5 +11,8 @@ RIG.LOG
 MP_OUT.TXT
 *.tmp
 
+# QEMU+FreeDOS session output (run-qemu-freedos.sh).
+qemu-freedos.log
+
 # CI-generated test script.
 SCRIPT.PY
