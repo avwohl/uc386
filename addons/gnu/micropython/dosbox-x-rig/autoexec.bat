@@ -59,6 +59,17 @@ goto :after_mp
 
 :after_mp
 echo --- after-mp marker --- >> RIG.LOG
+
+rem Extender comparison: if MP_DOS4G.EXE is present, run it under
+rem dos4g (different INT 21h reflector). MP.EXE under PMODE/W
+rem hangs at _main → _write; if MP_DOS4G.EXE prints
+rem "[mp-main-entered]" the bug is PMODE/W-specific. Otherwise the
+rem bug lives in something earlier (maybe in our codegen-emitted
+rem _write or in DOSBox-X itself).
+if not exist MP_DOS4G.EXE goto :done
+echo --- before-mp-dos4g marker --- >> RIG.LOG
+MP_DOS4G.EXE < SCRIPT.PY >> RIG.LOG
+echo --- after-mp-dos4g marker --- >> RIG.LOG
 goto :done
 
 :no_exe

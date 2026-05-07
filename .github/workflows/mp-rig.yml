@@ -142,6 +142,23 @@ jobs:
           ls -la addons/gnu/micropython/dosbox-x-rig/MP.EXE
           file addons/gnu/micropython/dosbox-x-rig/MP.EXE
 
+      - name: Bind MP_DOS4G.EXE via dos4g (extender comparison)
+        # Same source asm, different extender. If MP_DOS4G.EXE prints
+        # "[mp-main-entered]" under the rig but MP.EXE doesn't, the
+        # bug is PMODE/W-specific (its INT 21h reflector has caller-
+        # EIP-dependent behavior at high VAs). Best-effort — if
+        # dos4gw.exe stub isn't available in this Watcom install,
+        # the binding can fail and we just skip the comparison.
+        continue-on-error: true
+        run: |
+          ls "$WATCOM/binw/" | grep -iE "dos4g|cwstub|pmodew" || true
+          python -m addons.harness.exe \
+            addons/gnu/micropython/build/micropython.asm \
+            -o addons/gnu/micropython/dosbox-x-rig/MP_DOS4G.EXE \
+            --extender dos4g
+          ls -la addons/gnu/micropython/dosbox-x-rig/MP_DOS4G.EXE
+          file addons/gnu/micropython/dosbox-x-rig/MP_DOS4G.EXE
+
       - name: Fetch NE2000.COM
         run: |
           cd addons/gnu/micropython/dosbox-x-rig
@@ -285,6 +302,8 @@ jobs:
               "[mp-before-deinit]" \
               "[bridge-post-main]" \
               "after-mp marker" \
+              "before-mp-dos4g marker" \
+              "after-mp-dos4g marker" \
               "MicroPython" \
               "10.0.2.15" \
               "'pktdrv'"; do
@@ -316,6 +335,7 @@ jobs:
             addons/gnu/micropython/dosbox-x-rig/RIG.LOG
             addons/gnu/micropython/dosbox-x-rig/SCRIPT.PY
             addons/gnu/micropython/dosbox-x-rig/MP.EXE
+            addons/gnu/micropython/dosbox-x-rig/MP_DOS4G.EXE
             addons/gnu/micropython/dosbox-x-rig/ECHOTEST.EXE
             addons/gnu/micropython/dosbox-x-rig/MP_OUT.TXT
             addons/gnu/micropython/build/micropython.asm
