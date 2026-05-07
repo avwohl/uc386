@@ -4293,6 +4293,64 @@ _clock:
         inc     dword [_time_counter]
         ret
 
+; time_t mktime(struct tm *tm)
+;   Calendar time → epoch seconds. Real ports want real conversion;
+;   uc386's libc returns a deterministic-but-not-meaningful 0 because
+;   the only callers we ship are axtls's asn1_get_utc_time (cert
+;   notBefore/notAfter parsing — unused with CONFIG_SSL_CERT_VERIFICATION
+;   off) and modtime's time.mktime (which actually goes through
+;   shared/timeutils/timeutils_mktime, not this libc function). When
+;   real cert validation lands, replace this with a Howard Hinnant
+;   "days from civil" algorithm.
+_mktime:
+        xor     eax, eax
+        ret
+
+; int gettimeofday(struct timeval *tv, void *tz)
+;   Fills tv->tv_sec / tv->tv_usec from the BIOS tick counter
+;   (INT 1Ah AH=0). Each tick is ~54.925 ms (PIT 1193180 / 65536).
+;   tv_sec  = ticks * 65536 / 1193180   (≈ ticks / 18)
+;   tv_usec = (ticks % 18) * 54925
+;   Used by axtls for RNG seeding; precision doesn't matter — the
+;   only requirement is that successive calls return different
+;   values, which the BIOS counter guarantees. tz is ignored.
+;   Returns 0 always.
+_gettimeofday:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    esi
+        push    edi
+        ; Read BIOS ticks → EAX
+        xor     eax, eax
+        int     0x1A
+        movzx   esi, cx
+        shl     esi, 16
+        movzx   edi, dx
+        or      esi, edi              ; ESI = ticks (32-bit)
+        mov     edi, [ebp + 8]        ; tv pointer
+        test    edi, edi
+        jz      .done
+        ; tv_sec = ticks / 18  (close enough to the real ~18.20649)
+        mov     eax, esi
+        xor     edx, edx
+        mov     ecx, 18
+        div     ecx                   ; EAX=quot, EDX=rem
+        mov     [edi], eax            ; tv_sec
+        ; tv_usec = rem * 54925       (54.925 ms = 54925 us)
+        mov     eax, edx
+        mov     ecx, 54925
+        mul     ecx                   ; EAX = rem * 54925 (fits in 32 bits)
+        mov     [edi + 4], eax        ; tv_usec
+.done:
+        xor     eax, eax              ; return 0
+        pop     edi
+        pop     esi
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
 ; uint32_t bios_ticks(void) — INT 1Ah AH=00h, returns the BIOS
 ; system-tick counter as a 32-bit value. CX holds the high 16 bits,
 ; DX the low 16. Each tick is ~55 ms on a stock PC (PIT runs at
@@ -5319,6 +5377,19 @@ _rand:                                      ; alias
         jmp     _random
 _srand:                                     ; alias
         jmp     _srandom
+
+; int rand_r(unsigned int *seedp)
+;   POSIX reentrant rand. Updates *seedp via the same glibc LCG and
+;   returns the masked result. Used by axtls's RNG_initialize() to
+;   stir the entropy pool when no /dev/urandom is available.
+_rand_r:
+        mov     ecx, [esp + 4]              ; seedp
+        mov     eax, [ecx]
+        imul    eax, eax, 1103515245
+        add     eax, 12345
+        mov     [ecx], eax
+        and     eax, 0x7FFFFFFF
+        ret
 
 ; ---- fileno(stream): given FILE*, return underlying fd ----------------------
 ; FILE* in our libc is just an int handle stored as the pointer value.

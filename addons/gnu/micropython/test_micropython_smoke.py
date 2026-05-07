@@ -3041,3 +3041,64 @@ def test_dosbox_x_rig_loads_ne2000(tmp_path: Path) -> None:
     assert "I/O port 0x300" in log, (
         f"NE2000 didn't bind I/O 0x300: {log}"
     )
+
+
+# ---------------------------------------------------------------------------
+# `ssl` / `tls` module — extmod/modtls_axtls.c bridged to upstream/lib/axtls/.
+#
+# Real TLS handshakes need a server somewhere (and lwIP routed to it via
+# NE2000+SLIRP under QEMU). These tests cover the API surface that's
+# exercisable without a network: import, SSLContext construction, attribute
+# defaults. End-to-end handshake against `python -m http.server` over TLS
+# is in the QEMU+FreeDOS rig under dosbox-x-rig/run-qemu-freedos.sh.
+# ---------------------------------------------------------------------------
+
+
+def test_micropython_import_ssl(micropython_bin: Path) -> None:
+    """`import ssl` should resolve to the modtls_axtls.c-backed module
+    (registered as both `tls` and `ssl` aliases in moduledefs.h).
+    The module exposes `SSLContext`, `PROTOCOL_TLS_CLIENT`, and
+    `CERT_NONE`.
+    """
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    program = (
+        b"import ssl\n"
+        b"print('SSL_MARK', hasattr(ssl, 'SSLContext'),"
+        b" ssl.PROTOCOL_TLS_CLIENT, ssl.CERT_NONE)\n"
+        b"\x04"
+    )
+    res = run(micropython_bin,
+              stdin_bytes=program,
+              timeout_seconds=20.0,
+              instruction_limit=8_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert "SSL_MARK True 0 0" in res.stdout, (
+        f"`import ssl` smoke failed: {res.stdout!r}"
+    )
+
+
+def test_micropython_ssl_context_construct(micropython_bin: Path) -> None:
+    """SSLContext(PROTOCOL_TLS_CLIENT) should construct without
+    raising; verify_mode reads back as CERT_NONE (only supported
+    value in the axtls-backed implementation)."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from uc386.dos_emu import run
+
+    program = (
+        b"import ssl\n"
+        b"ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)\n"
+        b"print('CTX_MARK', ctx.verify_mode == ssl.CERT_NONE)\n"
+        b"\x04"
+    )
+    res = run(micropython_bin,
+              stdin_bytes=program,
+              timeout_seconds=20.0,
+              instruction_limit=8_000_000_000)
+    assert not res.timed_out, "REPL didn't exit"
+    assert res.error is None, f"dos_emu reported error: {res.error}"
+    assert "CTX_MARK True" in res.stdout, (
+        f"SSLContext construction failed: {res.stdout!r}"
+    )

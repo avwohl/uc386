@@ -252,17 +252,35 @@ extern unsigned long bios_ticks(void);
 #define MICROPY_PY_HASHLIB                (1)
 #define MICROPY_PY_HASHLIB_SHA256         (1)
 
-// MD5 + SHA1 — useful for verifying mTCP-downloaded files (most
-// FreeDOS distribution checksums are MD5/SHA1, not SHA256). The
-// upstream modhashlib.c gates these on MICROPY_SSL_AXTLS, but we
-// don't actually pull axtls — see uc386-dos/lib/axtls/crypto/
-// crypto.h for the shim that routes the AXTLS API to B-Con's
-// public-domain reference impls. MICROPY_SSL=0 stays (no actual
-// SSL/TLS), MICROPY_SSL_AXTLS=1 just selects the axtls branch of
-// the modhashlib.c #if cascade.
+// MD5 + SHA1 are gated on MICROPY_SSL_AXTLS in upstream modhashlib.c.
+// We compile the real axtls library (upstream/lib/axtls/), so the
+// AXTLS branch of modhashlib.c picks up its native MD5/SHA1 from
+// crypto/md5.c and crypto/sha1.c. (Earlier the port shimmed the
+// AXTLS API onto B-Con's public-domain hashes via
+// uc386-dos/lib/axtls/crypto/crypto.h to get hashlib without TLS;
+// that shim is now superseded by the real axtls build, but we keep
+// the search path priority so it would still work if disabled.)
 #define MICROPY_PY_HASHLIB_SHA1           (1)
 #define MICROPY_PY_HASHLIB_MD5            (1)
 #define MICROPY_SSL_AXTLS                 (1)
+
+// Real TLS via axtls. modtls_axtls.c is the MicroPython glue,
+// upstream/lib/axtls/{ssl,crypto}/ is the library itself. axtls's
+// I/O is wired to mp_stream_posix_read/write (extmod/axtls-include/
+// axtls_os_port.h) so reads/writes go through the lwIP socket's
+// stream protocol — no separate BIO wrapper needed. Cert verification
+// is OFF (CONFIG_SSL_CERT_VERIFICATION undef in the same header), so
+// `import ssl` accepts whatever the server presents; this matches
+// upstream MP's posture on resource-constrained ports. Use a CA
+// chain via load_verify_locations once the bigger ROM budget
+// allows — for now, server-auth is the user's responsibility.
+#define MICROPY_PY_SSL                    (1)
+// MICROPY_STREAMS_POSIX_API exposes mp_stream_posix_{read,write,lseek}
+// in py/stream.c — axtls's SOCKET_READ/SOCKET_WRITE macros (in
+// extmod/axtls-include/axtls_os_port.h) call those to bridge axtls
+// I/O to the underlying lwIP socket. Without this gate the symbols
+// are #ifdef'd out and the link fails.
+#define MICROPY_STREAMS_POSIX_API         (1)
 
 // lwIP — IPv4-only TCP/UDP/DNS stack. Phase 1 is loopback-only
 // (no packet driver yet), so socket(AF_INET, SOCK_STREAM) can

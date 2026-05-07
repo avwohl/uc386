@@ -19,6 +19,31 @@ fetch_b_con_crypto() {
     done
 }
 
+# axtls — TLS library, submodule in upstream/.gitmodules pointing at
+# micropython/axtls (a fork of axtls-2.1.x maintained for MP). Pinned
+# to the SHA the upstream MP tarball references (gitlinks aren't pulled
+# by the tarball, so we fetch a tree archive directly). The MP-extmod
+# glue at upstream/extmod/modtls_axtls.c expects this tree at
+# upstream/lib/axtls/.
+fetch_axtls() {
+    AXTLS_SHA="531cab9c278c947d268bd4c94ecab9153a961b43"
+    AXTLS_DIR="upstream/lib/axtls"
+    if [ -d "$AXTLS_DIR/ssl" ]; then
+        return 0
+    fi
+    echo "micropython: fetching axtls $AXTLS_SHA …"
+    AXTLS_TMP="$(mktemp -d)"
+    trap 'rm -rf "$AXTLS_TMP"' RETURN 2>/dev/null || true
+    curl -fsSL \
+        "https://github.com/micropython/axtls/archive/${AXTLS_SHA}.tar.gz" \
+        -o "$AXTLS_TMP/axtls.tgz"
+    tar -xzf "$AXTLS_TMP/axtls.tgz" -C "$AXTLS_TMP"
+    mkdir -p "$AXTLS_DIR"
+    cp -r "$AXTLS_TMP"/axtls-*/ssl    "$AXTLS_DIR/"
+    cp -r "$AXTLS_TMP"/axtls-*/crypto "$AXTLS_DIR/"
+    rm -rf "$AXTLS_TMP"
+}
+
 # lwIP — submodule in upstream/.gitmodules but not pulled by the
 # tarball. Fetch a pinned release tarball into upstream/lib/lwip/
 # alongside the existing crypto-algorithms stash. STABLE-2_2_1 is
@@ -139,6 +164,7 @@ if [ -d upstream ]; then
     echo "micropython: upstream/ already present — skipping main fetch."
     fetch_b_con_crypto
     fetch_lwip
+    fetch_axtls
     patch_modlwip_loopback_poll
     patch_main_startup_markers
     exit 0
@@ -162,5 +188,6 @@ echo "micropython: upstream tree at addons/gnu/micropython/upstream/"
 
 fetch_b_con_crypto
 fetch_lwip
+fetch_axtls
 patch_modlwip_loopback_poll
 patch_main_startup_markers

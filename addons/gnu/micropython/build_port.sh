@@ -106,15 +106,33 @@ SOURCES_FILE="build/_port_sources.txt"
     echo upstream/extmod/modjson.c
     echo upstream/extmod/modplatform.c
     echo upstream/extmod/modselect.c
-    # B-Con public-domain MD5 + SHA1 reference impls. Pulled into
-    # upstream/lib/crypto-algorithms/ alongside sha256.c by fetch.sh's
-    # post-fetch hook; the AXTLS-shaped API the upstream modhashlib.c
-    # expects is provided by uc386-dos/lib/axtls/crypto/crypto.h.
-    echo upstream/lib/crypto-algorithms/md5.c
-    echo upstream/lib/crypto-algorithms/sha1.c
+    # MD5 + SHA1 are now from upstream/lib/axtls/crypto/ (added below
+    # in the axtls section). B-Con's MD5 + SHA1 sources are still
+    # fetched by fetch.sh's `fetch_b_con_crypto` hook so the legacy
+    # shim at uc386-dos/lib/axtls/crypto/crypto.h still resolves
+    # cleanly if you flip MICROPY_PY_SSL=0 + drop axtls from this
+    # list, but they aren't compiled in the SSL build to avoid
+    # carrying two MD5 implementations.
     # lwIP — IPv4-only TCP/UDP/DNS stack with loopback for testing.
     # Phase 1: just core + ipv4 + netif/ethernet. DHCP / IPv6 / SLIP /
     # PPP are off in lwipopts.h so their sources don't pull in.
+    # axtls — real TLS via upstream/lib/axtls/. modtls_axtls.c is
+    # the MP glue (gated on MICROPY_PY_SSL && MICROPY_SSL_AXTLS).
+    # Sources mirror upstream/extmod/extmod.mk's AXTLS_DIR list.
+    echo upstream/extmod/modtls_axtls.c
+    echo upstream/lib/axtls/ssl/asn1.c
+    echo upstream/lib/axtls/ssl/loader.c
+    echo upstream/lib/axtls/ssl/tls1.c
+    echo upstream/lib/axtls/ssl/tls1_svr.c
+    echo upstream/lib/axtls/ssl/tls1_clnt.c
+    echo upstream/lib/axtls/ssl/x509.c
+    echo upstream/lib/axtls/crypto/aes.c
+    echo upstream/lib/axtls/crypto/bigint.c
+    echo upstream/lib/axtls/crypto/crypto_misc.c
+    echo upstream/lib/axtls/crypto/hmac.c
+    echo upstream/lib/axtls/crypto/md5.c
+    echo upstream/lib/axtls/crypto/sha1.c
+    echo upstream/lib/axtls/crypto/rsa.c
     echo upstream/extmod/modlwip.c
     echo upstream/lib/lwip/src/core/init.c
     echo upstream/lib/lwip/src/core/def.c
@@ -170,10 +188,16 @@ tr '\n' '\0' < "$SOURCES_FILE" \
         -I upstream \
         -I upstream/lib/lwip/src/include \
         -I upstream/extmod/lwip-include \
+        -I upstream/lib/axtls/ssl \
+        -I upstream/lib/axtls/crypto \
+        -I upstream/extmod/axtls-include \
         -I uc386-dos \
         -I build \
         -D__linux__=1 \
         -DNDEBUG=1 \
+        -DMICROPY_SSL_AXTLS=1 \
+        -DMICROPY_PY_SSL=1 \
+        -Dmp_stream_errno=errno \
         -o build/micropython.asm
 rc=$?
 set -e

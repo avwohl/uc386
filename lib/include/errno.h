@@ -42,4 +42,8 @@ extern int errno;
 #define ENOTEMPTY   39   /* Directory not empty */
 #define ENAMETOOLONG 36  /* File name too long */
 
+/* Linux aliases / extensions used by socket-aware code (axtls, lwIP).
+ * EWOULDBLOCK == EAGAIN on Linux; we mirror that. */
+#define EWOULDBLOCK EAGAIN
+
 #endif /* _ERRNO_H */

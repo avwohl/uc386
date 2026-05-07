@@ -450,6 +450,21 @@ extern const struct _mp_obj_module_t mp_module_select;
 #define UCDOS_MOD_ENTRY_SELECT
 #endif
 
+// `tls` (and the `ssl` alias) — extmod/modtls_axtls.c. Wraps a
+// socket through axtls: SSLContext + wrap_socket -> SSLSocket
+// implementing the standard stream protocol. The actual axtls
+// library lives at upstream/lib/axtls/{ssl,crypto}/.
+#if MICROPY_PY_SSL
+extern const struct _mp_obj_module_t mp_module_tls;
+#define UCDOS_MOD_ENTRY_TLS { MP_ROM_QSTR(MP_QSTR_tls), MP_ROM_PTR(&mp_module_tls) },
+// Python's stdlib name is `ssl`; map it to the same object so user
+// code written against CPython continues to work.
+#define UCDOS_MOD_ENTRY_SSL { MP_ROM_QSTR(MP_QSTR_ssl), MP_ROM_PTR(&mp_module_tls) },
+#else
+#define UCDOS_MOD_ENTRY_TLS
+#define UCDOS_MOD_ENTRY_SSL
+#endif
+
 #define MICROPY_REGISTERED_MODULES \
     { MP_ROM_QSTR(MP_QSTR_builtins), MP_ROM_PTR(&mp_module_builtins) }, \
     { MP_ROM_QSTR(MP_QSTR_sys), MP_ROM_PTR(&mp_module_sys) }, \
@@ -482,7 +497,9 @@ extern const struct _mp_obj_module_t mp_module_select;
     UCDOS_MOD_ENTRY_LWIP \
     UCDOS_MOD_ENTRY_SOCKET \
     UCDOS_MOD_ENTRY_UC386_NET \
-    UCDOS_MOD_ENTRY_SELECT
+    UCDOS_MOD_ENTRY_SELECT \
+    UCDOS_MOD_ENTRY_TLS \
+    UCDOS_MOD_ENTRY_SSL
 
 // Module attribute-access delegation table — modules whose attr
 // loads/stores need to dispatch through a port-supplied function.

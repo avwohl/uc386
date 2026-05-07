@@ -1,19 +1,19 @@
-# MicroPython port — status: **full REPL @ EXTRA_FEATURES + lwIP DHCP + Crynwr packet-driver path** (2026-05-05)
+# MicroPython port — status: **full REPL @ EXTRA_FEATURES + lwIP DHCP + Crynwr packet-driver path + axtls TLS** (2026-05-07)
 
 **Upstream**: https://github.com/micropython/micropython
 **License**: MIT
 
 **`addons/gnu/micropython/build_port.sh` produces a runnable
-`build/micropython.bin` (~296 KB at EXTRA_FEATURES with the
-full surface — `os` (incl. listdir/stat/system/getenv/environ
-+ port-supplied `os.path` submodule) + `time` (incl. time_ns)
-+ `random`/`binascii`/`hashlib` (md5 + sha1 + sha256)/`re`/
-`cmath`/`heapq`/`deflate`/`io`/`uctypes`/`json`/`platform`/
-`base64`/`shutil`/`tempfile` modules + LONGINT_LONGLONG +
-MICROPY_STACK_CHECK + EXACT float formatter + `help()` +
-module `__file__`. Was ~169 KB at MINIMUM, ~199 KB at
-CORE_FEATURES, ~263 KB at the first EXTRA_FEATURES
-landing).** Run under `uc386.dos_emu.run`,
+`build/micropython.bin` (~444 KB at EXTRA_FEATURES + axtls TLS;
+~408 KB pre-axtls; ~296 KB pre-lwIP-DHCP. Surface: `os` (incl.
+listdir/stat/system/getenv/environ + port-supplied `os.path`
+submodule) + `time` (incl. time_ns) + `random`/`binascii`/
+`hashlib` (md5 + sha1 + sha256)/`re`/`cmath`/`heapq`/`deflate`/
+`io`/`uctypes`/`json`/`platform`/`base64`/`shutil`/`tempfile`/
+`ssl` (= `tls`) modules + LONGINT_LONGLONG + MICROPY_STACK_CHECK
++ EXACT float formatter + `help()` + module `__file__`. Was
+~169 KB at MINIMUM, ~199 KB at CORE_FEATURES, ~263 KB at the
+first EXTRA_FEATURES landing).** Run under `uc386.dos_emu.run`,
 it boots the MicroPython REPL and accepts essentially full Python:
 
 ```
@@ -138,6 +138,50 @@ What works (70 smoke tests pin the core wins):
 - `print()` with real newlines (qstr reverse-mangling correctly
   decodes `_brace_open__colon__hash_b_brace_close_` → `{:#b}`)
 - clean Ctrl-D exit
+
+- `import ssl` (and `import tls` — same module under both names)
+  — full TLSv1 client + server via axtls (upstream/lib/axtls/,
+  pinned to micropython/axtls @ 531cab9c). 13 axtls source files
+  compile clean through uc386 (ssl/{asn1,loader,tls1,tls1_svr,
+  tls1_clnt,x509}.c + crypto/{aes,bigint,crypto_misc,hmac,md5,rsa,
+  sha1}.c). Library size: +36 KB on top of pre-SSL. The MP glue is
+  upstream's `extmod/modtls_axtls.c` — exposes `ssl.SSLContext`,
+  `ssl.PROTOCOL_TLS_CLIENT`, `ssl.CERT_NONE`, `SSLContext.wrap_socket`,
+  `load_cert_chain`. Import + SSLContext construction smoke-tested
+  in `test_micropython_smoke.py::test_micropython_import_ssl` and
+  `::test_micropython_ssl_context_construct`.
+
+  axtls's I/O is wired through `extmod/axtls-include/axtls_os_port.h`
+  to `mp_stream_posix_read/write` (gated on `MICROPY_STREAMS_POSIX_API=1`,
+  flipped in `uc386-dos/mpconfigport.h`), so reads/writes traverse
+  the underlying lwIP socket via the standard stream protocol — no
+  separate BIO needed. Required additions to support the build:
+    - `lib/include/arpa/inet.h` (htonl/ntohl/htons/ntohs)
+    - `lib/include/sys/time.h` (struct timeval, gettimeofday decl)
+    - `lib/i386_dos_libc.asm`: `_gettimeofday` (BIOS-tick-derived
+      tv_sec/tv_usec for axtls's RNG seeding), `_rand_r` (POSIX
+      reentrant LCG that axtls's RNG_initialize uses to stir the
+      entropy pool when /dev/urandom is unavailable), and `_mktime`
+      (stub returning 0 — axtls's `asn1_get_utc_time` calls it for
+      cert notBefore/notAfter parsing, but with
+      `CONFIG_SSL_CERT_VERIFICATION` off the result is unused).
+    - `EWOULDBLOCK` alias to `EAGAIN` in `lib/include/errno.h`.
+
+  Cert verification is **off** (CONFIG_SSL_CERT_VERIFICATION undef
+  in `extmod/axtls-include/config.h`): a TLS handshake against any
+  server will succeed regardless of certificate identity. This
+  matches upstream MP's posture on resource-constrained ports
+  (esp32 etc. where a CA bundle won't fit). Enabling verification
+  needs (a) opting in via the flag, (b) real `time()` from the DOS
+  RTC, (c) a CA bundle baked into the image, (d) real `mktime()`.
+  All four are mechanical; not blockers.
+
+  End-to-end TLS handshake (the actual cipher exchange + record
+  stream) needs lwIP routed to the network — the QEMU+FreeDOS rig
+  with NE2000+SLIRP is the closest local proxy for that. The
+  REPL itself can `import ssl; ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)`
+  cleanly today; the wire-level test is a runtime task tied to the
+  FreeDOS-in-VMware milestone, not the library bringup.
 
 What doesn't work yet (separate gates, pinned in mpconfigport.h):
 
