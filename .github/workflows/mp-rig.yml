@@ -142,35 +142,26 @@ jobs:
           ls -la addons/gnu/micropython/dosbox-x-rig/MP.EXE
           file addons/gnu/micropython/dosbox-x-rig/MP.EXE
 
-      - name: Bind MP_DOS4G.EXE via dos4g (extender comparison)
-        # Same source asm, different extender. If MP_DOS4G.EXE prints
-        # "[mp-main-entered]" under the rig but MP.EXE doesn't, the
-        # bug is PMODE/W-specific (its INT 21h reflector has caller-
-        # EIP-dependent behavior at high VAs). Best-effort — if
-        # dos4gw.exe stub isn't available in this Watcom install,
-        # the binding can fail and we just skip the comparison.
-        # Also copy dos4gw.exe alongside in case the bundled MZ
-        # stub just loads it from disk (some Watcom installs).
-        continue-on-error: true
+      # NOTE on dos4g extender comparison (run 25478838687):
+      # Building MP_DOS4G.EXE / ECHO_DOS4G.EXE with --extender dos4g
+      # succeeds (dos4gw.exe is in $WATCOM/binw, the LE binary is
+      # produced cleanly), BUT under DOSBox-X they produce zero
+      # output: dos4gw needs INT 15h AX=BF01 / BFDE which DOSBox-X
+      # doesn't implement (logs "BIOS:INT15:Unknown call ax=BFDE").
+      # So extender-comparison-via-dos4g doesn't work in this rig.
+      # The dos4g binding step has been removed; if you want to
+      # try it again, you'll also need a different DOS emulator.
+      - name: Install DOSBox 0.74-3 (parallel test)
+        # Try MP.EXE under classic DOSBox 0.74-3 instead of DOSBox-X
+        # to isolate whether the _main → _write hang is specific
+        # to DOSBox-X's emulation. exe-smoke.yml's echo.exe runs
+        # successfully under DOSBox 0.74-3, so that emulator
+        # handles PMODE/W INT 21h passthrough cleanly for small
+        # binaries; if MP.EXE prints "[mp-main-entered]" under
+        # 0.74-3, the bug is DOSBox-X-specific.
         run: |
-          ls "$WATCOM/binw/" | grep -iE "dos4g|cwstub|pmodew" || true
-          python -m addons.harness.exe \
-            addons/gnu/micropython/build/micropython.asm \
-            -o addons/gnu/micropython/dosbox-x-rig/MP_DOS4G.EXE \
-            --extender dos4g
-          # Drop dos4gw.exe in the rig dir in case the .exe needs it.
-          cp "$WATCOM/binw/dos4gw.exe" addons/gnu/micropython/dosbox-x-rig/
-          ls -la addons/gnu/micropython/dosbox-x-rig/MP_DOS4G.EXE
-          ls -la addons/gnu/micropython/dosbox-x-rig/dos4gw.exe
-          file addons/gnu/micropython/dosbox-x-rig/MP_DOS4G.EXE
-          # Also build echo with dos4g to verify dos4g works at all
-          # under the rig — if ECHO_DOS4G.EXE doesn't print "hello"
-          # then dos4g itself isn't viable here.
-          python -m addons.harness.exe \
-            addons/gnu/echo/main.c \
-            -o addons/gnu/micropython/dosbox-x-rig/ECHO_DOS4G.EXE \
-            --extender dos4g
-          ls -la addons/gnu/micropython/dosbox-x-rig/ECHO_DOS4G.EXE
+          sudo apt-get install -y dosbox
+          dosbox --version 2>&1 | head -3 || true
 
       - name: Fetch NE2000.COM
         run: |
@@ -214,6 +205,44 @@ jobs:
           printf '\x1a' >> addons/gnu/micropython/dosbox-x-rig/SCRIPT.PY
           ls -la addons/gnu/micropython/dosbox-x-rig/SCRIPT.PY
           cat addons/gnu/micropython/dosbox-x-rig/SCRIPT.PY
+
+      - name: Run MP.EXE under classic DOSBox 0.74-3 (alternate emulator)
+        # Mirror the DOSBox-X rig but with classic DOSBox 0.74-3.
+        # Same MP.EXE binary, same NE2000.COM, same SCRIPT.PY.
+        # If "[mp-main-entered]" appears in DOSBOX_RIG.LOG but not
+        # in DOSBox-X's RIG.LOG, the bug is DOSBox-X-specific.
+        # Best-effort — DOSBox 0.74-3 lacks NE2000+SLIRP, so the
+        # NE2000 driver load will fail; we only care about MP.EXE
+        # printing or not.
+        continue-on-error: true
+        run: |
+          cd addons/gnu/micropython/dosbox-x-rig
+          # Generate a minimal classic-DOSBox conf
+          cat > dosbox-classic.conf <<'CONF'
+          [cpu]
+          cputype=pentium
+          core=normal
+          cycles=max
+          [dosbox]
+          memsize=16
+          [autoexec]
+          mount C .
+          C:
+          MP.EXE < SCRIPT.PY > MP_DOSBOX.LOG
+          exit
+          CONF
+          rm -f MP_DOSBOX.LOG
+          export SDL_VIDEODRIVER=dummy
+          export SDL_AUDIODRIVER=dummy
+          timeout -k 10 90 dosbox -conf dosbox-classic.conf > /tmp/dosbox.stderr 2>&1 || \
+            echo "(timeout/error — exit $?)"
+          echo "=== MP_DOSBOX.LOG ==="
+          if [ -s MP_DOSBOX.LOG ]; then
+            cat MP_DOSBOX.LOG
+            echo "(size: $(wc -c < MP_DOSBOX.LOG) bytes)"
+          else
+            echo "(empty or missing)"
+          fi
 
       - name: Run the DOSBox-X rig
         # `-silent` skips the SDL window. SDL_VIDEODRIVER=dummy +
@@ -315,10 +344,6 @@ jobs:
               "[mp-before-deinit]" \
               "[bridge-post-main]" \
               "after-mp marker" \
-              "before-mp-dos4g marker" \
-              "after-mp-dos4g marker" \
-              "before-echo-dos4g" \
-              "hello dos4g rig" \
               "MicroPython" \
               "10.0.2.15" \
               "'pktdrv'"; do
@@ -348,9 +373,9 @@ jobs:
           name: mp-rig-artifacts
           path: |
             addons/gnu/micropython/dosbox-x-rig/RIG.LOG
+            addons/gnu/micropython/dosbox-x-rig/MP_DOSBOX.LOG
             addons/gnu/micropython/dosbox-x-rig/SCRIPT.PY
             addons/gnu/micropython/dosbox-x-rig/MP.EXE
-            addons/gnu/micropython/dosbox-x-rig/MP_DOS4G.EXE
             addons/gnu/micropython/dosbox-x-rig/ECHOTEST.EXE
             addons/gnu/micropython/dosbox-x-rig/MP_OUT.TXT
             addons/gnu/micropython/build/micropython.asm
