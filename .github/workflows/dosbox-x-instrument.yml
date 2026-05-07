@@ -1,0 +1,229 @@
+name: dosbox-x-instrument
+
+# Build DOSBox-X from source with a logging patch on the AH=0x40
+# (DOS write to handle) path, then run MP.EXE under it to capture
+# what DOSBox-X actually sees during the failing call.
+#
+# This produces the decisive diagnostic data for the upstream bug
+# report — the "what bytes did MEM_BlockRead pull into dos_copybuf
+# at the failing call site" question that we can't answer from
+# outside the emulator.
+#
+# Heavy workflow: full DOSBox-X build (autotools + SDL2 + 5-10 min
+# compile). Manual-trigger only.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  instrument:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+              build-essential autoconf automake libtool pkg-config \
+              libsdl2-dev libsdl2-net-dev libpng-dev libfreetype-dev \
+              libslirp-dev libpcap-dev libfluidsynth-dev \
+              git
+          autoconf --version | head -1
+          automake --version | head -1
+
+      - name: Clone DOSBox-X (shallow)
+        run: |
+          git clone --depth=1 https://github.com/joncampbell123/dosbox-x.git \
+              /tmp/dosbox-x
+          cd /tmp/dosbox-x
+          git rev-parse HEAD
+
+      - name: Apply AH=0x40 logging patch
+        run: |
+          # Patch src/dos/dos.cpp to log every AH=0x40 call's full
+          # register state, the linear address it reads from, and
+          # the first 16 bytes pulled into dos_copybuf. This lets
+          # us see exactly what DOSBox-X observes — and crucially,
+          # WHAT BYTES end up in dos_copybuf for the failing call.
+          # If they're zeros, DOSBox-X is reading from an empty
+          # location (PMODE/W bounce buffer didn't get populated,
+          # or got written to a different one).
+          python3 - << 'PYEOF'
+          import re, pathlib
+          p = pathlib.Path("/tmp/dosbox-x/src/dos/dos.cpp")
+          src = p.read_text()
+          # Insert log after the MEM_BlockRead call in case 0x40.
+          marker = "MEM_BlockRead(SegPhys(ds)+reg_dx,dos_copybuf,towrite);\n"
+          insertion = (
+              "MEM_BlockRead(SegPhys(ds)+reg_dx,dos_copybuf,towrite);\n"
+              "                LOG_MSG(\"AH=40 BX=%04x DX=%04x ECX=%08x DS=%04x SS=%04x SP=%04x \"\n"
+              "                    \"DS_lin=%08x DX_lin=%08x dos_copybuf[0..15]=\"\n"
+              "                    \"%02x %02x %02x %02x %02x %02x %02x %02x \"\n"
+              "                    \"%02x %02x %02x %02x %02x %02x %02x %02x towrite=%u\",\n"
+              "                    reg_bx, reg_dx, reg_ecx,\n"
+              "                    SegValue(ds), SegValue(ss), reg_sp,\n"
+              "                    SegPhys(ds), SegPhys(ds)+reg_dx,\n"
+              "                    dos_copybuf[0], dos_copybuf[1], dos_copybuf[2], dos_copybuf[3],\n"
+              "                    dos_copybuf[4], dos_copybuf[5], dos_copybuf[6], dos_copybuf[7],\n"
+              "                    dos_copybuf[8], dos_copybuf[9], dos_copybuf[10], dos_copybuf[11],\n"
+              "                    dos_copybuf[12], dos_copybuf[13], dos_copybuf[14], dos_copybuf[15],\n"
+              "                    (unsigned)towrite);\n"
+          )
+          if marker not in src:
+              raise SystemExit("marker not found — dos.cpp shape changed?")
+          new_src = src.replace(marker, insertion, 1)
+          p.write_text(new_src)
+          PYEOF
+          # Show the patched section
+          grep -n -A 20 "case 0x40:" /tmp/dosbox-x/src/dos/dos.cpp | head -40
+
+      - name: Build DOSBox-X
+        run: |
+          cd /tmp/dosbox-x
+          # Generate configure
+          ./autogen.sh
+          # Build SDL2 variant (matches apt-installed version)
+          ./configure --enable-sdl2 \
+              --disable-debug \
+              --disable-mt32 \
+              --without-fluidsynth || (cat config.log | tail -50; exit 1)
+          make -j$(nproc) 2>&1 | tail -30
+          ls -la src/dosbox-x
+
+      - name: Install pre-built apt deps for the test
+        run: |
+          sudo apt-get install -y nasm dosbox curl unzip
+
+      - name: Install Open Watcom V2
+        run: |
+          mkdir -p ~/.local/opt/watcom
+          curl -sL -o /tmp/watcom.bin \
+            https://github.com/open-watcom/open-watcom-v2/releases/download/Current-build/open-watcom-2_0-c-linux-x64
+          unzip -q /tmp/watcom.bin -d ~/.local/opt/watcom
+          chmod +x ~/.local/opt/watcom/binl64/wlink || true
+          echo "WATCOM=$HOME/.local/opt/watcom" >> $GITHUB_ENV
+          echo "$HOME/.local/opt/watcom/binl64" >> $GITHUB_PATH
+
+      - name: Set up Python + install harness deps
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install "uc_core @ git+https://github.com/avwohl/uc_core@main"
+          pip install -e .
+
+      - name: Fetch MP.EXE from latest mp-rig artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id=$(gh run list --workflow=mp-rig.yml \
+              --status=completed \
+              --limit=10 \
+              --json databaseId \
+              --jq '.[0].databaseId')
+          mkdir -p /tmp/mp-rig-artifacts
+          gh run download "$run_id" \
+              --name mp-rig-artifacts \
+              --dir /tmp/mp-rig-artifacts
+          find /tmp/mp-rig-artifacts -name "MP.EXE" -exec cp {} /tmp/MP.EXE \;
+          ls -la /tmp/MP.EXE
+
+      - name: Run MP.EXE under PATCHED DOSBox-X (failing config)
+        # Use the bug-triggering autoexec so we see the failing
+        # AH=0x40 call's register state + buffer bytes.
+        run: |
+          mkdir -p /tmp/dx-fail
+          cp /tmp/MP.EXE /tmp/dx-fail/
+          cat > /tmp/dx-fail/dosbox-x.conf << 'EOF'
+          [cpu]
+          cputype = pentium
+          core    = normal
+          cycles  = max
+          [dosbox]
+          memsize = 16
+
+          [autoexec]
+          mount C /tmp/dx-fail
+          C:
+          MP.EXE > MPOUT.TXT
+          exit
+          EOF
+          SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+              timeout 60 /tmp/dosbox-x/src/dosbox-x \
+              -silent \
+              -conf /tmp/dx-fail/dosbox-x.conf \
+              > /tmp/dx-fail.stdout 2>&1 || true
+          echo "=== MPOUT.TXT (failing) ==="
+          wc -c /tmp/dx-fail/MPOUT.TXT
+          xxd /tmp/dx-fail/MPOUT.TXT | tail -10
+          echo
+          echo "=== AH=40 log entries (failing) ==="
+          grep "AH=40" /tmp/dx-fail.stdout | head -30
+          echo
+          echo "=== last 5 AH=40 entries (failing) ==="
+          grep "AH=40" /tmp/dx-fail.stdout | tail -5
+
+      - name: Run MP.EXE under PATCHED DOSBox-X (non-failing config)
+        run: |
+          mkdir -p /tmp/dx-pass
+          cp /tmp/MP.EXE /tmp/dx-pass/
+          cat > /tmp/dx-pass/dosbox-x.conf << 'EOF'
+          [cpu]
+          cputype = pentium
+          core    = normal
+          cycles  = max
+          [dosbox]
+          memsize = 16
+
+          [autoexec]
+          mount C /tmp/dx-pass
+          C:
+          MP.EXE > MPOUT.TXT
+          EOF
+          # Note: NO `exit` line — DOS will sit at prompt after MP.
+          SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+              timeout 30 /tmp/dosbox-x/src/dosbox-x \
+              -silent \
+              -conf /tmp/dx-pass/dosbox-x.conf \
+              > /tmp/dx-pass.stdout 2>&1 || true
+          echo "=== MPOUT.TXT (passing) ==="
+          wc -c /tmp/dx-pass/MPOUT.TXT
+          xxd /tmp/dx-pass/MPOUT.TXT | tail -10
+          echo
+          echo "=== AH=40 log entries (passing) — first 30 ==="
+          grep "AH=40" /tmp/dx-pass.stdout | head -30
+
+      - name: Diff
+        run: |
+          echo "=========================================="
+          echo "Pull AH=40 entries with marker-buffer first"
+          echo "bytes ('[mp-' = 0x5b 0x6d 0x70 0x2d) for"
+          echo "easy comparison."
+          echo "=========================================="
+          echo
+          echo "--- FAILING run AH=40 entries with first byte != 0x5b ---"
+          grep "AH=40" /tmp/dx-fail.stdout | grep -v "5b 6d 70 2d" | head -10
+          echo
+          echo "--- PASSING run AH=40 entries with first byte != 0x5b ---"
+          grep "AH=40" /tmp/dx-pass.stdout | grep -v "5b 6d 70 2d" | head -10
+          echo
+          echo "--- AH=40 calls before & at failing point ---"
+          grep "AH=40" /tmp/dx-fail.stdout | head -25
+
+      - name: Upload diagnostic artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dosbox-x-instrument-artifacts
+          path: |
+            /tmp/MP.EXE
+            /tmp/dx-fail.stdout
+            /tmp/dx-pass.stdout
+            /tmp/dx-fail/MPOUT.TXT
+            /tmp/dx-pass/MPOUT.TXT
+          if-no-files-found: warn
