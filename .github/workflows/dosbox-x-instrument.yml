@@ -154,8 +154,9 @@ jobs:
           exit
           EOF
           SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
-              timeout 60 /tmp/dosbox-x/src/dosbox-x \
+              timeout -k 10 60 /tmp/dosbox-x/src/dosbox-x \
               -silent \
+              -exit \
               -conf /tmp/dx-fail/dosbox-x.conf \
               > /tmp/dx-fail.stdout 2>&1 || true
           echo "=== MPOUT.TXT (failing) ==="
@@ -186,8 +187,11 @@ jobs:
           MP.EXE > MPOUT.TXT
           EOF
           # Note: NO `exit` line — DOS will sit at prompt after MP.
+          # No `-exit` flag here — we WANT DOS to sit at the
+          # prompt (that's the non-failing config). timeout will
+          # send SIGTERM/SIGKILL when 30s have elapsed.
           SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
-              timeout 30 /tmp/dosbox-x/src/dosbox-x \
+              timeout -k 10 30 /tmp/dosbox-x/src/dosbox-x \
               -silent \
               -conf /tmp/dx-pass/dosbox-x.conf \
               > /tmp/dx-pass.stdout 2>&1 || true

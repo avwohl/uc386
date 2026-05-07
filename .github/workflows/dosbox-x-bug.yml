@@ -142,9 +142,13 @@ jobs:
           exit
           EOF
           # SDL_VIDEODRIVER=dummy keeps headless runners happy.
+          # `timeout -k 10` SIGKILLs 10s after SIGTERM if dosbox-x
+          # ignores the terminate (some headless dosbox-x builds
+          # do hang on SIGTERM).
           SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
-              timeout 60 dosbox-x \
+              timeout -k 10 60 dosbox-x \
               -silent \
+              -exit \
               -conf /tmp/dx/dosbox-x.conf \
               > /tmp/dosbox-x-stdout.log 2>&1 || true
           echo "=== MPOUT.TXT (DOSBox-X) — bytes & xxd dump ==="
@@ -181,7 +185,8 @@ jobs:
           exit
           EOF
           SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
-              timeout 60 dosbox \
+              timeout -k 10 60 dosbox \
+              -exit \
               -conf /tmp/dc/dosbox.conf \
               > /tmp/dosbox-classic-stdout.log 2>&1 || true
           echo "=== MPOUT.TXT (classic DOSBox) — bytes & xxd dump ==="
