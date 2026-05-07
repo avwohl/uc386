@@ -208,17 +208,21 @@ jobs:
 
       - name: Run MP.EXE under classic DOSBox 0.74-3 (alternate emulator)
         # Mirror the DOSBox-X rig but with classic DOSBox 0.74-3.
-        # Same MP.EXE binary, same NE2000.COM, same SCRIPT.PY.
-        # If "[mp-main-entered]" appears in DOSBOX_RIG.LOG but not
-        # in DOSBox-X's RIG.LOG, the bug is DOSBox-X-specific.
-        # Best-effort — DOSBox 0.74-3 lacks NE2000+SLIRP, so the
-        # NE2000 driver load will fail; we only care about MP.EXE
-        # printing or not.
+        # Same MP.EXE binary, same SCRIPT.PY. If "[mp-main-entered]"
+        # appears in MPDOS.LOG (classic DOSBox) but not in RIG.LOG
+        # (DOSBox-X), the bug is DOSBox-X-specific. Best-effort.
+        #
+        # File names must be 8.3 — DOS truncates "MP_DOSBOX.LOG"
+        # to "MP_DOSBO.LOG" silently. Use short names everywhere.
+        # Mount path is absolute (matches exe-smoke.yml).
         continue-on-error: true
         run: |
-          cd addons/gnu/micropython/dosbox-x-rig
-          # Generate a minimal classic-DOSBox conf
-          cat > dosbox-classic.conf <<'CONF'
+          mkdir -p /tmp/dosbox-mp
+          cp addons/gnu/micropython/dosbox-x-rig/MP.EXE \
+             addons/gnu/micropython/dosbox-x-rig/ECHOTEST.EXE \
+             addons/gnu/micropython/dosbox-x-rig/SCRIPT.PY \
+             /tmp/dosbox-mp/
+          cat > /tmp/dosbox-mp.conf <<'CONF'
           [cpu]
           cputype=pentium
           core=normal
@@ -226,27 +230,31 @@ jobs:
           [dosbox]
           memsize=16
           [autoexec]
-          mount C .
-          C:
-          echo --- before-MP under classic DOSBox --- > MP_DOSBOX.LOG
-          ECHOTEST.EXE classic-dosbox echo >> MP_DOSBOX.LOG
-          echo --- before-MP.EXE --- >> MP_DOSBOX.LOG
-          MP.EXE < SCRIPT.PY >> MP_DOSBOX.LOG
-          echo --- after-MP.EXE --- >> MP_DOSBOX.LOG
+          mount c /tmp/dosbox-mp
+          c:
+          echo before-mp > MPDOS.LOG
+          ECHOTEST.EXE classic dosbox >> MPDOS.LOG
+          echo before-MP.EXE >> MPDOS.LOG
+          MP.EXE < SCRIPT.PY >> MPDOS.LOG
+          echo after-MP.EXE >> MPDOS.LOG
           exit
           CONF
-          rm -f MP_DOSBOX.LOG
           export SDL_VIDEODRIVER=dummy
           export SDL_AUDIODRIVER=dummy
-          timeout -k 10 90 dosbox -conf dosbox-classic.conf > /tmp/dosbox.stderr 2>&1 || \
+          timeout 90 dosbox -conf /tmp/dosbox-mp.conf -exit > /tmp/dosbox-classic.log 2>&1 || \
             echo "(timeout/error — exit $?)"
-          echo "=== MP_DOSBOX.LOG ==="
-          if [ -s MP_DOSBOX.LOG ]; then
-            cat MP_DOSBOX.LOG
-            echo "(size: $(wc -c < MP_DOSBOX.LOG) bytes)"
+          ls -la /tmp/dosbox-mp/
+          echo "=== MPDOS.LOG ==="
+          if [ -s /tmp/dosbox-mp/MPDOS.LOG ]; then
+            cat /tmp/dosbox-mp/MPDOS.LOG
+            echo "(size: $(wc -c < /tmp/dosbox-mp/MPDOS.LOG) bytes)"
           else
             echo "(empty or missing)"
           fi
+          echo "=== dosbox classic stderr (last 20) ==="
+          tail -20 /tmp/dosbox-classic.log
+          # Copy MPDOS.LOG to the upload area
+          cp /tmp/dosbox-mp/MPDOS.LOG addons/gnu/micropython/dosbox-x-rig/ 2>/dev/null || true
 
       - name: Run the DOSBox-X rig
         # `-silent` skips the SDL window. SDL_VIDEODRIVER=dummy +
@@ -377,7 +385,7 @@ jobs:
           name: mp-rig-artifacts
           path: |
             addons/gnu/micropython/dosbox-x-rig/RIG.LOG
-            addons/gnu/micropython/dosbox-x-rig/MP_DOSBOX.LOG
+            addons/gnu/micropython/dosbox-x-rig/MPDOS.LOG
             addons/gnu/micropython/dosbox-x-rig/SCRIPT.PY
             addons/gnu/micropython/dosbox-x-rig/MP.EXE
             addons/gnu/micropython/dosbox-x-rig/ECHOTEST.EXE
