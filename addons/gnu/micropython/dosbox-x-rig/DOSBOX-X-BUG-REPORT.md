@@ -163,19 +163,19 @@ The unified diff is in
 [`dosbox-x-fix.patch`](https://github.com/avwohl/uc386/blob/main/addons/gnu/micropython/dosbox-x-rig/dosbox-x-fix.patch)
 in this repo.
 
-## Optional defense in depth
+## Side note: `LocalFile::Write` is buffered on POSIX
 
-`LocalFile::Write` on the non-Windows branch uses `fwrite`
-(buffered), while the Windows branch uses unbuffered `WriteFile`.
-A program SIGKILLed by anything (DOSBox-X crash, host OOM
-killer, user `kill -9`) loses its in-buffer redirect-file
-bytes only on the POSIX path. Adding `fflush(fhandle)` after
-the `fwrite` would make the POSIX path match the Windows
-behavior. It's not strictly needed to fix this bug — the
-clean-shutdown path the silent-quit fix unblocks already
-flushes — but it removes a class of latent SIGKILL-induced
-output truncation. The patch file includes both hunks; the
-second is optional.
+Independent of this bug, the non-Windows branch of
+`LocalFile::Write` uses `fwrite` (host-stdio buffered) while
+the Windows branch uses unbuffered `WriteFile`. So any DOS
+program SIGKILLed by anything else (DOSBox-X crash, host OOM
+killer, user `kill -9`) on POSIX still loses its last
+in-stdio-buffer redirect-file bytes. Programs that explicitly
+`INT 21h AH=0x68` (commit) after writes are immune; programs
+that rely on real DOS's "writes are immediately durable"
+behavior are not. Worth filing separately if anyone wants
+POSIX/Windows parity here, but it's not required to fix the
+report's symptom.
 
 ## Diagnostic infrastructure
 
