@@ -228,7 +228,11 @@ jobs:
           [autoexec]
           mount C .
           C:
-          MP.EXE < SCRIPT.PY > MP_DOSBOX.LOG
+          echo --- before-MP under classic DOSBox --- > MP_DOSBOX.LOG
+          ECHOTEST.EXE classic-dosbox echo >> MP_DOSBOX.LOG
+          echo --- before-MP.EXE --- >> MP_DOSBOX.LOG
+          MP.EXE < SCRIPT.PY >> MP_DOSBOX.LOG
+          echo --- after-MP.EXE --- >> MP_DOSBOX.LOG
           exit
           CONF
           rm -f MP_DOSBOX.LOG
