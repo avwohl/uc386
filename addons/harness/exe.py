@@ -475,6 +475,22 @@ _pmodew_start:
         mov     eax, [_main + 14]
         call    _bridge_emit_hex32
 
+        ; --- Direct write-from-bridge of the string at str_addr -
+        ; If _main's _write call produces only NULs but the SAME
+        ; bytes printed via _bridge_emit (which uses INT 21h AH=0x40
+        ; with EDX=str_addr, ECX=18, BX=1) DO appear, the bug is
+        ; that the call _main → ... → call _write somehow doesn't
+        ; reach our _write OR doesn't pass the right args. Whereas
+        ; if even the direct write produces NULs, the issue is
+        ; downstream of fd 1's redirect (some DOS-side state that
+        ; got corrupted between the previous bridge writes and
+        ; this one).
+        mov     edx, _bridge_marker_dump_writetest
+        call    _bridge_emit_str0
+        mov     edx, [_main + 7]         ; str_addr (0x227a3)
+        mov     ecx, 18                   ; same count _main uses
+        call    _bridge_emit              ; write 18 bytes from str_addr
+
         ; --- Call _main (mirrors codegen _start's call _main) ----
         mov     edx, _bridge_marker_premain
         mov     ecx, 23
