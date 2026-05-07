@@ -40,6 +40,45 @@ jobs:
           cd /tmp/dosbox-x
           git rev-parse HEAD
 
+      - name: Apply quit-confirm-headless-fix + fflush patch
+        # Two-part patch:
+        #   1. CheckQuit() in sdlmain.cpp returns true unconditionally
+        #      when -silent is active (avoids the tinyfd y/n loop in
+        #      headless mode that hangs DOSBox-X until SIGKILL).
+        #   2. LocalFile::Write in drive_local.cpp does fflush(fhandle)
+        #      after each fwrite so that stdio buffers don't lose data
+        #      on SIGKILL.
+        run: |
+          python3 - << 'PYEOF'
+          import pathlib
+
+          # Patch 1: skip quit confirmation in silent mode.
+          p = pathlib.Path("/tmp/dosbox-x/src/gui/sdlmain.cpp")
+          src = p.read_text()
+          marker = "bool CheckQuit(void) {\n#if !defined(HX_DOS)"
+          repl = ("bool CheckQuit(void) {\n"
+                  "#if !defined(HX_DOS)\n"
+                  "    /* PATCH: in -silent mode there is no UI to answer y/n;\n"
+                  "     * tinyfd loops forever waiting for stdin. Auto-confirm. */\n"
+                  "    if (control && control->opt_silent) return true;\n")
+          if marker not in src:
+              raise SystemExit("CheckQuit marker not found")
+          new_src = src.replace(marker, repl, 1)
+          p.write_text(new_src)
+
+          # Patch 2: fflush after fwrite in LocalFile::Write.
+          p = pathlib.Path("/tmp/dosbox-x/src/dos/drive_local.cpp")
+          src = p.read_text()
+          marker2 = "*size=file_access_tries>0?(uint16_t)write(fileno(fhandle),data,*size):(uint16_t)fwrite(data,1,*size,fhandle);\n\t\treturn true;"
+          repl2 = ("*size=file_access_tries>0?(uint16_t)write(fileno(fhandle),data,*size):(uint16_t)fwrite(data,1,*size,fhandle);\n"
+                   "\t\tfflush(fhandle);  /* PATCH: flush so stdio buffers aren't lost on SIGKILL */\n"
+                   "\t\treturn true;")
+          if marker2 not in src:
+              raise SystemExit("fwrite marker not found in drive_local.cpp")
+          new_src = src.replace(marker2, repl2, 1)
+          p.write_text(new_src)
+          PYEOF
+
       - name: Apply AH=0x40 logging patch
         run: |
           # Patch src/dos/dos.cpp to log every AH=0x40 call's full
