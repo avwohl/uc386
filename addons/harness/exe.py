@@ -103,7 +103,10 @@ _bridge_marker_postmain: db "[bridge-post-main]", 10
 _bridge_marker_diag:    db "[bridge-diag-stub]", 10
 _bridge_marker_postdiag: db "[bridge-post-diag]", 10
 _bridge_marker_dump_main7: db "[main+7]=", 0
-_bridge_marker_dump_str:   db "[str@7c7a3]=", 0
+_bridge_marker_dump_str:   db "[str-bytes]=", 0
+_bridge_marker_dump_mainaddr: db "[main_addr]=", 0
+_bridge_marker_dump_main0:  db "[main+0]=", 0
+_bridge_marker_dump_main4:  db "[main+4]=", 0
 _bridge_hex_buf:           times 12 db 0    ; 8 hex chars + LF + slack
 
         section _TEXT use32 class=CODE
@@ -412,21 +415,32 @@ _pmodew_start:
         mov     ecx, 19
         call    _bridge_emit
 
-        ; --- LE FIXUP application check ------------------------
-        ; mp-rig run 25466296064: the FIXUP record at _main+7
-        ; (file offset 0x63777) says obj=2 target_off=0xc7a3, so
-        ; the LOADED imm32 should be obj2_base + 0xc7a3 = 0x7c7a3
-        ; (assuming PMODE/W loaded obj2 at its declared base 0x70000).
-        ; Dump the actual byte value here to confirm. If we see
-        ; 0x0000c7a3 the loader didn't apply the fixup; if we see
-        ; 0x0007c7a3 the fixup applied and the failure is elsewhere.
-        ;
-        ; Then dump 4 bytes from the address the imm32 points to —
-        ; tells us whether the data section is actually loaded
-        ; with the marker string at that VA. We use the (possibly-
-        ; un-fixed) imm32 from _main+7 as the read address, so
-        ; this read is safe regardless of fixup state (it just
-        ; reads from whatever address main was about to use).
+        ; --- LE FIXUP / runtime addressing diagnostics ----------
+        ; mp-rig run 25475877877: the imm32 at runtime is 0x000227a3
+        ; (correctly fixed-up to the relocated obj2 base + 0xc7a3),
+        ; and bytes at 0x227a3 are "[mp-" — so loader did the right
+        ; thing and the data section is correctly loaded. Yet
+        ; _main's call to _write produces only NULs in RIG.LOG.
+        ; Add more diagnostics: the runtime address of _main, and
+        ; the bytes at _main itself (we expect c8 04 00 00 6a 12 …).
+        ; If the bytes don't match the expected enter-prolog the
+        ; bridge is calling something other than the codegen-emitted
+        ; _main (broken extern resolution by wlink).
+        mov     edx, _bridge_marker_dump_mainaddr
+        call    _bridge_emit_str0
+        mov     eax, _main                ; _main's address as a value
+        call    _bridge_emit_hex32
+
+        mov     edx, _bridge_marker_dump_main0
+        call    _bridge_emit_str0
+        mov     eax, [_main]              ; first 4 bytes of _main
+        call    _bridge_emit_hex32
+
+        mov     edx, _bridge_marker_dump_main4
+        call    _bridge_emit_str0
+        mov     eax, [_main + 4]          ; bytes 4..7 (push 18 + opcode of push imm32)
+        call    _bridge_emit_hex32
+
         mov     edx, _bridge_marker_dump_main7
         call    _bridge_emit_str0
         mov     eax, [_main + 7]         ; the imm32 inside push imm32
