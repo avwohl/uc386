@@ -107,11 +107,13 @@ _bridge_marker_dump_str:   db "[str-bytes]=", 0
 _bridge_marker_dump_mainaddr: db "[main_addr]=", 0
 _bridge_marker_dump_main0:  db "[main+0]=", 0
 _bridge_marker_dump_main4:  db "[main+4]=", 0
+_bridge_marker_dump_writetest: db "[direct-write]=", 0
 _bridge_hex_buf:           times 12 db 0    ; 8 hex chars + LF + slack
 
         section _TEXT use32 class=CODE
         global _pmodew_start
         extern _main
+        extern _write
         extern _bss_zero_start
         extern _bss_zero_end
 
@@ -444,14 +446,30 @@ _pmodew_start:
         mov     edx, _bridge_marker_dump_main7
         call    _bridge_emit_str0
         mov     eax, [_main + 7]         ; the imm32 inside push imm32
-        push    eax                      ; save for second dump
-        call    _bridge_emit_hex32
+        push    eax                      ; save twice (for hex dump + write test)
+        push    eax
+        call    _bridge_emit_hex32       ; dumps top-of-stack value (also EAX)
 
         mov     edx, _bridge_marker_dump_str
         call    _bridge_emit_str0
-        pop     eax                      ; address to dereference
+        pop     eax                      ; first copy → the address
         mov     eax, [eax]                ; first 4 bytes there
         call    _bridge_emit_hex32
+
+        ; --- Direct _write test from the bridge -----------------
+        ; If _main's _write produces only NULs but the SAME _write
+        ; called from here with matching args produces the right
+        ; string, the bug is specific to _main's call-site state
+        ; (stack alignment / argv plumbing / something subtle).
+        mov     edx, _bridge_marker_dump_writetest
+        call    _bridge_emit_str0
+        ; Stack still has one copy of the str_addr (push eax above).
+        pop     edx                      ; str_addr
+        push    18                       ; count
+        push    edx                      ; buf
+        push    1                        ; fd
+        call    _write
+        add     esp, 12
 
         ; --- Call _main (mirrors codegen _start's call _main) ----
         mov     edx, _bridge_marker_premain
@@ -613,6 +631,7 @@ def build_exe(
         line.lstrip().startswith("_bss_zero_start:")
         for line in rewritten
     )
+    rewritten.insert(0, "        global _write")
     rewritten.insert(0, "        global _main")
     if has_bss_labels:
         rewritten.insert(0, "        global _bss_zero_end")
