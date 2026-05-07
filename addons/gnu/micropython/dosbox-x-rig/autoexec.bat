@@ -36,6 +36,17 @@ ECHOTEST.EXE hello dos rig >> RIG.LOG
 echo --- after-echo-baseline --- >> RIG.LOG
 
 :run_mp
+rem Run MP_DOS4G.EXE FIRST (if it exists) so its result is visible
+rem before MP.EXE — under PMODE/W, MP.EXE hangs at _main → _write
+rem and dosbox-x gets SIGKILLed before reaching anything after.
+rem If MP_DOS4G.EXE produces "[mp-main-entered]" but MP.EXE doesn't,
+rem the bug is PMODE/W-specific.
+if not exist MP_DOS4G.EXE goto :try_mp
+echo --- before-mp-dos4g marker --- >> RIG.LOG
+MP_DOS4G.EXE < SCRIPT.PY >> RIG.LOG
+echo --- after-mp-dos4g marker --- >> RIG.LOG
+
+:try_mp
 if not exist MP.EXE goto :no_exe
 echo --- before-mp marker --- >> RIG.LOG
 if exist SCRIPT.PY goto :run_scripted
@@ -59,17 +70,6 @@ goto :after_mp
 
 :after_mp
 echo --- after-mp marker --- >> RIG.LOG
-
-rem Extender comparison: if MP_DOS4G.EXE is present, run it under
-rem dos4g (different INT 21h reflector). MP.EXE under PMODE/W
-rem hangs at _main → _write; if MP_DOS4G.EXE prints
-rem "[mp-main-entered]" the bug is PMODE/W-specific. Otherwise the
-rem bug lives in something earlier (maybe in our codegen-emitted
-rem _write or in DOSBox-X itself).
-if not exist MP_DOS4G.EXE goto :done
-echo --- before-mp-dos4g marker --- >> RIG.LOG
-MP_DOS4G.EXE < SCRIPT.PY >> RIG.LOG
-echo --- after-mp-dos4g marker --- >> RIG.LOG
 goto :done
 
 :no_exe
