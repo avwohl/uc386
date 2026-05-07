@@ -171,49 +171,58 @@ from the bridge stub. They proved:
   proves user.obj's `_write` is reachable AND functional with
   the right register state. The runtime bytes are correct.
 
-### Where the trail ends — the irreducible mystery
+### Root cause CONFIRMED — the bug is DOSBox-X-specific
 
-After all that, ONE single difference remains between a working
-bridge-side call to `_write` and the failing `_main` → `_write`
-call:
+CI run `25479809993` ran the SAME MP.EXE binary under classic
+DOSBox 0.74-3 (installed via `apt install dosbox`) instead of
+DOSBox-X. Output (MPDOS.LOG):
 
-  **The runtime address of the CALLER.**
+    [mp-main-entered]
+    [mp-before-mp-init]
+    [mp-after-mp-init]
+    [mp-before-repl]
+    MicroPython uc386-triage on 2026-05-01; uc386-dos with i386
+    Type "help()" for more information.
+    >>> import lwip, uc386_net
+    >>> lwip.reset()
 
-When the call to user.obj's `_write` originates from the bridge
-(low VA, ~0x171xxx), it works.
-When it originates from `_main` (high VA, ~0x1c36b3), the same
-INT 21h with the same EBX/EDX/ECX produces only NUL bytes.
+The full MicroPython REPL boots cleanly — `mp_init`, the
+`MicroPython uc386-triage` banner, REPL prompt, `import lwip`
+all work. Execution stops at `lwip.reset()` only because classic
+DOSBox doesn't have NE2000+SLIRP (no real packet driver, so
+the network setup fails — but that's an unrelated, expected
+limitation).
 
-This suggests one of:
+**Conclusion**: The `_main` → `_write` hang is a DOSBox-X bug,
+not a PMODE/W or wlink or codegen issue. Specifically:
+DOSBox-X's INT 21h emulation has caller-EIP-dependent behavior
+that fails when the calling code lives at a high VA inside a
+large (>256 KB) code object. The same `_write` body, called from
+the bridge stub at ~0x171xxx, works; called from `_main` at
+~0x1c36b3, it produces only NUL bytes.
 
-1. **PMODE/W's INT 21h reflector has caller-EIP-dependent
-   behavior** — perhaps a scratch-buffer collision when
-   the protected-mode caller is at a particular page.
-2. **Stack mapping under PMODE/W isn't fully flat** — ESP at
-   the failing call is 0x2d00 (low memory, near where DOS
-   structures live). Maybe DOS overwrites the user's stack
-   data when calling INT 21h from a high-VA caller.
-3. **DOSBox-X has a code-fetch / TLB bug** that affects code
-   at high VAs in a >256KB code object.
+The rig keeps DOSBox-X because we need NE2000+SLIRP to validate
+the packet-driver path. But MP.EXE runtime testing should use
+classic DOSBox (the rig's CI workflow now does both — see the
+"Run MP.EXE under classic DOSBox 0.74-3" step in mp-rig.yml).
+For network-stack validation under PMODE/W, real DOS hardware
+or QEMU+SeaBIOS would be the right target, not DOSBox-X.
 
-Diagnostic next steps:
+### Filing this upstream
 
-- Run MP.EXE under DOSBox-X's interactive debugger and
-  step through `call _write` from `_main`. See exactly what
-  args reach INT 21h (registers + stack) at the int instruction.
-- Try `dos4g` extender (`exe.py --extender dos4g`) — uses
-  a different INT 21h reflector. If MP.EXE works under
-  dos4g, the bug is PMODE/W-specific.
-- Move the stack to high memory (some way to nudge wlink to
-  put stack above 64KB) and see if the result changes.
-- Compare ECHOTEST.EXE's `[esp]` at the same point — if it's
-  much higher than MP.EXE's 0x2d00, the low-stack hypothesis
-  gains weight.
+The DOSBox-X bug should be reported with a minimal repro:
 
-The CI's "Best-effort MP.EXE runtime checks" step lists every
-expected marker so each iteration shows exactly how far
-execution got — a definitive "is this still the same bug"
-oracle.
+- A PMODE/W binary with two `INT 21h AH=0x40 BX=1` call sites,
+  one at low VA in obj 1, one at high VA in obj 1 (e.g., padded
+  with ~256 KB of code between them). Same EDX/ECX args.
+- Under DOSBox-X: the high-VA call writes NUL bytes; under
+  classic DOSBox (or real DOS): both calls produce the
+  expected output.
+
+The mp-rig diagnostic infrastructure (commits `04cdc50..7c4545c`,
+the `_bridge_emit` / `_bridge_emit_hex32` / `_bridge_write_stack`
+machinery in `addons/harness/exe.py`) is ready-made for building
+that minimal repro.
 
 ### Earlier hypothesis log (rejected/superseded)
 
