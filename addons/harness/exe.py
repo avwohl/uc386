@@ -110,6 +110,9 @@ _bridge_marker_dump_main4:  db "[main+4]=", 0
 _bridge_marker_dump_main11: db "[main+11]=", 0
 _bridge_marker_dump_main14: db "[main+14]=", 0
 _bridge_marker_dump_writetest: db "[direct-write]=", 0
+_bridge_marker_dump_writeaddr: db "[write_addr]=", 0
+_bridge_marker_dump_write0: db "[write+0]=", 0
+_bridge_marker_dump_write4: db "[write+4]=", 0
 _bridge_hex_buf:           times 12 db 0    ; 8 hex chars + LF + slack
 
         section _TEXT use32 class=CODE
@@ -476,20 +479,41 @@ _pmodew_start:
         call    _bridge_emit_hex32
 
         ; --- Direct write-from-bridge of the string at str_addr -
-        ; If _main's _write call produces only NULs but the SAME
-        ; bytes printed via _bridge_emit (which uses INT 21h AH=0x40
-        ; with EDX=str_addr, ECX=18, BX=1) DO appear, the bug is
-        ; that the call _main → ... → call _write somehow doesn't
-        ; reach our _write OR doesn't pass the right args. Whereas
-        ; if even the direct write produces NULs, the issue is
-        ; downstream of fd 1's redirect (some DOS-side state that
-        ; got corrupted between the previous bridge writes and
-        ; this one).
+        ; Confirmed (run 25476601480): this prints "[mp-main-entered]"
+        ; correctly, while _main's identical call produces NULs.
         mov     edx, _bridge_marker_dump_writetest
         call    _bridge_emit_str0
         mov     edx, [_main + 7]         ; str_addr (0x227a3)
         mov     ecx, 18                   ; same count _main uses
         call    _bridge_emit              ; write 18 bytes from str_addr
+
+        ; --- Compute call rel32 target from _main+13 and dump it -
+        ; The call rel32 in _main at +13 has imm32 at +14. Target
+        ; address = (_main + 13 + 5) + rel32 = _main + 18 + rel32.
+        ; That should be _write's runtime address. Dump the address
+        ; and the bytes at that address (expected: 55 89 e5 ... =
+        ; push ebp; mov ebp, esp; ...). If those bytes don't match
+        ; _write's prologue, _main is calling something else.
+        mov     edx, _bridge_marker_dump_writeaddr
+        call    _bridge_emit_str0
+        mov     eax, [_main + 14]        ; rel32 imm
+        add     eax, _main
+        add     eax, 18                   ; eax = call target
+        push    eax
+        call    _bridge_emit_hex32       ; dump the target address
+
+        mov     edx, _bridge_marker_dump_write0
+        call    _bridge_emit_str0
+        pop     eax                       ; recover target
+        push    eax
+        mov     eax, [eax]                ; first 4 bytes there
+        call    _bridge_emit_hex32       ; expected: e5 89 55 + first byte after
+
+        mov     edx, _bridge_marker_dump_write4
+        call    _bridge_emit_str0
+        pop     eax                       ; recover target
+        mov     eax, [eax + 4]            ; next 4 bytes
+        call    _bridge_emit_hex32       ; expected: 5d 8b ... (mov ebx, [ebp+8])
 
         ; --- Call _main (mirrors codegen _start's call _main) ----
         mov     edx, _bridge_marker_premain
