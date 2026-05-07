@@ -102,6 +102,9 @@ _bridge_marker_premain: db "[bridge-pre-call-main]", 10
 _bridge_marker_postmain: db "[bridge-post-main]", 10
 _bridge_marker_diag:    db "[bridge-diag-stub]", 10
 _bridge_marker_postdiag: db "[bridge-post-diag]", 10
+_bridge_marker_dump_main7: db "[main+7]=", 0
+_bridge_marker_dump_str:   db "[str@7c7a3]=", 0
+_bridge_hex_buf:           times 12 db 0    ; "XXXXXXXX\n\0\0"
 
         section _TEXT use32 class=CODE
         global _pmodew_start
@@ -126,6 +129,49 @@ _bridge_emit:
         int     0x21
         pop     ebx
         pop     eax
+        ret
+
+; _bridge_emit_hex32(EAX=value): write "XXXXXXXX\n" hex to fd 1.
+; Trashes EAX, EBX, ECX, EDX. Format: 8 lowercase hex digits + LF.
+_bridge_emit_hex32:
+        push    edi
+        mov     edi, _bridge_hex_buf
+        mov     ecx, 8
+.loop:
+        rol     eax, 4
+        mov     edx, eax
+        and     edx, 0x0F
+        cmp     dl, 9
+        jbe     .digit
+        add     dl, 'a' - 10 - '0'
+.digit:
+        add     dl, '0'
+        mov     [edi], dl
+        inc     edi
+        loop    .loop
+        mov     byte [edi], 10           ; LF
+        ; Now write 9 bytes (8 hex + LF) via _bridge_emit
+        pop     edi
+        mov     edx, _bridge_hex_buf
+        mov     ecx, 9
+        call    _bridge_emit
+        ret
+
+; _bridge_emit_str0(EDX=ptr to NUL-terminated string): writes string
+; (without NUL) to fd 1. Trashes ECX, AL.
+_bridge_emit_str0:
+        push    edi
+        mov     edi, edx
+        xor     ecx, ecx
+.scan:
+        cmp     byte [edi], 0
+        je      .done
+        inc     edi
+        inc     ecx
+        jmp     .scan
+.done:
+        pop     edi
+        call    _bridge_emit
         ret
 
 ; _diag_main(): in-bridge stub that mimics what main() should do
@@ -365,6 +411,33 @@ _pmodew_start:
         mov     edx, _bridge_marker_postdiag
         mov     ecx, 19
         call    _bridge_emit
+
+        ; --- LE FIXUP application check ------------------------
+        ; mp-rig run 25466296064: the FIXUP record at _main+7
+        ; (file offset 0x63777) says obj=2 target_off=0xc7a3, so
+        ; the LOADED imm32 should be obj2_base + 0xc7a3 = 0x7c7a3
+        ; (assuming PMODE/W loaded obj2 at its declared base 0x70000).
+        ; Dump the actual byte value here to confirm. If we see
+        ; 0x0000c7a3 the loader didn't apply the fixup; if we see
+        ; 0x0007c7a3 the fixup applied and the failure is elsewhere.
+        ;
+        ; Then dump 4 bytes from the address the imm32 points to —
+        ; tells us whether the data section is actually loaded
+        ; with the marker string at that VA. We use the (possibly-
+        ; un-fixed) imm32 from _main+7 as the read address, so
+        ; this read is safe regardless of fixup state (it just
+        ; reads from whatever address main was about to use).
+        mov     edx, _bridge_marker_dump_main7
+        call    _bridge_emit_str0
+        mov     eax, [_main + 7]         ; the imm32 inside push imm32
+        push    eax                      ; save for second dump
+        call    _bridge_emit_hex32
+
+        mov     edx, _bridge_marker_dump_str
+        call    _bridge_emit_str0
+        pop     eax                      ; address to dereference
+        mov     eax, [eax]                ; first 4 bytes there
+        call    _bridge_emit_hex32
 
         ; --- Call _main (mirrors codegen _start's call _main) ----
         mov     edx, _bridge_marker_premain
