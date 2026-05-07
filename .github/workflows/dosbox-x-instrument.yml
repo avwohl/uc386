@@ -61,7 +61,7 @@ jobs:
           marker = "if((fWritten = DOS_WriteFile(reg_bx, dos_copybuf, &towrite))) {"
           insertion = (
               "{ uint32_t _h = RealHandle(reg_bx); const char *_fn = \"<bad>\";\n"
-              "  if (_h < DOS_FILES && Files[_h]) _fn = Files[_h]->name.c_str();\n"
+              "  if (_h < DOS_FILES && Files[_h] && Files[_h]->name) _fn = Files[_h]->name;\n"
               "  uint16_t _pre_towrite = towrite;\n"
               "  fWritten = DOS_WriteFile(reg_bx, dos_copybuf, &towrite);\n"
               "  LOG_MSG(\"AH=40 POST: BX=%04x handle=%u file=%s pre_towrite=%u post_towrite=%u fWritten=%d errcode=%u\",\n"
