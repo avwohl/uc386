@@ -33,6 +33,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
 
       - name: Install nasm + DOSBox-X + DOSBox 0.74-3 + QEMU + mtools
         run: |
@@ -55,11 +59,30 @@ jobs:
           echo "WATCOM=$HOME/.local/opt/watcom" >> $GITHUB_ENV
           echo "$HOME/.local/opt/watcom/binl64" >> $GITHUB_PATH
 
-      - name: Build PMWBUG.EXE
+      - name: Install Python deps (for exe.py bridge build)
+        run: |
+          python -m pip install --upgrade pip
+          pip install "uc_core @ git+https://github.com/avwohl/uc_core@main"
+          pip install -e .
+
+      - name: Build PMWBUG.EXE (standalone, no bridge)
         run: |
           cd addons/gnu/micropython/dosbox-x-rig/pmwbug
           ./build.sh
           file PMWBUG.EXE
+          ls -la PMWBUG.EXE
+
+      - name: Build PMWBUG2.EXE (MP.EXE-shaped, exe.py bridge)
+        # Build a 2-obj LE that mirrors MP.EXE's structure:
+        # bridge.obj (with diagnostic markers) + user.obj
+        # (minimal _main + _write at high VA). This is the
+        # SHAPE that triggers the bug in MP.EXE.
+        run: |
+          python -m addons.harness.exe \
+              addons/gnu/micropython/dosbox-x-rig/pmwbug/pmwbug_user.asm \
+              -o addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG2.EXE
+          ls -la addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG2.EXE
+          file addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG2.EXE
 
       - name: Run PMWBUG.EXE under DOSBox-X
         # Expected: only the low-CS:EIP line prints; high-CS:EIP
@@ -68,6 +91,8 @@ jobs:
           mkdir -p /tmp/dosbox-x-rig
           cp addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG.EXE \
               /tmp/dosbox-x-rig/PMWBUG.EXE
+          cp addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG2.EXE \
+              /tmp/dosbox-x-rig/PMWBUG2.EXE
           cat > /tmp/dosbox-x-rig/dosbox-x.conf << 'EOF'
           [cpu]
           cputype = pentium
@@ -98,17 +123,26 @@ jobs:
               -c "mount c /tmp/dosbox-x-rig" \
               -c "c:" \
               -c "PMWBUG.EXE > OUT.TXT" \
+              -c "PMWBUG2.EXE > OUT2.TXT" \
               -c "exit" \
               > /tmp/dosbox-x-stdout.log 2>&1 || true
           echo "--- DOSBox-X stdout ---"
           cat /tmp/dosbox-x-stdout.log || true
           echo
-          echo "--- captured OUT.TXT (xxd) ---"
+          echo "--- captured PMWBUG.EXE OUT.TXT (xxd) ---"
           if [ -f /tmp/dosbox-x-rig/OUT.TXT ]; then
               xxd /tmp/dosbox-x-rig/OUT.TXT
               cp /tmp/dosbox-x-rig/OUT.TXT /tmp/dosbox-x-OUT.TXT
           else
               echo "(OUT.TXT not produced)"
+          fi
+          echo
+          echo "--- captured PMWBUG2.EXE OUT2.TXT (xxd) ---"
+          if [ -f /tmp/dosbox-x-rig/OUT2.TXT ]; then
+              xxd /tmp/dosbox-x-rig/OUT2.TXT
+              cp /tmp/dosbox-x-rig/OUT2.TXT /tmp/dosbox-x-OUT2.TXT
+          else
+              echo "(OUT2.TXT not produced)"
           fi
 
       - name: Run PMWBUG.EXE under classic DOSBox 0.74-3
@@ -117,6 +151,8 @@ jobs:
           mkdir -p /tmp/dosbox-classic
           cp addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG.EXE \
               /tmp/dosbox-classic/PMWBUG.EXE
+          cp addons/gnu/micropython/dosbox-x-rig/pmwbug/PMWBUG2.EXE \
+              /tmp/dosbox-classic/PMWBUG2.EXE
           cat > /tmp/dosbox-classic.conf << 'EOF'
           [cpu]
           cputype = pentium
@@ -130,14 +166,23 @@ jobs:
               -c "mount c /tmp/dosbox-classic" \
               -c "c:" \
               -c "PMWBUG.EXE > OUT.TXT" \
+              -c "PMWBUG2.EXE > OUT2.TXT" \
               -c "exit" \
               > /tmp/dosbox-classic-stdout.log 2>&1 || true
-          echo "--- captured OUT.TXT (xxd) ---"
+          echo "--- captured PMWBUG.EXE OUT.TXT (xxd) ---"
           if [ -f /tmp/dosbox-classic/OUT.TXT ]; then
               xxd /tmp/dosbox-classic/OUT.TXT
               cp /tmp/dosbox-classic/OUT.TXT /tmp/dosbox-classic-OUT.TXT
           else
               echo "(OUT.TXT not produced)"
+          fi
+          echo
+          echo "--- captured PMWBUG2.EXE OUT2.TXT (xxd) ---"
+          if [ -f /tmp/dosbox-classic/OUT2.TXT ]; then
+              xxd /tmp/dosbox-classic/OUT2.TXT
+              cp /tmp/dosbox-classic/OUT2.TXT /tmp/dosbox-classic-OUT2.TXT
+          else
+              echo "(OUT2.TXT not produced)"
           fi
 
       - name: Run PMWBUG.EXE under QEMU+FreeDOS
