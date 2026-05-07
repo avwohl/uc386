@@ -66,17 +66,10 @@ jobs:
           new_src = src.replace(marker, repl, 1)
           p.write_text(new_src)
 
-          # Patch 2: fflush after fwrite in LocalFile::Write.
-          p = pathlib.Path("/tmp/dosbox-x/src/dos/drive_local.cpp")
-          src = p.read_text()
-          marker2 = "*size=file_access_tries>0?(uint16_t)write(fileno(fhandle),data,*size):(uint16_t)fwrite(data,1,*size,fhandle);\n\t\treturn true;"
-          repl2 = ("*size=file_access_tries>0?(uint16_t)write(fileno(fhandle),data,*size):(uint16_t)fwrite(data,1,*size,fhandle);\n"
-                   "\t\tfflush(fhandle);  /* PATCH: flush so stdio buffers aren't lost on SIGKILL */\n"
-                   "\t\treturn true;")
-          if marker2 not in src:
-              raise SystemExit("fwrite marker not found in drive_local.cpp")
-          new_src = src.replace(marker2, repl2, 1)
-          p.write_text(new_src)
+          # NOTE: Patch 2 (fflush after fwrite) is intentionally NOT
+          # applied here. With only the silent-quit patch, the bug
+          # report's claim "the y/n loop is the real bug; without it
+          # shutdown completes and fclose flushes buffers" is testable.
           PYEOF
 
       - name: Apply AH=0x40 logging patch
