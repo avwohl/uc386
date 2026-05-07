@@ -107,13 +107,14 @@ _bridge_marker_dump_str:   db "[str-bytes]=", 0
 _bridge_marker_dump_mainaddr: db "[main_addr]=", 0
 _bridge_marker_dump_main0:  db "[main+0]=", 0
 _bridge_marker_dump_main4:  db "[main+4]=", 0
+_bridge_marker_dump_main11: db "[main+11]=", 0
+_bridge_marker_dump_main14: db "[main+14]=", 0
 _bridge_marker_dump_writetest: db "[direct-write]=", 0
 _bridge_hex_buf:           times 12 db 0    ; 8 hex chars + LF + slack
 
         section _TEXT use32 class=CODE
         global _pmodew_start
         extern _main
-        extern _write
         extern _bss_zero_start
         extern _bss_zero_end
 
@@ -455,21 +456,24 @@ _pmodew_start:
         pop     eax                      ; first copy → the address
         mov     eax, [eax]                ; first 4 bytes there
         call    _bridge_emit_hex32
+        pop     eax                      ; discard the second copy of str_addr
 
-        ; --- Direct _write test from the bridge -----------------
-        ; If _main's _write produces only NULs but the SAME _write
-        ; called from here with matching args produces the right
-        ; string, the bug is specific to _main's call-site state
-        ; (stack alignment / argv plumbing / something subtle).
-        mov     edx, _bridge_marker_dump_writetest
+        ; --- Verify the call rel32 in _main targets _write -----
+        ; main+11 should be `6a 01` (push 1), main+13 = `e8 ?? ?? ?? ??`
+        ; (call rel32 → _write). Dumping main+11 (next 4 bytes:
+        ; 6a 01 e8 lo) and main+14 (the high 3 bytes of rel32 + 83
+        ; from `add esp, 12`). At runtime the call target is
+        ; (main+18) + rel32. If that's not within obj1's code
+        ; range, the bug is wlink mis-resolving the cross-obj rel32.
+        mov     edx, _bridge_marker_dump_main11
         call    _bridge_emit_str0
-        ; Stack still has one copy of the str_addr (push eax above).
-        pop     edx                      ; str_addr
-        push    18                       ; count
-        push    edx                      ; buf
-        push    1                        ; fd
-        call    _write
-        add     esp, 12
+        mov     eax, [_main + 11]
+        call    _bridge_emit_hex32
+
+        mov     edx, _bridge_marker_dump_main14
+        call    _bridge_emit_str0
+        mov     eax, [_main + 14]
+        call    _bridge_emit_hex32
 
         ; --- Call _main (mirrors codegen _start's call _main) ----
         mov     edx, _bridge_marker_premain
@@ -631,7 +635,14 @@ def build_exe(
         line.lstrip().startswith("_bss_zero_start:")
         for line in rewritten
     )
-    rewritten.insert(0, "        global _write")
+    # _write is only present in TUs that pull in the libc bundle's
+    # write() (e.g. MP.EXE — main.c uses write() for the startup
+    # markers). echo.exe goes through fputs/putchar which don't pull
+    # _write. Only export _write when the asm actually defines it,
+    # otherwise wlink errors on the bridge's `extern _write`.
+    has_write = any(line.lstrip().startswith("_write:") for line in rewritten)
+    if has_write:
+        rewritten.insert(0, "        global _write")
     rewritten.insert(0, "        global _main")
     if has_bss_labels:
         rewritten.insert(0, "        global _bss_zero_end")
