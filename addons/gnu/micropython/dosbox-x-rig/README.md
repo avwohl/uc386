@@ -208,6 +208,50 @@ classic DOSBox (the rig's CI workflow now does both — see the
 For network-stack validation under PMODE/W, real DOS hardware
 or QEMU+SeaBIOS would be the right target, not DOSBox-X.
 
+### QEMU + FreeDOS — the real-target proxy
+
+The actual production target for this binary is FreeDOS (typical
+deployment: VMware on Windows). Classic DOSBox 0.74-3 proves
+"the binary works under a non-DOSBox-X DOS emulator", but DOSBox
+isn't FreeDOS — it intercepts INT 21h in its own DOS layer.
+QEMU+FreeDOS is the next step closer to real hardware: full PC
+emulation booting an actual FreeDOS kernel, with PMODE/W and
+INT 21h going through the same code path the production VM uses.
+
+The CI workflow includes a "Run MP.EXE under QEMU+FreeDOS" step
+that:
+
+1. Boots `qemu-system-i386` headless (`-display none -serial stdio`)
+   from a FreeDOS minimal floppy image
+   (`codercowboy/freedosbootdisks/bootdisks/freedos.boot.disk.1.4MB.img`)
+   with MP.EXE, ECHOTEST.EXE, and an AUTOEXEC.BAT injected via
+   mtools.
+2. Autoexec runs `CTTY COM1` so DOS console I/O lands on the
+   serial port (which QEMU pipes to host stdout), then runs
+   ECHOTEST as a baseline and MP.EXE bare (no I/O redirect, since
+   the REPL reads via INT 21h AH=0x01 which doesn't honor `<`
+   redirects from a CTTY-redirected shell).
+3. Host-side, polls the captured log for "MicroPython" and stops
+   QEMU as soon as the banner appears — that's proof the full
+   `_main → _write → INT 21h AH=0x40` path works under FreeDOS.
+
+Local Mac repro (verified 2026-05-07 on Darwin 25.4.0,
+qemu-system-i386 from Homebrew):
+
+    [bridge-entered] ... [bridge-pre-call-main]
+    [mp-main-entered]
+    [mp-before-mp-init]
+    [mp-after-mp-init]
+    [mp-before-repl]
+    MicroPython uc386-triage on 2026-05-01; uc386-dos with i386
+    Type "help()" for more information.
+    >>>
+
+The DOSBox-X-specific INT 21h bug does NOT manifest under FreeDOS
+on QEMU. So the binary's only blocker for the production target
+is whatever stops it inside DOSBox-X — which, per the bisect
+above, is purely a DOSBox-X emulation defect.
+
 ### Filing this upstream
 
 The DOSBox-X bug should be reported with a minimal repro:

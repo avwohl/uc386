@@ -247,16 +247,20 @@ jobs:
           # Build AUTOEXEC.BAT — CTTY COM1 redirects DOS stdin/stdout
           # to COM1 so QEMU's -serial stdio captures it. Use CRLF
           # line endings (DOS expects them).
+          # No redirects — MP.EXE's output goes directly to COM1
+          # (and thus QEMU stdout) so we see bridge markers and the
+          # MicroPython REPL banner live. MP doesn't return cleanly
+          # under headless serial (REPL waits on CON keyboard via
+          # INT 21h AH=0x01, which doesn't honor stdin redirect),
+          # so the host-side timeout below greps for "MicroPython"
+          # and stops QEMU as soon as the banner appears.
           {
             printf '@echo off\r\n'
             printf 'CTTY COM1\r\n'
-            printf '=== FreeDOS rig start ===\r\n'
             printf 'echo === FreeDOS rig start ===\r\n'
             printf 'ECHOTEST.EXE hello qemu freedos\r\n'
             printf 'echo === before mp ===\r\n'
-            printf 'MP.EXE ^< SCRIPT.PY ^> MP.LOG\r\n'
-            printf 'echo === after mp ===\r\n'
-            printf 'type MP.LOG\r\n'
+            printf 'MP.EXE\r\n'
             printf 'echo === finished ===\r\n'
           } > /tmp/AUTOEXEC.BAT
           mcopy -i /tmp/test.img -o /tmp/AUTOEXEC.BAT ::AUTOEXEC.BAT
@@ -280,10 +284,15 @@ jobs:
             -no-reboot \
             < /dev/null > /tmp/qemu-freedos.log 2>&1 &
           QEMU_PID=$!
-          # Give DOS time to boot, run autoexec, finish
-          for i in $(seq 1 90); do
+          # MP.EXE doesn't exit cleanly (REPL waits on keyboard
+          # via INT 21h AH=0x01 which can't be EOF'd from headless
+          # serial), so stop QEMU as soon as the REPL banner
+          # appears — that's the proof the full _main → _write
+          # path runs end-to-end (the same path that fails under
+          # DOSBox-X). Cap at 120s for cold boot + bridge run.
+          for i in $(seq 1 120); do
             sleep 1
-            if grep -q "=== finished ===" /tmp/qemu-freedos.log 2>/dev/null; then
+            if grep -q "MicroPython" /tmp/qemu-freedos.log 2>/dev/null; then
               break
             fi
             if ! kill -0 $QEMU_PID 2>/dev/null; then
