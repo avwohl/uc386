@@ -115,6 +115,7 @@ _bridge_marker_dump_write0: db "[write+0]=", 0
 _bridge_marker_dump_write4: db "[write+4]=", 0
 _bridge_marker_dump_stackwrite: db "[stack-write]=", 0
 _bridge_marker_dump_esp: db "[esp]=", 0
+_bridge_marker_dump_likemain: db "[mainlike]=", 0
 _bridge_hex_buf:           times 12 db 0    ; 8 hex chars + LF + slack
 
         section _TEXT use32 class=CODE
@@ -215,6 +216,26 @@ _diag_main:
         mov     edx, _bridge_marker_diag
         mov     ecx, 19
         call    _bridge_emit
+        xor     eax, eax
+        leave
+        ret
+
+; _diag_main_writelike(argc, argv) cdecl: mirrors _main EXACTLY —
+; same enter prolog, same push 18 / push str_addr / push 1 / call
+; pattern. The only difference vs the real _main is that this
+; calls _bridge_write_stack (in bridge .obj) instead of _write
+; (in user .obj). If this prints "[mp-main-entered]" but the real
+; _main produces NULs, the bug is something specific to the user
+; .obj's _write that doesn't manifest with bridge .obj's identical
+; copy of the same code (very strange — possibly a wlink
+; section-layout bug, or DOSBox-X-side cache issue).
+_diag_main_writelike:
+        enter   4, 0
+        push    18
+        push    dword [_main + 7]
+        push    1
+        call    _bridge_write_stack
+        add     esp, 12
         xor     eax, eax
         leave
         ret
@@ -556,6 +577,18 @@ _pmodew_start:
         call    _bridge_emit_str0
         mov     eax, esp
         call    _bridge_emit_hex32
+
+        ; --- Mainlike test: bridge does call _diag_main_writelike
+        ; with cdecl args, like the real call _main below.
+        ; If this prints "[mp-main-entered]" but the real _main
+        ; doesn't, the user .obj's _write differs at runtime from
+        ; the bridge's identical copy.
+        mov     edx, _bridge_marker_dump_likemain
+        call    _bridge_emit_str0
+        push    dword [_pmodew_argv]
+        push    dword [_pmodew_argc]
+        call    _diag_main_writelike
+        add     esp, 8
 
         ; --- Call _main (mirrors codegen _start's call _main) ----
         mov     edx, _bridge_marker_premain
