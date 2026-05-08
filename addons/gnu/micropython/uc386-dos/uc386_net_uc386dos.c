@@ -24,6 +24,12 @@ extern unsigned int uc386dos_eth_netmask(void);
 extern unsigned int uc386dos_eth_gateway(void);
 extern int uc386dos_eth_is_up(void);
 extern int uc386dos_eth_driver(void);
+extern volatile unsigned int pktdrv_thunk_invocations;
+extern volatile unsigned int pktdrv_thunk_phase0_count;
+extern volatile unsigned int pktdrv_thunk_phase1_count;
+extern unsigned int pktdrv_last_handle;
+extern unsigned int pktdrv_dpmi_seg;
+extern unsigned int pktdrv_dpmi_off;
 
 static unsigned int parse_ip4(const char *s) {
     unsigned int parts[4] = {0};
@@ -91,11 +97,25 @@ static mp_obj_t mod_uc386_net_eth_set_static(mp_obj_t ip_obj, mp_obj_t mask_obj,
 static MP_DEFINE_CONST_FUN_OBJ_3(
     mod_uc386_net_eth_set_static_obj, mod_uc386_net_eth_set_static);
 
+static mp_obj_t mod_uc386_net_pktdrv_diag(void) {
+    mp_obj_t items[6];
+    items[0] = MP_OBJ_NEW_SMALL_INT(pktdrv_thunk_invocations);
+    items[1] = MP_OBJ_NEW_SMALL_INT(pktdrv_thunk_phase0_count);
+    items[2] = MP_OBJ_NEW_SMALL_INT(pktdrv_thunk_phase1_count);
+    items[3] = MP_OBJ_NEW_SMALL_INT(pktdrv_last_handle);
+    items[4] = MP_OBJ_NEW_SMALL_INT(pktdrv_dpmi_seg);
+    items[5] = MP_OBJ_NEW_SMALL_INT(pktdrv_dpmi_off);
+    return mp_obj_new_tuple(6, items);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(
+    mod_uc386_net_pktdrv_diag_obj, mod_uc386_net_pktdrv_diag);
+
 static const mp_rom_map_elem_t mp_module_uc386_net_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__),   MP_ROM_QSTR(MP_QSTR_uc386_net) },
     { MP_ROM_QSTR(MP_QSTR_eth_init),   MP_ROM_PTR(&mod_uc386_net_eth_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_eth_status), MP_ROM_PTR(&mod_uc386_net_eth_status_obj) },
     { MP_ROM_QSTR(MP_QSTR_eth_set_static), MP_ROM_PTR(&mod_uc386_net_eth_set_static_obj) },
+    { MP_ROM_QSTR(MP_QSTR_pktdrv_diag), MP_ROM_PTR(&mod_uc386_net_pktdrv_diag_obj) },
 };
 static MP_DEFINE_CONST_DICT(
     mp_module_uc386_net_globals, mp_module_uc386_net_globals_table);

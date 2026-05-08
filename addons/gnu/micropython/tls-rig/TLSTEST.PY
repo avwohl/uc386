@@ -19,6 +19,8 @@ print('TLSTEST: post_eth_init')
 sys.stdout.write('TLSTEST: rc_eq_zero=' + str(rc == 0) + '\n')
 uc386_net.eth_set_static('10.0.2.15', '255.255.255.0', '10.0.2.2')
 print('TLSTEST: post_set_static')
+diag0 = uc386_net.pktdrv_diag()
+sys.stdout.write('TLSTEST: diag_init thunk=' + str(diag0[0]) + ' p0=' + str(diag0[1]) + ' p1=' + str(diag0[2]) + ' handle=' + str(diag0[3]) + ' tramp=' + str(diag0[4]) + ':' + str(diag0[5]) + '\n')
 # A few callback ticks so the link comes up cleanly, but no long
 # DHCP wait — IP is already configured.
 for tick in range(5):
@@ -33,10 +35,32 @@ if not up or not ip or ip == '0.0.0.0':
     sys.exit(1)
 addr = socket.getaddrinfo('10.0.2.2', 8443)[0][-1]
 s = socket.socket()
+s.setblocking(False)
+try:
+    s.connect(addr)
+except OSError:
+    pass  # EINPROGRESS expected on non-blocking connect; lwIP will
+          # send the SYN (and ARP-resolve the gateway) as we pump.
+print('TLSTEST: connect_initiated')
+# Pump lwIP and watch the thunk diag. If thunk count stays at 0
+# across many seconds of polling, the DPMI receiver trampoline isn't
+# being invoked even though packets are going OUT — that pinpoints
+# the RX side as the next bug.
+for tick in range(100):
+    _ = lwip.callback()
+    if (tick % 20) == 0:
+        d = uc386_net.pktdrv_diag()
+        sys.stdout.write('TLSTEST: diag tick=' + str(tick) + ' thunk=' + str(d[0]) + ' p0=' + str(d[1]) + ' p1=' + str(d[2]) + '\n')
+    time.sleep_ms(50)
+d = uc386_net.pktdrv_diag()
+sys.stdout.write('TLSTEST: diag_final thunk=' + str(d[0]) + ' p0=' + str(d[1]) + ' p1=' + str(d[2]) + '\n')
+s.setblocking(True)
+# Last-attempt connect — would succeed instantly if the non-blocking
+# connect completed during the polling, otherwise OSError.
 try:
     s.connect(addr)
 except OSError as e:
-    print('TLSTEST: connect_failed', e)
+    print('TLSTEST: connect_failed_after_poll', e)
     sys.exit(2)
 print('TLSTEST: tcp_connected')
 with open('TESTCA.PEM', 'rb') as f:

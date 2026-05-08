@@ -90,6 +90,13 @@ pktdrv_rmcs_t pktdrv_rmcs;
 unsigned int  pktdrv_dpmi_seg = 0;   // real-mode trampoline segment
 unsigned int  pktdrv_dpmi_off = 0;   // real-mode trampoline offset
 
+// Diagnostic counters for the static-IP rig — exposed to Python so
+// the test script can poll without rebuilding to add markers.
+volatile unsigned int pktdrv_thunk_invocations = 0;
+volatile unsigned int pktdrv_thunk_phase0_count = 0;
+volatile unsigned int pktdrv_thunk_phase1_count = 0;
+unsigned int pktdrv_last_handle = 0xDEADBEEF;
+
 // Conventional-memory bounce buffer for talking to the real-mode
 // Crynwr packet driver under PMODE/W. The driver expects ES:DI /
 // DS:SI to point at real-mode-addressable memory (linear < 1 MB,
@@ -360,13 +367,10 @@ static int pktdrv_access(unsigned int linear_receiver) {
     rm.edi = linear_receiver & 0xFFFF;     // offset
     rm.esi = 0;
     rm.ebp = 0; rm.reserved = 0;
-    rm.ebx = 0xFFFF;                        // if_type=0xFFFF wildcard (catch-all DIX/802.3)
+    rm.ebx = 0;                             // if_type=0 (driver default)
     rm.edx = 0;                             // if_number=0 (first card)
     rm.ecx = 0;                             // type_len=0 (catch-all type)
-    // AH=0x02 access_type, AL=0x01 if_class=DIX Ethernet. AL=0 was a
-    // bug — invalid class, driver registers a useless handle and
-    // never dispatches packets to it (CF=0 = silently accepted).
-    rm.eax = 0x0201;
+    rm.eax = 0x0201;                        // AH=02 access_type, AL=01 Ethernet DIX
     rm.flags = 0;
     rm.es = (unsigned short)((linear_receiver >> 16) & 0xFFFF);
     rm.ds = 0; rm.fs = 0; rm.gs = 0;
@@ -384,7 +388,7 @@ static int pktdrv_access(unsigned int linear_receiver) {
         // at the prot-mode level, so this works there.
         unsigned int regs[8] = {0};
         regs[R_EAX] = 0x0201;       // AH=02 access_type, AL=01 Ethernet DIX
-        regs[R_EBX] = 0xFFFF;        // if_type wildcard
+        regs[R_EBX] = 0;             // if_type=0 (driver default)
         regs[R_ECX] = 0;
         regs[R_EDX] = 0;
         regs[R_EDI] = linear_receiver;
@@ -393,12 +397,14 @@ static int pktdrv_access(unsigned int linear_receiver) {
             return -1;
         }
         pktdrv_handle = (int)(regs[R_EAX] & 0xFFFF);
+        pktdrv_last_handle = (unsigned int)(regs[R_EAX] & 0xFFFFFFFF);
         return 0;
     }
     if (rm.flags & 1) {
         return -1;
     }
     pktdrv_handle = (int)(rm.eax & 0xFFFF);
+    pktdrv_last_handle = (unsigned int)(rm.eax & 0xFFFFFFFF);
     return 0;
 }
 
@@ -452,10 +458,13 @@ unsigned char *uc386dos_pktdrv_receiver(int phase, unsigned int len) {
 // well — dos_emu's DPMI fn 0x0303 emulation invokes this through
 // the same path. (No-op under hardware DPMI; the host calls it.)
 void uc386dos_pktdrv_dpmi_thunk(void) {
-    extern int write(int fd, const void *buf, unsigned int n);
-    write(1, "[thunk!]", 8);
+    // Bump the invocation counter ASAP — IRQ context, can't safely
+    // call DOS for write(); the counter is what Python polls.
+    pktdrv_thunk_invocations++;
     unsigned int phase  = pktdrv_rmcs.eax & 0xFFFF;
     unsigned int length = pktdrv_rmcs.ecx & 0xFFFF;
+    if (phase == 0) pktdrv_thunk_phase0_count++;
+    if (phase == 1) pktdrv_thunk_phase1_count++;
     unsigned char *buf = uc386dos_pktdrv_receiver((int)phase, length);
     if (phase == 0 && buf != NULL) {
         unsigned int linear = (unsigned int)(unsigned long)buf;
