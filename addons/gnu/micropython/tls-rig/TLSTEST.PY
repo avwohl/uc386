@@ -28,15 +28,18 @@ sys.stdout.write('TLSTEST: post_first_callback\n')
 info = uc386_net.eth_status()
 sys.stdout.write('TLSTEST: post_first_status ip=' + str(info[0]) + ' up=' + str(info[3]) + '\n')
 for tick in range(60):
-    if (tick % 10) == 0:
-        sys.stdout.write('TLSTEST: tick=' + str(tick) + '\n')
+    sys.stdout.write('T:cb-pre\n')
     _ = lwip.callback()
+    sys.stdout.write('T:cb-post\n')
     info = uc386_net.eth_status()
+    sys.stdout.write('T:status-post\n')
     ip = info[0]
     up = info[3]
     if up and ip and ip != '0.0.0.0':
         break
+    sys.stdout.write('T:sleep-pre\n')
     time.sleep_ms(100)
+    sys.stdout.write('T:sleep-post\n')
 print('TLSTEST: ifup', up, 'ip', ip)
 if not up or not ip or ip == '0.0.0.0':
     print('TLSTEST: dhcp_failed')
