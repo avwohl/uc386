@@ -182,30 +182,34 @@ cat tls-server.log
 
 echo
 echo "=== Result ==="
-# Anchor to the *actual print output*, not the source-code echo
-# from MP's paste-mode that mirrors `print('TLSTEST: PASS')` back
-# to the serial line as it ingests the script. The output line
-# starts at column 0; the source echoes are indented (since they
-# live inside the `if/else` block).
+# Anchor checks to actual print output (column 0), not the
+# source-code echoes paste-mode mirrors back to the serial line
+# as it ingests the script — those lines are indented inside
+# `if/for/with` blocks and would false-positive any non-anchored
+# grep.
 if grep -qE '^TLSTEST: PASS$' "$LOG" 2>/dev/null; then
     echo "PASS: end-to-end TLS handshake completed; uc386 MP read decrypted bytes from the host TLS server."
     exit 0
 fi
-# Best-effort progress diagnostics — what made it across the wire?
-for marker in "TLSTEST: start" "TLSTEST: ip" "TLSTEST: tcp_connected" \
-              "TLSTEST: ctx_ready" "TLSTEST: handshake_ok" \
-              "TLSTEST: received"; do
-    if grep -qF "$marker" "$LOG" 2>/dev/null \
-       && ! grep -qE "print\\('${marker#TLSTEST: }" "$LOG" 2>/dev/null \
-       || grep -qE "^${marker}" "$LOG" 2>/dev/null; then
-        echo "  reached: $marker"
+
+echo "Progress markers seen in MP stdout:"
+for marker in "TLSTEST: start" \
+              "TLSTEST: ip " \
+              "TLSTEST: tcp_connected" \
+              "TLSTEST: ctx_ready" \
+              "TLSTEST: handshake_ok" \
+              "TLSTEST: received" \
+              "TLSTEST: dhcp_failed" \
+              "TLSTEST: connect_failed" \
+              "TLSTEST: handshake_failed"; do
+    if grep -qE "^${marker}" "$LOG" 2>/dev/null; then
+        echo "  YES: ${marker}"
     fi
 done
-if grep -qF "[tls-server] connection from" tls-server.log 2>/dev/null; then
-    echo "  host TLS server saw a TCP connection"
-fi
-if grep -qF "[tls-server] handshake ok" tls-server.log 2>/dev/null; then
-    echo "  host TLS server completed the handshake"
-fi
+
+echo "Host TLS server progress:"
+grep -E "listening|connection from|handshake ok|sent " tls-server.log \
+    2>/dev/null | sed 's/^/  /'
+
 echo "FAIL: TLSTEST: PASS marker missing; see logs above"
 exit 1
