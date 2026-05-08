@@ -9,8 +9,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from uc_core.lexer import Lexer, LexerError
-from uc_core.parser import Parser, ParseError
+from uc_core.frontend import parse as _frontend_parse
 from uc_core import ast as ast_module
 from uc_core.preprocessor import Preprocessor, PreprocessorError, Macro
 from uc_core.ast_optimizer import ASTOptimizer
@@ -310,8 +309,7 @@ def main() -> int:
                 if args.preprocess_only:
                     print(source)
                     continue
-            tokens = list(Lexer(source, str(p)).tokenize())
-            asts.append(Parser(tokens).parse())
+            asts.append(_frontend_parse(source, str(p)))
 
         if args.preprocess_only:
             return 0
@@ -368,11 +366,8 @@ def main() -> int:
                     print(f"    {name}: {count}")
         return 0
 
-    except (PreprocessorError, LexerError) as e:
+    except PreprocessorError as e:
         print(f"uc386: {e}", file=sys.stderr)
-        return 1
-    except ParseError as e:
-        print(f"uc386: {e.location}: {e.message}", file=sys.stderr)
         return 1
 
 
