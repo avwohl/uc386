@@ -42,7 +42,11 @@ on:
 jobs:
   tls-rig:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # Cold build of micropython.bin (the long pole) often runs ~85 min
+    # but has been observed taking up to 2 h on a slow runner, so the
+    # 120-min cap was clipping the rig step itself. 180 leaves room
+    # for the build + the actual rig run + all setup.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v6
       - name: Set up Python
