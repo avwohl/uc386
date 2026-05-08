@@ -5,18 +5,22 @@ import uc386_net
 import socket
 import ssl
 print('TLSTEST: start')
+print('TLSTEST: pre_lwip_reset')
 _ = lwip.reset()
-_ = uc386_net.eth_init()
+print('TLSTEST: post_lwip_reset')
+print('TLSTEST: pre_eth_init')
+rc = uc386_net.eth_init()
+print('TLSTEST: post_eth_init rc=' + str(rc))
 ip = ''
 up = False
-for tick in range(400):
+for tick in range(60):
     _ = lwip.callback()
     info = uc386_net.eth_status()
     ip = info[0]
     up = info[3]
     if up and ip and ip != '0.0.0.0':
         break
-    time.sleep_ms(50)
+    time.sleep_ms(100)
 print('TLSTEST: ifup', up, 'ip', ip)
 if not up or not ip or ip == '0.0.0.0':
     print('TLSTEST: dhcp_failed')

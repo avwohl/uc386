@@ -105,9 +105,10 @@ AUTOEXEC=$(mktemp)
 # the one that shows "MicroPython" banner cleanly.
 {
     printf '@echo off\r\n'
-    printf 'NE2000 0x60 9 0x300 > NUL\r\n'
     printf 'CTTY COM1\r\n'
-    printf 'echo === rig start ===\r\n'
+    printf 'echo === before NE2000 ===\r\n'
+    printf 'NE2000 0x60 9 0x300\r\n'
+    printf 'echo === after NE2000 ===\r\n'
     printf 'MP.EXE < TLSTEST.PY\r\n'
     printf 'echo === rig done ===\r\n'
 } > "$AUTOEXEC"
@@ -194,7 +195,11 @@ fi
 
 echo "Progress markers seen in MP stdout:"
 for marker in "TLSTEST: start" \
-              "TLSTEST: ip " \
+              "TLSTEST: pre_lwip_reset" \
+              "TLSTEST: post_lwip_reset" \
+              "TLSTEST: pre_eth_init" \
+              "TLSTEST: post_eth_init" \
+              "TLSTEST: ifup" \
               "TLSTEST: tcp_connected" \
               "TLSTEST: ctx_ready" \
               "TLSTEST: handshake_ok" \
