@@ -21,7 +21,15 @@ sys.stdout.write('TLSTEST: rc_lt_zero=' + str(rc < 0) + '\n')
 sys.stdout.write('TLSTEST: rc_gt_million=' + str(rc > 1000000) + '\n')
 ip = ''
 up = False
+print('TLSTEST: pre_dhcp_loop')
+sys.stdout.write('TLSTEST: pre_first_callback\n')
+_ = lwip.callback()
+sys.stdout.write('TLSTEST: post_first_callback\n')
+info = uc386_net.eth_status()
+sys.stdout.write('TLSTEST: post_first_status ip=' + str(info[0]) + ' up=' + str(info[3]) + '\n')
 for tick in range(60):
+    if (tick % 10) == 0:
+        sys.stdout.write('TLSTEST: tick=' + str(tick) + '\n')
     _ = lwip.callback()
     info = uc386_net.eth_status()
     ip = info[0]
