@@ -565,6 +565,8 @@ int pktdrv_init(unsigned char mac[6]) {
 // to the bare-INT path with a flat-linear DS:SI value — dos_emu's
 // AH=04 hook handles that, real DOS doesn't.
 int pktdrv_send(const unsigned char *buf, unsigned int len) {
+    extern int write(int fd, const void *buf, unsigned int n);
+    write(1, "[ps:enter]", 10);
     if (pktdrv_int_num == 0) {
         return -1;
     }
@@ -581,7 +583,9 @@ int pktdrv_send(const unsigned char *buf, unsigned int len) {
             (unsigned int)pktdrv_int_num, regs);
         return carry ? -1 : 0;
     }
+    write(1, "[ps:cp]", 7);
     memcpy((unsigned char *)pktdrv_bounce_linear, buf, len);
+    write(1, "[ps:rm]", 7);
     static pktdrv_rmcs_t rm;
     rm.edi = 0;
     rm.esi = 0;                                 // SI offset = 0 within bounce
@@ -599,7 +603,9 @@ int pktdrv_send(const unsigned char *buf, unsigned int len) {
     dpmi[R_EBX] = (unsigned int)pktdrv_int_num & 0xFF;
     dpmi[R_ECX] = 0;
     dpmi[R_EDI] = (unsigned int)(unsigned long)&rm;
+    write(1, "[ps:int]", 8);
     unsigned char carry = pktdrv_int_invoke(0x31, dpmi);
+    write(1, "[ps:int-done]", 13);
     if (carry || (rm.flags & 1)) {
         return -1;
     }
