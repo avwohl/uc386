@@ -90,6 +90,63 @@ pktdrv_rmcs_t pktdrv_rmcs;
 unsigned int  pktdrv_dpmi_seg = 0;   // real-mode trampoline segment
 unsigned int  pktdrv_dpmi_off = 0;   // real-mode trampoline offset
 
+// DPMI fn 0x0300 — Simulate Real Mode Interrupt. Required to reach
+// real-mode INT handlers (like the Crynwr packet driver at INT 0x60)
+// from a protected-mode DPMI client like ours under PMODE/W. A bare
+// `INT 0x60` instruction from prot mode goes through the IDT, which
+// is *not* the real-mode IVT; the Crynwr handler lives in real-mode
+// memory and only fires when reached via DPMI fn 0x0300.
+//
+// Inputs (regs[]):  EAX, EBX, ECX, EDX, ESI, EDI all copied into the
+// RMCS as-is (these are the real-mode register values the int
+// handler sees on entry).
+// Outputs (regs[]): EAX, EBX, ECX, EDX, ESI, EDI written back from
+// the post-int RMCS.
+// Return: bit 0 of the post-int real-mode flags (CF as the
+// driver-success indicator), or 1 on outright DPMI failure.
+//
+// Only used for non-DPMI INT vectors (anything that needs to be
+// dispatched into real mode). For DPMI services themselves —
+// INT 31h fn 0x0200 / 0x0303 / etc. — call pktdrv_int_invoke
+// directly: PMODE/W's IDT handles INT 31h in protected mode.
+static unsigned char pktdrv_simulate_real_int(
+        unsigned int int_num, unsigned int regs[8]) {
+    static pktdrv_rmcs_t rm;
+    // Memset would be cleaner; uc386's libc has memset, but we
+    // also avoid the dependency by zeroing field-by-field.
+    rm.edi = regs[R_EDI];
+    rm.esi = regs[R_ESI];
+    rm.ebp = 0;
+    rm.reserved = 0;
+    rm.ebx = regs[R_EBX];
+    rm.edx = regs[R_EDX];
+    rm.ecx = regs[R_ECX];
+    rm.eax = regs[R_EAX];
+    rm.flags = 0;
+    rm.es = 0; rm.ds = 0; rm.fs = 0; rm.gs = 0;
+    rm.ip = 0; rm.cs = 0; rm.sp = 0; rm.ss = 0;
+
+    // INT 0x31 fn 0x0300: AX=0x0300, BL=int_num, BH=0,
+    // CX=words-to-copy=0, ES:EDI=ptr to RMCS.
+    unsigned int dpmi[8] = {0};
+    dpmi[R_EAX] = 0x0300;
+    dpmi[R_EBX] = int_num & 0xFF;
+    dpmi[R_ECX] = 0;
+    dpmi[R_EDI] = (unsigned int)(unsigned long)&rm;
+    unsigned char carry = pktdrv_int_invoke(0x31, dpmi);
+    if (carry) {
+        return 1;
+    }
+
+    regs[R_EAX] = rm.eax;
+    regs[R_EBX] = rm.ebx;
+    regs[R_ECX] = rm.ecx;
+    regs[R_EDX] = rm.edx;
+    regs[R_ESI] = rm.esi;
+    regs[R_EDI] = rm.edi;
+    return (rm.flags & 1) ? 1 : 0;
+}
+
 // Probe an IVT slot to see if a Crynwr packet driver is installed
 // there. Two checks, in order:
 //
@@ -113,14 +170,16 @@ unsigned int  pktdrv_dpmi_off = 0;   // real-mode trampoline offset
 // as a positive non-zero token) on success, 0 on miss.
 static unsigned int pktdrv_probe_slot(unsigned int int_num) {
     // (1) driver_info call: AH=0x01, BX=0xFFFF (= "no handle yet").
-    // Crynwr says: returns DH=class, DL=type, BX=version,
-    // CL=number, CX=basic/extended, ES:SI=driver name string,
-    // CF=clear on success.
+    // Routed through DPMI 0x0300 (Simulate Real Mode Interrupt) so
+    // it reaches the real-mode Crynwr handler under PMODE/W.
+    // Crynwr returns: DH=class, DL=type, BX=version, CL=number,
+    // CX=basic/extended, ES:SI=driver name string, CF=clear on
+    // success.
     {
         unsigned int regs[8] = {0};
         regs[R_EAX] = 0x0100;       // AH=0x01 driver_info, AL=0
         regs[R_EBX] = 0xFFFF;
-        unsigned char carry = pktdrv_int_invoke(int_num, regs);
+        unsigned char carry = pktdrv_simulate_real_int(int_num, regs);
         if (!carry) {
             // Spot-check: a real Crynwr driver returns BX with a
             // version like 0x0100..0x01FF (1.x), and class DH in
@@ -175,6 +234,14 @@ int pktdrv_detect(void) {
 }
 
 // AH=0x06 get_address — fetch the NIC's MAC into `out[6]`.
+// NOTE: still uses pktdrv_int_invoke directly (not DPMI 0x0300) —
+// under PMODE/W on real DOS this fails because INT 0x60 from
+// protected mode goes through the IDT, not the real-mode IVT.
+// Wiring this through DPMI 0x0300 needs a DPMI low-memory bounce
+// buffer (allocate via DPMI 0x0100, copy result back) — that's
+// the next step on the real-DOS networking path. Works under
+// dos_emu because dos_emu emulates Crynwr at the protected-mode
+// INT level.
 static int pktdrv_get_addr(unsigned char out[6]) {
     if (pktdrv_int_num == 0 || pktdrv_handle < 0) {
         return -1;
@@ -184,8 +251,7 @@ static int pktdrv_get_addr(unsigned char out[6]) {
     regs[R_EBX] = (unsigned int)pktdrv_handle;
     regs[R_ECX] = 6;
     regs[R_EDI] = (unsigned int)(unsigned long)out;
-    regs[R_ES]  = 0;                               // flat — dos_emu treats
-                                                   // ES:DI as linear EDI.
+    regs[R_ES]  = 0;
     unsigned char carry = pktdrv_int_invoke(
         (unsigned int)pktdrv_int_num, regs);
     if (carry) {

@@ -200,16 +200,45 @@ What works (70 smoke tests pin the core wins):
   with TLSTEST.PY paste-fed through MP's REPL paste mode, and
   exercises a real TLS handshake against a host-side `tls_server.py`
   constrained to TLSv1.0 + AES128-SHA (the cipher set axtls
-  speaks). CI driver: `.github/workflows/tls-rig.yml`. Current
-  state: MP boots cleanly through the bridge, REPL banner
-  appears, paste-mode delivers TLSTEST.PY in one shot, and the
-  first script statement prints. Networking start (eth_init +
-  DHCP wait via lwip.callback() pump) emits some progress bytes
-  before the wall-clock cap hits — the residual `[mp-*]` startup-
-  surface debug parity that mp-rig.yml also tracks as best-effort.
-  The CI step is `continue-on-error: true` for now; the library is
-  proven, and the rig is a checkpoint for the runtime-side
-  follow-up.
+  speaks). CI driver: `.github/workflows/tls-rig.yml`.
+
+  Current state — MP boots cleanly, REPL banner appears, paste
+  mode delivers TLSTEST.PY in one shot, and execution begins
+  (`TLSTEST: start`). The bisect markers identify exactly where
+  it stops: `uc386_net.eth_init()` returns -1 because
+  `pktdrv_detect` fails. Root cause: under PMODE/W on real DOS,
+  a bare `INT 0x60` from protected mode goes through the IDT,
+  not the real-mode IVT — so the Crynwr packet driver (loaded
+  via NE2000.COM at INT 0x60 in DOS real mode) isn't reached.
+  The byte-signature scan also fails because conventional memory
+  isn't always mapped at the linear address the seg*16+off math
+  assumes under PMODE/W's paging.
+
+  Partial fix landed in `uc386-dos/pktdrv_uc386dos.c`: probe
+  candidate IVT slots via DPMI fn 0x0300 (Simulate Real Mode
+  Interrupt) calling Crynwr's `driver_info` (AH=0x01). That gets
+  detection working under PMODE/W. The remaining pktdrv calls
+  (`pktdrv_access`, `pktdrv_get_addr`, send/recv) still use the
+  bare-INT path and ALSO need to route through DPMI 0x0300, plus
+  buffers must live in conventional memory (allocated via DPMI
+  fn 0x0100 + bounce-copy back to flat-32 buffers). That's the
+  open work item — meaningful but non-trivial DOS-extender
+  plumbing, ~1-2 days. The CI step is `continue-on-error: true`
+  while that lands.
+
+  Not blocking on TLS itself: the library, smoke tests, and rig
+  infrastructure are all in place. Once pktdrv works under
+  PMODE/W, the TLS handshake should "just work" — axtls's I/O
+  is wired through `mp_stream_posix_read/write` over the lwIP
+  socket, which gets its packets through the same pktdrv path
+  the existing dosbox-x-rig already validates under DOSBox-X.
+
+  Side note: there's a second, smaller mystery in the QEMU+FreeDOS
+  output — `repr(-1)` returns the string "11111111111111111111111"
+  (23 ones) instead of "-1". `str(0)` / `str(255)` etc. all work
+  correctly under dos_emu. Likely a uc386 codegen bug that only
+  manifests under PMODE/W's BSS layout. Diagnostic-only; doesn't
+  block the wire test once eth_init returns 0.
 
 What doesn't work yet (separate gates, pinned in mpconfigport.h):
 
