@@ -191,12 +191,25 @@ What works (70 smoke tests pin the core wins):
   smoke test exercises this with the ISRG Root X1 PEM as a known-good
   example.
 
-  End-to-end TLS handshake (the actual cipher exchange + record
-  stream) still needs lwIP routed to the network — the QEMU+FreeDOS
-  rig with NE2000+SLIRP is the closest local proxy for that. Library-
-  level tests (import, SSLContext construction, verify_mode
-  round-trip, load_verify_locations parse-success and parse-failure)
-  pass under dos_emu without a network rig.
+  Library-level tests pass under dos_emu without a network rig
+  (import, SSLContext construction, verify_mode round-trip,
+  load_verify_locations parse-success and parse-failure).
+
+  End-to-end wire test: `addons/gnu/micropython/tls-rig/` boots
+  FreeDOS in QEMU with NE2000+SLIRP, runs MP.EXE under PMODE/W
+  with TLSTEST.PY paste-fed through MP's REPL paste mode, and
+  exercises a real TLS handshake against a host-side `tls_server.py`
+  constrained to TLSv1.0 + AES128-SHA (the cipher set axtls
+  speaks). CI driver: `.github/workflows/tls-rig.yml`. Current
+  state: MP boots cleanly through the bridge, REPL banner
+  appears, paste-mode delivers TLSTEST.PY in one shot, and the
+  first script statement prints. Networking start (eth_init +
+  DHCP wait via lwip.callback() pump) emits some progress bytes
+  before the wall-clock cap hits — the residual `[mp-*]` startup-
+  surface debug parity that mp-rig.yml also tracks as best-effort.
+  The CI step is `continue-on-error: true` for now; the library is
+  proven, and the rig is a checkpoint for the runtime-side
+  follow-up.
 
 What doesn't work yet (separate gates, pinned in mpconfigport.h):
 

@@ -182,10 +182,30 @@ cat tls-server.log
 
 echo
 echo "=== Result ==="
-if grep -q "TLSTEST: PASS" "$LOG" 2>/dev/null; then
+# Anchor to the *actual print output*, not the source-code echo
+# from MP's paste-mode that mirrors `print('TLSTEST: PASS')` back
+# to the serial line as it ingests the script. The output line
+# starts at column 0; the source echoes are indented (since they
+# live inside the `if/else` block).
+if grep -qE '^TLSTEST: PASS$' "$LOG" 2>/dev/null; then
     echo "PASS: end-to-end TLS handshake completed; uc386 MP read decrypted bytes from the host TLS server."
     exit 0
-else
-    echo "FAIL: see logs above"
-    exit 1
 fi
+# Best-effort progress diagnostics — what made it across the wire?
+for marker in "TLSTEST: start" "TLSTEST: ip" "TLSTEST: tcp_connected" \
+              "TLSTEST: ctx_ready" "TLSTEST: handshake_ok" \
+              "TLSTEST: received"; do
+    if grep -qF "$marker" "$LOG" 2>/dev/null \
+       && ! grep -qE "print\\('${marker#TLSTEST: }" "$LOG" 2>/dev/null \
+       || grep -qE "^${marker}" "$LOG" 2>/dev/null; then
+        echo "  reached: $marker"
+    fi
+done
+if grep -qF "[tls-server] connection from" tls-server.log 2>/dev/null; then
+    echo "  host TLS server saw a TCP connection"
+fi
+if grep -qF "[tls-server] handshake ok" tls-server.log 2>/dev/null; then
+    echo "  host TLS server completed the handshake"
+fi
+echo "FAIL: TLSTEST: PASS marker missing; see logs above"
+exit 1
