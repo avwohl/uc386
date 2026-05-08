@@ -360,10 +360,13 @@ static int pktdrv_access(unsigned int linear_receiver) {
     rm.edi = linear_receiver & 0xFFFF;     // offset
     rm.esi = 0;
     rm.ebp = 0; rm.reserved = 0;
-    rm.ebx = 0;                             // if_type=0 (any)
-    rm.edx = 0;                             // if_number=0
-    rm.ecx = 0;                             // type_len=0
-    rm.eax = 0x0200;
+    rm.ebx = 0xFFFF;                        // if_type=0xFFFF wildcard (catch-all DIX/802.3)
+    rm.edx = 0;                             // if_number=0 (first card)
+    rm.ecx = 0;                             // type_len=0 (catch-all type)
+    // AH=0x02 access_type, AL=0x01 if_class=DIX Ethernet. AL=0 was a
+    // bug — invalid class, driver registers a useless handle and
+    // never dispatches packets to it (CF=0 = silently accepted).
+    rm.eax = 0x0201;
     rm.flags = 0;
     rm.es = (unsigned short)((linear_receiver >> 16) & 0xFFFF);
     rm.ds = 0; rm.fs = 0; rm.gs = 0;
@@ -380,8 +383,8 @@ static int pktdrv_access(unsigned int linear_receiver) {
         // for dos_emu compatibility. dos_emu intercepts INT 0x60
         // at the prot-mode level, so this works there.
         unsigned int regs[8] = {0};
-        regs[R_EAX] = 0x0200;
-        regs[R_EBX] = 0;
+        regs[R_EAX] = 0x0201;       // AH=02 access_type, AL=01 Ethernet DIX
+        regs[R_EBX] = 0xFFFF;        // if_type wildcard
         regs[R_ECX] = 0;
         regs[R_EDX] = 0;
         regs[R_EDI] = linear_receiver;
