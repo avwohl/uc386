@@ -90,6 +90,49 @@ pktdrv_rmcs_t pktdrv_rmcs;
 unsigned int  pktdrv_dpmi_seg = 0;   // real-mode trampoline segment
 unsigned int  pktdrv_dpmi_off = 0;   // real-mode trampoline offset
 
+// Conventional-memory bounce buffer for talking to the real-mode
+// Crynwr packet driver under PMODE/W. The driver expects ES:DI /
+// DS:SI to point at real-mode-addressable memory (linear < 1 MB,
+// representable as a 16-bit seg:offset). Our flat-32 BSS sits well
+// above 1 MB on a port the size of MicroPython, so flat pointers
+// can't be encoded that way.
+//
+// Allocated once at init via DPMI fn 0x0100. Sized to comfortably
+// fit a max ethernet frame (1518 bytes) plus headroom, and reused
+// for every TX / RX / get_addr — the packet driver is single-
+// threaded from our perspective, so one shared buffer is fine.
+//
+// Linear address (seg << 4) is what we read/write from flat-32
+// code. Standard DOS extenders (PMODE/W, DOS/4GW, CWSDPMI) map
+// conventional memory at low linear addresses, so flat reads at
+// `bounce_seg << 4` work directly.
+#define PKTDRV_BOUNCE_SIZE 2048
+static unsigned int  pktdrv_bounce_seg     = 0;   // real-mode segment
+static unsigned int  pktdrv_bounce_sel     = 0;   // PM selector (unused, kept for free)
+static unsigned int  pktdrv_bounce_linear  = 0;   // flat-32 linear (= seg << 4)
+
+// DPMI fn 0x0100 — Allocate DOS Memory.
+// On entry: AX=0x0100, BX=number of paragraphs (16-byte units).
+// On exit (CF clear): AX=real-mode segment, DX=PM selector.
+// On error: CF set, AX=DOS error code, BX=largest paragraphs free.
+static int pktdrv_alloc_bounce(void) {
+    if (pktdrv_bounce_seg != 0) {
+        return 0;  // already allocated
+    }
+    unsigned int paragraphs = (PKTDRV_BOUNCE_SIZE + 15) / 16;
+    unsigned int regs[8] = {0};
+    regs[R_EAX] = 0x0100;
+    regs[R_EBX] = paragraphs;
+    unsigned char carry = pktdrv_int_invoke(0x31, regs);
+    if (carry) {
+        return -1;
+    }
+    pktdrv_bounce_seg    = regs[R_EAX] & 0xFFFF;
+    pktdrv_bounce_sel    = regs[R_EDX] & 0xFFFF;
+    pktdrv_bounce_linear = pktdrv_bounce_seg << 4;
+    return 0;
+}
+
 // DPMI fn 0x0300 — Simulate Real Mode Interrupt. Required to reach
 // real-mode INT handlers (like the Crynwr packet driver at INT 0x60)
 // from a protected-mode DPMI client like ours under PMODE/W. A bare
@@ -234,28 +277,63 @@ int pktdrv_detect(void) {
 }
 
 // AH=0x06 get_address — fetch the NIC's MAC into `out[6]`.
-// NOTE: still uses pktdrv_int_invoke directly (not DPMI 0x0300) —
-// under PMODE/W on real DOS this fails because INT 0x60 from
-// protected mode goes through the IDT, not the real-mode IVT.
-// Wiring this through DPMI 0x0300 needs a DPMI low-memory bounce
-// buffer (allocate via DPMI 0x0100, copy result back) — that's
-// the next step on the real-DOS networking path. Works under
-// dos_emu because dos_emu emulates Crynwr at the protected-mode
-// INT level.
+// Routed through DPMI 0x0300; ES:DI points at the bounce buffer
+// (real-mode addressable). After the call, copy the 6 MAC bytes
+// from the bounce buffer's linear address into the caller's
+// flat-32 `out` buffer.
+//
+// Under dos_emu (which emulates Crynwr at the prot-mode INT level
+// and also intercepts DPMI 0x0300), the same code path works —
+// dos_emu treats the seg:off ES:DI as a linear pointer and writes
+// to bounce_linear directly.
 static int pktdrv_get_addr(unsigned char out[6]) {
     if (pktdrv_int_num == 0 || pktdrv_handle < 0) {
         return -1;
     }
-    unsigned int regs[8] = {0};
-    regs[R_EAX] = 0x0600;                          // AH=06, AL=0
-    regs[R_EBX] = (unsigned int)pktdrv_handle;
-    regs[R_ECX] = 6;
-    regs[R_EDI] = (unsigned int)(unsigned long)out;
-    regs[R_ES]  = 0;
-    unsigned char carry = pktdrv_int_invoke(
-        (unsigned int)pktdrv_int_num, regs);
-    if (carry) {
-        return -1;
+    if (pktdrv_bounce_seg == 0) {
+        // Fallback for the rare case the bounce buffer wasn't
+        // allocated (DPMI 0x0100 failed). Use the flat pointer —
+        // works under dos_emu, broken on real DOS but at least
+        // doesn't crash.
+        unsigned int regs[8] = {0};
+        regs[R_EAX] = 0x0600;
+        regs[R_EBX] = (unsigned int)pktdrv_handle;
+        regs[R_ECX] = 6;
+        regs[R_EDI] = (unsigned int)(unsigned long)out;
+        unsigned char carry = pktdrv_int_invoke(
+            (unsigned int)pktdrv_int_num, regs);
+        if (carry) {
+            return -1;
+        }
+    } else {
+        // Use the bounce buffer. ES gets set in the RMCS by the
+        // simulate-real-int wrapper variant below (the basic
+        // wrapper zeros ES; we need a custom path here).
+        static pktdrv_rmcs_t rm;
+        rm.edi = 0;                // offset within the bounce buffer
+        rm.esi = 0;
+        rm.ebp = 0; rm.reserved = 0;
+        rm.ebx = (unsigned int)pktdrv_handle;
+        rm.edx = 0;
+        rm.ecx = 6;
+        rm.eax = 0x0600;
+        rm.flags = 0;
+        rm.es = (unsigned short)pktdrv_bounce_seg;
+        rm.ds = 0; rm.fs = 0; rm.gs = 0;
+        rm.ip = 0; rm.cs = 0; rm.sp = 0; rm.ss = 0;
+        unsigned int dpmi[8] = {0};
+        dpmi[R_EAX] = 0x0300;
+        dpmi[R_EBX] = (unsigned int)pktdrv_int_num & 0xFF;
+        dpmi[R_ECX] = 0;
+        dpmi[R_EDI] = (unsigned int)(unsigned long)&rm;
+        unsigned char carry = pktdrv_int_invoke(0x31, dpmi);
+        if (carry) {
+            return -1;
+        }
+        if (rm.flags & 1) {
+            return -1;
+        }
+        memcpy(out, (unsigned char *)pktdrv_bounce_linear, 6);
     }
     memcpy(pktdrv_mac_cache, out, 6);
     return 0;
@@ -264,22 +342,60 @@ static int pktdrv_get_addr(unsigned char out[6]) {
 // AH=0x02 access_type — register `receiver` as the packet handler
 // for `ethertype`. Use ethertype=0x0000 with type_len=0 to catch
 // every protocol (broadcast netif sees ARP + IPv4 alike).
+// AH=0x02 access_type — register the receiver with the driver.
+// The `linear_receiver` argument is already encoded as a real-mode
+// seg:offset packed into a single 32-bit value (high word = seg,
+// low word = offset) by pktdrv_init when DPMI 0x0303 succeeded.
+// We unpack that into the RMCS's ES:EDI directly. With type_len=0
+// (catch-all), DS:SI is ignored.
+//
+// Under dos_emu the legacy bare-INT path remains as a fallback —
+// dos_emu's AH=02 hook reads the linear receiver value out of EDI
+// regardless.
 static int pktdrv_access(unsigned int linear_receiver) {
-    unsigned int regs[8] = {0};
-    regs[R_EAX] = 0x0200;     // AH=02
-    regs[R_EBX] = 0;          // if_type=0 (any)
-    regs[R_ECX] = 0;          // type_len=0 -> match all ethertypes
-    regs[R_EDX] = 0;          // if_number=0
-    regs[R_ESI] = 0;          // type bytes (ignored when len=0)
-    regs[R_EDI] = linear_receiver;
-    regs[R_DS]  = 0;
-    regs[R_ES]  = 0;
-    unsigned char carry = pktdrv_int_invoke(
-        (unsigned int)pktdrv_int_num, regs);
-    if (carry) {
+    if (pktdrv_int_num == 0) {
         return -1;
     }
-    pktdrv_handle = (int)(regs[R_EAX] & 0xFFFF);
+    static pktdrv_rmcs_t rm;
+    rm.edi = linear_receiver & 0xFFFF;     // offset
+    rm.esi = 0;
+    rm.ebp = 0; rm.reserved = 0;
+    rm.ebx = 0;                             // if_type=0 (any)
+    rm.edx = 0;                             // if_number=0
+    rm.ecx = 0;                             // type_len=0
+    rm.eax = 0x0200;
+    rm.flags = 0;
+    rm.es = (unsigned short)((linear_receiver >> 16) & 0xFFFF);
+    rm.ds = 0; rm.fs = 0; rm.gs = 0;
+    rm.ip = 0; rm.cs = 0; rm.sp = 0; rm.ss = 0;
+
+    unsigned int dpmi[8] = {0};
+    dpmi[R_EAX] = 0x0300;
+    dpmi[R_EBX] = (unsigned int)pktdrv_int_num & 0xFF;
+    dpmi[R_ECX] = 0;
+    dpmi[R_EDI] = (unsigned int)(unsigned long)&rm;
+    unsigned char carry = pktdrv_int_invoke(0x31, dpmi);
+    if (carry) {
+        // DPMI 0x0300 itself failed (no DPMI host?). Try bare INT
+        // for dos_emu compatibility. dos_emu intercepts INT 0x60
+        // at the prot-mode level, so this works there.
+        unsigned int regs[8] = {0};
+        regs[R_EAX] = 0x0200;
+        regs[R_EBX] = 0;
+        regs[R_ECX] = 0;
+        regs[R_EDX] = 0;
+        regs[R_EDI] = linear_receiver;
+        carry = pktdrv_int_invoke((unsigned int)pktdrv_int_num, regs);
+        if (carry) {
+            return -1;
+        }
+        pktdrv_handle = (int)(regs[R_EAX] & 0xFFFF);
+        return 0;
+    }
+    if (rm.flags & 1) {
+        return -1;
+    }
+    pktdrv_handle = (int)(rm.eax & 0xFFFF);
     return 0;
 }
 
@@ -296,9 +412,25 @@ unsigned char *uc386dos_pktdrv_receiver(int phase, unsigned int len) {
             return NULL;
         }
         pktdrv_rx_len = len;
+        // On dos_emu the receiver writes directly to the flat
+        // pktdrv_rx_buf in BSS. On real DOS under PMODE/W the
+        // BSS lands above 1 MB so the seg:off encoding in the
+        // dpmi_thunk below would overflow — return the bounce
+        // buffer's flat-linear address instead so the encoding
+        // stays in range. After phase=1 we copy from bounce_linear
+        // to pktdrv_rx_buf for MP-side consumption.
+        if (pktdrv_bounce_seg != 0
+                && len <= PKTDRV_BOUNCE_SIZE) {
+            return (unsigned char *)pktdrv_bounce_linear;
+        }
         return pktdrv_rx_buf;
     }
-    // phase == 1: packet has been copied.
+    // phase == 1: real-mode driver has copied the frame in.
+    if (pktdrv_bounce_seg != 0 && pktdrv_rx_len <= sizeof(pktdrv_rx_buf)) {
+        memcpy(pktdrv_rx_buf,
+               (unsigned char *)pktdrv_bounce_linear,
+               pktdrv_rx_len);
+    }
     pktdrv_rx_pending = 1;
     return NULL;
 }
@@ -395,15 +527,19 @@ int pktdrv_init(unsigned char mac[6]) {
     if (pktdrv_detect() == 0) {
         return -1;
     }
+    // Allocate the conventional-memory bounce buffer first — used
+    // by pktdrv_get_addr / pktdrv_send below, and silently handed
+    // to the receiver thunk for the RX seg:offset encoding. On
+    // dos_emu DPMI 0x0100 returns success and we get a real
+    // segment; on a host without DPMI the call sets CF and we
+    // continue without a bounce buffer (fallback flat-pointer
+    // paths still work under emulation).
+    (void)pktdrv_alloc_bounce();
+
     unsigned int receiver_linear;
     if (pktdrv_alloc_dpmi_callback() == 0) {
-        // Pack the real-mode seg:offset as a single linear value
-        // for access_type. Crynwr expects ES:DI of the receiver
-        // — under DPMI that's the trampoline, not the flat C
-        // function. We thread it through pktdrv_access's `linear`
-        // arg by encoding seg in the high word, offset in the low.
-        // dos_emu's AH=02 hook unpacks it back; PMODE/W's INT-bridge
-        // forwards the regs as-is to the packet driver.
+        // DPMI trampoline succeeded — encode its real-mode
+        // seg:offset for access_type's ES:DI.
         receiver_linear = (pktdrv_dpmi_seg << 16) | (pktdrv_dpmi_off & 0xFFFF);
     } else {
         receiver_linear = (unsigned int)(unsigned long)
@@ -421,20 +557,53 @@ int pktdrv_init(unsigned char mac[6]) {
     return 0;
 }
 
-// AH=0x04 send_pkt — transmit a frame. `buf` is flat-linear; the
-// driver under PMODE/W's DPMI host translates DS:SI internally.
+// AH=0x04 send_pkt — transmit a frame. The packet driver expects
+// DS:SI to point at real-mode-addressable memory; copy `buf` into
+// our DPMI-allocated bounce buffer and pass its seg:offset.
+//
+// Without a bounce buffer (early init or DPMI failure) we fall back
+// to the bare-INT path with a flat-linear DS:SI value — dos_emu's
+// AH=04 hook handles that, real DOS doesn't.
 int pktdrv_send(const unsigned char *buf, unsigned int len) {
     if (pktdrv_int_num == 0) {
         return -1;
     }
-    unsigned int regs[8] = {0};
-    regs[R_EAX] = 0x0400;
-    regs[R_ECX] = len;
-    regs[R_ESI] = (unsigned int)(unsigned long)buf;
-    regs[R_DS]  = 0;
-    unsigned char carry = pktdrv_int_invoke(
-        (unsigned int)pktdrv_int_num, regs);
-    return carry ? -1 : 0;
+    if (len > PKTDRV_BOUNCE_SIZE) {
+        return -1;
+    }
+    if (pktdrv_bounce_seg == 0) {
+        // Fallback path.
+        unsigned int regs[8] = {0};
+        regs[R_EAX] = 0x0400;
+        regs[R_ECX] = len;
+        regs[R_ESI] = (unsigned int)(unsigned long)buf;
+        unsigned char carry = pktdrv_int_invoke(
+            (unsigned int)pktdrv_int_num, regs);
+        return carry ? -1 : 0;
+    }
+    memcpy((unsigned char *)pktdrv_bounce_linear, buf, len);
+    static pktdrv_rmcs_t rm;
+    rm.edi = 0;
+    rm.esi = 0;                                 // SI offset = 0 within bounce
+    rm.ebp = 0; rm.reserved = 0;
+    rm.ebx = (unsigned int)pktdrv_handle;
+    rm.edx = 0;
+    rm.ecx = len;
+    rm.eax = 0x0400;
+    rm.flags = 0;
+    rm.es = 0; rm.fs = 0; rm.gs = 0;
+    rm.ds = (unsigned short)pktdrv_bounce_seg;
+    rm.ip = 0; rm.cs = 0; rm.sp = 0; rm.ss = 0;
+    unsigned int dpmi[8] = {0};
+    dpmi[R_EAX] = 0x0300;
+    dpmi[R_EBX] = (unsigned int)pktdrv_int_num & 0xFF;
+    dpmi[R_ECX] = 0;
+    dpmi[R_EDI] = (unsigned int)(unsigned long)&rm;
+    unsigned char carry = pktdrv_int_invoke(0x31, dpmi);
+    if (carry || (rm.flags & 1)) {
+        return -1;
+    }
+    return 0;
 }
 
 // Drain the RX slot if one is pending. Returns the byte count
