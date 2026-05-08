@@ -11,8 +11,14 @@ print('TLSTEST: post_lwip_reset')
 print('TLSTEST: pre_eth_init')
 rc = uc386_net.eth_init(True)
 print('TLSTEST: post_eth_init')
-print('TLSTEST: rc_repr', repr(rc))
-print('TLSTEST: rc_type', type(rc))
+# Bypass print formatting — write raw bytes via sys.stdout.write
+# to rule out any concat / format / encoding side effects.
+sys.stdout.write('TLSTEST: rc_eq_zero=' + str(rc == 0) + '\n')
+sys.stdout.write('TLSTEST: rc_eq_minus1=' + str(rc == -1) + '\n')
+sys.stdout.write('TLSTEST: rc_eq_minus2=' + str(rc == -2) + '\n')
+sys.stdout.write('TLSTEST: rc_eq_minus3=' + str(rc == -3) + '\n')
+sys.stdout.write('TLSTEST: rc_lt_zero=' + str(rc < 0) + '\n')
+sys.stdout.write('TLSTEST: rc_gt_million=' + str(rc > 1000000) + '\n')
 ip = ''
 up = False
 for tick in range(60):
