@@ -85,19 +85,28 @@ mcopy -i "$TEST_IMG" -o ./test-server-ca.pem ::TESTCA.PEM
 # COM1 (no CTTY — DOS console is screen) so the rig can detect
 # completion via the serial log.
 AUTOEXEC=$(mktemp)
+# CTTY COM1 routes DOS console I/O to the serial port so we see MP's
+# output live in qemu-tls.log. Without CTTY, file-redirected output
+# from MP.EXE stays buffered and doesn't make it back to the host
+# until QEMU exits. mp-rig.yml uses the same CTTY pattern and that's
+# the one that shows "MicroPython" banner cleanly.
 {
     printf '@echo off\r\n'
     printf 'NE2000 0x60 9 0x300 > NUL\r\n'
-    printf 'echo === rig start === > COM1\r\n'
-    printf 'MP.EXE < TLSTEST.PY > TLSOUT.TXT\r\n'
-    printf 'echo === rig done === > COM1\r\n'
+    printf 'CTTY COM1\r\n'
+    printf 'echo === rig start ===\r\n'
+    printf 'MP.EXE < TLSTEST.PY\r\n'
+    printf 'echo === rig done ===\r\n'
 } > "$AUTOEXEC"
 mcopy -i "$TEST_IMG" -o "$AUTOEXEC" ::AUTOEXEC.BAT
 rm -f "$AUTOEXEC"
 
 # 3. Start the host TLS server in the background. Reaped at exit.
+# max-seconds covers the full QEMU lifetime (boot + DHCP + TLS) plus
+# margin so the server is still listening when MP's lwIP finally
+# routes a packet at it.
 echo "[rig] starting tls_server.py on port $TLS_PORT ..."
-python3 ./tls_server.py --port "$TLS_PORT" --max-seconds 90 \
+python3 ./tls_server.py --port "$TLS_PORT" --max-seconds 300 \
     > tls-server.log 2>&1 &
 SERVER_PID=$!
 
@@ -131,10 +140,15 @@ qemu-system-i386 \
     < /dev/null > "$LOG" 2>&1 &
 QEMU_PID=$!
 
-# Watch for the "rig done" marker in COM1 output. Cap at 180s.
-for _ in $(seq 1 180); do
+# Watch for the success marker (or rig-done from autoexec) in
+# COM1 output. With CTTY COM1, MP's stdout flows live to the
+# serial line and ends up in $LOG. Cap at 240s to give DHCP +
+# TLS handshake plenty of room.
+for _ in $(seq 1 240); do
     sleep 1
-    if grep -q "rig done" "$LOG" 2>/dev/null; then
+    if grep -q "TLSTEST: PASS\|TLSTEST: FAIL\|rig done" "$LOG" 2>/dev/null; then
+        # Give a beat for any trailing output to flush.
+        sleep 2
         break
     fi
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
@@ -146,26 +160,16 @@ sleep 1
 kill -KILL "$QEMU_PID" 2>/dev/null || true
 wait "$QEMU_PID" 2>/dev/null || true
 
-# 5. Pull TLSOUT.TXT off the floppy.
-mcopy -i "$TEST_IMG" -n -o ::TLSOUT.TXT ./tls-out.txt 2>/dev/null || true
-
 echo
 echo "=== Captured COM1 (qemu-tls.log) ==="
 cat "$LOG"
-echo
-echo "=== TLSOUT.TXT (MP stdout) ==="
-if [ -f ./tls-out.txt ]; then
-    cat ./tls-out.txt
-else
-    echo "(no TLSOUT.TXT produced)"
-fi
 echo
 echo "=== tls-server.log (host TLS server) ==="
 cat tls-server.log
 
 echo
 echo "=== Result ==="
-if [ -f ./tls-out.txt ] && grep -q "TLSTEST: PASS" ./tls-out.txt; then
+if grep -q "TLSTEST: PASS" "$LOG" 2>/dev/null; then
     echo "PASS: end-to-end TLS handshake completed; uc386 MP read decrypted bytes from the host TLS server."
     exit 0
 else
