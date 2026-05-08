@@ -90,18 +90,53 @@ pktdrv_rmcs_t pktdrv_rmcs;
 unsigned int  pktdrv_dpmi_seg = 0;   // real-mode trampoline segment
 unsigned int  pktdrv_dpmi_off = 0;   // real-mode trampoline offset
 
-// DPMI INT 0x31 fn 0x0200 — Get Real Mode Interrupt Vector.
-// On entry: AX=0x0200, BL=int_num.
-// On exit:  CX=segment, DX=offset, CF clear on success.
+// Probe an IVT slot to see if a Crynwr packet driver is installed
+// there. Two checks, in order:
 //
-// Reading the real-mode IVT directly from a flat 32-bit binary
-// would only be valid if the loader maps the real-mode IVT into our
-// flat address space (uc386's dos_emu happens to do that — the IVT
-// lives in [0,0x400)). Real DOS via PMODE/W is in protected mode
-// with paging, and the real-mode IVT is *not* mapped at 0:0; the
-// official path is DPMI 0x0200, which both PMODE/W and dos_emu can
-// implement uniformly.
+//   1. Functional probe — issue the driver's `driver_info` call
+//      (AH=0x01, BX=0xFFFF). A Crynwr driver returns CF clear and
+//      a sensible class+type+version triple in BX/CX/DX/DH; an
+//      unrelated default INT vector either returns CF set or
+//      garbage. This is the canonical Crynwr-presence test and
+//      doesn't depend on conventional-memory mapping.
+//
+//   2. Fallback signature scan — DPMI fn 0x0200 + linear-address
+//      byte read at offset 3 ("PKT DRVR"). Works under dos_emu
+//      (where conventional memory is mapped flat at low linear
+//      addresses) but is fragile under PMODE/W on real DOS in
+//      QEMU+FreeDOS, where the linear-to-real mapping isn't
+//      uniformly available. Kept as a backstop for the dos_emu
+//      smoke tests where pktdrv_int_invoke's own probe path
+//      isn't fully wired.
+//
+// Returns the linear handler address (or just `int_num` rebadged
+// as a positive non-zero token) on success, 0 on miss.
 static unsigned int pktdrv_probe_slot(unsigned int int_num) {
+    // (1) driver_info call: AH=0x01, BX=0xFFFF (= "no handle yet").
+    // Crynwr says: returns DH=class, DL=type, BX=version,
+    // CL=number, CX=basic/extended, ES:SI=driver name string,
+    // CF=clear on success.
+    {
+        unsigned int regs[8] = {0};
+        regs[R_EAX] = 0x0100;       // AH=0x01 driver_info, AL=0
+        regs[R_EBX] = 0xFFFF;
+        unsigned char carry = pktdrv_int_invoke(int_num, regs);
+        if (!carry) {
+            // Spot-check: a real Crynwr driver returns BX with a
+            // version like 0x0100..0x01FF (1.x), and class DH in
+            // {0x01..0x10} (Ethernet et al.). Reject obvious
+            // garbage from a default IVT vector that happened to
+            // not set CF.
+            unsigned int bx = regs[R_EBX] & 0xFFFF;
+            unsigned int dh = (regs[R_EDX] >> 8) & 0xFF;
+            if (bx >= 0x0100 && bx <= 0x01FF
+                    && dh >= 0x01 && dh <= 0x20) {
+                return int_num | 0x80000000;  // non-zero token
+            }
+        }
+    }
+
+    // (2) Signature-scan fallback for dos_emu compatibility.
     unsigned int regs[8] = {0};
     regs[R_EAX] = 0x0200;
     regs[R_EBX] = int_num & 0xFF;
@@ -116,9 +151,6 @@ static unsigned int pktdrv_probe_slot(unsigned int int_num) {
         return 0;
     }
     unsigned char *handler = (unsigned char *)linear;
-    // Real Crynwr drivers begin with `JMP SHORT 0x08` followed by
-    // the 8-byte signature. Some implementations differ on the JMP
-    // form; just match the signature at +3.
     for (int i = 0; i < 8; i++) {
         if (handler[3 + i] != PKT_SIG[i]) {
             return 0;
