@@ -109,6 +109,14 @@ AUTOEXEC=$(mktemp)
     printf 'echo === before NE2000 ===\r\n'
     printf 'NE2000 0x60 9 0x300\r\n'
     printf 'echo === after NE2000 ===\r\n'
+    # Sanity-check the floppy is readable for non-redirected I/O before
+    # MP.EXE runs. If TYPE works but the subsequent < redirection fails
+    # with "unknown command given to driver", the bug is in PMODE/W's
+    # INT 21h AH=3F reflection (or DOS state corruption by MP), not the
+    # disk itself.
+    printf 'echo === pre-TYPE TLSTEST ===\r\n'
+    printf 'TYPE TLSTEST.PY\r\n'
+    printf 'echo === post-TYPE TLSTEST ===\r\n'
     printf 'MP.EXE < TLSTEST.PY\r\n'
     printf 'echo === rig done ===\r\n'
 } > "$AUTOEXEC"
