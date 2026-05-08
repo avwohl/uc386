@@ -75,7 +75,20 @@ echo "[rig] building FAT12 image ..."
 cp "$FREEDOS_IMG" "$TEST_IMG"
 mcopy -i "$TEST_IMG" -o "$MP_EXE"      ::MP.EXE
 mcopy -i "$TEST_IMG" -o "$NE2000_COM"  ::NE2000.COM
-mcopy -i "$TEST_IMG" -o ./TLSTEST.PY   ::TLSTEST.PY
+# Wrap TLSTEST.PY in MP REPL paste-mode markers so the whole script
+# enters as one block instead of being re-parsed line-by-line through
+# the slow COM1 INT 21h AH=01 character path. Ctrl-E (0x05) opens
+# paste mode; Ctrl-D (0x04) closes it and triggers execution. A
+# trailing newline + Ctrl-D exits the REPL after the script returns.
+TLSTEST_WRAPPED="$(mktemp)"
+{
+    printf '\x05'
+    cat ./TLSTEST.PY
+    printf '\x04'
+    printf '\n\x04'
+} > "$TLSTEST_WRAPPED"
+mcopy -i "$TEST_IMG" -o "$TLSTEST_WRAPPED" ::TLSTEST.PY
+rm -f "$TLSTEST_WRAPPED"
 mcopy -i "$TEST_IMG" -o ./test-server-ca.pem ::TESTCA.PEM
 
 # AUTOEXEC.BAT: load the packet driver at INT 0x60 / IRQ 9 / IO 0x300
