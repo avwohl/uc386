@@ -449,6 +449,8 @@ unsigned char *uc386dos_pktdrv_receiver(int phase, unsigned int len) {
 // well — dos_emu's DPMI fn 0x0303 emulation invokes this through
 // the same path. (No-op under hardware DPMI; the host calls it.)
 void uc386dos_pktdrv_dpmi_thunk(void) {
+    extern int write(int fd, const void *buf, unsigned int n);
+    write(1, "[thunk!]", 8);
     unsigned int phase  = pktdrv_rmcs.eax & 0xFFFF;
     unsigned int length = pktdrv_rmcs.ecx & 0xFFFF;
     unsigned char *buf = uc386dos_pktdrv_receiver((int)phase, length);
@@ -537,11 +539,14 @@ int pktdrv_init(unsigned char mac[6]) {
     (void)pktdrv_alloc_bounce();
 
     unsigned int receiver_linear;
+    extern int write(int fd, const void *buf, unsigned int n);
     if (pktdrv_alloc_dpmi_callback() == 0) {
+        write(1, "[dpmi:cb-ok]", 12);
         // DPMI trampoline succeeded — encode its real-mode
         // seg:offset for access_type's ES:DI.
         receiver_linear = (pktdrv_dpmi_seg << 16) | (pktdrv_dpmi_off & 0xFFFF);
     } else {
+        write(1, "[dpmi:cb-fail]", 14);
         receiver_linear = (unsigned int)(unsigned long)
                           &uc386dos_pktdrv_receiver;
     }
