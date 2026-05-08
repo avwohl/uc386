@@ -80,15 +80,25 @@ mcopy -i "$TEST_IMG" -o "$NE2000_COM"  ::NE2000.COM
 # the slow COM1 INT 21h AH=01 character path. Ctrl-E (0x05) opens
 # paste mode; Ctrl-D (0x04) closes it and triggers execution. A
 # trailing newline + Ctrl-D exits the REPL after the script returns.
-TLSTEST_WRAPPED="$(mktemp)"
+#
+# We feed this stream into QEMU's -serial stdio rather than redirecting
+# MP's stdin from a file on the floppy. The DOS-side `<` redirection
+# under PMODE/W deterministically aborts at MP's first read with
+# "Error reading from drive A: unknown command given to driver" once
+# the binary reaches a certain size (verified: TYPE TLSTEST.PY in the
+# same AUTOEXEC works fine, only MP's INT 21h AH=3F on a redirected
+# handle blows up). Going through CTTY COM1's console path is a
+# completely different DOS code path and sidesteps the bug.
+TLSTEST_WRAPPED="$(pwd)/tlstest-wrapped.in"
 {
     printf '\x05'
     cat ./TLSTEST.PY
     printf '\x04'
     printf '\n\x04'
 } > "$TLSTEST_WRAPPED"
-mcopy -i "$TEST_IMG" -o "$TLSTEST_WRAPPED" ::TLSTEST.PY
-rm -f "$TLSTEST_WRAPPED"
+# Still copy TLSTEST.PY onto the floppy so any future probe / fallback
+# can read it; not required for the live REPL feed.
+mcopy -i "$TEST_IMG" -o ./TLSTEST.PY ::TLSTEST.PY
 mcopy -i "$TEST_IMG" -o ./test-server-ca.pem ::TESTCA.PEM
 
 # AUTOEXEC.BAT: load the packet driver at INT 0x60 / IRQ 9 / IO 0x300
@@ -109,15 +119,10 @@ AUTOEXEC=$(mktemp)
     printf 'echo === before NE2000 ===\r\n'
     printf 'NE2000 0x60 9 0x300\r\n'
     printf 'echo === after NE2000 ===\r\n'
-    # Sanity-check the floppy is readable for non-redirected I/O before
-    # MP.EXE runs. If TYPE works but the subsequent < redirection fails
-    # with "unknown command given to driver", the bug is in PMODE/W's
-    # INT 21h AH=3F reflection (or DOS state corruption by MP), not the
-    # disk itself.
-    printf 'echo === pre-TYPE TLSTEST ===\r\n'
-    printf 'TYPE TLSTEST.PY\r\n'
-    printf 'echo === post-TYPE TLSTEST ===\r\n'
-    printf 'MP.EXE < TLSTEST.PY\r\n'
+    # MP.EXE without `<` redirection: stdin = console = COM1 (via
+    # CTTY). The host feeds the paste-mode-wrapped script through
+    # QEMU's -serial stdio (see TLSTEST_WRAPPED below).
+    printf 'MP.EXE\r\n'
     printf 'echo === rig done ===\r\n'
 } > "$AUTOEXEC"
 mcopy -i "$TEST_IMG" -o "$AUTOEXEC" ::AUTOEXEC.BAT
@@ -149,6 +154,11 @@ trap cleanup EXIT INT TERM
 #    the TLS server is listening. No hostfwd needed; the guest reaches
 #    the server by talking to the gateway.
 echo "[rig] booting QEMU + FreeDOS + NE2000 (log: $LOG) ..."
+# Feed the paste-mode-wrapped TLSTEST.PY into QEMU's serial stdio so
+# COM1 RX delivers it to MP.EXE's console-read path. QEMU buffers
+# bytes in the chardev → 8250 RX FIFO until the guest drains them,
+# so timing is forgiving (bytes sit in the buffer through DOS boot
+# + AUTOEXEC + NE2000 load until MP starts reading).
 qemu-system-i386 \
     -display none \
     -serial stdio \
@@ -159,7 +169,7 @@ qemu-system-i386 \
     -netdev user,id=net0 \
     -device ne2k_isa,netdev=net0,iobase=0x300,irq=9 \
     -no-reboot \
-    < /dev/null > "$LOG" 2>&1 &
+    < "$TLSTEST_WRAPPED" > "$LOG" 2>&1 &
 QEMU_PID=$!
 
 # Watch for the success marker (or rig-done from autoexec) in
