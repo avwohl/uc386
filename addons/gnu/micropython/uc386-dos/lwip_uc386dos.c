@@ -196,6 +196,19 @@ int uc386dos_eth_start(int dhcp_start_now) {
     return 0;
 }
 
+// Static-IP override path for tests / environments where DHCP isn't
+// available. Caller has already run uc386dos_eth_start(False) so the
+// netif exists; this just clears any DHCP state and writes the
+// addresses directly.
+void uc386dos_eth_set_addr(unsigned int ip, unsigned int mask, unsigned int gw) {
+    if (!uc386dos_eth_active) return;
+    dhcp_release_and_stop(&uc386dos_eth_netif);
+    ip4_addr_t a, n, g;
+    a.addr = ip; n.addr = mask; g.addr = gw;
+    netif_set_addr(&uc386dos_eth_netif, &a, &n, &g);
+    netif_set_up(&uc386dos_eth_netif);
+}
+
 // Read-back helpers for the Python-facing module to inspect state.
 unsigned int uc386dos_eth_ip(void)      { return uc386dos_eth_netif.ip_addr.addr; }
 unsigned int uc386dos_eth_netmask(void) { return uc386dos_eth_netif.netmask.addr; }

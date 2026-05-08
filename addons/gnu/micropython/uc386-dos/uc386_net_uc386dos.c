@@ -18,11 +18,27 @@
 #include "py/obj.h"
 
 extern int uc386dos_eth_start(int dhcp_start_now);
+extern void uc386dos_eth_set_addr(unsigned int ip, unsigned int mask, unsigned int gw);
 extern unsigned int uc386dos_eth_ip(void);
 extern unsigned int uc386dos_eth_netmask(void);
 extern unsigned int uc386dos_eth_gateway(void);
 extern int uc386dos_eth_is_up(void);
 extern int uc386dos_eth_driver(void);
+
+static unsigned int parse_ip4(const char *s) {
+    unsigned int parts[4] = {0};
+    int idx = 0;
+    while (*s && idx < 4) {
+        unsigned int v = 0;
+        while (*s >= '0' && *s <= '9') {
+            v = v * 10 + (*s - '0');
+            s++;
+        }
+        parts[idx++] = v & 0xff;
+        if (*s == '.') s++;
+    }
+    return parts[0] | (parts[1] << 8) | (parts[2] << 16) | (parts[3] << 24);
+}
 
 static mp_obj_t mod_uc386_net_ip4_to_str(unsigned int addr) {
     char buf[16];
@@ -65,10 +81,21 @@ static mp_obj_t mod_uc386_net_eth_status(void) {
 static MP_DEFINE_CONST_FUN_OBJ_0(
     mod_uc386_net_eth_status_obj, mod_uc386_net_eth_status);
 
+static mp_obj_t mod_uc386_net_eth_set_static(mp_obj_t ip_obj, mp_obj_t mask_obj, mp_obj_t gw_obj) {
+    const char *ip_s   = mp_obj_str_get_str(ip_obj);
+    const char *mask_s = mp_obj_str_get_str(mask_obj);
+    const char *gw_s   = mp_obj_str_get_str(gw_obj);
+    uc386dos_eth_set_addr(parse_ip4(ip_s), parse_ip4(mask_s), parse_ip4(gw_s));
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_3(
+    mod_uc386_net_eth_set_static_obj, mod_uc386_net_eth_set_static);
+
 static const mp_rom_map_elem_t mp_module_uc386_net_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__),   MP_ROM_QSTR(MP_QSTR_uc386_net) },
     { MP_ROM_QSTR(MP_QSTR_eth_init),   MP_ROM_PTR(&mod_uc386_net_eth_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_eth_status), MP_ROM_PTR(&mod_uc386_net_eth_status_obj) },
+    { MP_ROM_QSTR(MP_QSTR_eth_set_static), MP_ROM_PTR(&mod_uc386_net_eth_set_static_obj) },
 };
 static MP_DEFINE_CONST_DICT(
     mp_module_uc386_net_globals, mp_module_uc386_net_globals_table);

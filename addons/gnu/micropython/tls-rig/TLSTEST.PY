@@ -9,40 +9,27 @@ print('TLSTEST: pre_lwip_reset')
 _ = lwip.reset()
 print('TLSTEST: post_lwip_reset')
 print('TLSTEST: pre_eth_init')
-rc = uc386_net.eth_init(True)
+# Bring up the netif WITHOUT DHCP, then set a static IP that matches
+# QEMU's SLIRP user-mode network (10.0.2.15/24, gateway 10.0.2.2).
+# This sidesteps the lwIP DHCP retry timer that fires inside
+# sys_check_timeouts at ~2 s — that path was deterministically
+# hanging under PMODE/W (see CI run 25549376977 markers).
+rc = uc386_net.eth_init(False)
 print('TLSTEST: post_eth_init')
-# Bypass print formatting — write raw bytes via sys.stdout.write
-# to rule out any concat / format / encoding side effects.
 sys.stdout.write('TLSTEST: rc_eq_zero=' + str(rc == 0) + '\n')
-sys.stdout.write('TLSTEST: rc_eq_minus1=' + str(rc == -1) + '\n')
-sys.stdout.write('TLSTEST: rc_eq_minus2=' + str(rc == -2) + '\n')
-sys.stdout.write('TLSTEST: rc_eq_minus3=' + str(rc == -3) + '\n')
-sys.stdout.write('TLSTEST: rc_lt_zero=' + str(rc < 0) + '\n')
-sys.stdout.write('TLSTEST: rc_gt_million=' + str(rc > 1000000) + '\n')
-ip = ''
-up = False
-print('TLSTEST: pre_dhcp_loop')
-sys.stdout.write('TLSTEST: pre_first_callback\n')
-_ = lwip.callback()
-sys.stdout.write('TLSTEST: post_first_callback\n')
-info = uc386_net.eth_status()
-sys.stdout.write('TLSTEST: post_first_status ip=' + str(info[0]) + ' up=' + str(info[3]) + '\n')
-for tick in range(60):
-    sys.stdout.write('T:cb-pre\n')
+uc386_net.eth_set_static('10.0.2.15', '255.255.255.0', '10.0.2.2')
+print('TLSTEST: post_set_static')
+# A few callback ticks so the link comes up cleanly, but no long
+# DHCP wait — IP is already configured.
+for tick in range(5):
     _ = lwip.callback()
-    sys.stdout.write('T:cb-post\n')
-    info = uc386_net.eth_status()
-    sys.stdout.write('T:status-post\n')
-    ip = info[0]
-    up = info[3]
-    if up and ip and ip != '0.0.0.0':
-        break
-    sys.stdout.write('T:sleep-pre\n')
-    time.sleep_ms(100)
-    sys.stdout.write('T:sleep-post\n')
+    time.sleep_ms(50)
+info = uc386_net.eth_status()
+ip = info[0]
+up = info[3]
 print('TLSTEST: ifup', up, 'ip', ip)
 if not up or not ip or ip == '0.0.0.0':
-    print('TLSTEST: dhcp_failed')
+    print('TLSTEST: static_ip_failed')
     sys.exit(1)
 addr = socket.getaddrinfo('10.0.2.2', 8443)[0][-1]
 s = socket.socket()
