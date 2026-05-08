@@ -9,8 +9,10 @@ print('TLSTEST: pre_lwip_reset')
 _ = lwip.reset()
 print('TLSTEST: post_lwip_reset')
 print('TLSTEST: pre_eth_init')
-rc = uc386_net.eth_init()
-print('TLSTEST: post_eth_init rc=' + str(rc))
+rc = uc386_net.eth_init(True)
+print('TLSTEST: post_eth_init')
+print('TLSTEST: rc_repr', repr(rc))
+print('TLSTEST: rc_type', type(rc))
 ip = ''
 up = False
 for tick in range(60):
