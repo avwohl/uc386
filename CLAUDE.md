@@ -16,8 +16,8 @@ See `README.md` for the public roadmap (Phase 0–6).
 
 ## Toolchain
 
-- Python ≥ 3.11 (uc_core uses `dataclass(kw_only=True)`, added in 3.10).
-  Linux ships 3.11+ in current LTSes; on macOS install via
+- Python ≥ 3.10 (uc_core uses `dataclass(kw_only=True)`, added in 3.10).
+  Linux ships 3.10+ in current LTSes; on macOS install via
   `brew install python@3.12` (Apple's system 3.9 is too old).
 - Working venv at `.venv/` with `uc_core`, `uc386`, `unicorn` installed.
   - Create: `python3 -m venv .venv && .venv/bin/pip install pytest unicorn -e ../uc_core -e .`

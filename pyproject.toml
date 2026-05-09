@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "C23 compiler targeting x86-32 (i386) and MS-DOS (skeleton)"
 readme = "README.md"
 license = "GPL-3.0-or-later"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
     "uc_core>=0.1.0",
 ]
@@ -24,6 +24,7 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
