@@ -22,7 +22,7 @@ from uc_core.preprocessor import Preprocessor
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-INCLUDE = REPO_ROOT / "lib" / "include"
+INCLUDE = REPO_ROOT / "src" / "uc386" / "lib" / "include"
 
 
 def _compile_to_asm(src: str, tmp_path: Path) -> Path:

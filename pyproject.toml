@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "uc386"
-version = "0.0.1"
-description = "C23 compiler targeting x86-32 (i386) and MS-DOS (skeleton)"
+version = "0.1.0"
+description = "C23 compiler targeting x86-32 (i386) and MS-DOS"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 requires-python = ">=3.10"
 dependencies = [
-    "uc_core>=0.3.2",
+    "uc_core>=0.3.4",
 ]
 authors = [
     {name = "uc386 developers"}
@@ -20,7 +20,7 @@ keywords = [
     "cross-compiler", "retro-computing", "16-bit", "32-bit"
 ]
 classifiers = [
-    "Development Status :: 1 - Planning",
+    "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
@@ -41,6 +41,13 @@ uc386 = "uc386.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+uc386 = [
+    "py.typed",
+    "lib/*.asm",
+    "lib/include/**/*.h",
+]
 
 [project.optional-dependencies]
 dev = [

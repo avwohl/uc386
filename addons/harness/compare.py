@@ -19,7 +19,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 ADDONS_ROOT = REPO_ROOT / "addons"
-LIB_INCLUDE = REPO_ROOT / "lib" / "include"
+LIB_INCLUDE = REPO_ROOT / "src" / "uc386" / "lib" / "include"
 
 # DJGPP (i586-pc-msdosdjgpp-gcc) ships as an out-of-tree tarball — we
 # look in $PATH, $DJGPP_PREFIX/bin, and the conventional ~/.local/opt/djgpp

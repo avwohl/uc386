@@ -54,7 +54,7 @@ def build_one_addon(name: str) -> Path | None:
     cmd = [
         sys.executable, "-m", "uc386.main",
         *sources, "-o", str(asm_path),
-        "-I", str(REPO_ROOT / "lib" / "include"),
+        "-I", str(REPO_ROOT / "src" / "uc386" / "lib" / "include"),
         *extra,
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT)

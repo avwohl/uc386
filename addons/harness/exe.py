@@ -45,7 +45,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-LIB_INCLUDE = REPO_ROOT / "lib" / "include"
+LIB_INCLUDE = REPO_ROOT / "src" / "uc386" / "lib" / "include"
 
 
 # The PMODE/W bridge stub. Linked into every .exe build; provides:

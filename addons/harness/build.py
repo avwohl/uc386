@@ -26,7 +26,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 ADDONS_ROOT = REPO_ROOT / "addons"
-LIB_INCLUDE = REPO_ROOT / "lib" / "include"
+LIB_INCLUDE = REPO_ROOT / "src" / "uc386" / "lib" / "include"
 EXAMPLES_DIR = REPO_ROOT / "examples"
 
 

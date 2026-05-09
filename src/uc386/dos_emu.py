@@ -1479,7 +1479,7 @@ def run(
     return res
 
 
-LIBC_ASM_PATH = Path(__file__).resolve().parents[2] / "lib" / "i386_dos_libc.asm"
+LIBC_ASM_PATH = Path(__file__).resolve().parent / "lib" / "i386_dos_libc.asm"
 
 
 def _libc_provided_symbols() -> set[str]:

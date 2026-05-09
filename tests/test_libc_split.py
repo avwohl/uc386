@@ -256,7 +256,7 @@ def test_emit_skips_unreferenced_data_and_bss():
 
 @pytest.fixture(scope="module")
 def real_libc():
-    libc_path = Path(__file__).resolve().parents[1] / "lib" / "i386_dos_libc.asm"
+    libc_path = Path(__file__).resolve().parents[1] / "src" / "uc386" / "lib" / "i386_dos_libc.asm"
     return parse_libc(libc_path.read_text())
 
 
@@ -289,7 +289,7 @@ def test_real_libc_emit_minimal_size(real_libc):
     full libc."""
     out = real_libc.emit({"_printf"})
     full_lines = sum(1 for l in (Path(__file__).resolve().parents[1] /
-                                  "lib" / "i386_dos_libc.asm")
+                                  "src" / "uc386" / "lib" / "i386_dos_libc.asm")
                       .read_text().splitlines())
     out_lines = len(out.splitlines())
     assert out_lines < full_lines * 0.05  # < 5% of original

@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 UC386_DIR = Path(__file__).parent
-LIB_INCLUDE = UC386_DIR / "lib" / "include"
+LIB_INCLUDE = UC386_DIR / "src" / "uc386" / "lib" / "include"
 TORTURE_DIR = (
     Path(__file__).resolve().parent.parent
     / "external" / "llvm-test-suite"

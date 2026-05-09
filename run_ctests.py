@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 UC386_DIR = Path(__file__).parent
-LIB_INCLUDE = UC386_DIR / "lib" / "include"
+LIB_INCLUDE = UC386_DIR / "src" / "uc386" / "lib" / "include"
 TEST_SUITE_DIR = Path(__file__).resolve().parent.parent / "external" / "c-testsuite" / "tests" / "single-exec"
 # Optional per-platform .c overrides, mirroring uc80's tests/c-testsuite-z80
 # layout. Drop a `<num>.c` here to substitute a tweaked source.
