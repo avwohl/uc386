@@ -17,8 +17,7 @@ from textwrap import dedent
 import pytest
 
 from uc386.codegen import CodeGenerator
-from uc_core.lexer import Lexer
-from uc_core.parser import Parser
+from uc_core.frontend import parse
 from uc_core.preprocessor import Preprocessor
 
 
@@ -35,8 +34,7 @@ def _compile_to_asm(src: str, tmp_path: Path) -> Path:
     asm_path = tmp_path / "prog.asm"
     pp = Preprocessor(include_paths=[str(INCLUDE)])
     pp_text = pp.preprocess(src, str(src_path))
-    tokens = list(Lexer(pp_text, str(src_path)).tokenize())
-    unit = Parser(tokens).parse()
+    unit = parse(pp_text, str(src_path))
     asm_path.write_text(CodeGenerator().generate(unit))
     return asm_path
 
