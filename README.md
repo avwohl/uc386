@@ -31,13 +31,17 @@ See `docs/path-a-mz-le.md`. DOOM boots end-to-end through uc386 → NASM → dos
 (reaches W_InitFiles after V_Init / M_LoadDefaults / Z_Init; exits 1
 at WAD-not-found as expected; smoke-tested via
 `addons/games/doom/test_doom_smoke.py`). MicroPython is a
-fully-functional Python REPL — `addons/gnu/micropython/build_port.sh`
-produces a ~169 KB i386 DOS binary that evaluates expressions, defines
-functions and classes, runs list comprehensions, handles exceptions,
-and dispatches ~25 named builtins (`print`, `min`, `max`, `sum`,
-`sorted`, `bin`, `hex`, `oct`, `len`, `range`, `repr`, `type`,
-`isinstance`, ...). 12 smoke tests pin the wins (see
-`addons/gnu/micropython/test_micropython_smoke.py`). BWK awk runs
+fully-functional Python REPL, packaged separately as
+[freedos_micro_python](https://github.com/avwohl/freedos_micro_python)
+(`pip install freedos_micro_python`). The bundled
+`freedos-micropython port` CLI builds an i386 DOS binary that
+evaluates expressions, defines functions and classes, runs list
+comprehensions, handles exceptions, and dispatches ~25 named builtins
+(`print`, `min`, `max`, `sum`, `sorted`, `bin`, `hex`, `oct`, `len`,
+`range`, `repr`, `type`, `isinstance`, ...). The MP smoke test
+(`tests/test_micropython_integration.py`) re-uses uc386's `dos_emu`
+to pin the REPL banner and is the toughest end-to-end exercise we
+have for the compiler. BWK awk runs
 arithmetic, regex, aggregation, and string functions
 (`addons/gnu/awk-bwk/test_awk_smoke.py`). 16 in-tree GNU utilities
 (`true`, `cat`, `wc`, ...) get parametrized regression coverage via

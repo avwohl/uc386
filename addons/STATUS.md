@@ -251,6 +251,13 @@ real-mode-32 binaries that dos_emu loads directly.
 
 ## ✓ Include the latest MicroPython (2026-05-01 ask)
 
+**Status: split out into its own repo on 2026-05-09 — see
+[freedos_micro_python](https://github.com/avwohl/freedos_micro_python)
+(`pip install freedos_micro_python`). uc386's smoke test moved to
+`tests/test_micropython_integration.py` and skips when MP isn't
+built. The historical context below stays here so the per-slice
+diary still makes sense.**
+
 **Runnable `micropython.bin` is a fully-functional Python REPL.**
 A ~169 KB flat i386 DOS binary built end-to-end through uc386
 prints:
