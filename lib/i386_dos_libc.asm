@@ -2430,6 +2430,7 @@ _printf_legacy:
         ; Parse flags and width.
         xor     ecx, ecx              ; width
         mov     byte [ebp - 4], 0     ; zero_pad flag
+        mov     byte [ebp - 8], 0     ; ll-length flag (set by `ll` in .eatlen)
 .flags:
         mov     al, [esi]
         cmp     al, '0'
@@ -2477,12 +2478,15 @@ _printf_legacy:
         inc     esi
         jmp     .pd
 .lenp:
-        ; Eat 'l', 'll', 'h', 'hh', 'z' length specifiers (ignored — we
-        ; treat all integer args as 32-bit).
+        ; Eat length specifiers. `h`, `hh`, `z`, `L`, and a single `l`
+        ; are consumed but otherwise ignored (we treat the affected arg
+        ; as 32-bit). A double `ll` sets [ebp-8] so the conversion
+        ; dispatch (currently only %llx/%llX) can read 8 bytes from the
+        ; va list instead of 4.
 .eatlen:
         mov     al, [esi]
         cmp     al, 'l'
-        je      .eat1
+        je      .eat_l
         cmp     al, 'h'
         je      .eat1
         cmp     al, 'z'
@@ -2490,6 +2494,15 @@ _printf_legacy:
         cmp     al, 'L'
         je      .eat1
         jmp     .conv
+.eat_l:
+        inc     esi
+        ; Look ahead for a second 'l' — if present, set the ll flag.
+        mov     al, [esi]
+        cmp     al, 'l'
+        jne     .eatlen
+        mov     byte [ebp - 8], 1
+        inc     esi
+        jmp     .eatlen
 .eat1:
         inc     esi
         jmp     .eatlen
@@ -2605,6 +2618,8 @@ _printf_legacy:
         jmp     .next
 
 .pd_hex:
+        cmp     byte [ebp - 8], 0
+        jne     .pd_llhex
         mov     eax, [edi]
         add     edi, 4
         movzx   ebx, byte [ebp - 4]   ; zero_pad
@@ -2616,6 +2631,8 @@ _printf_legacy:
         jmp     .next
 
 .pd_HEX:
+        cmp     byte [ebp - 8], 0
+        jne     .pd_llHEX
         mov     eax, [edi]
         add     edi, 4
         movzx   ebx, byte [ebp - 4]
@@ -2624,6 +2641,34 @@ _printf_legacy:
         push    1                     ; 1 = uppercase
         call    _printf_emit_hex
         add     esp, 12
+        jmp     .next
+
+.pd_llhex:
+        ; Pass the 64-bit value on the stack — the printf-engine's
+        ; peephole pass can't see across a `call`, so a hidden EDX:EAX
+        ; arg gets its `mov eax, [edi]` deleted as "dead." Push the
+        ; value explicitly to keep both halves alive.
+        movzx   ebx, byte [ebp - 4]
+        push    ebx                   ; zero_pad
+        push    ecx                   ; width
+        push    0                     ; 0 = lowercase
+        push    dword [edi + 4]       ; high dword
+        push    dword [edi]           ; low dword
+        add     edi, 8
+        call    _printf_emit_hex64
+        add     esp, 20
+        jmp     .next
+
+.pd_llHEX:
+        movzx   ebx, byte [ebp - 4]
+        push    ebx
+        push    ecx
+        push    1                     ; 1 = uppercase
+        push    dword [edi + 4]
+        push    dword [edi]
+        add     edi, 8
+        call    _printf_emit_hex64
+        add     esp, 20
         jmp     .next
 
 .pd_oct:
@@ -2818,6 +2863,65 @@ _printf_emit_hex:
         ; Push width/zero-pad from caller's stack frame to ours.
         push    dword [ebp + 16]     ; zero_pad
         push    dword [ebp + 12]     ; width
+        push    edi
+        push    ebx
+        call    _emit_padded_digits_wp
+        add     esp, 16
+        pop     ebx
+        pop     edi
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- print 64-bit hex ------------------------------------------------------
+; _printf_emit_hex64(uint32_t low, uint32_t high, int uppercase,
+;                    int width, int zero_pad)
+; All args via stack — the printf-engine's peephole pass deletes
+; "dead" loads to caller-saved registers across a call, so the value
+; must travel on the stack instead of in EDX:EAX.
+; Mirrors _printf_emit_hex but iterates up to 16 nibbles, walking the
+; 64-bit value rightward 4 bits at a time via SHRD/SHR.
+_printf_emit_hex64:
+        push    ebp
+        mov     ebp, esp
+        sub     esp, 32
+        push    esi
+        push    edi
+        push    ebx
+        mov     eax, [ebp + 8]       ; low dword
+        mov     edx, [ebp + 12]      ; high dword
+        mov     ecx, [ebp + 16]      ; uppercase flag
+        lea     edi, [ebp - 4]
+        mov     byte [edi], 0
+.l:
+        mov     ebx, eax
+        and     ebx, 0x0F
+        cmp     ebx, 9
+        jbe     .digit
+        sub     ebx, 10
+        test    ecx, ecx
+        jnz     .upper
+        add     ebx, 'a'
+        jmp     .write
+.upper:
+        add     ebx, 'A'
+        jmp     .write
+.digit:
+        add     ebx, '0'
+.write:
+        dec     edi
+        mov     [edi], bl
+        ; Shift EDX:EAX right by 4 bits.
+        shrd    eax, edx, 4
+        shr     edx, 4
+        ; Loop while either half is non-zero.
+        mov     ebx, eax
+        or      ebx, edx
+        jnz     .l
+        xor     ebx, ebx             ; sign flag (none for hex)
+        push    dword [ebp + 24]     ; zero_pad
+        push    dword [ebp + 20]     ; width
         push    edi
         push    ebx
         call    _emit_padded_digits_wp
