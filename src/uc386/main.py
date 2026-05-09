@@ -148,8 +148,15 @@ def _mangle_static_globals(unit, prefix: str) -> None:
     """
     import dataclasses
 
+    def _flatten_top(decls):
+        for d in decls:
+            if isinstance(d, ast_module.DeclarationList):
+                yield from _flatten_top(d.declarations)
+            else:
+                yield d
+
     statics: set[str] = set()
-    for d in unit.declarations:
+    for d in _flatten_top(unit.declarations):
         if isinstance(d, (ast_module.VarDecl, ast_module.FunctionDecl)):
             if getattr(d, "storage_class", None) == "static" and d.name:
                 statics.add(d.name)
