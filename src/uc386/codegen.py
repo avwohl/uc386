@@ -316,6 +316,59 @@ class _FuncCtx:
         return f".L{self._next_label}_{hint}"
 
 
+def _try_simple_int_fold(expr) -> int | None:
+    """Cheap structural constant fold for integer expressions built only
+    from IntLiterals, parens, unary +/-/~, and binary arithmetic / bit
+    ops. Used by struct-member array-size handling, where the AST
+    optimizer often hasn't run (it walks statements, not type-position
+    expressions).
+
+    Returns the folded value or None if anything in the expression
+    isn't trivially evaluable. Deliberately narrow — no identifier
+    lookups, no calls, no sizeof — so it can't recurse into expensive
+    paths like the full _const_eval would.
+    """
+    if isinstance(expr, ast.IntLiteral):
+        return expr.value
+    if isinstance(expr, ast.CharLiteral):
+        return expr.value
+    if isinstance(expr, ast.UnaryOp):
+        v = _try_simple_int_fold(expr.operand)
+        if v is None:
+            return None
+        if expr.op == "-":
+            return -v
+        if expr.op == "+":
+            return v
+        if expr.op == "~":
+            return ~v
+        if expr.op == "!":
+            return 1 if v == 0 else 0
+        return None
+    if isinstance(expr, ast.BinaryOp):
+        a = _try_simple_int_fold(expr.left)
+        if a is None:
+            return None
+        b = _try_simple_int_fold(expr.right)
+        if b is None:
+            return None
+        op = expr.op
+        try:
+            if op == "+":  return a + b
+            if op == "-":  return a - b
+            if op == "*":  return a * b
+            if op == "/":  return a // b if b else None
+            if op == "%":  return a %  b if b else None
+            if op == "<<": return a << b
+            if op == ">>": return a >> b
+            if op == "&":  return a &  b
+            if op == "|":  return a |  b
+            if op == "^":  return a ^  b
+        except Exception:
+            return None
+    return None
+
+
 class CodeGenerator:
     """i386/MS-DOS backend."""
 
@@ -12936,6 +12989,23 @@ class CodeGenerator:
                     t.size is not None
                     and not isinstance(t.size, ast.IntLiteral)
                 ):
+                    # Struct members can't legally have non-constant
+                    # sizes in C. Macro-heavy headers (axtls, lwIP, …)
+                    # commonly write `uint32_t ks[(AES_MAXROUNDS+1)*8]`
+                    # where the size expression is constant but the
+                    # AST optimizer didn't fold it (it walks expressions
+                    # in statements, not type-annotation positions).
+                    # Try a cheap structural fold here: if the expr is
+                    # built from IntLiterals + arithmetic only, evaluate
+                    # it directly. Anything else falls through to the
+                    # original VLA-capture path.
+                    folded = _try_simple_int_fold(t.size)
+                    if folded is not None:
+                        t.size = ast.IntLiteral(
+                            value=folded, location=t.size.location,
+                        )
+                        walk(t.base_type)
+                        return
                     slot_name = (
                         f"__vla_capture_struct_"
                         f"{decl.name or '<anon>'}_{len(captures)}"
