@@ -64,12 +64,17 @@ all pointers are 32-bit flat.
 ## Design
 
 The uc80/uc386 family shares a single C23 frontend
-([uc_core](https://github.com/avwohl/uc_core)). This project
-contributes only:
+([uc_core](https://github.com/avwohl/uc_core), itself uplox-driven).
+This project contributes only:
 
 - `main.py` — driver (CLI, I/O, embedding, post-processing)
-- `codegen.py` — x86-32 code generator (stub)
-- `runtime.py` — DOS/DPMI runtime bindings (stub)
+- `codegen.py` — x86-32 NASM code generator
+- `peephole.py` — NASM-text peephole optimizer
+- `asm_dce.py` — assembly-level dead-code elimination from `_start` / `_main`
+- `libc_split.py` — selective inclusion of `lib/i386_dos_libc.asm` symbols
+- `runtime.py` — MS-DOS runtime library bindings (INT 21h wrappers, stubs)
+- `dos_emu.py` — i386 emulator harness for testing flat-binary output
+- `dos_emu_netsim.py` — simulated network for the INT 0x83 packet-driver shim
 
 Every front-end improvement (new C23 feature, AST optimization, DOS-era
 syntax tolerance) lands in uc_core and benefits both targets
