@@ -82,10 +82,21 @@ automatically.
 
 ## Install
 
-Quick start (Linux, Debian/Ubuntu):
+From PyPI:
 
 ```
-sudo apt-get install -y python3 python3-venv nasm
+pip install uc386
+```
+
+That gets you the `uc386` driver, the bundled `i386_dos_libc.asm`,
+and the `lib/include/` headers. To assemble + run the output you
+also need `nasm` (system package) and, for the `dos_emu` test
+harness, `pip install unicorn`.
+
+Source checkout for development:
+
+```
+sudo apt-get install -y python3 python3-venv nasm    # Debian/Ubuntu
 python3 -m venv .venv && . .venv/bin/activate
 pip install pytest unicorn "uc_core @ git+https://github.com/avwohl/uc_core@main" -e .
 pytest tests/
