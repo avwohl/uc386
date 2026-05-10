@@ -694,13 +694,16 @@ def build_exe(
     if shutil.which("nasm") is None:
         return False, "nasm not found — install with apt/brew"
     wlink = _which_first(WATCOM_CANDIDATES)
-    if wlink is None:
+    # wlink is OPTIONAL — when missing (typical on macOS, where Open
+    # Watcom has no native build), the linker step falls back to pyle
+    # (pure Python, ships in the same package). The fallback only
+    # supports the pmodew extender; for causeway/dos4g, wlink is still
+    # required so we error out below if it's missing.
+    if wlink is None and extender != "pmodew":
         return False, (
-            "wlink not found — install Open Watcom V2 "
-            "(https://github.com/open-watcom/open-watcom-v2/releases/"
-            "download/Current-build/open-watcom-2_0-c-linux-x64). "
-            "Set WATCOM=<install-dir> if it's somewhere unusual. "
-            "macOS hasn't a native Watcom build today."
+            f"wlink not found — extender={extender!r} requires Open Watcom. "
+            f"Use --extender=pmodew to use the pyle fallback (pure Python). "
+            f"Or install Open Watcom V2 and set WATCOM=<install-dir>."
         )
 
     # uc386 emits `section .text` / `section .data` / `section .bss`
@@ -821,6 +824,27 @@ def build_exe(
     )
     if proc.returncode != 0:
         return False, f"nasm bridge rc={proc.returncode}: {proc.stderr[:400]}"
+
+    # If wlink is missing (typical on macOS), fall back to pyle — our
+    # pure-Python OMF→MZ+LE linker. pyle handles the same bridge.obj
+    # + user.obj + PMODE/W stub combination wlink does, just without
+    # needing Open Watcom installed. Verified end-to-end against
+    # bit-identical pmodew stub bytes carved from a reference MP.EXE.
+    if wlink is None and extender == "pmodew":
+        from . import pyle
+        stub = Path(__file__).resolve().parent / "pmodew_stub.bin"
+        if not stub.is_file():
+            return False, (
+                f"pyle fallback: missing PMODE/W stub at {stub}. "
+                f"Carve from a wlink-built .exe and place there."
+            )
+        try:
+            objects = [pyle.parse_omf(p) for p in (obj_path, bridge_obj)]
+            image = pyle.link(objects)
+            pyle.write_le(image, stub.read_bytes(), "_pmodew_start", out_path)
+        except Exception as exc:
+            return False, f"pyle: {exc}"
+        return True, ""
 
     # wlink wants WATCOM in env so it can find its stub library.
     env = os.environ.copy()
