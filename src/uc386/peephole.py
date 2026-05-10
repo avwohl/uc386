@@ -3238,6 +3238,44 @@ class PeepholeOptimizer:
         "esp": frozenset({"esp", "sp"}),
     }
 
+    # Reverse map: each alias → its 32-bit family. Built once at class
+    # definition; used by the bulk-extraction helpers below to map a
+    # regex match back to the canonical reg.
+    _ALIAS_TO_FAMILY: dict[str, str] = {
+        a: fam for fam, aliases in _REG_FAMILY.items() for a in aliases
+    }
+
+    # One pre-compiled regex per family — the hot _references_reg_family
+    # path was the dominant cost (>90%) of multi-TU codegen with
+    # peephole, calling re.search for each alias on each line on each
+    # register on each pass. With this pre-compile, each family check is
+    # a single regex search.
+    _FAMILY_RE: dict[str, "re.Pattern"] = {
+        fam: re.compile(rf"\b(?:{'|'.join(sorted(aliases, key=len, reverse=True))})\b", re.IGNORECASE)
+        for fam, aliases in _REG_FAMILY.items()
+    }
+
+    # One pre-compiled regex matching ANY alias of any family. Used by
+    # the bulk-extraction helper to compute "which families does this
+    # text touch" in a single pass over the text.
+    _ALL_ALIASES_RE: "re.Pattern" = re.compile(
+        rf"\b(?:{'|'.join(sorted(_ALIAS_TO_FAMILY, key=len, reverse=True))})\b",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _families_referenced(text: str) -> set[str]:
+        """Return the set of 32-bit reg families that ``text`` mentions
+        (via any alias). One regex pass per call — much cheaper than
+        looping over each family and each alias separately."""
+        if not text:
+            return set()
+        out: set[str] = set()
+        a2f = PeepholeOptimizer._ALIAS_TO_FAMILY
+        for m in PeepholeOptimizer._ALL_ALIASES_RE.finditer(text):
+            out.add(a2f[m.group().lower()])
+        return out
+
     # libc internal helpers that read EAX as a non-cdecl input
     # register (the value to print/format). Without this set, the
     # liveness analyzer treats `call _printf_emit_dec` like any
@@ -3255,10 +3293,9 @@ class PeepholeOptimizer:
     @staticmethod
     def _references_reg_family(text: str, reg32: str) -> bool:
         """Does `text` reference reg32 or any of its sub-aliases?"""
-        for alias in PeepholeOptimizer._REG_FAMILY[reg32]:
-            if _references_register(text, alias):
-                return True
-        return False
+        if not text:
+            return False
+        return PeepholeOptimizer._FAMILY_RE[reg32].search(text) is not None
 
     @staticmethod
     def _is_pure_reg_write(line: Line, reg32: str) -> bool:
@@ -4383,21 +4420,24 @@ class PeepholeOptimizer:
         ALL_GP = {"eax", "ecx", "edx", "ebx", "esi", "edi"}
         out: list[set[str] | None] = [None] * len(lines)
         ranges = PeepholeOptimizer._function_ranges(lines)
+        families_referenced = PeepholeOptimizer._families_referenced
         for start, end in ranges:
             referenced: set[str] = set()
             for i in range(start, end):
                 line = lines[i]
                 if line.kind != "instr":
                     continue
-                # Operand-level reference check.
+                # Operand-level reference check — single regex pass
+                # per line via _families_referenced.
                 ops = line.operands
-                for reg in ALL_GP:
-                    if reg in referenced:
-                        continue
-                    if PeepholeOptimizer._references_reg_family(
-                        ops, reg
-                    ):
-                        referenced.add(reg)
+                if ops:
+                    referenced |= families_referenced(ops) & ALL_GP
+                if referenced >= ALL_GP:
+                    # All 6 GP regs already referenced — nothing more
+                    # to learn from later instructions in this function.
+                    # Still need to walk to the end to set out[] so we
+                    # can drop the work shortly.
+                    break
                 # Implicit-reference ops.
                 op = line.op
                 if op in IMPLICIT_EAX_USERS:
