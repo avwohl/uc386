@@ -3003,6 +3003,78 @@ def test_int128_multiply_emits_full_schoolbook():
     assert asm.count("        mul     ") >= 10
 
 
+def test_ll_mul_u32_x_u32_emits_single_mul():
+    """`(uint64_t)a * b` with both `unsigned int` operands lowers to a
+    single `mul r32` — full 32×32→64. The general 64×64 schoolbook
+    emits 3 multiplies (1 `mul` + 2 `imul`) plus a stack dance; with
+    both operands provably zero-extended we drop the 2 cross-product
+    `imul`s. This is the axtls bigint inner-loop hot path (see
+    `regular_multiply` in lib/axtls/crypto/bigint.c) where the
+    pessimization meaningfully bites RSA modexp throughput.
+    """
+    asm = _compile(
+        "unsigned int a, b;\n"
+        "unsigned long long c;\n"
+        "int main(void) { c = (unsigned long long)a * b; return 0; }\n"
+    )
+    # Count the `mul`/`imul` instructions in main's body — should be
+    # exactly one `mul`, zero `imul`s, in the optimized path.
+    mul_count = sum(
+        1 for line in asm.splitlines()
+        if line.strip().startswith("mul ") or line.strip().startswith("mul\t")
+    )
+    imul_count = sum(
+        1 for line in asm.splitlines()
+        if line.strip().startswith("imul")
+    )
+    assert mul_count == 1, f"expected 1 mul, got {mul_count}:\n{asm}"
+    assert imul_count == 0, f"expected 0 imul, got {imul_count}:\n{asm}"
+
+
+def test_ll_mul_u32_x_ull_emits_two_mul():
+    """`(uint64_t)a * b` with `a` uint32_t but `b` already uint64_t:
+    LH = 0 → drop the LH*RC cross-product, but keep LL*RH. Result:
+    1 `mul` + 1 `imul`.
+    """
+    asm = _compile(
+        "unsigned int a;\n"
+        "unsigned long long b, c;\n"
+        "int main(void) { c = (unsigned long long)a * b; return 0; }\n"
+    )
+    mul_count = sum(
+        1 for line in asm.splitlines()
+        if line.strip().startswith("mul ") or line.strip().startswith("mul\t")
+    )
+    imul_count = sum(
+        1 for line in asm.splitlines()
+        if line.strip().startswith("imul")
+    )
+    assert mul_count == 1, f"expected 1 mul, got {mul_count}"
+    assert imul_count == 1, f"expected 1 imul, got {imul_count}"
+
+
+def test_ll_mul_ull_x_ull_keeps_full_schoolbook():
+    """Both operands genuinely `unsigned long long` (high not provably
+    zero): keep emitting the full 64×64 codegen with 1 `mul` + 2
+    `imul`. Guards against the new fast-path triggering when it
+    shouldn't.
+    """
+    asm = _compile(
+        "unsigned long long a, b, c;\n"
+        "int main(void) { c = a * b; return 0; }\n"
+    )
+    mul_count = sum(
+        1 for line in asm.splitlines()
+        if line.strip().startswith("mul ") or line.strip().startswith("mul\t")
+    )
+    imul_count = sum(
+        1 for line in asm.splitlines()
+        if line.strip().startswith("imul")
+    )
+    assert mul_count == 1
+    assert imul_count == 2
+
+
 def test_int128_compare_emits_dword_chain():
     # u128 < u128 walks 4 dwords from high to low.
     asm = _compile(

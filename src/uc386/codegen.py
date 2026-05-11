@@ -5478,6 +5478,36 @@ class CodeGenerator:
     def _is_int128(t: ast.TypeNode) -> bool:
         return isinstance(t, ast.BasicType) and t.name == "int128"
 
+    def _ll_operand_high_known_zero(
+        self, expr: ast.Expression, ctx: _FuncCtx,
+    ) -> bool:
+        """True if evaluating `expr` to EDX:EAX is guaranteed to leave
+        EDX = 0. Used by the 64×64 multiply codegen to drop unnecessary
+        cross-product imuls when one or both operands were widened from
+        a 32-bit-or-smaller unsigned value (the common case in axtls'
+        bigint, where uint32_t * uint32_t is the inner hot path).
+
+        Conservatively unsigned: signed types sign-extend, which yields
+        0xFFFFFFFF in EDX for negative values — not safe to assume 0.
+        """
+        # IntLiteral with value fitting in 32 unsigned bits.
+        if isinstance(expr, ast.IntLiteral):
+            return 0 <= expr.value < (1 << 32)
+        # An explicit cast to long long from an unsigned narrower type.
+        if isinstance(expr, ast.Cast):
+            if not self._is_long_long(expr.target_type):
+                return False
+            src_ty = self._type_of(expr.expr, ctx)
+            if self._is_long_long(src_ty):
+                return self._ll_operand_high_known_zero(expr.expr, ctx)
+            return self._is_unsigned(src_ty)
+        # An expression whose own type is unsigned + non-long-long is
+        # zero-extended into EDX by `_eval_expr_to_edx_eax`.
+        t = self._type_of(expr, ctx)
+        if self._is_long_long(t):
+            return False
+        return self._is_unsigned(t)
+
     # ---- __int128 lowering --------------------------------------------
     #
     # `__int128` and `unsigned __int128` are GCC extensions for 128-bit
@@ -13213,22 +13243,72 @@ class CodeGenerator:
             #   left  = LH:LL (EDX:EAX);  right = RH:RC (EBX:ECX)
             #   low  32 = (LL*RC) low
             #   high 32 = (LL*RC) high + (LL*RH) low + (LH*RC) low
-            mul_lines = [
-                "        push    edx",          # [esp+8] = LH
-                "        push    eax",          # [esp+4] = LL (after one more push below)
-                "        mul     ecx",          # edx:eax = LL * RC
-                "        mov     esi, edx",     # esi = high 32 of LL*RC
-                "        push    eax",          # [esp]   = LL*RC low
-                "        mov     eax, [esp + 4]",   # LL
-                "        imul    eax, ebx",     # eax = LL * RH (low 32)
-                "        add     esi, eax",
-                "        mov     eax, [esp + 8]",   # LH
-                "        imul    eax, ecx",     # eax = LH * RC (low 32)
-                "        add     esi, eax",
-                "        pop     eax",          # eax = LL*RC low
-                "        mov     edx, esi",     # edx = high 32 of full product
-                "        add     esp, 8",       # discard LL and LH
-            ]
+            #
+            # Fast paths when the operand types prove the high halves
+            # are zero:
+            #
+            # * Both operands' high = 0: just `mul ecx` (EDX:EAX = LL*RC).
+            #   This is the axtls bigint inner-loop case — `tmp =
+            #   sr[r_index] + ((long_comp)sa[j]) * sb[i] + carry;` with
+            #   `comp` = uint32_t. The general 64×64 codegen emits 12
+            #   instructions per multiply, almost all working with
+            #   known-zero high halves. RSA-2048 modexp runs millions
+            #   of these; the saved instruction count matters.
+            #
+            # * Only one side's high = 0: drop the cross-product that
+            #   would multiply by zero. Saves one imul + the surrounding
+            #   load.
+            left_hi_zero  = self._ll_operand_high_known_zero(expr.left, ctx)
+            right_hi_zero = self._ll_operand_high_known_zero(expr.right, ctx)
+            if left_hi_zero and right_hi_zero:
+                # EDX:EAX = left (EDX = 0, ignored), ECX = RC (right low),
+                # EBX = 0 (right's high, ignored). `mul ecx` gives the
+                # full 64-bit product in EDX:EAX. Done.
+                mul_lines = ["        mul     ecx"]
+            elif left_hi_zero:
+                # LH = 0 → drop LH*RC cross-product.
+                #   low  32 = (LL*RC) low
+                #   high 32 = (LL*RC) high + (LL*RH) low
+                # Save LL on the stack since `mul ecx` clobbers EAX, then
+                # do the LL*RH after.
+                mul_lines = [
+                    "        push    eax",          # save LL
+                    "        mul     ecx",          # edx:eax = LL*RC
+                    "        xchg    edx, [esp]",   # edx = LL,  [esp] = LL*RC high
+                    "        imul    edx, ebx",     # edx = LL*RH (low 32)
+                    "        add     edx, [esp]",   # edx = LL*RC high + LL*RH
+                    "        add     esp, 4",
+                ]
+            elif right_hi_zero:
+                # RH = 0 → drop LL*RH cross-product.
+                #   low  32 = (LL*RC) low
+                #   high 32 = (LL*RC) high + (LH*RC) low
+                mul_lines = [
+                    "        push    edx",          # save LH
+                    "        mul     ecx",          # edx:eax = LL*RC
+                    "        xchg    edx, [esp]",   # edx = LH, [esp] = LL*RC high
+                    "        imul    edx, ecx",     # edx = LH*RC (low 32)
+                    "        add     edx, [esp]",   # edx = LL*RC high + LH*RC
+                    "        add     esp, 4",
+                ]
+            else:
+                # Full 64×64 — neither side proven to have high = 0.
+                mul_lines = [
+                    "        push    edx",          # [esp+8] = LH
+                    "        push    eax",          # [esp+4] = LL (after one more push below)
+                    "        mul     ecx",          # edx:eax = LL * RC
+                    "        mov     esi, edx",     # esi = high 32 of LL*RC
+                    "        push    eax",          # [esp]   = LL*RC low
+                    "        mov     eax, [esp + 4]",   # LL
+                    "        imul    eax, ebx",     # eax = LL * RH (low 32)
+                    "        add     esi, eax",
+                    "        mov     eax, [esp + 8]",   # LH
+                    "        imul    eax, ecx",     # eax = LH * RC (low 32)
+                    "        add     esi, eax",
+                    "        pop     eax",          # eax = LL*RC low
+                    "        mov     edx, esi",     # edx = high 32 of full product
+                    "        add     esp, 8",       # discard LL and LH
+                ]
             mask = self._bitfield_precision_mask(expr.left, expr.right, ctx=ctx)
             return out + mul_lines + mask
         if op in ("/", "%"):
