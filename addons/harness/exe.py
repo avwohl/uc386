@@ -611,6 +611,22 @@ _pmodew_start:
         mov     ecx, 23
         call    _bridge_emit
 
+        ; CRITICAL: load ES from DS before user code runs. PMODE/W
+        ; (and DOS/32A) hand control to the LE entry point with ES
+        ; pointing at the PSP selector (256-byte limit). libc's
+        ; memset/memcpy use `rep stosb`/`rep movsb` which both write
+        ; through ES:EDI. With ES != DS, those writes either land in
+        ; the wrong region or fault silently — the symptom is that
+        ; memset(buf, X, N) leaves `buf` untouched but the program
+        ; otherwise runs fine. Verified empirically: lwIP's
+        ; pbuf_copy_partial → memcpy filled a static tx_buf with
+        ; zeros (ES != DS write went elsewhere) and the NE2000
+        ; driver shipped a 60-byte zero frame instead of an ARP
+        ; request. Setting ES = DS here fixes every libc string/mem
+        ; primitive at once.
+        push    ds
+        pop     es
+
         ; cdecl: argc/argv on stack at [ebp+8]/[ebp+12] in main.
         ; Use an INDIRECT call (call eax with eax=_main) instead of
         ; `call _main` (rel32). Last run showed rel32 target lands
@@ -671,6 +687,7 @@ def build_exe(
     *,
     extender: str = "pmodew",
     extra_obj_files: list[Path] | None = None,
+    dos32a_stub_path: Path | None = None,
 ) -> tuple[bool, str]:
     """Run nasm + wlink to turn `asm_path` into `out_path` (.exe).
 
@@ -697,12 +714,13 @@ def build_exe(
     # wlink is OPTIONAL — when missing (typical on macOS, where Open
     # Watcom has no native build), the linker step falls back to pyle
     # (pure Python, ships in the same package). The fallback only
-    # supports the pmodew extender; for causeway/dos4g, wlink is still
-    # required so we error out below if it's missing.
-    if wlink is None and extender != "pmodew":
+    # supports the pmodew + dos32a extenders; for causeway/dos4g,
+    # wlink is still required so we error out below if it's missing.
+    if wlink is None and extender not in ("pmodew", "dos32a"):
         return False, (
             f"wlink not found — extender={extender!r} requires Open Watcom. "
-            f"Use --extender=pmodew to use the pyle fallback (pure Python). "
+            f"Use --extender=pmodew or --extender=dos32a to use the pyle "
+            f"fallback (pure Python). "
             f"Or install Open Watcom V2 and set WATCOM=<install-dir>."
         )
 
@@ -846,6 +864,33 @@ def build_exe(
             return False, f"pyle: {exc}"
         return True, ""
 
+    # DOS/32A pyle path. Unlike PMODE/W, DOS/32A's stub isn't a
+    # ready-to-prepend blob — it's a standalone DOS32A.EXE that needs
+    # SUNSYS Bind's transform applied first. pyle.bind_dos32a_stub
+    # does that transform in pure Python. The caller supplies the
+    # path to DOS32A.EXE (not bundled because it's a 27 KB binary
+    # licensed under zlib that the host project would have to vendor
+    # — easier to fetch on demand from archive.org).
+    if wlink is None and extender == "dos32a":
+        from . import pyle
+        if dos32a_stub_path is None or not dos32a_stub_path.is_file():
+            return False, (
+                f"dos32a: pass --stub-binary <path/to/DOS32A.EXE>. "
+                f"Fetch from https://archive.org/details/dos32a-912-bin."
+            )
+        try:
+            raw_stub = dos32a_stub_path.read_bytes()
+            stub_bytes = pyle.bind_dos32a_stub(raw_stub)
+            objects = [pyle.parse_omf(p) for p in (obj_path, bridge_obj)]
+            image = pyle.link(objects)
+            pyle.write_le(
+                image, stub_bytes, "_pmodew_start", out_path,
+                explicit_stack_object=True,
+            )
+        except Exception as exc:
+            return False, f"pyle (dos32a): {exc}"
+        return True, ""
+
     # wlink wants WATCOM in env so it can find its stub library.
     env = os.environ.copy()
     if "WATCOM" not in env:
@@ -921,8 +966,12 @@ def main() -> int:
     ap.add_argument("-o", "--output", required=True, help="output .exe path")
     ap.add_argument(
         "--extender", default="pmodew",
-        choices=["pmodew", "causeway", "dos4g"],
+        choices=["pmodew", "causeway", "dos4g", "dos32a"],
         help="DOS extender to bundle (default: pmodew)",
+    )
+    ap.add_argument(
+        "--stub-binary", type=Path, default=None,
+        help="Path to DOS32A.EXE (required when --extender=dos32a).",
     )
     args = ap.parse_args()
 
@@ -948,7 +997,11 @@ def main() -> int:
         sys.stderr.write(f"unrecognised extension: {src.suffix}\n")
         return 2
 
-    ok, msg = build_exe(asm_path, out, extender=args.extender)
+    ok, msg = build_exe(
+        asm_path, out,
+        extender=args.extender,
+        dos32a_stub_path=args.stub_binary,
+    )
     if not ok:
         sys.stderr.write(f"exe build failed: {msg}\n")
         return 1
