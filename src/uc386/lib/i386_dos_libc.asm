@@ -6151,6 +6151,49 @@ _pktdrv_int_invoke:
         ret
 
 ; -----------------------------------------------------------------
+; DPMI 0.9 fn 0x0303 PM callback wrapper.
+;
+; uc386 emits a normal cdecl `ret` at the end of every C function,
+; but the DPMI host invokes a fn 0x0303 callback via a FAR CALL
+; with EFLAGS pushed underneath CS:EIP, and expects the handler to
+; return via IRETD. A plain near-return desyncs the host's stack
+; and corrupts its trampoline state — the next DPMI dispatch GPFs.
+;
+; This stub is the public symbol the port code registers with DPMI
+; (via `pktdrv_alloc_dpmi_callback`). It bridges into the C handler
+; (renamed to `_uc386dos_pktdrv_dpmi_thunk_c`) and IRETDs.
+;
+; DS/ES on entry: the DPMI host sets DS:ESI to the saved real-mode
+; SS:SP and ES:EDI to the RMCS image — neither is our flat data
+; selector. Our C code reads `pktdrv_rmcs` as a normal global, so
+; we re-point DS/ES at our flat data selector (= SS at entry; the
+; host's locked PM stack lives in our app's data area) before the
+; call and restore them before IRETD.
+;
+; PUSHAD / POPAD save the eight GP registers we touch via the C
+; ABI cdecl side (EAX/EBX/ECX/EDX) plus the callee-saveds (ESI/
+; EDI/EBP); ESP is unchanged across PUSHAD/POPAD by design.
+; -----------------------------------------------------------------
+        extern  _uc386dos_pktdrv_dpmi_thunk_c
+        global  _uc386dos_pktdrv_dpmi_thunk
+_uc386dos_pktdrv_dpmi_thunk:
+        pushad
+        push    ds
+        push    es
+        ; Re-point DS/ES at our flat data selector. SS at entry is
+        ; the host-provided locked PM stack — same data selector as
+        ; our app uses, per the DOS/32A DPMI 0.9 convention.
+        mov     ax, ss
+        mov     ds, ax
+        mov     es, ax
+        cld
+        call    _uc386dos_pktdrv_dpmi_thunk_c
+        pop     es
+        pop     ds
+        popad
+        iretd
+
+; -----------------------------------------------------------------
 ; PM-native IO port helpers for the NE2000 driver. PMODE/W grants
 ; PM clients full IO permission by default, so direct in/out works
 ; without any DPMI fn 0x0E01 dance.
