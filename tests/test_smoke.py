@@ -3198,6 +3198,72 @@ def test_ll_add_both_high_zero_no_widen():
     assert "pop     ebx" not in body
 
 
+def test_ll_and_right_high_zero_zeroes_edx():
+    """`u64 & u32` — result high is always 0. The optimized path
+    evaluates the right (u32) without widening, ANDs the low halves,
+    and zeroes EDX. No `and edx, ebx` (with ebx=0)."""
+    asm = _compile(
+        "unsigned long long a; unsigned int b; unsigned long long r;\n"
+        "int main(void) { r = a & b; return 0; }\n"
+    )
+    body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
+    assert "and     eax, ecx" in body
+    assert "xor     edx, edx" in body
+    assert "and     edx, ebx" not in body
+
+
+def test_ll_and_both_high_zero_no_high_push():
+    """`(u64)u32_a & u32_b` — both sides high-zero. Single 32-bit
+    push/pop pair, low AND, zero EDX. No high-half stack slots."""
+    asm = _compile(
+        "unsigned int a, b; unsigned long long r;\n"
+        "int main(void) { r = (unsigned long long)a & b; return 0; }\n"
+    )
+    body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
+    assert "and     eax, ecx" in body
+    assert "xor     edx, edx" in body
+    assert "push    edx" not in body
+    assert "pop     ebx" not in body
+
+
+def test_ll_or_right_high_zero_passthrough():
+    """`u64 | u32` — result high = u64's high. Optimized path pops
+    the u64's high directly into EDX and skips the `or edx, ebx`
+    (which would be a no-op with ebx=0)."""
+    asm = _compile(
+        "unsigned long long a; unsigned int b; unsigned long long r;\n"
+        "int main(void) { r = a | b; return 0; }\n"
+    )
+    body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
+    assert "or      eax, ecx" in body
+    assert "or      edx, ebx" not in body
+    assert "pop     edx" in body
+
+
+def test_ll_xor_left_high_zero_swaps_via_or_path():
+    """`u32 ^ u64` — same shape as `u64 ^ u32` because the codegen
+    treats either-side-zero symmetrically for `|`/`^` (commutative)."""
+    asm = _compile(
+        "unsigned long long a; unsigned int b; unsigned long long r;\n"
+        "int main(void) { r = b ^ a; return 0; }\n"
+    )
+    body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
+    assert "xor     eax, ecx" in body
+    assert "xor     edx, ebx" not in body
+
+
+def test_ll_or_both_full_keeps_general_path():
+    """Regression: `u64 | u64` with both halves genuinely populated
+    still emits the generic `or eax,ecx ; or edx,ebx` ladder."""
+    asm = _compile(
+        "unsigned long long a, b, r;\n"
+        "int main(void) { r = a | b; return 0; }\n"
+    )
+    body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
+    assert "or      eax, ecx" in body
+    assert "or      edx, ebx" in body
+
+
 def test_ll_add_both_full_keeps_general_path():
     """Regression: when neither operand is provably high-zero, the
     standard `add eax,ecx ; adc edx,ebx` path must still kick in."""

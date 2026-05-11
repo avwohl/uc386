@@ -5576,6 +5576,82 @@ class CodeGenerator:
             expr.left, expr.right, ctx=ctx,
         )
 
+    def _binary_ll_bitwise_high_zero(
+        self, expr: ast.BinaryOp, op: str, ctx: _FuncCtx,
+    ) -> list[str] | None:
+        """Emit `&`, `|`, or `^` over u64 operands where at least one
+        operand has a provably zero high half. Returns None if no
+        operand has high-zero (caller falls through to the generic
+        path).
+
+        Semantics:
+        * `&`: zero on any side → result_high = 0. The other side's
+          high is unused; the low halves AND together normally.
+        * `|` / `^`: zero on one side → result_high = the other
+          side's high. Pop the other's high directly into EDX rather
+          than EBX-then-`or/xor edx, ebx` (since `op edx, 0` is a
+          no-op, we skip the op entirely).
+        * `& | ^` both-zero: result_high = 0; emit the low op into
+          EAX and zero EDX.
+        """
+        lhz = self._ll_operand_high_known_zero(expr.left, ctx)
+        rhz = self._ll_operand_high_known_zero(expr.right, ctx)
+        if not (lhz or rhz):
+            return None
+        low_op_line = {
+            "&": "        and     eax, ecx",
+            "|": "        or      eax, ecx",
+            "^": "        xor     eax, ecx",
+        }[op]
+        mask = self._bitfield_precision_mask(expr.left, expr.right, ctx=ctx)
+        if lhz and rhz:
+            # Both high zero — eval both as u32, single 32-bit
+            # push/pop, then zero EDX.
+            out = list(self._eval_ll_lo_when_hi_zero(expr.right, ctx))
+            out += ["        push    eax"]
+            out += self._eval_ll_lo_when_hi_zero(expr.left, ctx)
+            out += [
+                "        pop     ecx",
+                low_op_line,
+                "        xor     edx, edx",
+            ]
+            return out + mask
+        if op == "&":
+            # `&` with one side zero: result_high = 0 regardless of
+            # the other side's high. Eval the zero side as u32 (single
+            # push), eval the other side as u64 (its high half is
+            # computed but discarded), then AND lows and zero EDX.
+            zero_e, full_e = (
+                (expr.left, expr.right) if lhz else (expr.right, expr.left)
+            )
+            out = list(self._eval_ll_lo_when_hi_zero(zero_e, ctx))
+            out += ["        push    eax"]
+            out += self._eval_expr_to_edx_eax(full_e, ctx)
+            out += [
+                "        pop     ecx",
+                low_op_line,
+                "        xor     edx, edx",
+            ]
+            return out + mask
+        # op == "|" or "^" with one side zero: result_high = the
+        # other side's high. Eval the genuine u64 side first, push
+        # both halves; eval the zero side as u32; pop low into ECX
+        # then high directly into EDX (skipping the `or/xor edx, ebx`
+        # with ebx=0 that the generic path would emit).
+        if lhz:
+            full_e, zero_e = expr.right, expr.left
+        else:
+            full_e, zero_e = expr.left, expr.right
+        out = list(self._eval_expr_to_edx_eax(full_e, ctx))
+        out += ["        push    edx", "        push    eax"]
+        out += self._eval_ll_lo_when_hi_zero(zero_e, ctx)
+        out += [
+            "        pop     ecx",
+            "        pop     edx",
+            low_op_line,
+        ]
+        return out + mask
+
     def _eval_ll_lo_when_hi_zero(
         self, expr: ast.Expression, ctx: _FuncCtx,
     ) -> list[str]:
@@ -13363,6 +13439,15 @@ class CodeGenerator:
         # right-zero (and both-zero) cases collapse cleanly.
         if op in ("+", "-"):
             ll_lines = self._binary_ll_add_sub_high_zero(expr, op, ctx)
+            if ll_lines is not None:
+                return ll_lines
+        # Bitwise `&` / `|` / `^` with a high-zero operand. AND with
+        # zero pins the result high to 0; OR/XOR with zero passes the
+        # other side's high through unchanged. Either way the high-
+        # half of the zero side is dead data — skip the widen and the
+        # high-half push/pop dance.
+        if op in ("&", "|", "^"):
+            ll_lines = self._binary_ll_bitwise_high_zero(expr, op, ctx)
             if ll_lines is not None:
                 return ll_lines
         # Right to EDX:EAX, push (high then low so low ends up on top).
