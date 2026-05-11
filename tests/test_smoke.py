@@ -3142,6 +3142,74 @@ def test_ll_shr_signed_uses_sar():
     assert "test    cl, 32" not in asm
 
 
+def test_ll_add_right_high_zero_uses_adc_zero():
+    """`u64_val + u32_val` (u32 widened to u64) — the right side's
+    high half is provably zero. The optimized path drops the wasted
+    push-zero/pop-into-ebx pair and emits `adc edx, 0` instead of
+    `adc edx, ebx`. This is the inner-loop `+ carry` add in axtls
+    bigint's regular_multiply.
+    """
+    asm = _compile(
+        "unsigned long long acc; unsigned int c;\n"
+        "int main(void) { acc = acc + c; return 0; }\n"
+    )
+    body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
+    assert "adc     edx, 0" in body
+    assert "adc     edx, ebx" not in body
+
+
+def test_ll_add_left_high_zero_swaps_to_right_zero():
+    """`u32_val + u64_val` — `+` is commutative, so the codegen
+    should swap to the right-high-zero form. Same lean emission as
+    above (no `adc edx, ebx`)."""
+    asm = _compile(
+        "unsigned long long acc; unsigned int c;\n"
+        "int main(void) { acc = c + acc; return 0; }\n"
+    )
+    body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
+    assert "adc     edx, 0" in body
+    assert "adc     edx, ebx" not in body
+
+
+def test_ll_sub_right_high_zero_uses_sbb_zero():
+    """`u64_val - u32_val` — `sbb edx, 0`. `-` is not commutative
+    so the left-zero case stays on the generic path; only test the
+    right-zero one here."""
+    asm = _compile(
+        "unsigned long long acc; unsigned int c;\n"
+        "int main(void) { acc = acc - c; return 0; }\n"
+    )
+    body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
+    assert "sbb     edx, 0" in body
+    assert "sbb     edx, ebx" not in body
+
+
+def test_ll_add_both_high_zero_no_widen():
+    """`(u64)u32_a + u32_b` — neither side needs widening. Drop
+    every `xor edx, edx` and every high-half stack slot; result
+    edx comes from a single `xor` before the final `adc edx, 0`."""
+    asm = _compile(
+        "unsigned int a, b; unsigned long long r;\n"
+        "int main(void) { r = (unsigned long long)a + b; return 0; }\n"
+    )
+    body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
+    assert "adc     edx, 0" in body
+    assert "push    edx" not in body
+    assert "pop     ebx" not in body
+
+
+def test_ll_add_both_full_keeps_general_path():
+    """Regression: when neither operand is provably high-zero, the
+    standard `add eax,ecx ; adc edx,ebx` path must still kick in."""
+    asm = _compile(
+        "unsigned long long a, b, r;\n"
+        "int main(void) { r = a + b; return 0; }\n"
+    )
+    body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
+    assert "add     eax, ecx" in body
+    assert "adc     edx, ebx" in body
+
+
 def test_ll_shr_dynamic_keeps_runtime_branch():
     """Regression: dynamic shift count still emits the runtime
     test/jnz/shrd dance — the fast path is keyed on literal RHS."""
@@ -3497,11 +3565,14 @@ def test_long_long_compound_assign_array_element_routes_to_ll_path():
         "    return arr[0] == 0x100000000LL ? 0 : 1;\n"
         "}\n"
     )
-    # Look for the LL add: `add eax, ecx` followed by `adc edx, ebx`
-    # (the snapshot-Identifier path now flows through _binary_ll's
-    # standard add+adc with ECX/EBX as right operands).
+    # Look for the LL add ladder: `add eax, ecx` followed by an
+    # `adc edx, …`. The carry operand may be `ebx` (general path) or
+    # `0` (high-zero-aware path when the rhs literal is u32-sized).
     assert "        add     eax, ecx" in asm
-    assert "        adc     edx, ebx" in asm
+    assert (
+        "        adc     edx, ebx" in asm
+        or "        adc     edx, 0" in asm
+    )
 
 
 def test_long_long_comma_evaluates_lhs_for_side_effects():
@@ -3516,8 +3587,13 @@ def test_long_long_comma_evaluates_lhs_for_side_effects():
         "}\n"
     )
     # Both compound assigns should emit add (for +=) and a multiply
-    # sequence (for *=).
-    assert asm.count("adc     edx, ebx") >= 1
+    # sequence (for *=). The `adc` operand is `0` or `ebx` depending
+    # on whether the high-zero-aware path took over (small literals
+    # like 5 / 2 are u32-sized, so the optimized path applies).
+    assert (
+        asm.count("adc     edx, ebx") >= 1
+        or asm.count("adc     edx, 0") >= 1
+    )
     # And the LL multiply (`mul ecx` followed by partial products).
     assert "        mul     ecx" in asm
 

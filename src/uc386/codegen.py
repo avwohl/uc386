@@ -5508,6 +5508,74 @@ class CodeGenerator:
             return False
         return self._is_unsigned(t)
 
+    def _binary_ll_add_sub_high_zero(
+        self, expr: ast.BinaryOp, op: str, ctx: _FuncCtx,
+    ) -> list[str] | None:
+        """Emit a `+` or `-` over u64 operands where at least one
+        operand has a provably zero high half. Returns None if no
+        shortcut applies (caller falls through to the standard path).
+
+        Variants emitted:
+
+        * Right-high-zero (commutative-swap reaches this for `+` when
+          the left is the zero side): eval the zero side as 32-bit,
+          push only the low half, eval the other side as u64, do
+          `add/sub eax, ecx` then `adc/sbb edx, 0`. Saves the wasted
+          xor-widen plus a high-half push/pop pair vs the generic
+          path.
+
+        * Both-high-zero: both operands evaluated as 32-bit; result
+          high half is just the carry / borrow.
+
+        For `-`, a left-high-zero / right-not-zero combination has no
+        shorter encoding than the generic path, so we don't shortcut
+        it (the generic `sbb edx, ebx` with `edx=0` already does what
+        we need).
+        """
+        lhz = self._ll_operand_high_known_zero(expr.left, ctx)
+        rhz = self._ll_operand_high_known_zero(expr.right, ctx)
+        if not (lhz or rhz):
+            return None
+        low_op = "add" if op == "+" else "sub"
+        carry_op = "adc" if op == "+" else "sbb"
+        if lhz and rhz:
+            # Both halves provably zero. Eval both as 32-bit, push the
+            # right's low only, then do the low op + carry/borrow into
+            # a freshly zeroed EDX.
+            out = list(self._eval_ll_lo_when_hi_zero(expr.right, ctx))
+            out += ["        push    eax"]
+            out += self._eval_ll_lo_when_hi_zero(expr.left, ctx)
+            out += [
+                "        xor     edx, edx",
+                "        pop     ecx",
+                f"        {low_op}     eax, ecx",
+                f"        {carry_op}     edx, 0",
+            ]
+            return out + self._bitfield_precision_mask(
+                expr.left, expr.right, ctx=ctx,
+            )
+        if op == "+" and lhz:
+            # Commutative swap: treat left as the narrow side so we
+            # can share the right-zero emission. Side effects between
+            # `+`'s operands are unsequenced in C, so reordering is OK.
+            full, narrow = expr.right, expr.left
+        elif op == "-" and lhz and not rhz:
+            # Left zero, right nonzero subtract: no shortcut wins.
+            return None
+        else:
+            full, narrow = expr.left, expr.right
+        out = list(self._eval_ll_lo_when_hi_zero(narrow, ctx))
+        out += ["        push    eax"]
+        out += self._eval_expr_to_edx_eax(full, ctx)
+        out += [
+            "        pop     ecx",
+            f"        {low_op}     eax, ecx",
+            f"        {carry_op}     edx, 0",
+        ]
+        return out + self._bitfield_precision_mask(
+            expr.left, expr.right, ctx=ctx,
+        )
+
     def _eval_ll_lo_when_hi_zero(
         self, expr: ast.Expression, ctx: _FuncCtx,
     ) -> list[str]:
@@ -13282,6 +13350,21 @@ class CodeGenerator:
                 return out + self._bitfield_precision_mask(
                     expr.left, expr.right, ctx=ctx,
                 )
+        # `+` / `-` with one (or both) high half provably zero. The
+        # bigint inner loop is `sr[r] + (long_comp)sa[j]*sb[i] + carry`,
+        # where the first `+` has a u32-widened left and the second
+        # has a u32-widened right. The standard 64-bit path pushes
+        # the zero high half across the stack and pops it back into
+        # EBX just to feed `adc edx, ebx` (which adds zero plus the
+        # carry from the low add). Replace with `adc edx, 0` and skip
+        # the u64 widening entirely. `+` is commutative, so a left-
+        # high-zero `+` swaps to the right-high-zero form to share
+        # the same lean emission. `-` isn't commutative; only the
+        # right-zero (and both-zero) cases collapse cleanly.
+        if op in ("+", "-"):
+            ll_lines = self._binary_ll_add_sub_high_zero(expr, op, ctx)
+            if ll_lines is not None:
+                return ll_lines
         # Right to EDX:EAX, push (high then low so low ends up on top).
         right = self._eval_expr_to_edx_eax(expr.right, ctx)
         out = list(right)
