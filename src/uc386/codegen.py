@@ -5508,6 +5508,29 @@ class CodeGenerator:
             return False
         return self._is_unsigned(t)
 
+    def _eval_ll_lo_when_hi_zero(
+        self, expr: ast.Expression, ctx: _FuncCtx,
+    ) -> list[str]:
+        """For an expression whose high half is provably zero (per
+        `_ll_operand_high_known_zero`), evaluate just the low 32 bits to
+        EAX, skipping the u64 widening that `_eval_expr_to_edx_eax`
+        would emit. Caller must have already confirmed the high-zero
+        guarantee; otherwise the result is wrong.
+        """
+        # An explicit cast LL←u32 (etc.) — evaluate the source narrower
+        # value as 32-bit and let it fill EAX without zero-extending.
+        if isinstance(expr, ast.Cast):
+            if self._is_long_long(expr.target_type):
+                src_ty = self._type_of(expr.expr, ctx)
+                if not self._is_long_long(src_ty):
+                    return self._eval_expr_to_eax(expr.expr, ctx)
+        # An IntLiteral that fits in u32 — load it as a 32-bit constant.
+        if isinstance(expr, ast.IntLiteral) and 0 <= expr.value < (1 << 32):
+            return [f"        mov     eax, {expr.value}"]
+        # Otherwise the operand's own type is u32-or-narrower-unsigned;
+        # `_eval_expr_to_eax` is the 32-bit emitter for it.
+        return self._eval_expr_to_eax(expr, ctx)
+
     def _ll_shift_const(
         self, op: str, s: int, left: ast.Expression, ctx: _FuncCtx,
     ) -> list[str]:
@@ -13242,6 +13265,23 @@ class CodeGenerator:
                 return list(left_out) + self._ll_shift_const(
                     op, shift_const, expr.left, ctx
                 ) + self._bitfield_precision_mask(expr.left, ctx=ctx)
+        # Both-high-zero multiply: skip the u64 widen + stack dance and
+        # do a flat 32×32→64 directly. `mul ecx` writes the full 64-bit
+        # product into EDX:EAX regardless of EDX's prior value, so we
+        # don't need to clear EDX before the multiply or push the high
+        # half across the stack. This is the regular_multiply /
+        # regular_square inner loop in axtls bigint:
+        #   `(long_comp)sa[j] * sb[i]` with `comp` = uint32_t.
+        if op == "*":
+            if (self._ll_operand_high_known_zero(expr.left, ctx)
+                    and self._ll_operand_high_known_zero(expr.right, ctx)):
+                out = list(self._eval_ll_lo_when_hi_zero(expr.right, ctx))
+                out += ["        push    eax"]
+                out += self._eval_ll_lo_when_hi_zero(expr.left, ctx)
+                out += ["        pop     ecx", "        mul     ecx"]
+                return out + self._bitfield_precision_mask(
+                    expr.left, expr.right, ctx=ctx,
+                )
         # Right to EDX:EAX, push (high then low so low ends up on top).
         right = self._eval_expr_to_edx_eax(expr.right, ctx)
         out = list(right)
@@ -13327,14 +13367,11 @@ class CodeGenerator:
             # * Only one side's high = 0: drop the cross-product that
             #   would multiply by zero. Saves one imul + the surrounding
             #   load.
+            # NB: both-high-zero is handled by the early shortcut above
+            # (which avoids the surrounding push/pop dance entirely).
             left_hi_zero  = self._ll_operand_high_known_zero(expr.left, ctx)
             right_hi_zero = self._ll_operand_high_known_zero(expr.right, ctx)
-            if left_hi_zero and right_hi_zero:
-                # EDX:EAX = left (EDX = 0, ignored), ECX = RC (right low),
-                # EBX = 0 (right's high, ignored). `mul ecx` gives the
-                # full 64-bit product in EDX:EAX. Done.
-                mul_lines = ["        mul     ecx"]
-            elif left_hi_zero:
+            if left_hi_zero:
                 # LH = 0 → drop LH*RC cross-product.
                 #   low  32 = (LL*RC) low
                 #   high 32 = (LL*RC) high + (LL*RH) low

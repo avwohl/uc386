@@ -3008,7 +3008,8 @@ def test_ll_mul_u32_x_u32_emits_single_mul():
     single `mul r32` — full 32×32→64. The general 64×64 schoolbook
     emits 3 multiplies (1 `mul` + 2 `imul`) plus a stack dance; with
     both operands provably zero-extended we drop the 2 cross-product
-    `imul`s. This is the axtls bigint inner-loop hot path (see
+    `imul`s AND skip the u64 widening + high-half push/pop entirely.
+    This is the axtls bigint inner-loop hot path (see
     `regular_multiply` in lib/axtls/crypto/bigint.c) where the
     pessimization meaningfully bites RSA modexp throughput.
     """
@@ -3017,18 +3018,26 @@ def test_ll_mul_u32_x_u32_emits_single_mul():
         "unsigned long long c;\n"
         "int main(void) { c = (unsigned long long)a * b; return 0; }\n"
     )
-    # Count the `mul`/`imul` instructions in main's body — should be
-    # exactly one `mul`, zero `imul`s, in the optimized path.
+    body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
+    # Exactly one mul, zero imuls.
     mul_count = sum(
-        1 for line in asm.splitlines()
+        1 for line in body.splitlines()
         if line.strip().startswith("mul ") or line.strip().startswith("mul\t")
     )
     imul_count = sum(
-        1 for line in asm.splitlines()
+        1 for line in body.splitlines()
         if line.strip().startswith("imul")
     )
-    assert mul_count == 1, f"expected 1 mul, got {mul_count}:\n{asm}"
-    assert imul_count == 0, f"expected 0 imul, got {imul_count}:\n{asm}"
+    assert mul_count == 1, f"expected 1 mul, got {mul_count}:\n{body}"
+    assert imul_count == 0, f"expected 0 imul, got {imul_count}:\n{body}"
+    # The early shortcut should leave NO `xor edx, edx` in main: we
+    # don't widen u32 operands to u64, and `mul` writes EDX directly.
+    assert "xor     edx, edx" not in body, f"unwanted u64 widen leaked:\n{body}"
+    # And no high-half push/pop dance — a single 32-bit push/pop pair.
+    assert body.count("push    eax") == 1
+    assert body.count("pop     ecx") == 1
+    assert "push    edx" not in body
+    assert "pop     ebx" not in body
 
 
 def test_ll_mul_u32_x_ull_emits_two_mul():
