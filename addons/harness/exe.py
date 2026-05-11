@@ -463,133 +463,44 @@ _pmodew_start:
         call    _bridge_emit
 
         ; --- LE FIXUP / runtime addressing diagnostics ----------
-        ; mp-rig run 25475877877: the imm32 at runtime is 0x000227a3
-        ; (correctly fixed-up to the relocated obj2 base + 0xc7a3),
-        ; and bytes at 0x227a3 are "[mp-" — so loader did the right
-        ; thing and the data section is correctly loaded. Yet
-        ; _main's call to _write produces only NULs in RIG.LOG.
-        ; Add more diagnostics: the runtime address of _main, and
-        ; the bytes at _main itself (we expect c8 04 00 00 6a 12 …).
-        ; If the bytes don't match the expected enter-prolog the
-        ; bridge is calling something other than the codegen-emitted
-        ; _main (broken extern resolution by wlink).
-        mov     edx, _bridge_marker_dump_mainaddr
-        call    _bridge_emit_str0
-        mov     eax, _main                ; _main's address as a value
-        call    _bridge_emit_hex32
+        ;
+        ; (Previously a ~150-line block of `mov eax, [_main + N];
+        ; call _bridge_emit_hex32` and the like — debug code added
+        ; while chasing wlink fixup behavior in mp-rig runs
+        ; 25475877877 / 25476601480 / 25477796902. Those issues are
+        ; long resolved.)
+        ;
+        ; Removed because under paged DPMI hosts (CWSDPMI) the
+        ; dereferences of `[_main]`, `[_main + 7]`, etc. PF when
+        ; the loader didn't map those exact pages — the diagnostic
+        ; doesn't survive a host swap. Git history (commit f2faf76
+        ; and surroundings) preserves the originals for reference.
+        ;
+        ; If you're chasing a fixup / call-target bug again, copy
+        ; the relevant block back in temporarily — but gate it
+        ; behind a build flag so a release-style build doesn't
+        ; trip the next host's paging.
 
-        mov     edx, _bridge_marker_dump_main0
-        call    _bridge_emit_str0
-        mov     eax, [_main]              ; first 4 bytes of _main
-        call    _bridge_emit_hex32
-
-        mov     edx, _bridge_marker_dump_main4
-        call    _bridge_emit_str0
-        mov     eax, [_main + 4]          ; bytes 4..7 (push 18 + opcode of push imm32)
-        call    _bridge_emit_hex32
-
-        mov     edx, _bridge_marker_dump_main7
-        call    _bridge_emit_str0
-        mov     eax, [_main + 7]         ; the imm32 inside push imm32
-        push    eax                      ; save twice (for hex dump + write test)
-        push    eax
-        call    _bridge_emit_hex32       ; dumps top-of-stack value (also EAX)
-
-        mov     edx, _bridge_marker_dump_str
-        call    _bridge_emit_str0
-        pop     eax                      ; first copy → the address
-        mov     eax, [eax]                ; first 4 bytes there
-        call    _bridge_emit_hex32
-        pop     eax                      ; discard the second copy of str_addr
-
-        ; --- Verify the call rel32 in _main targets _write -----
-        ; main+11 should be `6a 01` (push 1), main+13 = `e8 ?? ?? ?? ??`
-        ; (call rel32 → _write). Dumping main+11 (next 4 bytes:
-        ; 6a 01 e8 lo) and main+14 (the high 3 bytes of rel32 + 83
-        ; from `add esp, 12`). At runtime the call target is
-        ; (main+18) + rel32. If that's not within obj1's code
-        ; range, the bug is wlink mis-resolving the cross-obj rel32.
-        mov     edx, _bridge_marker_dump_main11
-        call    _bridge_emit_str0
-        mov     eax, [_main + 11]
-        call    _bridge_emit_hex32
-
-        mov     edx, _bridge_marker_dump_main14
-        call    _bridge_emit_str0
-        mov     eax, [_main + 14]
-        call    _bridge_emit_hex32
-
-        ; --- Direct write-from-bridge of the string at str_addr -
-        ; Confirmed (run 25476601480): this prints "[mp-main-entered]"
-        ; correctly, while _main's identical call produces NULs.
-        mov     edx, _bridge_marker_dump_writetest
-        call    _bridge_emit_str0
-        mov     edx, [_main + 7]         ; str_addr (0x227a3)
-        mov     ecx, 18                   ; same count _main uses
-        call    _bridge_emit              ; write 18 bytes from str_addr
-
-        ; --- Compute call rel32 target from _main+13 and dump it -
-        ; The call rel32 in _main at +13 has imm32 at +14. Target
-        ; address = (_main + 13 + 5) + rel32 = _main + 18 + rel32.
-        ; That should be _write's runtime address. Dump the address
-        ; and the bytes at that address (expected: 55 89 e5 ... =
-        ; push ebp; mov ebp, esp; ...). If those bytes don't match
-        ; _write's prologue, _main is calling something else.
-        mov     edx, _bridge_marker_dump_writeaddr
-        call    _bridge_emit_str0
-        mov     eax, [_main + 14]        ; rel32 imm
-        add     eax, _main
-        add     eax, 18                   ; eax = call target
-        push    eax
-        call    _bridge_emit_hex32       ; dump the target address
-
-        mov     edx, _bridge_marker_dump_write0
-        call    _bridge_emit_str0
-        pop     eax                       ; recover target
-        push    eax
-        mov     eax, [eax]                ; first 4 bytes there
-        call    _bridge_emit_hex32       ; expected: e5 89 55 + first byte after
-
-        mov     edx, _bridge_marker_dump_write4
-        call    _bridge_emit_str0
-        pop     eax                       ; recover target
-        mov     eax, [eax + 4]            ; next 4 bytes
-        call    _bridge_emit_hex32       ; expected: 5d 8b ... (mov ebx, [ebp+8])
-
-        ; --- Stack-arg write test --------------------------------
-        ; _bridge_write_stack does the same INT 21h AH=0x40 BX=fd
-        ; that _write does, with args taken from the stack via
-        ; cdecl frame pointer. If _main's call _write produces
-        ; NULs but this DOES print "[mp-main-entered]", the bug
-        ; isn't in stack-based arg passing — it's something even
-        ; more specific to _main's call site or to the user-obj's
-        ; _write at runtime.
-        mov     edx, _bridge_marker_dump_stackwrite
-        call    _bridge_emit_str0
-        push    18
-        push    dword [_main + 7]        ; str_addr
-        push    1
-        call    _bridge_write_stack
-        add     esp, 12
-
-        ; Dump ESP (after all the diagnostic pushes/pops finished)
-        ; so we know where main's stack will land.
+        ; Dump ESP so we know where main's stack will land.
         mov     edx, _bridge_marker_dump_esp
         call    _bridge_emit_str0
         mov     eax, esp
         call    _bridge_emit_hex32
 
-        ; --- Mainlike test: bridge does call _diag_main_writelike
-        ; with cdecl args, like the real call _main below.
-        ; If this prints "[mp-main-entered]" but the real _main
-        ; doesn't, the user .obj's _write differs at runtime from
-        ; the bridge's identical copy.
-        mov     edx, _bridge_marker_dump_likemain
-        call    _bridge_emit_str0
-        push    dword [_pmodew_argv]
-        push    dword [_pmodew_argc]
-        call    _diag_main_writelike
-        add     esp, 8
+        ; --- Mainlike test: REMOVED -----------------------------
+        ; Previously a call to _diag_main_writelike — a stub that
+        ; pushed `[_main + 7]` (the rel32 displacement of _main's
+        ; first call) as an argument and invoked _bridge_write_stack
+        ; with it. Useful in 2024 for distinguishing _main-side _write
+        ; vs bridge-side _write bugs in a wlink/codegen issue that's
+        ; long resolved.
+        ;
+        ; Removed because under paged DPMI hosts (CWSDPMI) the bytes
+        ; at `_main + 7` no longer reliably form a valid pointer —
+        ; the value gets passed to _bridge_write_stack's memcpy and
+        ; PFs on unmapped pages. The diagnostic doesn't survive a
+        ; host swap. Git history (commit f2faf76 and surroundings)
+        ; preserves the original for reference.
 
         ; --- User-write test: REMOVED ---------------------------
         ; Run 25477796902 confirmed: calling user.obj's _write
