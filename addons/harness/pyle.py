@@ -591,18 +591,73 @@ LE_OBJ_FLAG_EXEC = 0x0004
 LE_OBJ_FLAG_32BIT = 0x2000
 
 
+def bind_dos32a_stub(dos32a_bytes: bytes) -> bytes:
+    """Convert an unbound DOS32A.EXE into a pyle-compatible MZ stub.
+
+    DOS/32A ships DOS32A.EXE as a standalone runtime with sentinel
+    e_lfanew = 0x00030000 (file beyond own end). The SUNSYS Bind
+    utility (SB.EXE) prepends it to an LE/LX file as the MZ portion.
+    This reimplements SB's transform so we can bind without a DOS-
+    only tool.
+
+    Algorithm (from SBIND.ASM bind_exec_):
+      1. Read e_lfarlc at MZ+0x18 (typically 0x3E for DOS32A.EXE).
+      2. Shift bytes from offset e_lfarlc upward to 0x40 — this opens
+         a (0x40 - e_lfarlc)-byte gap right before the relocation
+         table, room for a proper e_lfanew at 0x3C.
+      3. Zero the gap. Stub size grows by gap_bytes.
+      4. Update MZ header fields: e_cblp, e_cp, e_cparhdr, e_lfarlc=0x40,
+         e_lfanew = new_size (so the LE/LX appended at offset new_size
+         is found).
+
+    Returns the post-bind stub bytes; caller appends LE/LX directly
+    after these bytes (which is exactly what write_le does).
+    """
+    if dos32a_bytes[:2] != b"MZ":
+        raise ValueError("DOS32A binary lacks MZ signature")
+    e_lfarlc = struct.unpack_from("<H", dos32a_bytes, 0x18)[0]
+    if e_lfarlc >= 0x40:
+        raise ValueError(
+            f"DOS32A stub has e_lfarlc=0x{e_lfarlc:X}, expected <0x40"
+        )
+    e_crlc = struct.unpack_from("<H", dos32a_bytes, 0x06)[0]
+    gap = 0x40 - e_lfarlc
+    new_size = len(dos32a_bytes) + gap
+    out = bytearray(new_size)
+    # MZ header through e_lfarlc stays in place; gap zero-filled by
+    # bytearray(new_size); shifted bytes copied behind the gap.
+    out[: e_lfarlc] = dos32a_bytes[: e_lfarlc]
+    out[0x40 :] = dos32a_bytes[e_lfarlc :]
+    # Fix MZ header.
+    struct.pack_into("<H", out, 0x02, new_size & 0x1FF)         # e_cblp
+    struct.pack_into("<H", out, 0x04, (new_size >> 9) + 1)      # e_cp
+    struct.pack_into("<H", out, 0x08, (e_crlc * 4 + 0x4F) >> 4) # e_cparhdr
+    struct.pack_into("<H", out, 0x18, 0x40)                     # e_lfarlc
+    struct.pack_into("<I", out, 0x3C, new_size)                 # e_lfanew
+    return bytes(out)
+
+
 def write_le(
     image: LinkedImage,
     stub: bytes,
     entry_symbol: str,
     out_path: Path,
+    *,
+    explicit_stack_object: bool = False,
 ) -> None:
     """Emit the MZ+LE binary at `out_path`.
 
-    `stub` is the PMODE/W stub bytes (carve from an existing
-    wlink-built .exe — see scripts/extract_pmodew_stub.py).
+    `stub` is the MZ stub bytes — either a PMODE/W stub (carve from a
+    wlink-built .exe) or a DOS32A stub (output of `bind_dos32a_stub`).
     `entry_symbol` is the name of the program entry point (must be
     in image.symbols and live in the text object).
+
+    `explicit_stack_object`: when True, declare BSS as the stack object
+    (init_obj_ss=3, init_esp=top-of-bss, BSS virt_size bumped by 0x10000
+    to give the stack a runway). PMODE/W tolerates init_obj_ss=0 and
+    auto-allocates from `stack_size` at LE+0xAC; DOS/32A doesn't, and
+    crashes during init if the stack object is unspecified or vsize=0.
+    Set this True when bundling under DOS/32A.
     """
     if entry_symbol not in image.symbols:
         raise ValueError(f"entry symbol {entry_symbol!r} undefined")
@@ -684,9 +739,13 @@ def write_le(
     # Object 3: bss (no on-disk pages, page_idx=0 per wlink convention
     # — actually wlink puts BSS at page_idx=1+text+data with npg=0,
     # but page_idx=0 also works since npg=0).
+    # When explicit_stack_object is set, bump bss_virt_size so DOS/32A
+    # can use it as the stack — see write_le docstring.
+    STACK_RUNWAY = 0x10000  # 64 KB, matches LE+0xAC stack_size
+    bss_virt_size = bss_size + STACK_RUNWAY if explicit_stack_object else bss_size
     obj_table += struct.pack(
         "<IIIIIi",
-        bss_size, bss_base,
+        bss_virt_size, bss_base,
         LE_OBJ_FLAG_READ | LE_OBJ_FLAG_WRITE | LE_OBJ_FLAG_32BIT
                 | 0x40,  # 0x2043
         1 + text_pages + data_pages, 0, 0,
@@ -809,8 +868,14 @@ def write_le(
     struct.pack_into("<I", le_hdr, 20, n_pages)
     struct.pack_into("<I", le_hdr, 24, LE_OBJ_TEXT)   # init obj cs
     struct.pack_into("<I", le_hdr, 28, entry_off)     # eip (offset within text obj)
-    struct.pack_into("<I", le_hdr, 32, 0)             # init obj ss (0 = use auto stack)
-    struct.pack_into("<I", le_hdr, 36, 0)             # esp (0 = top of stack)
+    if explicit_stack_object:
+        # DOS/32A: point at BSS object, ESP = top of bss virt area.
+        struct.pack_into("<I", le_hdr, 32, LE_OBJ_BSS)
+        struct.pack_into("<I", le_hdr, 36, bss_virt_size)
+    else:
+        # PMODE/W: 0 = auto-allocate from stack_size at LE+0xAC.
+        struct.pack_into("<I", le_hdr, 32, 0)
+        struct.pack_into("<I", le_hdr, 36, 0)
     struct.pack_into("<I", le_hdr, 40, PAGE_SIZE)
     struct.pack_into("<I", le_hdr, 44, last_page_size)
     struct.pack_into("<I", le_hdr, 48, fixup_section_size)
@@ -937,7 +1002,13 @@ def main() -> int:
     )
     ap.add_argument(
         "--stub", type=Path, required=True,
-        help="PMODE/W stub binary (carve from existing wlink-built .exe).",
+        help="MZ stub binary: PMODE/W stub (carve from wlink-built .exe) "
+             "or DOS32A.EXE (use with --stub-kind=dos32a).",
+    )
+    ap.add_argument(
+        "--stub-kind", choices=("pmodew", "dos32a"), default="pmodew",
+        help="Stub type. pmodew (default) uses --stub bytes verbatim; "
+             "dos32a runs SUNSYS Bind transform on a raw DOS32A.EXE.",
     )
     ap.add_argument(
         "--entry", default="_pmodew_start",
@@ -948,7 +1019,12 @@ def main() -> int:
     objects = [parse_omf(p) for p in args.objects]
     image = link(objects)
     stub = args.stub.read_bytes()
-    write_le(image, stub, args.entry, args.output)
+    if args.stub_kind == "dos32a":
+        stub = bind_dos32a_stub(stub)
+    write_le(
+        image, stub, args.entry, args.output,
+        explicit_stack_object=(args.stub_kind == "dos32a"),
+    )
     print(f"pyle: wrote {args.output} ({args.output.stat().st_size:,} bytes)")
     return 0
 

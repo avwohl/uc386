@@ -6098,6 +6098,14 @@ _pktdrv_int_invoke:
         push    esi
         push    edi
         push    ebx
+        ; Save ES and force ES = DS for the duration of the int.
+        ; DOS leaves ES = PSP selector (256-byte limit) at program
+        ; start; if we leave it there, DPMI calls that pass an rmcs
+        ; pointer via ES:EDI fail (or, for DPMI 0x0301, hang) since
+        ; the flat-32 EDI exceeds the PSP selector's limit.
+        push    es
+        push    ds
+        pop     es
         ; Patch the INT immediate byte from int_num.
         mov     eax, [ebp + 8]
         mov     [.int_imm], al
@@ -6135,9 +6143,80 @@ _pktdrv_int_invoke:
         pop     dword [esi + 16]
         pop     eax                 ; EFLAGS
         and     eax, 1              ; → just the CF
+        pop     es                  ; restore ES (was pushed last in prologue)
         pop     ebx
         pop     edi
         pop     esi
+        pop     ebp
+        ret
+
+; -----------------------------------------------------------------
+; PM-native IO port helpers for the NE2000 driver. PMODE/W grants
+; PM clients full IO permission by default, so direct in/out works
+; without any DPMI fn 0x0E01 dance.
+; -----------------------------------------------------------------
+        global  _ne2k_outb
+_ne2k_outb:                          ; void ne2k_outb(uint port, uint val)
+        push    ebp
+        mov     ebp, esp
+        push    edx
+        mov     edx, [ebp + 8]       ; port
+        mov     eax, [ebp + 12]      ; val
+        out     dx, al
+        pop     edx
+        pop     ebp
+        ret
+
+        global  _ne2k_inb
+_ne2k_inb:                           ; uint ne2k_inb(uint port)
+        push    ebp
+        mov     ebp, esp
+        push    edx
+        mov     edx, [ebp + 8]       ; port
+        in      al, dx
+        movzx   eax, al
+        pop     edx
+        pop     ebp
+        ret
+
+        global  _ne2k_outsw
+_ne2k_outsw:                         ; void ne2k_outsw(uint port, void *src, uint wcount)
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        push    ecx
+        push    edx
+        ; Save and force ES = DS (rep outsw uses DS:ESI)
+        mov     edx, [ebp + 8]       ; port
+        mov     esi, [ebp + 12]      ; src
+        mov     ecx, [ebp + 16]      ; wcount
+        cld
+        rep     outsw
+        pop     edx
+        pop     ecx
+        pop     esi
+        pop     ebp
+        ret
+
+        global  _ne2k_insw
+_ne2k_insw:                          ; void ne2k_insw(uint port, void *dst, uint wcount)
+        push    ebp
+        mov     ebp, esp
+        push    edi
+        push    ecx
+        push    edx
+        push    es
+        push    ds
+        pop     es                   ; rep insw uses ES:EDI
+        mov     edx, [ebp + 8]       ; port
+        mov     edi, [ebp + 12]      ; dst
+        mov     ecx, [ebp + 16]      ; wcount
+        cld
+        rep     insw
+        pop     es
+        pop     edx
+        pop     ecx
+        pop     edi
         pop     ebp
         ret
 
