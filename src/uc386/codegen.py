@@ -5508,6 +5508,61 @@ class CodeGenerator:
             return False
         return self._is_unsigned(t)
 
+    def _ll_shift_const(
+        self, op: str, s: int, left: ast.Expression, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Emit a 64-bit shift of EDX:EAX by a compile-time constant `s`
+        (already masked to 0..63). The runtime path in `_binary_ll`
+        burns 8+ instructions on a test/jnz/shrd/jmp dance per shift,
+        which shows up in axtls bigint inner loops as a ~30% multiply-
+        loop overhead (each `(comp)(tmp >> COMP_BIT_SIZE)` falls into
+        this dance). Branchless constant shifts here.
+        """
+        s &= 63
+        if op == "<<":
+            if s == 0:
+                return []
+            if s < 32:
+                return [
+                    f"        shld    edx, eax, {s}",
+                    f"        shl     eax, {s}",
+                ]
+            if s == 32:
+                return [
+                    "        mov     edx, eax",
+                    "        xor     eax, eax",
+                ]
+            return [
+                "        mov     edx, eax",
+                "        xor     eax, eax",
+                f"        shl     edx, {s - 32}",
+            ]
+        # op == ">>"
+        unsigned = self._is_unsigned(self._type_of(left, ctx))
+        # 3-letter mnemonics get 5 spaces of padding to match the
+        # codegen's column convention (`shr     edx, ...`).
+        shift_high = "shr    " if unsigned else "sar    "
+        if s == 0:
+            return []
+        if s < 32:
+            return [
+                f"        shrd    eax, edx, {s}",
+                f"        {shift_high} edx, {s}",
+            ]
+        # s >= 32: low half becomes (old high >> (s-32)) with the high
+        # half collapsing to 0 (unsigned) or sign-replicated (signed).
+        ext = "xor     edx, edx" if unsigned else "sar     edx, 31"
+        if s == 32:
+            return [
+                "        mov     eax, edx",
+                f"        {ext}",
+            ]
+        return [
+            "        mov     eax, edx",
+            f"        {ext}",
+            f"        {shift_high} eax, {s - 32}",
+        ]
+
     # ---- __int128 lowering --------------------------------------------
     #
     # `__int128` and `unsigned __int128` are GCC extensions for 128-bit
@@ -13173,6 +13228,20 @@ class CodeGenerator:
                     out.append("        cdq")
                 return out
             return self._assign_ll(expr, ctx)
+        # Constant-shift fast path. `tmp >> COMP_BIT_SIZE` and the like
+        # are pervasive in axtls bigint (regular_multiply / regular_square
+        # inner loops do `>>32` every iteration); the dynamic-shift dance
+        # below burns 8+ instructions on a test/jnz/shrd/jmp sequence
+        # when 2 instructions suffice (`mov eax, edx; xor edx, edx` for
+        # `u64 >> 32`). Skip the push/pop entirely and emit a direct
+        # sequence sized to the constant.
+        if op in ("<<", ">>"):
+            shift_const = _try_simple_int_fold(expr.right)
+            if shift_const is not None and 0 <= shift_const < 64:
+                left_out = self._eval_expr_to_edx_eax(expr.left, ctx)
+                return list(left_out) + self._ll_shift_const(
+                    op, shift_const, expr.left, ctx
+                ) + self._bitfield_precision_mask(expr.left, ctx=ctx)
         # Right to EDX:EAX, push (high then low so low ends up on top).
         right = self._eval_expr_to_edx_eax(expr.right, ctx)
         out = list(right)

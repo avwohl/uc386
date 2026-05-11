@@ -3075,6 +3075,76 @@ def test_ll_mul_ull_x_ull_keeps_full_schoolbook():
     assert imul_count == 2
 
 
+def test_ll_shr_by_32_constant_collapses():
+    """`(u64) >> 32` with a literal shift is the axtls bigint
+    `(comp)(tmp >> COMP_BIT_SIZE)` pattern. Pre-fix it emitted
+    8+ instructions including a `test cl, 32` / `jnz` runtime
+    branch even though the shift count was a compile-time constant.
+    The constant-shift fast path should collapse it to two
+    instructions and drop the dynamic-shift dance entirely.
+    """
+    asm = _compile(
+        "unsigned long long x;\n"
+        "unsigned int hi;\n"
+        "int main(void) { hi = (unsigned int)(x >> 32); return 0; }\n"
+    )
+    assert "test    cl, 32" not in asm, f"runtime shift branch leaked:\n{asm}"
+    assert "shrd" not in asm, f"shrd leaked (s==32 doesn't need it):\n{asm}"
+    assert "jnz     .L" not in asm or "ll_shr" not in asm
+    # The collapsed sequence: mov eax, edx ; xor edx, edx
+    main_body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
+    assert "mov     eax, edx" in main_body
+    assert "xor     edx, edx" in main_body
+
+
+def test_ll_shr_by_small_constant_uses_shrd():
+    """For `s < 32` constant shifts, emit `shrd eax, edx, S; shr edx, S`
+    directly — no `test cl,32` branch, no `mov ecx, S` load."""
+    asm = _compile(
+        "unsigned long long x, r;\n"
+        "int main(void) { r = x >> 5; return 0; }\n"
+    )
+    assert "shrd    eax, edx, 5" in asm
+    assert "shr     edx, 5" in asm
+    assert "test    cl, 32" not in asm
+
+
+def test_ll_shl_by_32_constant_collapses():
+    """`u64 << 32` collapses to `mov edx, eax ; xor eax, eax`."""
+    asm = _compile(
+        "unsigned long long x, r;\n"
+        "int main(void) { r = x << 32; return 0; }\n"
+    )
+    assert "test    cl, 32" not in asm
+    assert "shld" not in asm
+    main_body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
+    assert "mov     edx, eax" in main_body
+    assert "xor     eax, eax" in main_body
+
+
+def test_ll_shr_signed_uses_sar():
+    """Signed `long long` shift by constant should use `sar`, and a
+    `>>32` constant should emit `mov eax, edx ; sar edx, 31`."""
+    asm = _compile(
+        "long long x;\n"
+        "int main(void) { return (int)(x >> 32); }\n"
+    )
+    assert "sar     edx, 31" in asm
+    assert "test    cl, 32" not in asm
+
+
+def test_ll_shr_dynamic_keeps_runtime_branch():
+    """Regression: dynamic shift count still emits the runtime
+    test/jnz/shrd dance — the fast path is keyed on literal RHS."""
+    asm = _compile(
+        "unsigned long long x; int n;\n"
+        "unsigned long long r;\n"
+        "int main(void) { r = x >> n; return 0; }\n"
+    )
+    assert "test    cl, 32" in asm
+    assert "shrd    eax, edx, cl" in asm
+
+
 def test_int128_compare_emits_dword_chain():
     # u128 < u128 walks 4 dwords from high to low.
     asm = _compile(
