@@ -3089,8 +3089,11 @@ def test_ll_shr_by_32_constant_collapses():
     `(comp)(tmp >> COMP_BIT_SIZE)` pattern. Pre-fix it emitted
     8+ instructions including a `test cl, 32` / `jnz` runtime
     branch even though the shift count was a compile-time constant.
-    The constant-shift fast path should collapse it to two
-    instructions and drop the dynamic-shift dance entirely.
+
+    With both the constant-shift fold AND the `_eval_ll_hi`
+    half-eval, this collapses further: we load `[x + 4]` directly
+    into EAX (skipping the low-half load) and just zero EDX.
+    No `shrd`, no `mov eax, edx`, no runtime branch.
     """
     asm = _compile(
         "unsigned long long x;\n"
@@ -3100,10 +3103,15 @@ def test_ll_shr_by_32_constant_collapses():
     assert "test    cl, 32" not in asm, f"runtime shift branch leaked:\n{asm}"
     assert "shrd" not in asm, f"shrd leaked (s==32 doesn't need it):\n{asm}"
     assert "jnz     .L" not in asm or "ll_shr" not in asm
-    # The collapsed sequence: mov eax, edx ; xor edx, edx
     main_body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
-    assert "mov     eax, edx" in main_body
+    # The optimized sequence: `mov eax, [_x + 4]` (load high directly)
+    # then `xor edx, edx` to complete the LL result.
+    assert "mov     eax, [_x + 4]" in main_body
     assert "xor     edx, edx" in main_body
+    # No low-half load: we never read [_x] (only [_x + 4]).
+    assert "mov     eax, [_x]" not in main_body
+    # No intermediate `mov eax, edx` either — we loaded direct to eax.
+    assert "mov     eax, edx" not in main_body
 
 
 def test_ll_shr_by_small_constant_uses_shrd():
@@ -3119,7 +3127,9 @@ def test_ll_shr_by_small_constant_uses_shrd():
 
 
 def test_ll_shl_by_32_constant_collapses():
-    """`u64 << 32` collapses to `mov edx, eax ; xor eax, eax`."""
+    """`u64 << 32` collapses to `mov edx, eax ; xor eax, eax` and
+    the source's high half load is suppressed (the `_eval_ll_lo`
+    half-eval only loads `[x]`, never `[x + 4]`)."""
     asm = _compile(
         "unsigned long long x, r;\n"
         "int main(void) { r = x << 32; return 0; }\n"
@@ -3129,6 +3139,56 @@ def test_ll_shl_by_32_constant_collapses():
     main_body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
     assert "mov     edx, eax" in main_body
     assert "xor     eax, eax" in main_body
+    # No high-half load — `_eval_ll_lo` skipped it.
+    assert "mov     edx, [_x + 4]" not in main_body
+    assert "mov     eax, [_x + 4]" not in main_body
+
+
+def test_ll_shr_by_32_of_lvalue_loads_high_directly():
+    """`u64 >> 32` of an Identifier lvalue should load `[v + 4]`
+    directly into EAX rather than loading both halves and moving
+    the high into EAX. Saves one load per shift.
+    """
+    asm = _compile(
+        "unsigned long long g;\n"
+        "unsigned long long r;\n"
+        "int main(void) { r = g >> 32; return 0; }\n"
+    )
+    body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
+    assert "mov     eax, [_g + 4]" in body
+    # No low load.
+    assert "mov     eax, [_g]" not in body
+    assert "mov     edx, [_g + 4]" not in body
+
+
+def test_ll_shl_by_32_of_lvalue_skips_high_load():
+    """`u64 << 32` of an Identifier lvalue: only the low half
+    survives, so the `_eval_ll_lo` helper loads `[v]` only — the
+    high load that the previous codegen produced (and was overwritten
+    one instruction later by `mov edx, eax`) is gone.
+    """
+    asm = _compile(
+        "unsigned long long g;\n"
+        "unsigned long long r;\n"
+        "int main(void) { r = g << 32; return 0; }\n"
+    )
+    body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
+    assert "mov     eax, [_g]" in body
+    # High load is gone.
+    assert "[_g + 4]" not in body
+
+
+def test_ll_shr_by_32_of_signed_uses_cdq():
+    """Signed `>>32` of an lvalue: load `[v + 4]` into EAX, then
+    `cdq` to sign-replicate into EDX."""
+    asm = _compile(
+        "long long g;\n"
+        "long long r;\n"
+        "int main(void) { r = g >> 32; return 0; }\n"
+    )
+    body = asm.split("_main:", 1)[1].split("\n_", 1)[0]
+    assert "mov     eax, [_g + 4]" in body
+    assert "sar     edx, 31" in body
 
 
 def test_ll_shr_signed_uses_sar():

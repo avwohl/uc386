@@ -5677,6 +5677,7 @@ class CodeGenerator:
 
     def _ll_shift_const(
         self, op: str, s: int, left: ast.Expression, ctx: _FuncCtx,
+        big_half_in_eax: bool = False,
     ) -> list[str]:
         """Emit a 64-bit shift of EDX:EAX by a compile-time constant `s`
         (already masked to 0..63). The runtime path in `_binary_ll`
@@ -5684,6 +5685,17 @@ class CodeGenerator:
         which shows up in axtls bigint inner loops as a ~30% multiply-
         loop overhead (each `(comp)(tmp >> COMP_BIT_SIZE)` falls into
         this dance). Branchless constant shifts here.
+
+        Input convention:
+        * `big_half_in_eax=False` (default) — caller has loaded the
+          full LL value into EDX:EAX. This is the only sound input
+          for shifts < 32 (both halves are needed).
+        * `big_half_in_eax=True` — caller has loaded only the half
+          of the source that survives `<<` / `>>` of `s >= 32`:
+          for `<<` this is the LOW half (becomes the result high);
+          for `>>` this is the HIGH half (becomes the result low).
+          EDX is unspecified. This skips the dead-half load when the
+          source is a memory-resident lvalue.
         """
         s &= 63
         if op == "<<":
@@ -5694,16 +5706,16 @@ class CodeGenerator:
                     f"        shld    edx, eax, {s}",
                     f"        shl     eax, {s}",
                 ]
+            if big_half_in_eax:
+                # EAX = source low half. Move to EDX (the new high)
+                # and zero the new low.
+                base = ["        mov     edx, eax", "        xor     eax, eax"]
+            else:
+                # EDX:EAX = full source. Same target shape.
+                base = ["        mov     edx, eax", "        xor     eax, eax"]
             if s == 32:
-                return [
-                    "        mov     edx, eax",
-                    "        xor     eax, eax",
-                ]
-            return [
-                "        mov     edx, eax",
-                "        xor     eax, eax",
-                f"        shl     edx, {s - 32}",
-            ]
+                return base
+            return base + [f"        shl     edx, {s - 32}"]
         # op == ">>"
         unsigned = self._is_unsigned(self._type_of(left, ctx))
         # 3-letter mnemonics get 5 spaces of padding to match the
@@ -5716,19 +5728,122 @@ class CodeGenerator:
                 f"        shrd    eax, edx, {s}",
                 f"        {shift_high} edx, {s}",
             ]
-        # s >= 32: low half becomes (old high >> (s-32)) with the high
-        # half collapsing to 0 (unsigned) or sign-replicated (signed).
+        # s >= 32: low half of result is (source_high >> (s-32)); high
+        # half collapses to 0 (unsigned) or sign-replicated (signed).
         ext = "xor     edx, edx" if unsigned else "sar     edx, 31"
+        if big_half_in_eax:
+            # EAX = source high half already, ready to be the new low.
+            base = [f"        {ext}"]
+        else:
+            # EDX:EAX = full source. Move high → eax, then zero/sign edx.
+            base = ["        mov     eax, edx", f"        {ext}"]
         if s == 32:
-            return [
-                "        mov     eax, edx",
-                f"        {ext}",
-            ]
-        return [
-            "        mov     eax, edx",
-            f"        {ext}",
-            f"        {shift_high} eax, {s - 32}",
-        ]
+            return base
+        return base + [f"        {shift_high} eax, {s - 32}"]
+
+    def _eval_ll_lo(
+        self, expr: ast.Expression, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Load only the LOW 32 bits of an LL expression into EAX,
+        skipping the high-half load when possible. Used by `<<` of
+        constant shift >= 32, where the source's high half is dead
+        (the low becomes the new high and the new low is zero).
+
+        For simple LL lvalues (Identifier / Index / Member) and
+        u32-widening casts, emits a single 32-bit load. For complex
+        expressions (BinaryOp results, calls) falls back to a full
+        EDX:EAX eval and ignores EDX — peephole still cleans up.
+        """
+        # Cast LL ← narrower: the source's value IS the low half.
+        if isinstance(expr, ast.Cast):
+            if self._is_long_long(expr.target_type):
+                src_ty = self._type_of(expr.expr, ctx)
+                if not self._is_long_long(src_ty):
+                    return self._eval_expr_to_eax(expr.expr, ctx)
+        # IntLiteral — load just the low 32 bits.
+        if isinstance(expr, ast.IntLiteral):
+            v = expr.value
+            if v < 0:
+                v = (1 << 64) + v
+            return [f"        mov     eax, 0x{v & 0xFFFFFFFF:08X}"]
+        # LL Identifier — `_identifier_load` already takes the low half
+        # for size-8 types (via `_load_to_eax`).
+        if isinstance(expr, ast.Identifier):
+            return self._eval_expr_to_eax(expr, ctx)
+        # LL Index / Member — `_eval_expr_to_eax` likewise takes the
+        # low half via `_load_to_eax(size=8)`.
+        if isinstance(expr, (ast.Index, ast.Member)):
+            try:
+                return self._eval_expr_to_eax(expr, ctx)
+            except CodegenError:
+                pass
+        # Fall back to the full eval; the dead high load is the same
+        # waste the previous codegen produced.
+        return self._eval_expr_to_edx_eax(expr, ctx)
+
+    def _eval_ll_hi(
+        self, expr: ast.Expression, ctx: _FuncCtx,
+    ) -> list[str]:
+        """Load only the HIGH 32 bits of an LL expression into EAX,
+        skipping the low-half load when possible. Used by `>>` of
+        constant shift >= 32, where the source's low half is dead
+        (the high becomes the new low and the new high is zero or
+        sign-extended).
+
+        For simple memory-resident LL lvalues, emits a single load
+        from `[addr + 4]`. For complex expressions falls back to a
+        full EDX:EAX eval and moves the high half into EAX.
+        """
+        # IntLiteral — extract the high 32 bits at compile time.
+        if isinstance(expr, ast.IntLiteral):
+            v = expr.value
+            if v < 0:
+                v = (1 << 64) + v
+            return [f"        mov     eax, 0x{(v >> 32) & 0xFFFFFFFF:08X}"]
+        # Cast LL ← narrower unsigned: high half is provably zero.
+        # Cast LL ← narrower signed: high half is sign-extension of
+        # the source's MSB. Both cases: emit just the high.
+        if isinstance(expr, ast.Cast):
+            if self._is_long_long(expr.target_type):
+                src_ty = self._type_of(expr.expr, ctx)
+                if not self._is_long_long(src_ty):
+                    if self._is_unsigned(src_ty):
+                        return ["        xor     eax, eax"]
+                    # Signed: produce the sign bit replicated.
+                    inner = self._eval_expr_to_eax(expr.expr, ctx)
+                    return inner + ["        cdq", "        mov     eax, edx"]
+        # LL Identifier (local or global): load [addr + 4] directly.
+        if isinstance(expr, ast.Identifier):
+            t = self._type_of(expr, ctx)
+            if self._is_long_long(t):
+                try:
+                    addr = self._identifier_addr_text(expr.name, ctx)
+                    high_addr = self._bump_addr(addr, 4)
+                    return [f"        mov     eax, {high_addr}"]
+                except CodegenError:
+                    pass
+        # LL Index: compute address, then load [addr + 4].
+        if isinstance(expr, ast.Index):
+            elem_ty = self._type_of(expr, ctx)
+            if self._is_long_long(elem_ty):
+                try:
+                    out = list(self._index_address(expr, ctx))
+                    return out + ["        mov     eax, [eax + 4]"]
+                except CodegenError:
+                    pass
+        # LL Member: similar.
+        if isinstance(expr, ast.Member):
+            mem_ty = self._type_of(expr, ctx)
+            if self._is_long_long(mem_ty):
+                try:
+                    out = list(self._member_address(expr, ctx))
+                    return out + ["        mov     eax, [eax + 4]"]
+                except CodegenError:
+                    pass
+        # Fall back: full eval, then move high → eax.
+        out = list(self._eval_expr_to_edx_eax(expr, ctx))
+        out.append("        mov     eax, edx")
+        return out
 
     # ---- __int128 lowering --------------------------------------------
     #
@@ -13402,12 +13517,25 @@ class CodeGenerator:
         # when 2 instructions suffice (`mov eax, edx; xor edx, edx` for
         # `u64 >> 32`). Skip the push/pop entirely and emit a direct
         # sequence sized to the constant.
+        #
+        # For shift amounts >= 32 we additionally short-cut the source
+        # eval: only one half of the LL operand survives (`<<` keeps
+        # the low, `>>` keeps the high), so for memory-resident lvalue
+        # sources we load just that half directly via `_eval_ll_lo` /
+        # `_eval_ll_hi` instead of pulling both halves and then
+        # overwriting one. Saves the dead high (or low) load.
         if op in ("<<", ">>"):
             shift_const = _try_simple_int_fold(expr.right)
             if shift_const is not None and 0 <= shift_const < 64:
-                left_out = self._eval_expr_to_edx_eax(expr.left, ctx)
+                if shift_const >= 32:
+                    if op == "<<":
+                        left_out = self._eval_ll_lo(expr.left, ctx)
+                    else:
+                        left_out = self._eval_ll_hi(expr.left, ctx)
+                else:
+                    left_out = self._eval_expr_to_edx_eax(expr.left, ctx)
                 return list(left_out) + self._ll_shift_const(
-                    op, shift_const, expr.left, ctx
+                    op, shift_const, expr.left, ctx, big_half_in_eax=shift_const >= 32,
                 ) + self._bitfield_precision_mask(expr.left, ctx=ctx)
         # Both-high-zero multiply: skip the u64 widen + stack dance and
         # do a flat 32×32→64 directly. `mul ecx` writes the full 64-bit
