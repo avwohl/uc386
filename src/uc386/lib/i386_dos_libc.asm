@@ -186,16 +186,19 @@ _fopen:
         mov     ah, 0x3C
         xor     ecx, ecx             ; attrs
         int     21h
+        jc      .null                ; real-DOS error: CF=1, AX=err
         jmp     .ret
 .readmode:
         mov     edx, [ebp + 8]       ; path
         mov     ah, 0x3D
         mov     al, 0
         int     21h
+        jc      .null                ; real-DOS error: CF=1, AX=err
 .ret:
-        ; If fd is -1, return NULL (0). Else return fd.
+        ; If fd is -1 (dos_emu sentinel), return NULL (0). Else return fd.
         cmp     eax, -1
         jne     .ok
+.null:
         xor     eax, eax
 .ok:
         pop     ebx
@@ -3947,9 +3950,11 @@ _close:
         mov     ebx, [ebp + 8]
         mov     ah, 0x3E
         int     21h
+        jc      .err                 ; real-DOS error: CF=1, AX=err
         movzx   eax, ax
-        cmp     ax, 0xFFFF
+        cmp     ax, 0xFFFF           ; dos_emu sentinel
         jne     .ok
+.err:
         mov     eax, -1
 .ok:
         mov     esp, ebp
@@ -4273,7 +4278,8 @@ _stat:
         xor     al, al
         mov     ah, 0x3D
         int     21h
-        cmp     eax, -1
+        jc      .stat_fail           ; real-DOS error: CF=1, AX=err
+        cmp     eax, -1              ; dos_emu sentinel
         je      .stat_fail
         mov     ebx, eax
         ; lseek(fd, 0, SEEK_END=2) — returns the new (= total) pos
@@ -4384,8 +4390,10 @@ _access:
         mov     al, 0                        ; mode = read-only
         mov     ah, 0x3D                     ; AH = 0x3D (open)
         int     21h
-        ; dos_emu doesn't set CF on open-failure; check EAX directly
-        ; (it returns -1 = 0xFFFFFFFF when the vfile isn't found).
+        ; Real DOS sets CF=1 + AX=err on failure; dos_emu returns
+        ; EAX=-1 with CF unset. Check both so the libc works under
+        ; either backend.
+        jc      ._fail
         cmp     eax, -1
         je      ._fail
         ; Got a valid fd in EAX (low 16). Close and return 0.
