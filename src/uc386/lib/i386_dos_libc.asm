@@ -6185,9 +6185,18 @@ _pktdrv_int_invoke:
         extern  _uc386dos_pktdrv_dpmi_thunk_c
         global  _uc386dos_pktdrv_dpmi_thunk
 _uc386dos_pktdrv_dpmi_thunk:
+        ; CLI at entry: NE2000.COM's IRQ handler calls us with IF
+        ; still set (it does an STI early in its ISR for nested
+        ; IRQs).  A nested timer IRQ that re-enters DOS while our
+        ; trampoline is mid-callback can stomp DOS/32A's PM scratch
+        ; state and surface as a #GP on the next INT 0x1A.  IRETD
+        ; at exit restores the caller's IF from the saved EFLAGS.
+        cli
         pushad
         push    ds
         push    es
+        push    fs
+        push    gs
         ; Re-point DS/ES at our flat data selector. SS at entry is
         ; the host-provided locked PM stack — same data selector as
         ; our app uses, per the DOS/32A DPMI 0.9 convention.
@@ -6196,6 +6205,8 @@ _uc386dos_pktdrv_dpmi_thunk:
         mov     es, ax
         cld
         call    _uc386dos_pktdrv_dpmi_thunk_c
+        pop     gs
+        pop     fs
         pop     es
         pop     ds
         popad
