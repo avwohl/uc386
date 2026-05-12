@@ -154,6 +154,21 @@ def run(
     # Load the program at address 0 (matches NASM `-f bin` default org 0).
     mu.mem_write(CODE_BASE, binary)
 
+    # Locate `pktdrv_int_invoke` in the loaded binary, if present, so
+    # we can intercept its calls — see the long comment further down
+    # where the UC_HOOK_CODE that does the intercept is installed.
+    # The function is uc386 libc's wrapper that takes a cdecl
+    # (int_num, regs[8]) and dispatches the INT. Its prologue is
+    # distinctive: push ebp / mov ebp,esp / push esi / push edi /
+    # push ebx / **push es** — that final `push es` (opcode 0x06) at
+    # function entry only happens in this helper, so a 7-byte byte
+    # pattern search finds the function reliably without symbol
+    # tables (the binary is flat). Verified empirically: the prefix
+    # appears at exactly one address in the MicroPython port build.
+    _PKTDRV_INT_INVOKE_SIG = b"\x55\x89\xe5\x56\x57\x53\x06"
+    pktdrv_int_invoke_addr = binary.find(_PKTDRV_INT_INVOKE_SIG)
+    pktdrv_invoke_seg_arena = [0x4000]   # bump allocator state
+
     # When a NetworkSimulator is wired with Crynwr enabled, plant a
     # "PKT DRVR" signature in low memory so the binary's IVT scan
     # via DPMI INT 31h fn 0x0200 lands a real-looking handler. The
@@ -1447,6 +1462,216 @@ def run(
         if insn_count[0] >= instruction_limit:
             res.timed_out = True
             uc.emu_stop()
+        if pktdrv_int_invoke_addr != -1 and address == pktdrv_int_invoke_addr:
+            _pktdrv_int_invoke_intercept(uc)
+
+    def _pktdrv_int_invoke_intercept(uc):
+        # Stand-in for the libc helper `pktdrv_int_invoke(int_num, regs)`
+        # defined in uc386's `lib/i386_dos_libc.asm`. The asm wraps an
+        # INT instruction with a `push es / push ds / pop es / ... INT
+        # n / ... / pop es` dance so DPMI's rmcs pointer (which lives in
+        # ES:EDI) hits a flat data selector instead of the PSP selector
+        # DOS hands the program at startup.
+        #
+        # That body trips two distinct unicorn 2.x bugs the moment any
+        # AH we don't otherwise implement reaches it:
+        #
+        #  - `pop es` faults with spurious #GP even when the value popped
+        #    is the null selector (0) — Intel explicitly permits null in
+        #    DS/ES; isolated unicorn programs of `pop es` from 0 work
+        #    fine, but only in the long-running emulator flow does the
+        #    fault appear.
+        #
+        #  - After we rewrote the asm to use `mov es, ax` (semantically
+        #    identical, and confirmed-good in isolation), the subsequent
+        #    `pop edx` started returning a phantom value (0xe8000679)
+        #    instead of the actual byte at [ESP] (verified 0x00000000 by
+        #    direct memory dump). Smells like a JIT cache invalidation
+        #    issue around ESP-relative addressing after a hook-handled
+        #    INT.
+        #
+        # Rather than try to patch unicorn or hand-balance the asm to
+        # avoid the buggy paths, we just bypass the function entirely:
+        # read its args (cdecl `int_num`, `regs`), service the AH=0x48
+        # / DPMI calls inline, write the results back into `regs[]`,
+        # and short-circuit straight to the caller's return address.
+        #
+        # The MicroPython port's bounce-buffer prealloc
+        # (upstream/ports/minimal/main.c:_preallocate_bounce_buffer)
+        # is the only user of this function that runs during dos_emu
+        # smoke tests. Real-DOS deployments (DOSBox-X, QEMU FreeDOS)
+        # use the real function and a real DPMI host — no interception.
+        esp = uc.reg_read(UC_X86_REG_ESP)
+        # cdecl: [esp+0] = return addr, [esp+4] = int_num, [esp+8] = regs
+        ret_addr, int_num, regs_ptr = struct.unpack(
+            "<III", uc.mem_read(esp, 12))
+        regs = list(struct.unpack("<8I", uc.mem_read(regs_ptr, 32)))
+        eax_in = regs[0]
+        ax_in  = eax_in & 0xFFFF
+        ah     = (eax_in >> 8) & 0xFF
+        carry  = 1
+
+        if int_num == 0x21 and ah == 0x48:
+            # INT 21h AH=0x48 — DOS Allocate Memory Block. BX = # of
+            # paragraphs requested; on success, AX = segment.
+            paragraphs = (regs[1] & 0xFFFF) or 1
+            seg = pktdrv_invoke_seg_arena[0]
+            pktdrv_invoke_seg_arena[0] += paragraphs
+            regs[0] = (eax_in & ~0xFFFF) | (seg & 0xFFFF)
+            carry = 0
+        elif int_num == 0x31 and ax_in == 0x0002:
+            # DPMI fn 0x0002 — Allocate LDT Descriptor for Real Mode
+            # Segment. BX = real-mode seg; on success, AX = selector.
+            # We don't simulate a real LDT; just hand back the segment
+            # value itself as the "selector" — the only thing the
+            # caller does with it is hand it to fn 0x0006 below.
+            regs[0] = (eax_in & ~0xFFFF) | (regs[1] & 0xFFFF)
+            carry = 0
+        elif int_num == 0x31 and ax_in == 0x0006:
+            # DPMI fn 0x0006 — Get Selector Base Address. BX = selector;
+            # on success, CX:DX = 32-bit linear base. We claim the
+            # base is seg << 4 (the conventional-memory mapping). This
+            # also matches what real DOS extenders do when the selector
+            # maps a real-mode segment 1:1.
+            sel = regs[1] & 0xFFFF
+            linear = (sel << 4) & 0xFFFFFFFF
+            regs[2] = (regs[2] & ~0xFFFF) | ((linear >> 16) & 0xFFFF)
+            regs[3] = (regs[3] & ~0xFFFF) | (linear & 0xFFFF)
+            carry = 0
+        elif int_num == 0x31 and ax_in == 0x0100:
+            # DPMI fn 0x0100 — Allocate DOS Memory. BX = paragraphs; on
+            # success, AX = real-mode segment, DX = selector (we reuse
+            # seg as selector, same shape as 0x0002).
+            paragraphs = (regs[1] & 0xFFFF) or 1
+            seg = pktdrv_invoke_seg_arena[0]
+            pktdrv_invoke_seg_arena[0] += paragraphs
+            regs[0] = (eax_in & ~0xFFFF) | (seg & 0xFFFF)
+            regs[3] = (regs[3] & ~0xFFFF) | (seg & 0xFFFF)
+            carry = 0
+        elif int_num == 0x31 and ax_in == 0x0301:
+            # DPMI fn 0x0301 — Simulate Real Mode Procedure With Far
+            # Return. ES:EDI is a flat pointer to a real-mode call
+            # structure (rmcs). Dispatch the INT it represents through
+            # the same handlers as direct INT 21h, then write the
+            # results back into the rmcs.
+            #
+            # The port (dosint21_uc386dos.c:dos_int21_call) builds an
+            # rmcs with cs:ip set to a 3-byte real-mode thunk (`CD 21
+            # CB` — int 21h + retf). DPMI 0x0301 would normally jump
+            # to that thunk and run it in real mode; we short-circuit
+            # by inspecting the rmcs.eax to recover the AH, and
+            # dispatching it directly.
+            _pktdrv_int_invoke_dispatch_rmcs(uc, regs[5])
+            carry = 0
+        # Everything else: return CF=1, regs untouched (caller sees a
+        # "host doesn't support this call" — valid on every real-DOS
+        # host too).
+
+        uc.mem_write(regs_ptr, struct.pack("<8I", *regs))
+        # Function returns CF (0 or 1) in EAX (low byte). Caller stores
+        # it as `unsigned char carry`.
+        uc.reg_write(UC_X86_REG_EAX, carry)
+        # Return to caller (cdecl: caller cleans args, we just pop the
+        # return-addr dword and set EIP to it).
+        uc.reg_write(UC_X86_REG_EIP, ret_addr)
+        uc.reg_write(UC_X86_REG_ESP, esp + 4)
+
+    def _pktdrv_int_invoke_dispatch_rmcs(uc, rmcs_linear):
+        # rmcs layout from port/dosint21_uc386dos.c:
+        #   uint32 edi, esi, ebp, reserved, ebx, edx, ecx, eax;
+        #   uint16 flags, es, ds, fs, gs, ip, cs, sp, ss;
+        # Total 32 + 18 = 50 bytes (the struct is packed).
+        edi, esi, ebp, _, ebx, edx, ecx, eax = struct.unpack(
+            "<IIIIIIII", uc.mem_read(rmcs_linear, 32))
+        flags, es, ds = struct.unpack("<HHH",
+                                       uc.mem_read(rmcs_linear + 32, 6))
+
+        # Reconstruct the linear address the program expected real-mode
+        # DS:DX to point to. Under real-DOS DS would be a segment register
+        # and DX a 16-bit offset; here both are usable directly because
+        # our 0x0002/0x0006 helpers above promised `linear = seg << 4`.
+        ds_linear = (ds << 4) & 0xFFFFFFFF
+        es_linear = (es << 4) & 0xFFFFFFFF
+
+        ah = (eax >> 8) & 0xFF
+        new_eax = eax
+        new_flags = flags & ~1  # default: CF=0
+
+        if ah == 0x3D:
+            # open(name, mode). Path is DS:DX in real-mode; the bounce
+            # buffer that holds the path lives at linear ds_linear.
+            name_linear = ds_linear + (edx & 0xFFFF)
+            name = bytes(_read_cstr_local(name_linear))
+            mode_byte = eax & 0xFF
+            if mode_byte == 0:
+                fd = _vfile_open(name, "r")
+            elif mode_byte in (1, 2):
+                fd = _vfile_open(name, "w")
+            else:
+                fd = -1
+            if fd < 0:
+                new_eax = (eax & ~0xFFFF) | 0x02   # ENOENT
+                new_flags |= 1                      # CF=1
+            else:
+                new_eax = (eax & ~0xFFFF) | (fd & 0xFFFF)
+        elif ah == 0x3F:
+            # read(fd, buf, count). DS:DX = buf, ECX = count.
+            buf_linear = ds_linear + (edx & 0xFFFF)
+            count = ecx & 0xFFFF
+            fd = ebx & 0xFFFF
+            n = _vfile_read(fd, buf_linear, count)
+            if n < 0:
+                new_eax = (eax & ~0xFFFF) | 0x06   # EBADF
+                new_flags |= 1
+            else:
+                new_eax = (eax & ~0xFFFF) | (n & 0xFFFF)
+        elif ah == 0x40:
+            # write(fd, buf, count).
+            buf_linear = ds_linear + (edx & 0xFFFF)
+            count = ecx & 0xFFFF
+            fd = ebx & 0xFFFF
+            n = _vfile_write(fd, buf_linear, count)
+            if n < 0:
+                new_eax = (eax & ~0xFFFF) | 0x06   # EBADF
+                new_flags |= 1
+            else:
+                new_eax = (eax & ~0xFFFF) | (n & 0xFFFF)
+        elif ah == 0x3E:
+            # close(fd).
+            fd = ebx & 0xFFFF
+            rc = _vfile_close(fd)
+            if rc != 0:
+                new_eax = (eax & ~0xFFFF) | 0x06
+                new_flags |= 1
+        elif ah == 0x42:
+            # lseek(fd, offset, whence). CX:DX = 32-bit offset, AL =
+            # whence (0=SET, 1=CUR, 2=END). Result in DX:AX.
+            fd = ebx & 0xFFFF
+            offset = (((ecx & 0xFFFF) << 16) | (edx & 0xFFFF)) & 0xFFFFFFFF
+            if offset >= 0x80000000:
+                offset -= 0x100000000
+            whence = eax & 0xFF
+            new_pos = _vfile_seek(fd, offset, whence)
+            if new_pos < 0:
+                new_eax = (eax & ~0xFFFF) | 0x06
+                new_flags |= 1
+            else:
+                new_eax = (eax & 0xFFFF0000) | (new_pos & 0xFFFF)
+                edx = (edx & 0xFFFF0000) | ((new_pos >> 16) & 0xFFFF)
+        else:
+            # Unrecognized AH inside an rmcs dispatch — set CF=1 so the
+            # caller (file_uc386dos.c) sees a generic DOS error and
+            # falls back / surfaces an error to Python.
+            new_flags |= 1
+            new_eax = (eax & ~0xFFFF) | 0x01       # invalid function
+
+        # Write the modified rmcs back. Only the fields the dispatch
+        # touched can change in our simplified world; rewrite the
+        # whole 32+6 byte head to keep things simple.
+        uc.mem_write(rmcs_linear, struct.pack(
+            "<IIIIIIII", edi, esi, ebp, 0, ebx, edx, ecx, new_eax))
+        uc.mem_write(rmcs_linear + 32, struct.pack(
+            "<HHH", new_flags & 0xFFFF, es, ds))
 
     mu.hook_add(unicorn.UC_HOOK_CODE, on_code)
 
