@@ -538,6 +538,23 @@ _pmodew_start:
         push    ds
         pop     es
 
+        ; --- Install PM INT 0x80 divmod handler -----------------
+        ; uc386 lowers 64-bit `/` and `%` into `int 0x80` with
+        ; EDX:EAX = numerator, EBX:ECX = denominator,
+        ; ESI low byte = op (0=udiv, 1=sdiv, 2=umod, 3=smod),
+        ; result returned in EDX:EAX. dos_emu intercepts this in
+        ; Python (uc386/src/uc386/dos_emu.py:683-721). On real DOS
+        ; the IDT entry for 0x80 is a no-op IRETD, so every 64-bit
+        ; / and % silently leaves EDX:EAX unchanged — the symptom
+        ; is integer formatting that emits the same digit byte over
+        ; and over (23 of them, the format-buffer size). Install a
+        ; PM handler via DPMI fn 0x0205 (Set PM Interrupt Vector).
+        mov     ax, 0x0205
+        mov     bl, 0x80
+        mov     cx, cs
+        mov     edx, _bridge_int80_handler
+        int     0x31
+
         ; cdecl: argc/argv on stack at [ebp+8]/[ebp+12] in main.
         ; Use an INDIRECT call (call eax with eax=_main) instead of
         ; `call _main` (rel32). Last run showed rel32 target lands
@@ -565,6 +582,141 @@ _pmodew_start:
         ; Exit DOS via INT 21h AH=4Ch with AL = main's return code.
         mov     ah, 0x4C
         int     0x21
+
+; -----------------------------------------------------------------
+; PM INT 0x80 handler — 64-bit divmod intrinsic.
+; Contract (matches dos_emu.py:683-721 byte-for-byte):
+;   IN:  EDX:EAX = numerator   (high:low)
+;        EBX:ECX = denominator (high:low)
+;        ESI low = op (0=udiv, 1=sdiv, 2=umod, 3=smod)
+;   OUT: EDX:EAX = result (quotient for div, remainder for mod)
+; All other GP regs preserved across the interrupt.
+;
+; Algorithm: binary long division, 64 iterations. Signed ops
+; normalize to unsigned (abs both operands), divide, then apply
+; the correct sign back. Mod sign follows numerator (C99 truncated
+; division). Divide-by-zero leaves EDX:EAX at original numerator
+; — matches "no handler installed" behavior; dos_emu errors in
+; this case, but production code shouldn't be dividing by zero.
+; -----------------------------------------------------------------
+_bridge_int80_handler:
+        push    ebp
+        push    edi
+        push    esi
+        push    ecx
+        push    ebx
+        sub     esp, 16
+        ; Local scratch layout:
+        ;   [esp+0]  = op (low byte of ESI on entry)
+        ;   [esp+4]  = sign_flags: bit0 = num_neg, bit1 = den_neg
+        ;   [esp+8]  = quot_low  (built MSB-first via shift+or)
+        ;   [esp+12] = quot_high
+        mov     dword [esp + 8], 0
+        mov     dword [esp + 12], 0
+        mov     ebp, esi
+        and     ebp, 0xFF
+        mov     [esp + 0], ebp
+        mov     dword [esp + 4], 0
+
+        ; Divide-by-zero guard: if EBX:ECX == 0, bail (EDX:EAX
+        ; still hold the original numerator).
+        mov     edi, ebx
+        or      edi, ecx
+        jz      .b80_restore
+
+        ; If signed op, normalize numerator + denominator to abs.
+        test    ebp, 1
+        jz      .b80_unsigned
+        test    edx, edx
+        jns     .b80_num_pos
+        not     edx
+        neg     eax
+        sbb     edx, -1
+        or      dword [esp + 4], 1
+.b80_num_pos:
+        test    ebx, ebx
+        jns     .b80_den_pos
+        not     ebx
+        neg     ecx
+        sbb     ebx, -1
+        or      dword [esp + 4], 2
+.b80_den_pos:
+
+.b80_unsigned:
+        ; Long division: rem = EDI:ESI (start 0), num = EDX:EAX
+        ; (shifted out bit-by-bit), den = EBX:ECX, quot built on
+        ; the stack.
+        xor     esi, esi
+        xor     edi, edi
+        mov     ebp, 64
+.b80_lloop:
+        ; num <<= 1, capturing bit 63 into CF.
+        shl     eax, 1
+        rcl     edx, 1
+        ; rem = (rem << 1) | CF
+        rcl     esi, 1
+        rcl     edi, 1
+        ; Tentative rem -= den.
+        sub     esi, ecx
+        sbb     edi, ebx
+        jc      .b80_undo
+        ; rem >= den: keep subtract, set quot bit (quot = (quot<<1)|1).
+        shl     dword [esp + 8], 1
+        rcl     dword [esp + 12], 1
+        or      dword [esp + 8], 1
+        jmp     .b80_cont
+.b80_undo:
+        add     esi, ecx
+        adc     edi, ebx
+        shl     dword [esp + 8], 1
+        rcl     dword [esp + 12], 1
+.b80_cont:
+        dec     ebp
+        jnz     .b80_lloop
+
+        ; Select output: quot (op bit 1 = 0) or rem (op bit 1 = 1).
+        mov     ebp, [esp + 0]
+        test    ebp, 2
+        jnz     .b80_pick_mod
+        mov     eax, [esp + 8]
+        mov     edx, [esp + 12]
+        jmp     .b80_signed_adjust
+.b80_pick_mod:
+        mov     eax, esi
+        mov     edx, edi
+
+.b80_signed_adjust:
+        test    ebp, 1
+        jz      .b80_restore
+        mov     ecx, [esp + 4]
+        test    ebp, 2
+        jnz     .b80_mod_sign
+        ; Quot sign = num_neg XOR den_neg
+        mov     bl, cl
+        shr     bl, 1
+        xor     bl, cl
+        and     bl, 1
+        jz      .b80_restore
+        not     edx
+        neg     eax
+        sbb     edx, -1
+        jmp     .b80_restore
+.b80_mod_sign:
+        ; Mod sign = num_neg (truncated division, C99).
+        test    cl, 1
+        jz      .b80_restore
+        not     edx
+        neg     eax
+        sbb     edx, -1
+
+.b80_restore:
+        add     esp, 16
+        pop     ebx
+        pop     ecx
+        pop     esi
+        pop     edi
+        pop     ebp
+        iretd
 """
 
 
