@@ -538,22 +538,41 @@ _pmodew_start:
         push    ds
         pop     es
 
-        ; --- Install PM INT 0x80 divmod handler -----------------
+        ; --- Probe & install PM INT 0x80 divmod handler ---------
         ; uc386 lowers 64-bit `/` and `%` into `int 0x80` with
         ; EDX:EAX = numerator, EBX:ECX = denominator,
         ; ESI low byte = op (0=udiv, 1=sdiv, 2=umod, 3=smod),
-        ; result returned in EDX:EAX. dos_emu intercepts this in
-        ; Python (uc386/src/uc386/dos_emu.py:683-721). On real DOS
-        ; the IDT entry for 0x80 is a no-op IRETD, so every 64-bit
-        ; / and % silently leaves EDX:EAX unchanged — the symptom
-        ; is integer formatting that emits the same digit byte over
-        ; and over (23 of them, the format-buffer size). Install a
-        ; PM handler via DPMI fn 0x0205 (Set PM Interrupt Vector).
+        ; result returned in EDX:EAX.
+        ;
+        ; Three deployment environments treat this differently:
+        ;   - dos_emu: Python harness intercepts via on_int hook
+        ;     (uc386/src/uc386/dos_emu.py:683-721).
+        ;   - dosiz: native C++ handler pre-installed in the IDT
+        ;     (dosiz/src/bridge.cc:dosiz_int80). Replacing this via
+        ;     DPMI 0x0205 with our PM handler breaks the IRETD path
+        ;     under dosiz's CPU emulator.
+        ;   - real DOS (PMODE/W, DOS/32A, CWSDPMI): the IDT entry
+        ;     is a no-op IRETD that leaves EDX:EAX untouched —
+        ;     every 64-bit / and % silently no-ops, integer
+        ;     formatting emits 23 chars of one garbage digit.
+        ;
+        ; Probe with a known-result modulo (5 % 3 == 2). If the
+        ; environment already services int 0x80 correctly, skip
+        ; our install. Otherwise install via DPMI 0x0205.
+        mov     eax, 5
+        xor     edx, edx
+        mov     ecx, 3
+        xor     ebx, ebx
+        mov     esi, 2                  ; op = umod
+        int     0x80
+        cmp     eax, 2
+        je      .b80_probe_already_works
         mov     ax, 0x0205
         mov     bl, 0x80
         mov     cx, cs
         mov     edx, _bridge_int80_handler
         int     0x31
+.b80_probe_already_works:
 
         ; cdecl: argc/argv on stack at [ebp+8]/[ebp+12] in main.
         ; Use an INDIRECT call (call eax with eax=_main) instead of
