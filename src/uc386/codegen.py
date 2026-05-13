@@ -106,7 +106,7 @@ Anything else raises CodegenError.
 
 import dataclasses
 
-from uc_core import ast
+from uc_core import ast_legacy as ast
 
 
 class CodegenError(NotImplementedError):

@@ -3870,7 +3870,7 @@ def test_preserves_trailing_newline():
 
 
 def test_codegen_runs_peephole_by_default():
-    from uc_core.frontend import parse
+    from uc_core.frontend_legacy import parse
     from uc386.codegen import CodeGenerator
 
     src = "int main(void) { return 0; }"
@@ -3890,7 +3890,7 @@ def test_codegen_runs_peephole_by_default():
 
 
 def test_codegen_skips_peephole_when_disabled():
-    from uc_core.frontend import parse
+    from uc_core.frontend_legacy import parse
     from uc386.codegen import CodeGenerator
 
     src = "int main(void) { return 0; }"
@@ -7854,7 +7854,7 @@ def test_dead_cleanup_before_leave_codegen_integration():
     """End-to-end: a function that calls another then exits drops
     the cleanup pop."""
     from uc386.codegen import CodeGenerator
-    from uc_core.frontend import parse
+    from uc_core.frontend_legacy import parse
 
     src = (
         "int g(int x) { return x * 2; }\n"
@@ -8020,7 +8020,7 @@ def test_cmp_load_promote_codegen_integration():
     """End-to-end: a typical for-loop indexing pattern triggers
     the rewrite."""
     from uc386.codegen import CodeGenerator
-    from uc_core.frontend import parse
+    from uc_core.frontend_legacy import parse
 
     src = (
         "int sum_arr(int *arr, int n) {\n"
@@ -8046,7 +8046,7 @@ def test_indirect_call_collapse_codegen_integration():
     """End-to-end: function pointer call lowers to a single
     `call dword [ebp + N]` after peephole."""
     from uc386.codegen import CodeGenerator
-    from uc_core.frontend import parse
+    from uc_core.frontend_legacy import parse
 
     src = (
         "int dispatch(int (*fp)(int, int), int x, int y) {\n"

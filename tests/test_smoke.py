@@ -6,7 +6,7 @@ import sys
 import pytest
 
 from uc_core.backend import CodeGenerator as CodeGeneratorProtocol
-from uc_core.frontend import parse
+from uc_core.frontend_legacy import parse
 
 from uc386.codegen import CodeGenerator, CodegenError
 
@@ -5186,7 +5186,7 @@ def test_va_arg_strength_reduce_safety():
     # the operand twice, advancing ap twice, skipping a value.
     # The optimizer is what fires this rule, so we have to run it
     # explicitly here — `_compile` skips it.
-    from uc_core.ast_optimizer import ASTOptimizer
+    from uc_core.ast_optimizer_legacy import ASTOptimizer
     src = (
         "typedef char *va_list;\n"
         "extern void abort(void);\n"
@@ -5225,7 +5225,7 @@ def test_member_access_with_side_effect_object_not_strength_reduced():
     # no `Member` case — it fell through to `return False` even
     # when the object expression was a function call. Result: the
     # call ran twice, doubling the side effects.
-    from uc_core.ast_optimizer import ASTOptimizer
+    from uc_core.ast_optimizer_legacy import ASTOptimizer
     src = (
         "struct S { int x; };\n"
         "extern struct S make(void);\n"
@@ -5246,7 +5246,7 @@ def test_compound_literal_with_side_effect_init_not_strength_reduced():
     # `_expr_has_side_effects` had no `Compound` case. Member is
     # now handled (recurses into obj = Compound), but Compound
     # itself still needed to recurse into its initializer list.
-    from uc_core.ast_optimizer import ASTOptimizer
+    from uc_core.ast_optimizer_legacy import ASTOptimizer
     src = (
         "extern int side(void);\n"
         "struct S { int x; };\n"
@@ -5380,7 +5380,7 @@ def test_while_loop_condition_invalidates_pre_loop_copies():
     # Fix: clear caches BEFORE optimizing the condition (in
     # WhileStmt and ForStmt), since the condition re-evaluates
     # each iteration with potentially-mutated state.
-    from uc_core.ast_optimizer import ASTOptimizer
+    from uc_core.ast_optimizer_legacy import ASTOptimizer
     src = (
         "extern void *malloc(unsigned);\n"
         "extern void free(void *);\n"
