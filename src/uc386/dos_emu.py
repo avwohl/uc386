@@ -1548,6 +1548,84 @@ def run(
             regs[0] = (eax_in & ~0xFFFF) | (seg & 0xFFFF)
             regs[3] = (regs[3] & ~0xFFFF) | (seg & 0xFFFF)
             carry = 0
+        elif (pktdrv_int is not None and int_num == pktdrv_int
+              and net is not None):
+            # Direct INT pktdrv_int — the Crynwr packet driver server.
+            # Mirror the AH dispatch that on_int does when the binary
+            # uses bare `INT 0x60`, since the unicorn-bug interceptor
+            # catches the call before it ever issues the INT.
+            if ah == 0x01:
+                # driver_info — caller only checks CF.
+                carry = 0
+            elif ah == 0x02:
+                # access_type — EDI is the (flat) receiver address.
+                net.pktdrv_receiver_addr = regs[5]
+                regs[0] = (eax_in & ~0xFFFF) | (net.pktdrv_handle & 0xFFFF)
+                carry = 0
+            elif ah == 0x04:
+                # send_pkt — DS:SI=buf (flat = regs[4]), CX=len.
+                length = regs[2] & 0xFFFF
+                src = regs[4]
+                frame = bytes(uc.mem_read(src, length)) if length else b""
+                rc = net.send_frame(frame)
+                if rc != 0:
+                    carry = 1
+                else:
+                    if net.pktdrv_rx_buf_addr:
+                        while net.rx_queue:
+                            pending = struct.unpack(
+                                "<I",
+                                uc.mem_read(net.pktdrv_rx_pending_addr, 4),
+                            )[0]
+                            if pending:
+                                break
+                            f = net.rx_queue.pop(0)
+                            uc.mem_write(net.pktdrv_rx_buf_addr, f)
+                            uc.mem_write(net.pktdrv_rx_len_addr,
+                                         struct.pack("<I", len(f)))
+                            uc.mem_write(net.pktdrv_rx_pending_addr,
+                                         struct.pack("<I", 1))
+                    carry = 0
+            elif ah == 0x06:
+                # get_address — ES:DI=buf (flat = regs[5]), CX=maxlen.
+                mac = net.init_mac()
+                uc.mem_write(regs[5], mac)
+                regs[2] = (regs[2] & ~0xFFFF) | len(mac)
+                carry = 0
+            else:
+                # Unhandled AH — CF=1 (real-DOS hosts often do the same).
+                carry = 1
+        elif int_num == 0x31 and ax_in == 0x0303 and net is not None:
+            # DPMI fn 0x0303 — Allocate Real Mode Callback. ESI =
+            # handler PM-linear address, EDI = rmcs PM-linear, on
+            # success CX:DX = fake real-mode seg:off pointing at the
+            # callback. The on_int hook does the same; record the
+            # registration on the simulator so tests can verify it.
+            fake_seg = net._next_dpmi_real_seg
+            net._next_dpmi_real_seg = (fake_seg + 0x10) & 0xFFFF
+            net.dpmi_callbacks.append(
+                (regs[4], regs[5], fake_seg, 0))
+            regs[2] = (regs[2] & 0xFFFF0000) | fake_seg
+            regs[3] = regs[3] & 0xFFFF0000
+            carry = 0
+        elif (int_num == 0x31 and ax_in == 0x0200
+              and pktdrv_int is not None
+              and (regs[1] & 0xFF) == pktdrv_int):
+            # DPMI fn 0x0200 — Get Real Mode Interrupt Vector. BL =
+            # int_num. On match for the simulator's Crynwr vector,
+            # return CX:DX = seg:off of the planted "PKT DRVR"
+            # signature handler. The on_int hook services the same
+            # call when reached via direct INT 31h, but this path is
+            # the one MP's pktdrv_detect() actually takes — that
+            # detector uses `pktdrv_int_invoke(0x31, regs)` because
+            # the unicorn-bug workaround intercepts before the INT
+            # ever fires.
+            from .dos_emu_netsim import PKTDRV_HANDLER_LINEAR
+            seg = (PKTDRV_HANDLER_LINEAR >> 4) & 0xFFFF
+            off = PKTDRV_HANDLER_LINEAR & 0xF
+            regs[2] = (regs[2] & 0xFFFF0000) | seg
+            regs[3] = (regs[3] & 0xFFFF0000) | off
+            carry = 0
         elif int_num == 0x31 and ax_in == 0x0301:
             # DPMI fn 0x0301 — Simulate Real Mode Procedure With Far
             # Return. ES:EDI is a flat pointer to a real-mode call
@@ -1583,8 +1661,8 @@ def run(
         # Total 32 + 18 = 50 bytes (the struct is packed).
         edi, esi, ebp, _, ebx, edx, ecx, eax = struct.unpack(
             "<IIIIIIII", uc.mem_read(rmcs_linear, 32))
-        flags, es, ds = struct.unpack("<HHH",
-                                       uc.mem_read(rmcs_linear + 32, 6))
+        flags, es, ds, _fs, _gs, ip, cs = struct.unpack(
+            "<HHHHHHH", uc.mem_read(rmcs_linear + 32, 14))
 
         # Reconstruct the linear address the program expected real-mode
         # DS:DX to point to. Under real-DOS DS would be a segment register
@@ -1596,6 +1674,74 @@ def run(
         ah = (eax >> 8) & 0xFF
         new_eax = eax
         new_flags = flags & ~1  # default: CF=0
+
+        # If the thunk at cs:ip is `CD 60 CB` (INT 0x60 + RETF),
+        # this is a Crynwr server call, not a DOS INT 21h call. The
+        # port uses the same rmcs shape for both — the only way to
+        # tell them apart is to read the thunk's second byte (the
+        # INT immediate). Dispatch the Crynwr AH set the same way
+        # on_int does for direct INT pktdrv_int.
+        thunk_linear = (cs << 4) + ip
+        try:
+            thunk_int_imm = uc.mem_read(thunk_linear + 1, 1)[0]
+        except Exception:
+            thunk_int_imm = 0
+        if (thunk_int_imm == pktdrv_int and pktdrv_int is not None
+                and net is not None):
+            if ah == 0x01:
+                # driver_info — set CX=0x0202 so the port detects us
+                # as a dosiz-compatible polling-RX provider (see
+                # pktdrv_register_polling_rx() in pktdrv_uc386dos.c).
+                ecx = (ecx & ~0xFFFF) | 0x0202
+                new_flags = flags & ~1
+            elif ah == 0x02:
+                net.pktdrv_receiver_addr = (es << 4) + (edi & 0xFFFF)
+                new_eax = (eax & ~0xFFFF) | (net.pktdrv_handle & 0xFFFF)
+                new_flags = flags & ~1
+            elif ah == 0x04:
+                length = ecx & 0xFFFF
+                src = (ds << 4) + (esi & 0xFFFF)
+                frame = bytes(uc.mem_read(src, length)) if length else b""
+                rc = net.send_frame(frame)
+                if rc == 0 and net.pktdrv_rx_buf_addr:
+                    # Pump any frames the simulator queued back.
+                    # Single-slot — wait for the binary to clear
+                    # `pending` before posting the next one.
+                    while net.rx_queue:
+                        pending = struct.unpack(
+                            "<I",
+                            uc.mem_read(net.pktdrv_rx_pending_addr, 4),
+                        )[0]
+                        if pending:
+                            break
+                        f = net.rx_queue.pop(0)
+                        uc.mem_write(net.pktdrv_rx_buf_addr, f)
+                        uc.mem_write(net.pktdrv_rx_len_addr,
+                                     struct.pack("<I", len(f)))
+                        uc.mem_write(net.pktdrv_rx_pending_addr,
+                                     struct.pack("<I", 1))
+                new_flags = (flags | 1) if rc != 0 else (flags & ~1)
+            elif ah == 0x06:
+                mac = net.init_mac()
+                uc.mem_write((es << 4) + (edi & 0xFFFF), mac)
+                ecx = (ecx & ~0xFFFF) | len(mac)
+                new_flags = flags & ~1
+            elif ah == 0x99:
+                # uc386dos polling-RX registration. Same fields as
+                # on_int's direct-INT path: EDI=buf, ESI=pending,
+                # ECX=len_slot — all flat 32-bit addresses.
+                net.pktdrv_rx_buf_addr     = edi
+                net.pktdrv_rx_pending_addr = esi
+                net.pktdrv_rx_len_addr     = ecx
+                new_flags = flags & ~1
+            else:
+                new_flags |= 1
+                new_eax = (eax & ~0xFFFF) | 0x01
+            uc.mem_write(rmcs_linear, struct.pack(
+                "<IIIIIIII", edi, esi, ebp, 0, ebx, edx, ecx, new_eax))
+            uc.mem_write(rmcs_linear + 32, struct.pack(
+                "<HHH", new_flags & 0xFFFF, es, ds))
+            return
 
         if ah == 0x3D:
             # open(name, mode). Path is DS:DX in real-mode; the bounce
