@@ -138,6 +138,22 @@ class _SynthLocalVar:
     is_noinit: bool = False
 
 
+def _to_legacy_type(t):
+    """Convert an auto-AST type-name (TypeName / TypeNameWithDeclarator)
+    or ResolvedType into the legacy ``ast_legacy`` tree. If ``t`` is
+    already a legacy type, return it unchanged."""
+    from uc_core.ast import resolved_to_legacy
+    if t is None:
+        return None
+    if isinstance(t, ast.TypeName):
+        rt = resolve_base_type(t.decl_specs)
+        return resolved_to_legacy(rt)
+    if isinstance(t, ast.TypeNameWithDeclarator):
+        _, rt = resolve_type_from_decl(t.decl_specs, t.declarator)
+        return resolved_to_legacy(rt)
+    return resolved_to_legacy(t)
+
+
 def _opt(node) -> str:
     """Return the operator string for an UnaryOp/BinaryOp/PostfixOp,
     handling both legacy str ``.op`` and the auto-AST Token-valued
@@ -493,6 +509,30 @@ class CodeGenerator:
         # whose `declarations` are the individual VarDecls. Flatten so
         # the rest of `generate()` can iterate uniformly.
         top_decls = list(self._flatten_decls(unit.items))
+        # Auto-AST: `int x, y;` at file scope is one ast.Declaration with
+        # two declarators. Expand each non-function declarator into a
+        # _SynthLocalVar so the legacy-shaped global / extern / struct /
+        # enum registration loops below see a VarDecl-like namespace per
+        # variable. Keep the ast.Declaration in place so the struct/enum
+        # *definition* registration (which scans decl_specs) still runs.
+        from uc_core.ast import resolved_to_legacy
+        expanded: list = []
+        for d in top_decls:
+            if isinstance(d, ast.Declaration):
+                expanded.append(d)
+                storage = decl_storage_class(d.decl_specs)
+                for nm, full, init, _is_fn in iter_var_decls(d):
+                    if nm is None:
+                        continue
+                    expanded.append(_SynthLocalVar(
+                        name=nm,
+                        var_type=resolved_to_legacy(full),
+                        init=init,
+                        storage_class=storage,
+                    ))
+            else:
+                expanded.append(d)
+        top_decls = expanded
 
         # Identify `extern inline` functions whose body uses
         # `__builtin_va_arg_pack`. These are GCC's gnu_inline pattern:
@@ -5006,7 +5046,11 @@ class CodeGenerator:
         "void": 1,          # GCC convention; standard C disallows arithmetic on void*
     }
 
-    def _size_of(self, t: _ltypes.TypeNode) -> int:
+    def _size_of(self, t) -> int:
+        # Auto-AST SizeofType.target_type is a TypeName /
+        # TypeNameWithDeclarator. Convert lazily.
+        if isinstance(t, (ast.TypeName, ast.TypeNameWithDeclarator)):
+            t = _to_legacy_type(t)
         if isinstance(t, _ltypes.PointerType):
             return 4
         if isinstance(t, _ltypes.BasicType):
