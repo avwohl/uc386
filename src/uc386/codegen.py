@@ -5185,6 +5185,15 @@ class CodeGenerator:
             try:
                 return self._BASIC_SIZES[t.name]
             except KeyError:
+                # The construction-time conversion of Compound /
+                # Cast target_type runs BEFORE the typedef resolver
+                # is installed, so typedef-name references survive
+                # as BasicType(name=<typedef>). Resolve through the
+                # codegen's typedef table on demand.
+                from uc_core.ast import resolved_to_legacy
+                resolved = self._resolve_typedef_name(t.name)
+                if resolved is not None:
+                    return self._size_of(resolved_to_legacy(resolved))
                 raise CodegenError(f"sizeof({t.name}) not known")
         if isinstance(t, _ltypes.ArrayType):
             if t.size is None:
