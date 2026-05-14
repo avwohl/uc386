@@ -2037,7 +2037,7 @@ class CodeGenerator:
             # Build a synthetic InitializerList by consuming one logical
             # value per array element.
             length = (
-                m_ty.size.value if isinstance(m_ty.size, ast.IntLiteral)
+                int_value(m_ty.size) if isinstance(m_ty.size, ast.IntLiteral)
                 else 0
             )
             elem_ty = m_ty.base_type
@@ -2064,7 +2064,7 @@ class CodeGenerator:
         if isinstance(t, _ltypes.ArrayType):
             if not isinstance(t.size, ast.IntLiteral):
                 return 1
-            return t.size.value * self._leaf_slot_count(t.base_type)
+            return int_value(t.size) * self._leaf_slot_count(t.base_type)
         if isinstance(t, _ltypes.StructType):
             try:
                 sname = self._resolve_struct_name(t)
@@ -2202,7 +2202,7 @@ class CodeGenerator:
             else:
                 length = 1
         else:
-            length = arr_ty.size.value
+            length = int_value(arr_ty.size)
 
         if isinstance(init, ast.StringLiteral):
             is_wide = getattr(init, "is_wide", False) or elem_size > 1
@@ -2948,7 +2948,7 @@ class CodeGenerator:
             if a.size is None or b.size is None:
                 return a.size is None and b.size is None
             if isinstance(a.size, ast.IntLiteral) and isinstance(b.size, ast.IntLiteral):
-                return a.size.value == b.size.value
+                return int_value(a.size) == int_value(b.size)
             return False
         if isinstance(a, _ltypes.StructType):
             return self._resolve_struct_name(a) == self._resolve_struct_name(b)
@@ -5006,7 +5006,7 @@ class CodeGenerator:
                 return 0
             if not isinstance(t.size, ast.IntLiteral):
                 raise CodegenError("sizeof(array): size must be an integer literal")
-            return t.size.value * self._size_of(t.base_type)
+            return int_value(t.size) * self._size_of(t.base_type)
         if isinstance(t, _ltypes.StructType):
             return self._struct_sizes[self._resolve_struct_name(t)]
         if isinstance(t, _ltypes.EnumType):
@@ -9341,7 +9341,7 @@ class CodeGenerator:
                     f"`{name}`: unsized array needs a brace or string initializer"
                 )
         else:
-            length = arr_type.size.value
+            length = int_value(arr_type.size)
 
         if isinstance(init, ast.StringLiteral):
             is_wide = getattr(init, "is_wide", False)
@@ -12848,7 +12848,7 @@ class CodeGenerator:
                 return out
             # ArrayType with constant size whose base contains a VLA.
             inner = self._emit_runtime_size_of(t.base_type, ctx)
-            count = t.size.value if isinstance(t.size, ast.IntLiteral) else 1
+            count = int_value(t.size) if isinstance(t.size, ast.IntLiteral) else 1
             out = list(inner)
             out.append(f"        imul    eax, eax, {count}")
             return out
