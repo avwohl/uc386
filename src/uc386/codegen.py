@@ -120,6 +120,24 @@ from uc_core.codegen_helpers import (
 )
 
 
+@dataclasses.dataclass
+class _SynthLocalVar:
+    """Per-variable namespace used to feed the legacy VarDecl-shaped
+    code paths inside CodeGenerator after the auto-AST migration. The
+    auto-AST collapses ``T a, b, c;`` into one ast.Declaration with N
+    declarators; we synthesise one of these per declarator and feed
+    each through the existing `if isinstance(node, ast.VarDecl)`
+    branches."""
+    name: str
+    var_type: object
+    init: object = None
+    storage_class: object = None
+    alignment: object = None
+    alias_target: object = None
+    no_instrument_function: bool = False
+    is_noinit: bool = False
+
+
 class CodegenError(NotImplementedError):
     """Raised when the AST contains a construct codegen can't handle yet."""
 
@@ -4306,7 +4324,23 @@ class CodeGenerator:
         for-init `int i = 0` reuses the same slot across iterations and a
         nested-block redeclaration of an existing name raises.
         """
-        if isinstance(node, ast.VarDecl):
+        # Auto-AST: ``T a, b, c;`` is one Declaration with N declarators.
+        # Expand to per-declarator legacy VarDecl-shaped objects and
+        # recurse so the original branch below handles each uniformly.
+        if isinstance(node, ast.Declaration):
+            storage = decl_storage_class(node.decl_specs)
+            if storage == "typedef":
+                return
+            from uc_core.ast import resolved_to_legacy
+            for nm, full, init, is_fn in iter_var_decls(node):
+                if nm is None:
+                    continue
+                legacy = resolved_to_legacy(full)
+                sv = _SynthLocalVar(name=nm, var_type=legacy, init=init,
+                                    storage_class=storage)
+                self._collect_locals(sv, ctx)
+            return
+        if isinstance(node, (ast.VarDecl, _SynthLocalVar)):
             # Local function declaration (`int f(int);` inside a body): no
             # storage, just a forward extern. Record return/param types so
             # subsequent calls type-check the same way as top-level externs.
@@ -12903,7 +12937,7 @@ class CodeGenerator:
             return self._index_load(expr, ctx)
         if isinstance(expr, ast.Member):
             return self._member_load(expr, ctx)
-        if isinstance(expr, ast.UnaryOp):
+        if isinstance(expr, (ast.UnaryOp, ast.PostfixOp)):
             # Vector unary: returns a temp address.
             if (
                 self._is_vector_op_node(expr)
@@ -14374,7 +14408,7 @@ class CodeGenerator:
         size = self._size_of(ty)
         width = "dword" if size == 4 else "qword"
         if isinstance(expr.left, ast.Identifier):
-            addr = self._float_lvalue_addr(expr.left.name, ctx)
+            addr = self._float_lvalue_addr(expr.left.name.text, ctx)
             out = self._eval_float_to_st0(expr.right, ctx)
             out.append(f"        fst     {width} {addr}")
             return out
@@ -15163,13 +15197,16 @@ class CodeGenerator:
         return out
 
     def _unary(self, expr, ctx: _FuncCtx) -> list[str]:
-        # Auto-AST UnaryOp.op is a Token; normalise.
+        # Auto-AST UnaryOp.op / PostfixOp.op are Tokens; normalise.
         if hasattr(expr.op, "text"):
+            is_prefix_flag = not isinstance(expr, ast.PostfixOp)
             class _OpView:
-                __slots__ = ("op", "operand", "pos")
-                def __init__(s, op, operand, pos):
+                __slots__ = ("op", "operand", "pos", "is_prefix")
+                def __init__(s, op, operand, pos, is_prefix):
                     s.op, s.operand, s.pos = op, operand, pos
-            expr = _OpView(expr.op.text, expr.operand, getattr(expr, "pos", None))
+                    s.is_prefix = is_prefix
+            expr = _OpView(expr.op.text, expr.operand, getattr(expr, "pos", None),
+                           is_prefix_flag)
         if expr.op in ("++", "--"):
             return self._inc_dec(expr, ctx)
         if expr.op == "&":
@@ -16263,7 +16300,7 @@ class CodeGenerator:
         if isinstance(target_ty, _ltypes.BasicType) and target_ty.name == "bool":
             out = self._eval_to_bool_eax(expr.right, ctx)
             if isinstance(expr.left, ast.Identifier):
-                return out + self._identifier_store(expr.left.name, ctx)
+                return out + self._identifier_store(expr.left.name.text, ctx)
             if isinstance(expr.left, ast.UnaryOp) and expr.left.op == "*":
                 addr = self._eval_expr_to_eax(expr.left.operand, ctx)
                 return (
@@ -16330,19 +16367,19 @@ class CodeGenerator:
 
         # `x = rhs` — direct slot store. Array names aren't lvalues in C.
         if isinstance(expr.left, ast.Identifier):
-            ty = self._identifier_type(expr.left.name, ctx)
+            ty = self._identifier_type(expr.left.name.text, ctx)
             if isinstance(ty, _ltypes.ArrayType):
                 raise CodegenError(
-                    f"cannot assign to array `{expr.left.name}`"
+                    f"cannot assign to array `{expr.left.name.text}`"
                 )
             if self._is_float_type(ty):
                 # Float lvalue → fstp from st(0) to the slot/global.
-                addr = self._float_lvalue_addr(expr.left.name, ctx)
+                addr = self._float_lvalue_addr(expr.left.name.text, ctx)
                 return self._eval_float_to_st0(
                     expr.right, ctx
                 ) + self._store_st0_to(addr, ty)
             return self._eval_expr_to_eax(expr.right, ctx) + self._identifier_store(
-                expr.left.name, ctx
+                expr.left.name.text, ctx
             )
         # `*p = rhs` — store-through-pointer. Evaluate the pointer expr
         # first, save its value, then evaluate rhs into EAX (so the result
@@ -17226,7 +17263,7 @@ class CodeGenerator:
                 )
 
         if isinstance(expr.left, ast.Identifier):
-            ty = self._identifier_type(expr.left.name, ctx)
+            ty = self._identifier_type(expr.left.name.text, ctx)
             if isinstance(ty, _ltypes.ArrayType):
                 # Vector compound assign `v op= rhs` desugars to
                 # `v = v op rhs`. We need to allocate a temp for
@@ -17236,7 +17273,7 @@ class CodeGenerator:
                 # here.
                 if not getattr(ty, "is_vector", False):
                     raise CodegenError(
-                        f"cannot assign to array `{expr.left.name}`"
+                        f"cannot assign to array `{expr.left.name.text}`"
                     )
                 inner = ast.BinaryOp(
                     op=op, left=expr.left, right=expr.right,
