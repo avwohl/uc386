@@ -2992,17 +2992,19 @@ class CodeGenerator:
         elif isinstance(ctrl_ty, _ltypes.FunctionType):
             ctrl_ty = _ltypes.PointerType(base_type=ctrl_ty)
         default_arm: ast.Expression | None = None
-        for assoc_ty, arm in expr.associations:
-            if assoc_ty is None:
-                default_arm = arm
+        for assoc in expr.associations:
+            if isinstance(assoc, ast.GenericDefault):
+                default_arm = assoc.expr
                 continue
+            assoc_ty = _to_legacy_type(assoc.target_type)
             if self._types_equal(ctrl_ty, self._strip_qualifiers(assoc_ty)):
-                return arm
+                return assoc.expr
         if default_arm is not None:
             return default_arm
         # Fall back to the first arm if a match is required and none
         # was found — keeps codegen producing *something*.
-        return expr.associations[0][1]
+        first = expr.associations[0]
+        return first.expr
 
     @staticmethod
     def _strip_qualifiers(t: _ltypes.TypeNode) -> _ltypes.TypeNode:
@@ -9485,7 +9487,7 @@ class CodeGenerator:
             if isinstance(init, ast.InitializerList):
                 length = self._infer_array_length_from_init(init.values, name)
             elif isinstance(init, ast.StringLiteral):
-                length = len(init.value) + 1
+                length = decoded_str_len(init.value.text) + 1
             else:
                 raise CodegenError(
                     f"`{name}`: unsized array needs a brace or string initializer"
@@ -9494,13 +9496,14 @@ class CodeGenerator:
             length = int_value(arr_type.size)
 
         if isinstance(init, ast.StringLiteral):
-            is_wide = getattr(init, "is_wide", False)
+            is_wide = string_is_wide(init.value.text)
+            init_str = decode_string_literal(init.value.text)
             if is_wide:
                 # `wchar_t s[] = L"...";` — each codepoint becomes one
                 # array element of `elem_size` bytes (typically 2 for
                 # `unsigned short`/wchar_t on this target). Range-check
                 # against the slot's payload width, then store.
-                codepoints = [ord(c) for c in init.value] + [0]
+                codepoints = [ord(c) for c in init_str] + [0]
                 if len(codepoints) > length:
                     raise CodegenError(
                         f"`{name}`: wide string init exceeds array size {length}"
@@ -9538,7 +9541,7 @@ class CodeGenerator:
             # 3 bytes (no null terminator), `char a[4] = "abc"` lays
             # out the 3 bytes plus the null. Arrays smaller than the
             # raw string content are an error.
-            raw_bytes = list(self._string_to_bytes(init.value))
+            raw_bytes = list(self._string_to_bytes(init_str))
             if len(raw_bytes) > length:
                 raise CodegenError(
                     f"`{name}`: string initializer exceeds array size {length}"
@@ -9848,7 +9851,11 @@ class CodeGenerator:
         for value in elided_values:
             if isinstance(value, ast.DesignatedInit):
                 first = value.designators[0]
-                if not isinstance(first, str):
+                if isinstance(first, ast.FieldDesignator):
+                    first = first.field.text
+                elif isinstance(first, str):
+                    pass
+                else:
                     raise CodegenError(
                         f"`{name}`: array designator on struct init"
                     )
