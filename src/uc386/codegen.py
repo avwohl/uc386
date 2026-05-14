@@ -2404,7 +2404,7 @@ class CodeGenerator:
                         )
                     else:
                         if isinstance(designator, ast.IntLiteral):
-                            idx = designator.value
+                            idx = int_value(designator)
                         else:
                             try:
                                 idx = self._const_eval(
@@ -4277,11 +4277,8 @@ class CodeGenerator:
         if node is None:
             return None
         if (isinstance(node, ast.Identifier)
-                and node.name in param_map):
-            return ast.Identifier(
-                name=param_map[node.name],
-                location=node.location,
-            )
+                and node.name.text in param_map):
+            return make_identifier(param_map[node.name.text])
         if isinstance(node, ast.Call):
             node.func = self._substitute_inline(
                 node.func, param_map, va_args
@@ -7040,7 +7037,7 @@ class CodeGenerator:
         # through `_assign` (its bool-target path uses
         # `_eval_to_bool_eax` so float / LL / int128 / complex rhs
         # convert correctly).
-        snap_id = ast.Identifier(name=addr_slot_name)
+        snap_id = make_identifier(addr_slot_name)
         deref = ast.UnaryOp(op="*", operand=snap_id)
         inner = ast.BinaryOp(op=op, left=deref, right=expr.right)
         synth = ast.BinaryOp(op="=", left=ast.UnaryOp(op="*", operand=snap_id), right=inner)
@@ -7104,13 +7101,13 @@ class CodeGenerator:
         # a synthetic *p lvalue that dereferences the addr_slot.
         # Use the base op (not the compound form) so the inner BinaryOp
         # is `snap + rhs`, not `snap += rhs`.
-        snap_id = ast.Identifier(name=snap_slot_name)
+        snap_id = make_identifier(snap_slot_name)
         inner = ast.BinaryOp(op=base_op, left=snap_id, right=expr.right)
         ctx.alloc_call_temp(inner, size)
         # We need to build the dereference of the address slot's value.
         # Easiest: compose a new lvalue = `*addr_slot_id`. Then
         # complex_copy_assign(BinaryOp("=", *addr_slot_id, inner)).
-        addr_id = ast.Identifier(name=addr_slot_name)
+        addr_id = make_identifier(addr_slot_name)
         deref_lvalue = ast.UnaryOp(op="*", operand=addr_id, is_prefix=True)
         return out + self._complex_copy_assign(
             ast.BinaryOp(op="=", left=deref_lvalue, right=inner),
@@ -7159,7 +7156,7 @@ class CodeGenerator:
             out.append(f"        mov     eax, [esi + {off}]")
             out.append(f"        mov     [edi + {off}], eax")
         # 3. Synthesize `snapshot OP rhs` and assign into *addr_slot.
-        snap_id = ast.Identifier(name=snap_slot_name)
+        snap_id = make_identifier(snap_slot_name)
         inner = ast.BinaryOp(op=op, left=snap_id, right=expr.right)
         ctx.alloc_call_temp(inner, size)
         # Evaluate inner into a vector temp via _vector_value_address
@@ -7222,7 +7219,7 @@ class CodeGenerator:
         out.append(f"        lea     edi, {_ebp_addr(snap_disp)}")
         out += self._emit_int128_copy("esi", "edi")
         # 3. Synthesize `snapshot OP rhs` and evaluate into a temp.
-        snap_id = ast.Identifier(name=snap_slot_name)
+        snap_id = make_identifier(snap_slot_name)
         inner = ast.BinaryOp(op=op, left=snap_id, right=expr.right)
         ctx.alloc_call_temp(inner, 16)
         result_disp = ctx.call_temps[id(inner)]
@@ -7828,7 +7825,7 @@ class CodeGenerator:
         # 3. Compute `snap OP rhs` via the LL ladder. The snapshot is a
         #    real local with a registered slot/type, so re-reading it
         #    is side-effect-free.
-        snap_id = ast.Identifier(name=snap_slot_name)
+        snap_id = make_identifier(snap_slot_name)
         inner = ast.BinaryOp(op=op_text, left=snap_id, right=expr.right)
         out += self._eval_expr_to_edx_eax(inner, ctx)
         # 4. Mask + position the result.
@@ -9388,7 +9385,7 @@ class CodeGenerator:
             else:
                 rhs = decl.init
             return self._int128_copy_assign(
-                ast.Identifier(name=decl.name), rhs, ctx,
+                make_identifier(decl.name), rhs, ctx,
             )
         if isinstance(var_type, _ltypes.ComplexType):
             # Complex local init — `__complex__ T r = expr` lowers via
@@ -9408,10 +9405,10 @@ class CodeGenerator:
                 return self._call_into_address(decl.init, dest, ctx)
             # If rhs is itself a complex expression, eval directly.
             if isinstance(init_ty, _ltypes.ComplexType):
-                synth = ast.BinaryOp(op="=", left=ast.Identifier(name=decl.name), right=decl.init)
+                synth = ast.BinaryOp(op="=", left=make_identifier(decl.name), right=decl.init)
                 return self._complex_copy_assign(synth, var_type, ctx)
             # Scalar init — promote to (val, 0).
-            synth = ast.Identifier(name=decl.name)
+            synth = make_identifier(decl.name)
             return self._complex_assign_from_scalar(
                 synth, decl.init, var_type, ctx,
             )
@@ -9609,7 +9606,7 @@ class CodeGenerator:
                                 f"compile-time constants"
                             )
                         idx_range = list(range(start, end + 1))
-                        actual = value_int_value(expr)
+                        actual = value_expr.value
                         cursor = end + 1
                     elif len(value_expr.designators) != 1:
                         raise CodegenError(
@@ -9620,7 +9617,7 @@ class CodeGenerator:
                         # Designator must be a constant integer expression
                         # (IntLiteral, enum constant, sizeof, etc).
                         if isinstance(designator, ast.IntLiteral):
-                            idx = designator.value
+                            idx = int_value(designator)
                         else:
                             try:
                                 idx = self._const_eval(
@@ -9631,7 +9628,7 @@ class CodeGenerator:
                                     f"`{name}`: array designator must reduce "
                                     f"to an integer constant"
                                 )
-                        actual = value_int_value(expr)
+                        actual = value_expr.value
                         cursor = idx + 1
                         idx_range = [idx]
                 else:
@@ -10763,7 +10760,7 @@ class CodeGenerator:
         # got promoted to complex (rare). Treat as (0, value) or
         # (value, 0) depending on whether it's imaginary.
         if isinstance(expr, ast.FloatLiteral) and expr.is_imaginary:
-            return self._complex_const_into_top(0.0, int_value(expr), eff_ty)
+            return self._complex_const_into_top(0.0, float_value(expr), eff_ty)
         # Fallback: evaluate as a scalar (real part), zero the imag.
         return self._scalar_to_complex_into_top(expr, eff_ty, ctx)
 
@@ -13571,7 +13568,7 @@ class CodeGenerator:
         if isinstance(t, _ltypes.ArrayType):
             if t.size is not None and id(t.size) in captured:
                 slot_name = captured[id(t.size)]
-                t.size = ast.Identifier(name=slot_name, location=t.size.location)
+                t.size = make_identifier(slot_name, location=t.size.location)
             self._replace_vla_size_with_capture(t.base_type, captured, fn_name)
             return
 
@@ -13633,9 +13630,7 @@ class CodeGenerator:
                 decl=orig_size,
             )
         for arr_t, orig_size, slot_name in captures:
-            arr_t.size = ast.Identifier(
-                name=slot_name, location=orig_size.location,
-            )
+            arr_t.size = make_identifier(slot_name)
         decl._vla_member_captures = [
             (slot_name, orig_size) for _arr_t, orig_size, slot_name in captures
         ]
@@ -13684,9 +13679,7 @@ class CodeGenerator:
                 # Replace BOTH `size` (the post-fallback IntLiteral)
                 # AND `_vla_size` (the original expression) with an
                 # Identifier reading from the captured slot.
-                slot_id = ast.Identifier(
-                    name=slot_name, location=orig_size.location,
-                )
+                slot_id = make_identifier(slot_name)
                 arr_t._vla_size = slot_id
 
     def _bitfield_precision_mask(
@@ -14129,7 +14122,7 @@ class CodeGenerator:
         out.append(f"        mov     {_ebp_addr(snap_disp)}, eax")
         out.append(f"        mov     {_ebp_addr(snap_disp + 4)}, edx")
         # 3. Compute `snap OP rhs` into EDX:EAX via the full LL ladder.
-        snap_id = ast.Identifier(name=snap_slot_name)
+        snap_id = make_identifier(snap_slot_name)
         inner = ast.BinaryOp(op=op, left=snap_id, right=expr.right)
         out += self._eval_expr_to_edx_eax(inner, ctx)
         # 4. Store result back at *addr_slot.
@@ -14970,10 +14963,7 @@ class CodeGenerator:
                     f"        mov     ecx, "
                     f"{_ebp_addr(ctx.trampoline_static_link_disp)}"
                 ]
-            callee = ast.Identifier(
-                name=mangled,
-                location=callee.location,
-            )
+            callee = make_identifier(mangled)
             # Build a fresh Call node so downstream code (param-type
             # lookups, struct-return retptr handling) keys on the new
             # name. Args are pass-by-reference; reusing them is fine.
@@ -15938,7 +15928,7 @@ class CodeGenerator:
         out.append(f"        and     eax, {mask}")
         out.append(f"        mov     {_ebp_addr(snap_disp)}, al")
         # 3. Synthesize `snap = snap OP rhs` and route through `_assign`.
-        snap_id = ast.Identifier(name=snap_name)
+        snap_id = make_identifier(snap_name)
         inner = ast.BinaryOp(op=op, left=snap_id, right=expr.right)
         synth = ast.BinaryOp(op="=", left=snap_id, right=inner)
         # We need the snap variable's type known to ctx for _assign's
