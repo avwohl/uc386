@@ -4045,11 +4045,6 @@ def test_for_loop_same_name_different_types_allocates_int128_temp():
     assert "        adc     [edi + 12], eax" in asm
 
 
-@pytest.mark.skip(
-    reason="GCC nested functions + __label__ + nonlocal goto: the new "
-    "plox-driven front-end doesn't model these GCC extensions yet "
-    "(grammar work, not codegen)."
-)
 def test_nested_fn_with_nonlocal_goto_emits_trampoline_and_setjmp():
     asm = _compile(
         "extern void exit(int);\n"

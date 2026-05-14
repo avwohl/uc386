@@ -140,6 +140,28 @@ class _SynthLocalVar:
     is_noinit: bool = False
 
 
+def _clone_declarator_renamed(node, new_name: str):
+    """Clone a declarator chain, replacing the innermost ``Declarator``'s
+    name token's text with ``new_name``. Used by the nested-fn lifter
+    to emit a renamed copy of a FunctionDef without mutating the
+    original AST."""
+    import dataclasses as _dc
+    from uc_core.c23_parser import Token as _Tok
+    if isinstance(node, ast.Declarator):
+        old_tok = node.name
+        new_tok = _Tok(
+            name=old_tok.name, text=new_name,
+            line=old_tok.line, column=old_tok.column,
+            offset=old_tok.offset, file_id=old_tok.file_id,
+        )
+        return ast.Declarator(name=new_tok, pos=node.pos)
+    if hasattr(node, "inner"):
+        cloned = _dc.replace(node)
+        cloned.inner = _clone_declarator_renamed(node.inner, new_name)
+        return cloned
+    return node
+
+
 def _to_legacy_type(t):
     """Convert an auto-AST type-name (TypeName / TypeNameWithDeclarator)
     or ResolvedType into the legacy ``ast_legacy`` tree. If ``t`` is
@@ -3445,19 +3467,16 @@ class CodeGenerator:
             self._func_param_types[mangled] = [
                 p.param_type for p in sub.params
             ]
-            # Build a renamed copy of the inner FunctionDecl so the
-            # emitted label uses the mangled name. Reusing the AST
-            # node would otherwise emit `_<inner>` and collide with
-            # any other inner of the same name.
+            # Build a renamed copy of the inner FunctionDef so the
+            # emitted label uses the mangled name. Cloning the
+            # declarator chain (rather than constructing fresh) avoids
+            # losing param/qualifier shape and avoids mutating the
+            # original AST.
             lifted = ast.FunctionDef(
-                name=mangled,
-                return_type=sub.return_type,
-                params=sub.params,
+                decl_specs=sub.decl_specs,
+                declarator=_clone_declarator_renamed(sub.declarator, mangled),
                 body=sub.body,
-                is_variadic=sub.is_variadic,
-                storage_class=sub.storage_class,
-                is_inline=sub.is_inline,
-                location=sub.location,
+                pos=sub.pos,
             )
             self._pending_functions.append(lifted)
         # Stash for later (used after locals are collected).
@@ -9025,6 +9044,18 @@ class CodeGenerator:
             # Nested function definition — already lifted in the
             # top-of-`_function` pre-pass. Emit no code at this point;
             # the lifted function compiles separately at file scope.
+            return []
+        if isinstance(item, ast.LabelDecl):
+            # GCC `__label__ name [, name]* ;` — declares one or more
+            # locally-scoped labels that can be jumped to from nested
+            # functions via nonlocal goto. The labels are still emitted
+            # by the corresponding LabelStmt; this declaration carries
+            # no codegen of its own. The pre-pass in `_function` reads
+            # the body's LabelStmt set to wire up the trampoline /
+            # setjmp / longjmp; LabelDecl tells the C type-checker the
+            # name is in scope, but uc386 doesn't run a separate
+            # type-check pass — the lifted nested fn's `goto X` falls
+            # through to the same lookup that finds X's LabelStmt.
             return []
         raise CodegenError(
             f"{type(item).__name__} not implemented yet"
