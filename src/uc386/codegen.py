@@ -12281,7 +12281,7 @@ class CodeGenerator:
             raise CodegenError(
                 "va_start: second argument must name a parameter"
             )
-        last_name = last_expr.name
+        last_name = last_expr.name.text
         if not ctx.has_local(last_name):
             raise CodegenError(
                 f"va_start: `{last_name}` is not a parameter or local"
@@ -15136,9 +15136,9 @@ class CodeGenerator:
         # call's value is defined when the user accidentally consumes
         # it. `va_arg` is handled at expression eval (see VaArgExpr).
         if isinstance(callee, ast.Identifier):
-            if callee.name in ("va_start", "__builtin_va_start"):
+            if callee.name.text in ("va_start", "__builtin_va_start"):
                 return self._va_start(expr.args, ctx)
-            if callee.name in ("va_end", "__builtin_va_end"):
+            if callee.name.text in ("va_end", "__builtin_va_end"):
                 # `va_end(ap)` is a no-op for cdecl, but we still
                 # evaluate `ap` for any side effects (e.g.
                 # `va_end(*ap_ptr++)` increments ap_ptr).
@@ -15150,7 +15150,7 @@ class CodeGenerator:
             # GCC branch-prediction hint: `__builtin_expect(expr, val)`
             # has the value of `expr`. We ignore the hint and just emit
             # the first argument's value.
-            if callee.name == "__builtin_expect" and len(expr.args) >= 1:
+            if callee.name.text == "__builtin_expect" and len(expr.args) >= 1:
                 # The second arg is "expected value" — gcc treats it as
                 # a runtime expression (not a static hint), so we eval
                 # it for any side effects, drop the result, then yield
@@ -15163,7 +15163,7 @@ class CodeGenerator:
             # `__builtin_choose_expr(cond, a, b)` selects a or b at
             # compile time based on `cond`'s integer-constant value.
             if (
-                callee.name == "__builtin_choose_expr"
+                callee.name.text == "__builtin_choose_expr"
                 and len(expr.args) == 3
             ):
                 try:
@@ -15177,7 +15177,7 @@ class CodeGenerator:
             # "yes" only when `_const_eval` succeeds without side effects.
             # String literals and FloatLiterals also count.
             if (
-                callee.name == "__builtin_constant_p"
+                callee.name.text == "__builtin_constant_p"
                 and len(expr.args) == 1
             ):
                 arg = expr.args[0]
@@ -15191,14 +15191,14 @@ class CodeGenerator:
             # `__builtin_unreachable()` and `__builtin_trap()` are
             # diagnostic-only — emit a 0 in EAX so calls to them in
             # value position are at least defined.
-            if callee.name in ("__builtin_unreachable", "__builtin_trap"):
+            if callee.name.text in ("__builtin_unreachable", "__builtin_trap"):
                 return ["        xor     eax, eax"]
             # `abs(int)` / `labs(long)` / `__builtin_abs` / `__builtin_labs`:
             # inline as `cdq; xor eax, edx; sub eax, edx`. Avoids the
             # user redefining `abs` to `abort()` (a gcc-canonical test
             # pattern) — gcc treats abs/labs/llabs as builtins and inlines.
             if (
-                callee.name in ("abs", "labs", "__builtin_abs", "__builtin_labs")
+                callee.name.text in ("abs", "labs", "__builtin_abs", "__builtin_labs")
                 and len(expr.args) == 1
             ):
                 out = self._eval_expr_to_eax(expr.args[0], ctx)
@@ -15212,12 +15212,12 @@ class CodeGenerator:
             # caller's argument area. For cdecl with no named params
             # before the variadic part, that's just [ebp+8] (after
             # retptr if present).
-            if callee.name == "__builtin_apply_args":
+            if callee.name.text == "__builtin_apply_args":
                 return ["        lea     eax, [ebp + 8]"]
             # __builtin_apply(fn, args, size) — call fn with `size`
             # bytes of args from `args`.
             if (
-                callee.name == "__builtin_apply"
+                callee.name.text == "__builtin_apply"
                 and len(expr.args) == 3
             ):
                 # Eval size first (compile-time constant in practice).
@@ -15261,7 +15261,7 @@ class CodeGenerator:
                 # Return value from the last call: it's a struct/value
                 # but the test typically discards it. Leave EAX as-is.
                 return out
-            if callee.name in (
+            if callee.name.text in (
                 "__builtin_add_overflow",
                 "__builtin_sub_overflow",
                 "__builtin_mul_overflow",
