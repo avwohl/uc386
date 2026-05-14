@@ -409,7 +409,7 @@ def _try_simple_int_fold(expr) -> int | None:
         b = _try_simple_int_fold(expr.right)
         if b is None:
             return None
-        op = expr.op
+        op = _opt(expr)
         try:
             if op == "+":  return a + b
             if op == "-":  return a - b
@@ -764,15 +764,13 @@ class CodeGenerator:
                         st = resolved_to_legacy(_resolve_struct_spec(spec))
                         if st is not None and (st.members or st.name):
                             self._resolve_struct_name(st)
-                    elif isinstance(spec, ast.EnumDef):
-                        from uc_core.ast import resolved_to_legacy
-                        from uc_core.codegen_helpers import _resolve_enum_spec
-                        et = resolved_to_legacy(_resolve_enum_spec(spec))
-                        # Inline values get registered for top-level enums; do
-                        # so via a synthetic EnumDecl shape.
-                        # (uc386's _register_enum expects ast.EnumDecl;
-                        # the legacy ComplexType-style registration via
-                        # _resolve_struct_name doesn't apply here.)
+                    elif isinstance(spec, (ast.EnumDef, ast.EnumAnon)):
+                        # File-scope `enum [tag] { A, B = 5, C };` declares
+                        # the enumerators as integer constants visible from
+                        # the point of declaration onward (C 6.7.2.2). Walk
+                        # the auto-AST EnumValue / EnumValueWithInit chain
+                        # and register each into self._enum_constants.
+                        self._register_enum_values_autoast(spec.values)
                 # Fall through to the per-declarator handling below.
             if isinstance(d, ast.StructDecl) and d.is_definition:
                 self._register_struct(d)
@@ -4775,7 +4773,7 @@ class CodeGenerator:
         # via `_complex_value_address`. Both flow through the same
         # fallback here.
         if isinstance(operand, ast.Identifier):
-            out = self._identifier_address(operand.name, ctx)
+            out = self._identifier_address(operand.name.text, ctx)
         elif isinstance(operand, ast.UnaryOp) and _opt(operand) == "*":
             out = self._eval_expr_to_eax(operand.operand, ctx)
         elif isinstance(operand, (ast.Member, ast.ArrowMember)):
@@ -5305,6 +5303,25 @@ class CodeGenerator:
                     )
             else:
                 self._enum_constants[ev.name] = cursor
+            cursor += 1
+
+    def _register_enum_values_autoast(self, values) -> None:
+        """Like `_register_enum_values` but consumes the auto-AST
+        EnumValue / EnumValueWithInit shape: each carries a Token
+        ``name`` (vs the legacy str) and the explicit value lives on
+        EnumValueWithInit (vs the legacy `value` Optional)."""
+        cursor = 0
+        for ev in values or []:
+            nm = ev.name.text if hasattr(ev.name, "text") else ev.name
+            if isinstance(ev, ast.EnumValueWithInit):
+                cursor = self._const_eval(ev.value, f"enum.{nm}")
+            if nm in self._enum_constants:
+                if self._enum_constants[nm] != cursor:
+                    raise CodegenError(
+                        f"conflicting redefinition of enum constant `{nm}`"
+                    )
+            else:
+                self._enum_constants[nm] = cursor
             cursor += 1
 
     def _resolve_struct_alias(self, name: str) -> str | None:
@@ -6292,7 +6309,7 @@ class CodeGenerator:
     def _binary_int128(
         self, expr: ast.BinaryOp, dest_disp: int, ctx: _FuncCtx,
     ) -> list[str]:
-        op = expr.op
+        op = _opt(expr)
         lt = self._type_of(expr.left, ctx)
         rt = self._type_of(expr.right, ctx)
         # Comma operator: evaluate left for side effects, then copy
@@ -6662,7 +6679,7 @@ class CodeGenerator:
         low, treating the topmost dword as signed (when the operands
         are signed) and the rest as unsigned.
         """
-        op = expr.op
+        op = _opt(expr)
         lt = self._type_of(expr.left, ctx)
         rt = self._type_of(expr.right, ctx)
         unsigned = self._is_unsigned(lt) or self._is_unsigned(rt)
@@ -6922,7 +6939,7 @@ class CodeGenerator:
     def _unary_int128(
         self, expr: ast.UnaryOp, dest_disp: int, ctx: _FuncCtx,
     ) -> list[str]:
-        op = expr.op
+        op = _opt(expr)
         if op == "+":
             # Identity: just copy.
             out = self._int128_value_address(expr.operand, ctx)
@@ -7227,7 +7244,7 @@ class CodeGenerator:
         # clobber it.
         out: list[str] = []
         if isinstance(lhs, ast.Identifier):
-            out += self._identifier_address(lhs.name, ctx)
+            out += self._identifier_address(lhs.name.text, ctx)
         elif isinstance(lhs, (ast.Member, ast.ArrowMember)):
             out += self._member_address(lhs, ctx)
         elif isinstance(lhs, ast.Index):
@@ -12228,7 +12245,7 @@ class CodeGenerator:
         struct.member.text / arr[i].member chains).
         """
         if isinstance(expr.ap, ast.Identifier):
-            ap_addr = self._identifier_addr_text(expr.ap.name, ctx)
+            ap_addr = self._identifier_addr_text(expr.ap.name.text, ctx)
             return [
                 f"        mov     ecx, {ap_addr}",
                 f"        add     dword {ap_addr}, {advance}",
@@ -13708,7 +13725,7 @@ class CodeGenerator:
         """64-bit binary op. Result in EDX:EAX. Stack-machine eval:
         right → push EDX:EAX, left → EDX:EAX, pop into ECX:EBX, op.
         """
-        op = expr.op
+        op = _opt(expr)
         if op in self._COMPOUND_OPS:
             # `lvalue OP= rhs` — desugar to `lvalue = lvalue OP rhs`
             # in long-long context. lhs is side-effect-safe when it's
@@ -14126,7 +14143,7 @@ class CodeGenerator:
         lhs = expr.left
         if isinstance(lhs, ast.Identifier):
             out = self._eval_expr_to_edx_eax(expr.right, ctx)
-            addr = self._identifier_addr_text(lhs.name, ctx)
+            addr = self._identifier_addr_text(lhs.name.text, ctx)
             out += self._store_from_edx_eax(addr)
             return out
         if isinstance(lhs, ast.UnaryOp) and _opt(lhs) == "*":
@@ -17149,7 +17166,7 @@ class CodeGenerator:
         op vec) loads the scalar to st(0) once before the loop and
         leaves it pinned (load fresh per element since faddp pops).
         """
-        op = expr.op
+        op = _opt(expr)
         op_map = {"+": "faddp", "-": "fsubp", "*": "fmulp", "/": "fdivp"}
         if op not in op_map:
             raise CodegenError(
