@@ -14478,7 +14478,7 @@ class CodeGenerator:
             return [f"        fld     {width} [{label}]"]
         if isinstance(expr, ast.Identifier):
             return self._float_identifier_load(expr.name.text, ctx)
-        if isinstance(expr, ast.UnaryOp):
+        if isinstance(expr, (ast.UnaryOp, ast.PostfixOp)):
             if _opt(expr) == "+":
                 return self._eval_float_to_st0(expr.operand, ctx)
             if _opt(expr) == "-":
