@@ -340,9 +340,9 @@ def _try_simple_int_fold(expr) -> int | None:
     paths like the full _const_eval would.
     """
     if isinstance(expr, ast.IntLiteral):
-        return expr.value
+        return int_value(expr)
     if isinstance(expr, ast.CharLiteral):
-        return expr.value
+        return int_value(expr)
     if isinstance(expr, ast.UnaryOp):
         v = _try_simple_int_fold(expr.operand)
         if v is None:
@@ -1255,10 +1255,10 @@ class CodeGenerator:
         while isinstance(expr, ast.Cast):
             expr = expr.expr
         if isinstance(expr, ast.FloatLiteral):
-            v = float(expr.value)
+            v = float(int_value(expr))
             return (0.0, v) if expr.is_imaginary else (v, 0.0)
         if isinstance(expr, ast.IntLiteral):
-            return (float(expr.value), 0.0)
+            return (float(int_value(expr)), 0.0)
         if isinstance(expr, ast.UnaryOp):
             if expr.op in ("+", "-"):
                 ar, ai = self._const_eval_complex(expr.operand, name)
@@ -2365,7 +2365,7 @@ class CodeGenerator:
         while isinstance(expr, ast.Cast):
             expr = expr.expr
         if isinstance(expr, ast.StringLiteral):
-            return self._intern_string(expr.value), 0
+            return self._intern_string(int_value(expr)), 0
         if isinstance(expr, ast.LabelAddr):
             # `&&label` — yields the label's address. We don't currently
             # have a use case for `&&l + N` arithmetic in static init,
@@ -2375,10 +2375,10 @@ class CodeGenerator:
             except CodegenError:
                 return None
         if isinstance(expr, ast.Identifier):
-            if expr.name in self._globals or expr.name in self._extern_vars:
-                return f"_{expr.name}", 0
-            if expr.name in self._func_return_types:
-                return f"_{expr.name}", 0
+            if expr.name.text in self._globals or expr.name.text in self._extern_vars:
+                return f"_{expr.name.text}", 0
+            if expr.name.text in self._func_return_types:
+                return f"_{expr.name.text}", 0
             return None
         if isinstance(expr, ast.UnaryOp) and expr.op == "*":
             # `*p` where p is a pointer-arithmetic expression. Lower as
@@ -2571,16 +2571,16 @@ class CodeGenerator:
             expr = expr.expr
             return inner
         if isinstance(expr, ast.FloatLiteral):
-            v = float(expr.value)
+            v = float(int_value(expr))
             # `1.0F` is float-typed in C — narrow to 32-bit precision so
             # the decimal-to-double approximation doesn't leak through.
             if getattr(expr, "is_float", False):
                 v = struct.unpack("<f", struct.pack("<f", v))[0]
             return v
         if isinstance(expr, ast.IntLiteral):
-            return float(expr.value)
+            return float(int_value(expr))
         if isinstance(expr, ast.CharLiteral):
-            return float(expr.value)
+            return float(int_value(expr))
         if isinstance(expr, ast.UnaryOp) and expr.op in ("+", "-"):
             v = self._const_eval_float(expr.operand, name)
             return -v if expr.op == "-" else v
@@ -2610,9 +2610,9 @@ class CodeGenerator:
         raises — globals can only be initialized from constants.
         """
         if isinstance(expr, ast.IntLiteral):
-            return expr.value
+            return int_value(expr)
         if isinstance(expr, ast.CharLiteral):
-            return expr.value
+            return int_value(expr)
         if (
             isinstance(expr, ast.Call)
             and isinstance(expr.func, ast.Identifier)
@@ -2654,9 +2654,9 @@ class CodeGenerator:
             if (
                 getattr(expr, "is_alignof", False)
                 and isinstance(expr.expr, ast.Identifier)
-                and expr.expr.name in self._func_alignments
+                and expr.expr.name.text in self._func_alignments
             ):
-                return self._func_alignments[expr.expr.name]
+                return self._func_alignments[expr.expr.name.text]
             # Wide string literal: bytes = (len + 1) * sizeof(wchar_t).
             # uc_core's optimizer skips folding wide-string sizeof so
             # we can apply the right wchar size (2 bytes) here.
@@ -2665,7 +2665,7 @@ class CodeGenerator:
                 and getattr(expr.expr, "is_wide", False)
                 and not getattr(expr, "is_alignof", False)
             ):
-                return (len(expr.expr.value) + 1) * 2
+                return (len(expr.int_value(expr)) + 1) * 2
             ty = self._type_of(expr.expr, _FuncCtx())
             if getattr(expr, "is_alignof", False):
                 return self._alignment_of(ty)
@@ -2726,11 +2726,11 @@ class CodeGenerator:
         if isinstance(expr, ast.Identifier):
             # Allow enum constants in global initializers — they're
             # already integer constants by the time codegen runs.
-            if expr.name in self._enum_constants:
-                return self._enum_constants[expr.name]
+            if expr.name.text in self._enum_constants:
+                return self._enum_constants[expr.name.text]
             raise CodegenError(
                 f"global `{name}`: initializer must be a constant "
-                f"expression (got Identifier `{expr.name}`)"
+                f"expression (got Identifier `{expr.name.text}`)"
             )
         if isinstance(expr, ast.UnaryOp) and expr.is_prefix:
             inner = self._const_eval(expr.operand, name)
@@ -2830,12 +2830,12 @@ class CodeGenerator:
         ctrl_ty: _ltypes.TypeNode | None = None
         if (
             isinstance(ctrl_expr, ast.Identifier)
-            and ctrl_expr.name in self._func_return_types
-            and not ctx.has_local(ctrl_expr.name)
-            and ctrl_expr.name not in self._globals
+            and ctrl_expr.name.text in self._func_return_types
+            and not ctx.has_local(ctrl_expr.name.text)
+            and ctrl_expr.name.text not in self._globals
         ):
-            ret_ty = self._func_return_types[ctrl_expr.name]
-            param_tys = self._func_param_types.get(ctrl_expr.name, [])
+            ret_ty = self._func_return_types[ctrl_expr.name.text]
+            param_tys = self._func_param_types.get(ctrl_expr.name.text, [])
             ctrl_ty = _ltypes.PointerType(
                 base_type=_ltypes.FunctionType(
                     return_type=ret_ty,
@@ -4487,7 +4487,7 @@ class CodeGenerator:
     ) -> list[str]:
         """Compute the address of a `_Complex T` value lvalue."""
         if isinstance(expr, ast.Identifier):
-            return self._identifier_address(expr.name, ctx)
+            return self._identifier_address(expr.name.text, ctx)
         if isinstance(expr, ast.UnaryOp) and expr.op == "*":
             return self._eval_expr_to_eax(expr.operand, ctx)
         if isinstance(expr, ast.Member):
@@ -4554,7 +4554,7 @@ class CodeGenerator:
             half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
             width = "dword" if half_size == 4 else "qword"
             r_label = self._intern_float(0.0, half_size)
-            i_label = self._intern_float(float(expr.value), half_size)
+            i_label = self._intern_float(float(int_value(expr)), half_size)
             return [
                 f"        fld     {width} [{r_label}]",
                 f"        fstp    {width} {_ebp_addr(disp)}",
@@ -5503,7 +5503,7 @@ class CodeGenerator:
         """
         # IntLiteral with value fitting in 32 unsigned bits.
         if isinstance(expr, ast.IntLiteral):
-            return 0 <= expr.value < (1 << 32)
+            return 0 <= int_value(expr) < (1 << 32)
         # An explicit cast to long long from an unsigned narrower type.
         if isinstance(expr, ast.Cast):
             if not self._is_long_long(expr.target_type):
@@ -5680,8 +5680,10 @@ class CodeGenerator:
                 if not self._is_long_long(src_ty):
                     return self._eval_expr_to_eax(expr.expr, ctx)
         # An IntLiteral that fits in u32 — load it as a 32-bit constant.
-        if isinstance(expr, ast.IntLiteral) and 0 <= expr.value < (1 << 32):
-            return [f"        mov     eax, {expr.value}"]
+        if isinstance(expr, ast.IntLiteral):
+            v = int_value(expr)
+            if 0 <= v < (1 << 32):
+                return [f"        mov     eax, {v}"]
         # Otherwise the operand's own type is u32-or-narrower-unsigned;
         # `_eval_expr_to_eax` is the 32-bit emitter for it.
         return self._eval_expr_to_eax(expr, ctx)
@@ -5773,7 +5775,7 @@ class CodeGenerator:
                     return self._eval_expr_to_eax(expr.expr, ctx)
         # IntLiteral — load just the low 32 bits.
         if isinstance(expr, ast.IntLiteral):
-            v = expr.value
+            v = int_value(expr)
             if v < 0:
                 v = (1 << 64) + v
             return [f"        mov     eax, 0x{v & 0xFFFFFFFF:08X}"]
@@ -5807,7 +5809,7 @@ class CodeGenerator:
         """
         # IntLiteral — extract the high 32 bits at compile time.
         if isinstance(expr, ast.IntLiteral):
-            v = expr.value
+            v = int_value(expr)
             if v < 0:
                 v = (1 << 64) + v
             return [f"        mov     eax, 0x{(v >> 32) & 0xFFFFFFFF:08X}"]
@@ -5828,7 +5830,7 @@ class CodeGenerator:
             t = self._type_of(expr, ctx)
             if self._is_long_long(t):
                 try:
-                    addr = self._identifier_addr_text(expr.name, ctx)
+                    addr = self._identifier_addr_text(expr.name.text, ctx)
                     high_addr = self._bump_addr(addr, 4)
                     return [f"        mov     eax, {high_addr}"]
                 except CodegenError:
@@ -5881,7 +5883,7 @@ class CodeGenerator:
     ) -> list[str]:
         """Lines that produce the address of an `__int128` value in EAX."""
         if isinstance(expr, ast.Identifier):
-            return self._identifier_address(expr.name, ctx)
+            return self._identifier_address(expr.name.text, ctx)
         if isinstance(expr, ast.UnaryOp) and expr.op == "*":
             return self._eval_expr_to_eax(expr.operand, ctx)
         if isinstance(expr, ast.Member):
@@ -7150,7 +7152,7 @@ class CodeGenerator:
         we can offset into it.
         """
         if isinstance(expr, ast.Identifier):
-            return self._identifier_address(expr.name, ctx)
+            return self._identifier_address(expr.name.text, ctx)
         if isinstance(expr, ast.Member):
             return self._member_address(expr, ctx)
         if isinstance(expr, ast.Index):
@@ -9382,7 +9384,7 @@ class CodeGenerator:
                                 f"compile-time constants"
                             )
                         idx_range = list(range(start, end + 1))
-                        actual = value_expr.value
+                        actual = value_int_value(expr)
                         cursor = end + 1
                     elif len(value_expr.designators) != 1:
                         raise CodegenError(
@@ -9404,7 +9406,7 @@ class CodeGenerator:
                                     f"`{name}`: array designator must reduce "
                                     f"to an integer constant"
                                 )
-                        actual = value_expr.value
+                        actual = value_int_value(expr)
                         cursor = idx + 1
                         idx_range = [idx]
                 else:
@@ -10173,8 +10175,10 @@ class CodeGenerator:
             out.append(f"        mov     byte {_ebp_addr(disp)}, 0")
         return out
 
-    def _return(self, stmt: ast.ReturnStmt, ctx: _FuncCtx) -> list[str]:
-        if stmt.value is None:
+    def _return(self, stmt, ctx: _FuncCtx) -> list[str]:
+        # Auto-AST: ``return;`` is ast.ReturnStmt (no value);
+        # ``return expr;`` is ast.ReturnStmtValue (with .value).
+        if isinstance(stmt, ast.ReturnStmt):
             return [
                 "        xor     eax, eax",
                 "        jmp     .epilogue",
@@ -10534,7 +10538,7 @@ class CodeGenerator:
         # got promoted to complex (rare). Treat as (0, value) or
         # (value, 0) depending on whether it's imaginary.
         if isinstance(expr, ast.FloatLiteral) and expr.is_imaginary:
-            return self._complex_const_into_top(0.0, expr.value, eff_ty)
+            return self._complex_const_into_top(0.0, int_value(expr), eff_ty)
         # Fallback: evaluate as a scalar (real part), zero the imag.
         return self._scalar_to_complex_into_top(expr, eff_ty, ctx)
 
@@ -11939,7 +11943,7 @@ class CodeGenerator:
         # lvalue form (Identifier / Index / Member / *p).
         if isinstance(ap_expr, ast.Identifier):
             out = [f"        lea     eax, {_ebp_addr(after_disp)}"]
-            out += self._identifier_store(ap_expr.name, ctx)
+            out += self._identifier_store(ap_expr.name.text, ctx)
             return out
         if isinstance(ap_expr, ast.Index):
             addr_lines = self._index_address(ap_expr, ctx)
@@ -12188,7 +12192,7 @@ class CodeGenerator:
         the conservative default keeps non-pointer code on the integer path.
         """
         if isinstance(expr, ast.Identifier):
-            return self._identifier_type(expr.name, ctx)
+            return self._identifier_type(expr.name.text, ctx)
         if isinstance(expr, ast.IntLiteral):
             # Honor the L/U suffixes per C 6.4.4.1: walk int → unsigned int
             # → long → unsigned long → long long → unsigned long long,
@@ -12845,11 +12849,11 @@ class CodeGenerator:
                 return self._binary(expr, ctx)
             return self._int128_value_address(expr, ctx)
         if isinstance(expr, ast.IntLiteral):
-            return [f"        mov     eax, {expr.value}"]
+            return [f"        mov     eax, {int_value(expr)}"]
         if isinstance(expr, ast.CharLiteral):
             # `'a'` is an integer constant in C — its parser-level value is
             # already the character code, so it lowers exactly like IntLiteral.
-            return [f"        mov     eax, {expr.value}"]
+            return [f"        mov     eax, {int_value(expr)}"]
         if isinstance(expr, ast.NullptrLiteral):
             # `nullptr` is the integer 0 with pointer type. Loading 0 into
             # EAX gives the right value for both pointer-init and pointer
@@ -12859,10 +12863,10 @@ class CodeGenerator:
             return [f"        mov     eax, {self._label_addr_text(expr.label, ctx)}"]
         if isinstance(expr, ast.StringLiteral):
             is_wide = getattr(expr, "is_wide", False)
-            label = self._intern_string(expr.value, is_wide=is_wide)
+            label = self._intern_string(int_value(expr), is_wide=is_wide)
             return [f"        mov     eax, {label}"]
         if isinstance(expr, ast.Identifier):
-            return self._identifier_load(expr.name, ctx)
+            return self._identifier_load(expr.name.text, ctx)
         if isinstance(expr, ast.Index):
             return self._index_load(expr, ctx)
         if isinstance(expr, ast.Member):
@@ -12955,9 +12959,9 @@ class CodeGenerator:
             if (
                 getattr(expr, "is_alignof", False)
                 and isinstance(expr.expr, ast.Identifier)
-                and expr.expr.name in self._func_alignments
+                and expr.expr.name.text in self._func_alignments
             ):
-                value = self._func_alignments[expr.expr.name]
+                value = self._func_alignments[expr.expr.name.text]
                 return [f"        mov     eax, {value}"]
             # Wide string literal `L"..."`: sizeof yields the byte
             # count of the wchar_t array, not the pointer (which is
@@ -12970,7 +12974,7 @@ class CodeGenerator:
                 and getattr(expr.expr, "is_wide", False)
                 and not getattr(expr, "is_alignof", False)
             ):
-                value = (len(expr.expr.value) + 1) * 2
+                value = (len(expr.int_value(expr)) + 1) * 2
                 return [f"        mov     eax, {value}"]
             ty = self._type_of(expr.expr, ctx)
             if getattr(expr, "is_alignof", False):
@@ -13065,7 +13069,7 @@ class CodeGenerator:
             ]
         # Direct loads.
         if isinstance(expr, ast.IntLiteral):
-            v = expr.value
+            v = int_value(expr)
             if v < 0:
                 v = (1 << 64) + v
             v &= 0xFFFFFFFFFFFFFFFF
@@ -13076,13 +13080,13 @@ class CodeGenerator:
                 f"        mov     edx, 0x{high:08X}",
             ]
         if isinstance(expr, ast.CharLiteral):
-            return [f"        mov     eax, {expr.value}", "        xor     edx, edx"]
+            return [f"        mov     eax, {int_value(expr)}", "        xor     edx, edx"]
         if isinstance(expr, ast.NullptrLiteral):
             return ["        xor     eax, eax", "        xor     edx, edx"]
         if isinstance(expr, ast.Identifier):
             t = self._type_of(expr, ctx)
             if self._is_long_long(t):
-                addr = self._identifier_addr_text(expr.name, ctx)
+                addr = self._identifier_addr_text(expr.name.text, ctx)
                 return self._load_to_edx_eax(addr)
             # Smaller-than-long-long Identifier in long-long context:
             # load as 32-bit value, then sign- or zero-extend to fill EDX.
@@ -14099,11 +14103,11 @@ class CodeGenerator:
         # Float-typed expression. Dispatch by node.
         if isinstance(expr, ast.FloatLiteral):
             size = 4 if ty.name == "float" else 8
-            label = self._intern_float(expr.value, size)
+            label = self._intern_float(int_value(expr), size)
             width = "dword" if size == 4 else "qword"
             return [f"        fld     {width} [{label}]"]
         if isinstance(expr, ast.Identifier):
-            return self._float_identifier_load(expr.name, ctx)
+            return self._float_identifier_load(expr.name.text, ctx)
         if isinstance(expr, ast.UnaryOp):
             if expr.op == "+":
                 return self._eval_float_to_st0(expr.operand, ctx)
@@ -15126,7 +15130,14 @@ class CodeGenerator:
         # the retptr (forwarded by the callee).
         return out
 
-    def _unary(self, expr: ast.UnaryOp, ctx: _FuncCtx) -> list[str]:
+    def _unary(self, expr, ctx: _FuncCtx) -> list[str]:
+        # Auto-AST UnaryOp.op is a Token; normalise.
+        if hasattr(expr.op, "text"):
+            class _OpView:
+                __slots__ = ("op", "operand", "pos")
+                def __init__(s, op, operand, pos):
+                    s.op, s.operand, s.pos = op, operand, pos
+            expr = _OpView(expr.op.text, expr.operand, getattr(expr, "pos", None))
         if expr.op in ("++", "--"):
             return self._inc_dec(expr, ctx)
         if expr.op == "&":
@@ -15891,7 +15902,15 @@ class CodeGenerator:
         ">>=": ">>",
     }
 
-    def _binary(self, expr: ast.BinaryOp, ctx: _FuncCtx) -> list[str]:
+    def _binary(self, expr, ctx: _FuncCtx) -> list[str]:
+        # expr.op is a Token in the auto-AST; normalise to its text.
+        if hasattr(expr.op, "text"):
+            class _OpView:
+                __slots__ = ("op", "left", "right", "pos")
+                def __init__(s, op, left, right, pos):
+                    s.op, s.left, s.right, s.pos = op, left, right, pos
+            expr = _OpView(expr.op.text, expr.left, expr.right,
+                           getattr(expr, "pos", None))
         if expr.op == "=":
             return self._assign(expr, ctx)
         if expr.op in self._COMPOUND_OPS:
@@ -16446,7 +16465,7 @@ class CodeGenerator:
         evaluation that fills the temp and leave its address in EAX.
         """
         if isinstance(expr, ast.Identifier):
-            return self._identifier_address(expr.name, ctx)
+            return self._identifier_address(expr.name.text, ctx)
         if isinstance(expr, ast.Index):
             return self._index_address(expr, ctx)
         if isinstance(expr, ast.Member):
