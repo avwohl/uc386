@@ -532,6 +532,13 @@ class CodeGenerator:
                 externs.add(d.name)
             elif isinstance(d, (ast.VarDecl, _SynthLocalVar)) and isinstance(d.var_type, _ltypes.FunctionType):
                 externs.add(d.name)
+            elif isinstance(d, ast.Declaration):
+                # Function prototype / extern variable.
+                for nm, full, _init, is_fn in iter_var_decls(d):
+                    if nm is None:
+                        continue
+                    if is_fn:
+                        externs.add(nm)
         externs -= defined_names
         # gnu_inline functions are never extern symbols — they're
         # inlined at every call site, so the linker shouldn't see them.
