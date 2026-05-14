@@ -3437,24 +3437,23 @@ class CodeGenerator:
         outer_user_labels: set[str] = set()
         for sub in self._walk_ast(fn.body):
             if isinstance(sub, ast.LabelStmt):
-                outer_user_labels.add(sub.label)
+                outer_user_labels.add(sub.label.text)
         # Per nested fn: ordered list of nonlocal-goto labels.
         nlg_per_inner: dict[str, list[str]] = {}
         for nested in nested_decls:
             inner_user_labels: set[str] = set()
             for sub in self._walk_ast(nested.body):
                 if isinstance(sub, ast.LabelStmt):
-                    inner_user_labels.add(sub.label)
+                    inner_user_labels.add(sub.label.text)
             seen: list[str] = []
             for sub in self._walk_ast(nested.body):
                 if (
                     isinstance(sub, ast.GotoStmt)
-                    and sub.target is None
-                    and sub.label in outer_user_labels
-                    and sub.label not in inner_user_labels
-                    and sub.label not in seen
+                    and sub.label.text in outer_user_labels
+                    and sub.label.text not in inner_user_labels
+                    and sub.label.text not in seen
                 ):
-                    seen.append(sub.label)
+                    seen.append(sub.label.text)
             if seen:
                 nlg_per_inner[nested.name] = seen
         # Allocate trampoline + buf-array slots in outer's frame for
@@ -3829,11 +3828,12 @@ class CodeGenerator:
         """
         for sub in self._walk_ast(node):
             if isinstance(sub, ast.LabelStmt):
-                if sub.label in ctx.user_labels:
+                lname = sub.label.text
+                if lname in ctx.user_labels:
                     raise CodegenError(
-                        f"duplicate label `{sub.label}` in function"
+                        f"duplicate label `{lname}` in function"
                     )
-                ctx.user_labels[sub.label] = ctx.label(f"user_{sub.label}")
+                ctx.user_labels[lname] = ctx.label(f"user_{lname}")
 
     def _resolve_typeof_in_body(self, node, ctx: _FuncCtx) -> None:
         """Walk `node` recursively and replace any `TypeofType` field
@@ -7759,7 +7759,7 @@ class CodeGenerator:
         `arr[i++].bf` etc. twice).
         """
         bit_offset, bit_width, member_ty, _unit_size = bf
-        op_text = self._COMPOUND_OPS[expr.op]
+        op_text = self._COMPOUND_OPS[_opt(expr)]
         is_unsigned = self._is_unsigned(member_ty)
         mask = (1 << bit_width) - 1
         low_m = mask & 0xFFFFFFFF
@@ -8796,15 +8796,15 @@ class CodeGenerator:
                 raise CodegenError("internal: case label not found")
             return [f"{label}:"] + self._item(item.stmt, ctx)
         if isinstance(item, ast.LabelStmt):
-            label = ctx.user_labels[item.label]
+            label = ctx.user_labels[item.label.text]
             return [f"{label}:"] + self._item(item.stmt, ctx)
         if isinstance(item, ast.GotoStmt):
-            # GCC computed goto: `goto *expr;` — evaluate the address
-            # and jump indirect.
-            if item.target is not None:
-                out = self._eval_expr_to_eax(item.target, ctx)
-                out.append("        jmp     eax")
-                return out
+            # The auto-AST GotoStmt always carries a label Token; the
+            # legacy "computed goto (`goto *expr;`)" case has no
+            # corresponding production in c23.uplox, so it's no longer
+            # reachable here. label_name is the user's source-level
+            # label identifier.
+            label_name = item.label.text
             # Non-local goto: a `goto X` from inside a lifted nested
             # fn where X was declared in the outer via `__label__ X`.
             # The static-link slot holds the address of outer's
@@ -8813,7 +8813,7 @@ class CodeGenerator:
             # `static_link + 12 * idx_X` and longjmp through it. The
             # outer's prologue has a matching setjmp that dispatches
             # to X on EAX=1.
-            idx = ctx.nonlocal_goto_targets.get(item.label)
+            idx = ctx.nonlocal_goto_targets.get(label_name)
             if idx is not None and ctx.trampoline_static_link_disp is not None:
                 slot_addr = _ebp_addr(ctx.trampoline_static_link_disp)
                 offset = 12 * idx
@@ -8827,10 +8827,10 @@ class CodeGenerator:
                 lines.append("        call    ___builtin_longjmp")
                 lines.append("        add     esp, 8")
                 return lines
-            target = ctx.user_labels.get(item.label)
+            target = ctx.user_labels.get(label_name)
             if target is None:
                 raise CodegenError(
-                    f"goto: unknown label `{item.label}`"
+                    f"goto: unknown label `{label_name}`"
                 )
             # Restore ESP to the post-locals baseline if we have VLAs.
             # This frees ALL VLAs (sub-esp-allocated). Safe when the
@@ -10693,7 +10693,7 @@ class CodeGenerator:
             # its side effect (which mutates the lvalue), then copy the
             # lvalue's new value into the destination at TOS.
             if _opt(expr) in self._COMPOUND_OPS:
-                inner_op = self._COMPOUND_OPS[expr.op]
+                inner_op = self._COMPOUND_OPS[_opt(expr)]
                 synth = ast.BinaryOp(op=inner_op, left=expr.left, right=expr.right)
                 ctx.alloc_call_temp(synth, self._size_of(eff_ty))
                 out: list[str] = []
@@ -14070,7 +14070,7 @@ class CodeGenerator:
         guarantees side effects in the lvalue's sub-expressions fire
         exactly once.
         """
-        op = self._COMPOUND_OPS[expr.op]
+        op = self._COMPOUND_OPS[_opt(expr)]
         if isinstance(expr.left, ast.Identifier):
             inner = ast.BinaryOp(op=op, left=expr.left, right=expr.right)
             return self._binary_ll(
@@ -14478,9 +14478,9 @@ class CodeGenerator:
                 out = self._eval_expr_to_eax(expr.left, ctx)
             out += self._eval_float_to_st0(expr.right, ctx)
             return out
-        if expr.op not in op_to_mnem:
+        if _opt(expr) not in op_to_mnem:
             raise CodegenError(
-                f"binary `{expr.op}` not supported on float operands"
+                f"binary `{_opt(expr)}` not supported on float operands"
             )
         # Pick eval order to minimize peak FPU stack depth. When the
         # right side is deeper than the left (a leaf or shallow), eval
@@ -14493,11 +14493,11 @@ class CodeGenerator:
         if r_depth > l_depth:
             out = self._eval_float_to_st0(expr.right, ctx)
             out += self._eval_float_to_st0(expr.left, ctx)
-            out.append(f"        {op_to_mnem_rev[expr.op]}   st1, st0")
+            out.append(f"        {op_to_mnem_rev[_opt(expr)]}   st1, st0")
             return out
         out = self._eval_float_to_st0(expr.left, ctx)
         out += self._eval_float_to_st0(expr.right, ctx)
-        out.append(f"        {op_to_mnem[expr.op]}   st1, st0")
+        out.append(f"        {op_to_mnem[_opt(expr)]}   st1, st0")
         return out
 
     def _fpu_depth(self, expr: ast.Expression, ctx: _FuncCtx) -> int:
@@ -14663,7 +14663,7 @@ class CodeGenerator:
         evaluate the rhs to st(0), apply `faddp`/`fsubp`/`fmulp`/
         `fdivp`, pop the address back into ECX, and `fst` through it.
         """
-        op = self._COMPOUND_OPS[expr.op]
+        op = self._COMPOUND_OPS[_opt(expr)]
         if isinstance(expr.left, ast.Identifier):
             inner = ast.BinaryOp(op=op, left=expr.left, right=expr.right)
             return self._float_assign(
@@ -15914,7 +15914,7 @@ class CodeGenerator:
         ptr_ty = _ltypes.PointerType(base_type=bool_ty)
         addr_disp = ctx.alloc_local(addr_name, ptr_ty, size=4)
         snap_disp = ctx.alloc_local(snap_name, bool_ty, size=4)
-        op = self._COMPOUND_OPS[expr.op]
+        op = self._COMPOUND_OPS[_opt(expr)]
         mask = (1 << bit_width) - 1
         clear_mask = (~(mask << bit_offset)) & 0xFFFFFFFF
         # 1. Compute &storage_unit, save in addr_slot.
@@ -15963,7 +15963,7 @@ class CodeGenerator:
         if len(bf) == 4 and bf[3] == 8:
             return self._compound_assign_bitfield_ll(expr, bf, ctx)
         bit_offset, bit_width, member_ty = bf[:3]
-        op = self._COMPOUND_OPS[expr.op]
+        op = self._COMPOUND_OPS[_opt(expr)]
         # `_Bool` bit-field with a wider-than-int rhs (float / LL /
         # int128 / complex): the regular path truncates rhs via
         # `_eval_expr_to_eax`, losing fractional / high-bit signal.
@@ -16750,7 +16750,7 @@ class CodeGenerator:
         if isinstance(expr, ast.BinaryOp) and _opt(expr) in self._COMPOUND_OPS:
             # Vector compound assign in vector-value context. Execute
             # the compound for its side effect, then return &lhs.
-            base_op = self._COMPOUND_OPS[expr.op]
+            base_op = self._COMPOUND_OPS[_opt(expr)]
             inner = ast.BinaryOp(
                 op=base_op, left=expr.left, right=expr.right,
             )
@@ -17341,7 +17341,7 @@ class CodeGenerator:
         # For `arr[i]` and `*p`, re-evaluating the lvalue would compute the
         # address (and any side effects in `i` or `p`) twice — we instead
         # compute it once and keep it on the stack while we read, op, store.
-        op = self._COMPOUND_OPS[expr.op]
+        op = self._COMPOUND_OPS[_opt(expr)]
 
         # __int128 compound assign: synthesize a BinaryOp for the
         # `lhs OP rhs` and route through `_int128_copy_assign`. The
