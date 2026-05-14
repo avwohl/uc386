@@ -658,6 +658,30 @@ class CodeGenerator:
         self._enum_constants = {}
         self._float_constants = {}
         for d in top_decls:
+            # Auto-AST: top-level ``struct S { ... };`` parses as
+            # ast.Declaration whose decl_specs contains a StructDef /
+            # StructAnon / EnumDef. Register the layout under the tag
+            # so subsequent uses resolve. We also follow each declarator
+            # below to catch struct types referenced through a typedef
+            # or variable decl.
+            if isinstance(d, ast.Declaration):
+                for spec in d.decl_specs or []:
+                    if isinstance(spec, (ast.StructDef, ast.StructAnon)):
+                        from uc_core.ast import resolved_to_legacy
+                        from uc_core.codegen_helpers import _resolve_struct_spec
+                        st = resolved_to_legacy(_resolve_struct_spec(spec))
+                        if st is not None and (st.members or st.name):
+                            self._resolve_struct_name(st)
+                    elif isinstance(spec, ast.EnumDef):
+                        from uc_core.ast import resolved_to_legacy
+                        from uc_core.codegen_helpers import _resolve_enum_spec
+                        et = resolved_to_legacy(_resolve_enum_spec(spec))
+                        # Inline values get registered for top-level enums; do
+                        # so via a synthetic EnumDecl shape.
+                        # (uc386's _register_enum expects ast.EnumDecl;
+                        # the legacy ComplexType-style registration via
+                        # _resolve_struct_name doesn't apply here.)
+                # Fall through to the per-declarator handling below.
             if isinstance(d, ast.StructDecl) and d.is_definition:
                 self._register_struct(d)
             elif isinstance(d, ast.EnumDecl) and d.is_definition:
@@ -2681,31 +2705,22 @@ class CodeGenerator:
                 raise CodegenError("sizeof: VLA — runtime evaluation needed")
             return self._size_of(expr.target_type)
         if isinstance(expr, ast.SizeofExpr):
-            # `sizeof(expr)` — operand is unevaluated; we just need its
-            # static type. _type_of needs a ctx, but for top-level usage
-            # (array dimensions, global initializers) there's no function
-            # context. A fresh empty _FuncCtx works because the type-of
-            # path falls through to globals when no local matches.
+            inner = expr.operand
             if (
                 getattr(expr, "is_alignof", False)
-                and isinstance(expr.expr, ast.Identifier)
-                and expr.expr.name.text in self._func_alignments
+                and isinstance(inner, ast.Identifier)
+                and inner.name.text in self._func_alignments
             ):
-                return self._func_alignments[expr.expr.name.text]
-            # Wide string literal: bytes = (len + 1) * sizeof(wchar_t).
-            # uc_core's optimizer skips folding wide-string sizeof so
-            # we can apply the right wchar size (2 bytes) here.
+                return self._func_alignments[inner.name.text]
             if (
-                isinstance(expr.expr, ast.StringLiteral)
-                and getattr(expr.expr, "is_wide", False)
+                isinstance(inner, ast.StringLiteral)
+                and string_is_wide(inner.value.text)
                 and not getattr(expr, "is_alignof", False)
             ):
-                return (len(expr.int_value(expr)) + 1) * 2
-            ty = self._type_of(expr.expr, _FuncCtx())
+                return (decoded_str_len(inner.value.text) + 1) * 2
+            ty = self._type_of(inner, _FuncCtx())
             if getattr(expr, "is_alignof", False):
                 return self._alignment_of(ty)
-            # Refuse the fold when the type contains a VLA so the
-            # runtime sizeof path runs instead.
             if self._type_has_vla(ty):
                 raise CodegenError("sizeof: VLA — runtime evaluation needed")
             return self._size_of(ty)
@@ -13055,33 +13070,27 @@ class CodeGenerator:
             return [f"        mov     eax, {v}"]
         if isinstance(expr, ast.SizeofExpr):
             # C: the operand of `sizeof` is *not* evaluated — only its
-            # static type matters. So we infer the type and never emit
-            # any of the operand's lowering code (no slot loads, no
-            # function calls).
+            # static type matters. Auto-AST SizeofExpr exposes the
+            # operand on ``.operand`` (the legacy attribute was ``.expr``).
+            inner = expr.operand
             if (
                 getattr(expr, "is_alignof", False)
-                and isinstance(expr.expr, ast.Identifier)
-                and expr.expr.name.text in self._func_alignments
+                and isinstance(inner, ast.Identifier)
+                and inner.name.text in self._func_alignments
             ):
-                value = self._func_alignments[expr.expr.name.text]
-                return [f"        mov     eax, {value}"]
+                return [f"        mov     eax, {self._func_alignments[inner.name.text]}"]
             # Wide string literal `L"..."`: sizeof yields the byte
-            # count of the wchar_t array, not the pointer (which is
-            # what `_type_of(StringLiteral)` would give). uc_core's
-            # optimizer leaves these unfolded so we can apply the
-            # right wchar_t size here. uc386 uses `wchar_t = unsigned
-            # short` (2 bytes) per `__WCHAR_TYPE__`.
+            # count of the wchar_t array, not the pointer.
             if (
-                isinstance(expr.expr, ast.StringLiteral)
-                and getattr(expr.expr, "is_wide", False)
+                isinstance(inner, ast.StringLiteral)
+                and string_is_wide(inner.value.text)
                 and not getattr(expr, "is_alignof", False)
             ):
-                value = (len(expr.int_value(expr)) + 1) * 2
+                value = (decoded_str_len(inner.value.text) + 1) * 2
                 return [f"        mov     eax, {value}"]
-            ty = self._type_of(expr.expr, ctx)
+            ty = self._type_of(inner, ctx)
             if getattr(expr, "is_alignof", False):
-                value = self._alignment_of(ty)
-                return [f"        mov     eax, {value}"]
+                return [f"        mov     eax, {self._alignment_of(ty)}"]
             return self._emit_runtime_size_of(ty, ctx)
         if isinstance(expr, ast.StmtExpr):
             # GCC statement expression: `({ stmt; stmt; expr; })`. Lower
