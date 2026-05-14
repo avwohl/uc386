@@ -4120,16 +4120,16 @@ class CodeGenerator:
         node's result needs a buffer (struct/vector/complex/int128
         return, compound literal, complex/vector/int128 sub-expression).
         """
-        if isinstance(sub, ast.Call) and self._is_struct_returning_call(sub, ctx):
+        if isinstance(sub, (ast.Call, ast.CallNoArgs)) and self._is_struct_returning_call(sub, ctx):
             ret_ty = self._call_return_type(sub, ctx)
             size = (self._size_of(ret_ty) + 3) & ~3
             ctx.alloc_call_temp(sub, size)
-        elif isinstance(sub, ast.Call) and self._is_vector_returning_call(sub, ctx):
+        elif isinstance(sub, (ast.Call, ast.CallNoArgs)) and self._is_vector_returning_call(sub, ctx):
             ret_ty = self._call_return_type(sub, ctx)
             size = (self._size_of(ret_ty) + 3) & ~3
             ctx.alloc_call_temp(sub, size)
         elif (
-            isinstance(sub, ast.Call)
+            isinstance(sub, (ast.Call, ast.CallNoArgs))
             and isinstance(sub.func, ast.Identifier)
             and sub.func.name.text == "__builtin_shuffle"
             and len(sub.args) >= 1
@@ -4144,14 +4144,14 @@ class CodeGenerator:
             ):
                 size = (self._size_of(ret_ty) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
-        elif isinstance(sub, ast.Call) and self._is_complex_returning_call(sub, ctx):
+        elif isinstance(sub, (ast.Call, ast.CallNoArgs)) and self._is_complex_returning_call(sub, ctx):
             # Complex-returning calls need a per-call-site temp
             # so consumers like `__real foo()` can address the
             # halves via a stable slot.
             ret_ty = self._call_return_type(sub, ctx)
             size = (self._size_of(ret_ty) + 3) & ~3
             ctx.alloc_call_temp(sub, size)
-        elif isinstance(sub, ast.Call) and self._is_int128_returning_call(sub, ctx):
+        elif isinstance(sub, (ast.Call, ast.CallNoArgs)) and self._is_int128_returning_call(sub, ctx):
             # __int128-returning call uses the retptr ABI; reserve
             # a 16-byte temp slot so the caller's expression chain
             # (e.g. `f() + g()`) sees stable addresses.
@@ -4669,7 +4669,7 @@ class CodeGenerator:
         # then yield the rhs's complex address. Use type-aware
         # evaluation for the lhs so a complex-typed lhs (e.g. `a = X`
         # where a is complex) doesn't try to load 16 bytes into EAX.
-        if isinstance(expr, ast.BinaryOp) and _opt(expr) == ",":
+        if isinstance(expr, (ast.BinaryOp, ast.SequenceExpr)) and _opt(expr) == ",":
             lt = self._type_of(expr.left, ctx)
             if isinstance(lt, _ltypes.ComplexType):
                 out = self._complex_value_address(expr.left, ctx)
@@ -6109,7 +6109,7 @@ class CodeGenerator:
             return out
         # Comma operator with __int128 result: eval left for side
         # effects, then eval right as the int128 value.
-        if isinstance(expr, ast.BinaryOp) and _opt(expr) == ",":
+        if isinstance(expr, (ast.BinaryOp, ast.SequenceExpr)) and _opt(expr) == ",":
             out = self._eval_expr_to_eax(expr.left, ctx)
             out += self._int128_value_address(expr.right, ctx)
             return out
@@ -7377,7 +7377,7 @@ class CodeGenerator:
             target_ty = self._type_of(expr.left, ctx)
             if isinstance(target_ty, _ltypes.StructType):
                 return self._struct_copy_assign(expr, target_ty, ctx)
-        if isinstance(expr, ast.BinaryOp) and _opt(expr) == ",":
+        if isinstance(expr, (ast.BinaryOp, ast.SequenceExpr)) and _opt(expr) == ",":
             # `(side_effect, struct_expr)` — eval lhs for side effects,
             # then yield the rhs's struct address.
             out = self._eval_expr_to_eax(expr.left, ctx)
@@ -13147,6 +13147,12 @@ class CodeGenerator:
             ):
                 return self._eval_vector_into_temp(expr, ctx)
             return self._binary(expr, ctx)
+        if isinstance(expr, ast.SequenceExpr):
+            # `a, b` — eval left for side effects (discard value), then
+            # eval right as the result. Matches BinaryOp(",") semantics.
+            out = self._eval_expr_to_eax(expr.left, ctx)
+            out += self._eval_expr_to_eax(expr.right, ctx)
+            return out
         if isinstance(expr, (ast.Call, ast.CallNoArgs)):
             if self._is_struct_returning_call(expr, ctx):
                 # Direct EAX returns can't carry a struct; route the
