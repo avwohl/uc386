@@ -3346,7 +3346,7 @@ class CodeGenerator:
             if isinstance(node, ast.SwitchStmt):
                 _collect_nested_decls(node.body)
                 return
-            if isinstance(node, ast.CaseStmt):
+            if isinstance(node, (ast.CaseStmt, ast.DefaultStmt)):
                 _collect_nested_decls(node.stmt)
                 return
             if isinstance(node, ast.LabelStmt):
@@ -4637,7 +4637,7 @@ class CodeGenerator:
         if isinstance(node, ast.SwitchStmt):
             self._collect_locals(node.body, ctx)
             return
-        if isinstance(node, ast.CaseStmt):
+        if isinstance(node, (ast.CaseStmt, ast.DefaultStmt)):
             # `case 1: case 2: VarDecl;` nests CaseStmts; each level's
             # `stmt` may eventually be a real declaration or a compound.
             # Recursing is enough — the next layer will be another
@@ -8861,18 +8861,18 @@ class CodeGenerator:
             return self._for(item, ctx)
         if isinstance(item, ast.SwitchStmt):
             return self._switch(item, ctx)
-        if isinstance(item, ast.CaseStmt):
+        if isinstance(item, (ast.CaseStmt, ast.DefaultStmt)):
             # Inside a switch body. The pre-walk in `_switch` assigned
-            # this CaseStmt a label; emit the label and recurse into
-            # the labeled statement.
+            # this CaseStmt / DefaultStmt a label; emit the label and
+            # recurse into the labeled statement.
             if not ctx.active_case_labels:
                 raise CodegenError("`case` outside of a switch")
             label = ctx.active_case_labels[-1].get(id(item))
             if label is None:
                 # Shouldn't happen — `_switch`'s walk reaches every
-                # CaseStmt within its body. If we hit this, the walk
-                # missed a structural node it should have descended
-                # into.
+                # CaseStmt / DefaultStmt within its body. If we hit
+                # this, the walk missed a structural node it should
+                # have descended into.
                 raise CodegenError("internal: case label not found")
             return [f"{label}:"] + self._item(item.stmt, ctx)
         if isinstance(item, ast.LabelStmt):
@@ -9102,6 +9102,18 @@ class CodeGenerator:
         def walk(node):
             nonlocal default_label
             if node is None:
+                return
+            if isinstance(node, ast.DefaultStmt):
+                if default_label is not None:
+                    raise CodegenError(
+                        "multiple `default` labels in switch"
+                    )
+                default_label = ctx.label("default")
+                case_specs.append(
+                    ("default", None, None, default_label)
+                )
+                case_label_map[id(node)] = default_label
+                walk(node.stmt)
                 return
             if isinstance(node, ast.CaseStmt):
                 if node.value is None:
