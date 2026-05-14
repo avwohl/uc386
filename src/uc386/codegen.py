@@ -12957,7 +12957,7 @@ class CodeGenerator:
             # `sizeof` returns size_t; treat it as int for our flat-32 ABI.
             return _ltypes.BasicType(name="int")
         if isinstance(expr, ast.VaArgExpr):
-            return expr.target_type
+            return _to_legacy_type(expr.target_type)
         if isinstance(expr, ast.Cast):
             return expr.target_type
         if isinstance(expr, ast.Compound):
