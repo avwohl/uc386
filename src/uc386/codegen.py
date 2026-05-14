@@ -1710,15 +1710,21 @@ class CodeGenerator:
         cursor = 0
         for value in elided_values:
             if isinstance(value, ast.DesignatedInit):
-                if (
-                    len(value.designators) != 1
-                    or not isinstance(value.designators[0], str)
-                ):
+                first = value.designators[0] if value.designators else None
+                if isinstance(first, ast.FieldDesignator):
+                    m_name_des = first.field.text
+                elif isinstance(first, str):
+                    m_name_des = first
+                else:
                     raise CodegenError(
                         f"global `{name}`: only single-level `.field` "
                         f"designators supported"
                     )
-                m_name_des = value.designators[0]
+                if len(value.designators) != 1:
+                    raise CodegenError(
+                        f"global `{name}`: only single-level `.field` "
+                        f"designators supported"
+                    )
                 if m_name_des not in member_index:
                     raise CodegenError(
                         f"global `{name}`: unknown member `{m_name_des}` "
@@ -1950,15 +1956,21 @@ class CodeGenerator:
         cursor = 0
         for value in init.values:
             if isinstance(value, ast.DesignatedInit):
-                if (
-                    len(value.designators) != 1
-                    or not isinstance(value.designators[0], str)
-                ):
+                first = value.designators[0] if value.designators else None
+                if isinstance(first, ast.FieldDesignator):
+                    m_name_des = first.field.text
+                elif isinstance(first, str):
+                    m_name_des = first
+                else:
                     raise CodegenError(
                         f"global `{name}`: only single-level `.field` "
                         f"designators supported in bit-field init"
                     )
-                m_name_des = value.designators[0]
+                if len(value.designators) != 1:
+                    raise CodegenError(
+                        f"global `{name}`: only single-level `.field` "
+                        f"designators supported in bit-field init"
+                    )
                 if m_name_des not in member_index:
                     raise CodegenError(
                         f"global `{name}`: unknown member "
@@ -2403,12 +2415,15 @@ class CodeGenerator:
                             f"designators supported in array init"
                         )
                     else:
-                        if isinstance(designator, ast.IntLiteral):
-                            idx = int_value(designator)
+                        idx_expr = designator
+                        if isinstance(designator, ast.IndexDesignator):
+                            idx_expr = designator.index
+                        if isinstance(idx_expr, ast.IntLiteral):
+                            idx = int_value(idx_expr)
                         else:
                             try:
                                 idx = self._const_eval(
-                                    designator, f"global `{name}` array index"
+                                    idx_expr, f"global `{name}` array index"
                                 )
                             except CodegenError:
                                 raise CodegenError(
@@ -4883,7 +4898,7 @@ class CodeGenerator:
                 # store the resolved literal so later code sees a literal.
                 try:
                     folded = self._const_eval(t.size, name)
-                    t.size = ast.IntLiteral(value=folded)
+                    t.size = make_int_lit(folded)
                 except CodegenError:
                     # Variable-length arrays (`int a[n]`) aren't fully
                     # supported (no runtime alloca). As a compile-only
@@ -4893,7 +4908,7 @@ class CodeGenerator:
                     # `_emit_runtime_size_of` can recompute the real
                     # byte count for `sizeof`.
                     t._vla_size = t.size
-                    t.size = ast.IntLiteral(value=16)
+                    t.size = make_int_lit(16)
             self._check_supported_type(t.base_type, name)
             return
         if isinstance(t, _ltypes.StructType):
@@ -5020,7 +5035,7 @@ class CodeGenerator:
             )
         return _ltypes.ArrayType(
             base_type=t.base_type,
-            size=ast.IntLiteral(value=n),
+            size=make_int_lit(n),
         )
 
     @staticmethod
@@ -9642,12 +9657,15 @@ class CodeGenerator:
                     else:
                         # Designator must be a constant integer expression
                         # (IntLiteral, enum constant, sizeof, etc).
-                        if isinstance(designator, ast.IntLiteral):
-                            idx = int_value(designator)
+                        idx_expr = designator
+                        if isinstance(designator, ast.IndexDesignator):
+                            idx_expr = designator.index
+                        if isinstance(idx_expr, ast.IntLiteral):
+                            idx = int_value(idx_expr)
                         else:
                             try:
                                 idx = self._const_eval(
-                                    designator, f"`{name}` array index"
+                                    idx_expr, f"`{name}` array index"
                                 )
                             except CodegenError:
                                 raise CodegenError(
