@@ -2933,12 +2933,25 @@ class CodeGenerator:
                 and inner.name.text in self._func_alignments
             ):
                 return self._func_alignments[inner.name.text]
-            if (
-                isinstance(inner, ast.StringLiteral)
-                and string_is_wide(inner.value.text)
-                and not getattr(expr, "is_alignof", False)
-            ):
-                return (decoded_str_len(inner.value.text) + 1) * 2
+            # String literals: C standard says they have array type
+            # `char[N+1]` (or `wchar_t[N+1]` for wide). sizeof of an
+            # array is the array's bytes — NOT the size of a decayed
+            # pointer. The auto-AST hands us a single StringLiteral or
+            # a list of adjacent StringLiterals (auto-concatenation).
+            inner_strs = (
+                inner if isinstance(inner, list)
+                and all(isinstance(p, ast.StringLiteral) for p in inner)
+                else [inner] if isinstance(inner, ast.StringLiteral)
+                else None
+            )
+            if inner_strs and not getattr(expr, "is_alignof", False):
+                is_wide = any(
+                    string_is_wide(p.value.text) for p in inner_strs
+                )
+                total = sum(
+                    decoded_str_len(p.value.text) for p in inner_strs
+                ) + 1
+                return total * 2 if is_wide else total
             ty = self._type_of(inner, _FuncCtx())
             if getattr(expr, "is_alignof", False):
                 return self._alignment_of(ty)
@@ -13675,14 +13688,24 @@ class CodeGenerator:
                 and inner.name.text in self._func_alignments
             ):
                 return [f"        mov     eax, {self._func_alignments[inner.name.text]}"]
-            # Wide string literal `L"..."`: sizeof yields the byte
-            # count of the wchar_t array, not the pointer.
-            if (
-                isinstance(inner, ast.StringLiteral)
-                and string_is_wide(inner.value.text)
-                and not getattr(expr, "is_alignof", False)
-            ):
-                value = (decoded_str_len(inner.value.text) + 1) * 2
+            # String literal(s): sizeof yields the byte count of the
+            # `char[N+1]` (or `wchar_t[N+1]`) array — not the size of
+            # the decayed pointer. The auto-AST keeps adjacent literals
+            # as a list (auto-concatenation), so handle both shapes.
+            inner_strs = (
+                inner if isinstance(inner, list)
+                and all(isinstance(p, ast.StringLiteral) for p in inner)
+                else [inner] if isinstance(inner, ast.StringLiteral)
+                else None
+            )
+            if inner_strs and not getattr(expr, "is_alignof", False):
+                is_wide = any(
+                    string_is_wide(p.value.text) for p in inner_strs
+                )
+                total = sum(
+                    decoded_str_len(p.value.text) for p in inner_strs
+                ) + 1
+                value = total * 2 if is_wide else total
                 return [f"        mov     eax, {value}"]
             ty = self._type_of(inner, ctx)
             if getattr(expr, "is_alignof", False):
@@ -13849,8 +13872,15 @@ class CodeGenerator:
                 out.append("        cdq")
             return out
         if isinstance(expr, ast.Cast):
-            target = expr.target_type
-            src_ty = self._type_of(expr.expr, ctx)
+            # Expand typedefs so `(fmt_uint_t)x` where
+            # `typedef unsigned long long fmt_uint_t` is recognised as
+            # a long-long target. Without this the ll → ll passthrough
+            # below misses and we fall into the 32-bit-truncate-then-
+            # extend path, dropping the high 32 bits.
+            target = self._expand_typedef_type(expr.target_type)
+            src_ty = self._expand_typedef_type(
+                self._type_of(expr.expr, ctx)
+            )
             # __int128 → long long: load low 8 bytes of the int128's
             # storage into EDX:EAX.
             if self._is_int128(src_ty) and self._is_long_long(target):
