@@ -133,8 +133,9 @@ def _mangling_prefix(path: Path) -> str:
 
 def _mangle_static_globals(unit, prefix: str) -> None:
     """Rename file-scope `static` decls in `unit` to `<prefix><name>`,
-    and rewrite intra-TU references to match. Walks the AST generically
-    via dataclasses.fields to avoid maintaining a per-node-type table.
+    and rewrite intra-TU references to match. Walks the auto-AST
+    generically via dataclasses.fields to avoid maintaining a
+    per-node-type table.
 
     Scope-aware: when a function parameter or block-local variable
     shadows a file-scope static, references within that scope refer
@@ -147,26 +148,79 @@ def _mangle_static_globals(unit, prefix: str) -> None:
     file-scope byte array, breaking the inline at the type level.
     """
     import dataclasses
+    from uc_core.codegen_helpers import decl_storage_class, declarator_ident
+    from uc_core.c23_parser import Token as _Token
 
-    def _flatten_top(decls):
-        for d in decls:
-            if isinstance(d, ast_module.DeclarationList):
-                yield from _flatten_top(d.declarations)
-            else:
-                yield d
+    def _innermost_declarator(node):
+        """Walk a declarator chain (PointerDeclarator, ArrayDeclarator,
+        FnDeclarator, GroupDeclarator) to the leaf Declarator carrying
+        the Token name. Returns the leaf or None."""
+        while node is not None:
+            if isinstance(node, ast_module.Declarator):
+                return node
+            inner = getattr(node, "inner", None)
+            if inner is None:
+                return None
+            node = inner
+        return None
 
+    def _function_param_idents(declarator):
+        """Yield the parameter name Tokens (from ParamDecl declarators)
+        on the outermost FnDeclarator of a function-typed declarator."""
+        node = declarator
+        while node is not None:
+            if isinstance(node, (ast_module.FnDeclarator,
+                                 ast_module.FnDeclaratorEmpty)):
+                params = getattr(node, "params", None) or []
+                if isinstance(params, ast_module.VariadicParams):
+                    params = params.params
+                for p in params:
+                    if isinstance(p, ast_module.ParamDecl):
+                        leaf = _innermost_declarator(p.declarator)
+                        if leaf is not None:
+                            yield leaf.name
+                return
+            node = getattr(node, "inner", None)
+
+    # Collect file-scope statics. The auto-AST stores top-level decls
+    # as ast.Declaration (with N declarators) and ast.FunctionDef.
     statics: set[str] = set()
-    for d in _flatten_top(unit.declarations):
-        if isinstance(d, (ast_module.VarDecl, ast_module.FunctionDecl)):
-            if getattr(d, "storage_class", None) == "static" and d.name:
-                statics.add(d.name)
+    for d in unit.items:
+        if isinstance(d, ast_module.Declaration):
+            if decl_storage_class(d.decl_specs) != "static":
+                continue
+            for init_decl in d.declarators or []:
+                inner = init_decl
+                if isinstance(inner, (ast_module.InitDeclarator,
+                                      ast_module.InitDeclaratorWithInit)):
+                    inner = inner.declarator
+                nm = declarator_ident(inner)
+                if nm:
+                    statics.add(nm)
+        elif isinstance(d, ast_module.FunctionDef):
+            if decl_storage_class(d.decl_specs) != "static":
+                continue
+            nm = declarator_ident(d.declarator)
+            if nm:
+                statics.add(nm)
     if not statics:
         return
 
-    def rename_in_scope(name: str, shadowed: frozenset[str]) -> str:
-        if name in statics and name not in shadowed:
-            return prefix + name
-        return name
+    def _rename_token(tok, shadowed: frozenset[str]):
+        """If ``tok`` names a static and isn't shadowed, return a new
+        Token with the prefix prepended to .text. Otherwise return
+        ``tok`` unchanged. Tokens are frozen dataclasses; callers
+        re-assign the returned Token onto the parent node."""
+        if tok is None:
+            return tok
+        text = getattr(tok, "text", None)
+        if text in statics and text not in shadowed:
+            return _Token(
+                name=tok.name, text=prefix + text,
+                line=tok.line, column=tok.column,
+                offset=tok.offset, file_id=tok.file_id,
+            )
+        return tok
 
     def walk(node, shadowed: frozenset[str]):
         if node is None:
@@ -178,58 +232,75 @@ def _mangle_static_globals(unit, prefix: str) -> None:
         if not dataclasses.is_dataclass(node):
             return
 
-        # FunctionDecl: rewrite the function's own name (rename
-        # respects shadowing, but at file scope nothing shadows yet),
-        # then push parameter names as shadow-set for the body.
-        if isinstance(node, ast_module.FunctionDecl):
-            node.name = rename_in_scope(node.name, shadowed)
+        # Function definition: rewrite the function's own name, then
+        # collect its parameter names as the shadow set for the body.
+        if isinstance(node, ast_module.FunctionDef):
+            leaf = _innermost_declarator(node.declarator)
+            if leaf is not None:
+                leaf.name = _rename_token(leaf.name, shadowed)
             param_names: set[str] = set()
-            params = getattr(node, "params", None) or []
-            for p in params:
-                pname = getattr(p, "name", None)
-                if pname:
-                    param_names.add(pname)
-                # Param's own type may reference statics (e.g.
-                # array-bound expr); walk it under the outer shadow set.
-                ptype = getattr(p, "type", None)
-                if ptype is not None:
-                    walk(ptype, shadowed)
+            for ptok in _function_param_idents(node.declarator):
+                if ptok is not None:
+                    param_names.add(ptok.text)
+            # Walk decl_specs + declarator (excluding the leaf we just
+            # handled) under the outer scope, then body under the
+            # extended scope.
+            for spec in node.decl_specs or []:
+                walk(spec, shadowed)
+            walk(node.declarator, shadowed)
             new_shadowed = shadowed | frozenset(param_names)
-            body = getattr(node, "body", None)
-            if body is not None:
-                walk(body, new_shadowed)
+            if node.body is not None:
+                walk(node.body, new_shadowed)
             return
 
-        # CompoundStmt / Block: collect VarDecls in this scope to
-        # extend the shadow set for siblings + nested scopes.
-        items = getattr(node, "items", None)
-        if items is not None and isinstance(node, ast_module.CompoundStmt):
+        # Declaration: rewrite each declarator's leaf name, then walk
+        # the init expressions under the current scope. Multi-decl
+        # `int a, b = a;` reads the outer `a` for `b`'s init (C 6.7.6).
+        if isinstance(node, ast_module.Declaration):
+            for init_decl in node.declarators or []:
+                inner = init_decl
+                if isinstance(inner, (ast_module.InitDeclarator,
+                                      ast_module.InitDeclaratorWithInit)):
+                    inner = init_decl.declarator
+                leaf = _innermost_declarator(inner)
+                if leaf is not None:
+                    leaf.name = _rename_token(leaf.name, shadowed)
+            for f in dataclasses.fields(node):
+                walk(getattr(node, f.name, None), shadowed)
+            return
+
+        # CompoundStmt: collect locally-declared names into the
+        # shadow set as we walk (source-order: a decl's initializer
+        # can still reference the static if the local hasn't been
+        # declared yet at that point).
+        if isinstance(node, ast_module.CompoundStmt):
             local_shadow = set(shadowed)
-            for item in items:
-                if isinstance(item, ast_module.VarDecl) and item.name:
-                    # The decl itself is processed first under the
-                    # current shadow (so its initializer can still
-                    # reference the static if the local hasn't yet
-                    # been declared in source order).
-                    walk(item, frozenset(local_shadow))
-                    local_shadow.add(item.name)
-                else:
-                    walk(item, frozenset(local_shadow))
+            for item in node.items or []:
+                walk(item, frozenset(local_shadow))
+                if isinstance(item, ast_module.Declaration):
+                    for init_decl in item.declarators or []:
+                        inner = init_decl
+                        if isinstance(inner, (ast_module.InitDeclarator,
+                                              ast_module.InitDeclaratorWithInit)):
+                            inner = init_decl.declarator
+                        leaf = _innermost_declarator(inner)
+                        if leaf is not None and leaf.name.text:
+                            local_shadow.add(leaf.name.text)
+                elif isinstance(item, ast_module.FunctionDef):
+                    leaf = _innermost_declarator(item.declarator)
+                    if leaf is not None and leaf.name.text:
+                        local_shadow.add(leaf.name.text)
             return
 
-        # Identifier: rewrite if it names a static and isn't shadowed.
+        # Identifier: rewrite the name token if it matches a static
+        # and isn't shadowed.
         if isinstance(node, ast_module.Identifier):
-            node.name = rename_in_scope(node.name, shadowed)
-
-        # Top-level VarDecl: rewrite its own name; recurse into
-        # initializer / type as usual.
-        if isinstance(node, ast_module.VarDecl):
-            node.name = rename_in_scope(node.name, shadowed)
+            node.name = _rename_token(node.name, shadowed)
 
         for f in dataclasses.fields(node):
             walk(getattr(node, f.name, None), shadowed)
 
-    for d in unit.declarations:
+    for d in unit.items:
         walk(d, frozenset())
 
 
@@ -332,9 +403,14 @@ def main() -> int:
             # match).
             for path, u in zip(input_paths, asts):
                 _mangle_static_globals(u, _mangling_prefix(path))
-            unit = ast_module.TranslationUnit(declarations=[])
+            unit = ast_module.TranslationUnit(items=[])
+            merged_vector_names: set[str] = set()
             for u in asts:
-                unit.declarations.extend(u.declarations)
+                unit.items.extend(u.items)
+                merged_vector_names |= getattr(
+                    u, "_vector_typedef_names", set(),
+                )
+            unit._vector_typedef_names = merged_vector_names
 
         if not args.no_ast_optimize:
             unit = ASTOptimizer(3, type_config=type_config).optimize(unit)

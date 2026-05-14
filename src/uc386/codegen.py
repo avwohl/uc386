@@ -606,6 +606,12 @@ class CodeGenerator:
             if isinstance(d, ast.Declaration):
                 expanded.append(d)
                 storage = decl_storage_class(d.decl_specs)
+                # `typedef T name;` creates a type alias, not a global
+                # variable — don't synthesise a _SynthLocalVar for it.
+                # The typedef table built in generate() already records
+                # the alias.
+                if storage == "typedef":
+                    continue
                 for nm, full, init, _is_fn in iter_var_decls(d):
                     if nm is None:
                         continue
@@ -5251,9 +5257,20 @@ class CodeGenerator:
                 # Flexible array member (`struct S s[];`) — sized 0 in
                 # the struct layout.
                 return 0
-            if not isinstance(t.size, ast.IntLiteral):
-                raise CodegenError("sizeof(array): size must be an integer literal")
-            return int_value(t.size) * self._size_of(t.base_type)
+            if isinstance(t.size, ast.IntLiteral):
+                return int_value(t.size) * self._size_of(t.base_type)
+            # Try to const-fold non-literal size expressions (enum
+            # constants, sizeof, macros). Mutate the AST so subsequent
+            # reads see the literal.
+            try:
+                folded = self._const_eval(t.size, "sizeof")
+                t.size = make_int_lit(folded)
+                return folded * self._size_of(t.base_type)
+            except CodegenError:
+                raise CodegenError(
+                    f"sizeof(array): size must be an integer literal "
+                    f"(got {type(t.size).__name__})"
+                )
         if isinstance(t, _ltypes.StructType):
             return self._struct_sizes[self._resolve_struct_name(t)]
         if isinstance(t, _ltypes.EnumType):
@@ -7440,6 +7457,21 @@ class CodeGenerator:
                 # for an Identifier/Member/Call obj.
                 struct_name = self._resolve_struct_name(obj_ty)
                 out = self._struct_address(expr.obj, ctx)
+            elif (
+                isinstance(obj_ty, _ltypes.PointerType)
+                and isinstance(obj_ty.base_type, _ltypes.BasicType)
+            ):
+                # `T *` where T is a typedef-name unresolved at the
+                # construction-time conversion. Expand and retry.
+                expanded = self._expand_typedef_type(obj_ty.base_type)
+                if isinstance(expanded, _ltypes.StructType):
+                    struct_name = self._resolve_struct_name(expanded)
+                    out = self._eval_expr_to_eax(expr.obj, ctx)
+                else:
+                    raise CodegenError(
+                        f"`->` requires a pointer to struct "
+                        f"(got pointer to {type(expanded).__name__})"
+                    )
             else:
                 raise CodegenError(
                     f"`->` requires a pointer to struct "
@@ -9056,6 +9088,20 @@ class CodeGenerator:
             # name is in scope, but uc386 doesn't run a separate
             # type-check pass — the lifted nested fn's `goto X` falls
             # through to the same lookup that finds X's LabelStmt.
+            return []
+        if isinstance(item, ast.EmptyStmt):
+            # `;` — empty statement (often from a stray semicolon or
+            # an empty macro expansion). No code.
+            return []
+        if isinstance(item, ast.EmptyDecl):
+            # Stray top-level `;` that lands inside a block. No code.
+            return []
+        if isinstance(item, (ast.StaticAssert, ast.StaticAssertWithMessage)):
+            # _Static_assert / static_assert at block scope. The
+            # condition must be a constant expression that's non-zero;
+            # if it folds to zero we'd ideally diagnose, but uc386
+            # doesn't currently surface compile-time errors for this.
+            # Treat as no-op for now.
             return []
         raise CodegenError(
             f"{type(item).__name__} not implemented yet"
@@ -12791,6 +12837,22 @@ class CodeGenerator:
                     struct_name = self._resolve_struct_name(obj_ty.base_type)
                 elif isinstance(obj_ty, _ltypes.StructType):
                     struct_name = self._resolve_struct_name(obj_ty)
+                elif (
+                    isinstance(obj_ty, _ltypes.PointerType)
+                    and isinstance(obj_ty.base_type, _ltypes.BasicType)
+                ):
+                    # `T *` where T is a typedef-name that resolves to a
+                    # struct. The construction-time conversion may have
+                    # landed the typedef as BasicType(name=<typedef>) —
+                    # expand and retry.
+                    expanded = self._expand_typedef_type(obj_ty.base_type)
+                    if isinstance(expanded, _ltypes.StructType):
+                        struct_name = self._resolve_struct_name(expanded)
+                    else:
+                        raise CodegenError(
+                            f"`->` requires a pointer to struct "
+                            f"(got pointer to {type(expanded).__name__})"
+                        )
                 else:
                     raise CodegenError(
                         f"`->` requires a pointer to struct "
