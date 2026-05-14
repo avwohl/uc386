@@ -107,7 +107,7 @@ Anything else raises CodegenError.
 import dataclasses
 
 from uc_core import ast
-from uc_core import ast_legacy as lt
+from uc_core import ast_legacy as _ltypes
 from uc_core._const import int_value, int_flags, make_int_lit
 from uc_core.codegen_helpers import (
     ResolvedType, resolve_type_from_decl, resolve_base_type,
@@ -147,13 +147,13 @@ class _FuncCtx:
         self.slots: list[dict[str, int]] = [{}]
         # Parallel scope chain for declared TypeNodes; used by `_type_of`
         # and pointer-arithmetic scaling.
-        self.types: list[dict[str, "lt.TypeNode"]] = [{}]
+        self.types: list[dict[str, "_ltypes.TypeNode"]] = [{}]
         # `_collect_locals` runs before emit and assigns each VarDecl a
         # frame slot. The (id(decl) → disp) mapping below survives the
         # collect-time scope pop, so the emit-time walk can re-bind the
         # name in its scope without re-bumping frame_size.
         self.decl_disps: dict[int, int] = {}
-        self.decl_types: dict[int, "lt.TypeNode"] = {}
+        self.decl_types: dict[int, "_ltypes.TypeNode"] = {}
         self.frame_size: int = 0          # bytes reserved by `sub esp, frame_size`
         self._next_label: int = 0
         # Stack of (continue_target, break_target) for the enclosing loops.
@@ -178,7 +178,7 @@ class _FuncCtx:
         self.user_labels: dict[str, str] = {}
         # The current function's declared return type. Used by `_return`
         # to dispatch float-returning functions to the FPU stack.
-        self.return_type: lt.TypeNode | None = None
+        self.return_type: _ltypes.TypeNode | None = None
         # Function-static local name → mangled global label. A
         # `static int x = 0;` inside `f` becomes the global
         # `_f__x` in `.data`/`.bss` instead of a frame slot, so the
@@ -258,7 +258,7 @@ class _FuncCtx:
     def alloc_local(
         self,
         name: str,
-        ty: "lt.TypeNode",
+        ty: "_ltypes.TypeNode",
         size: int = 4,
         *,
         decl: object | None = None,
@@ -292,7 +292,7 @@ class _FuncCtx:
         self.call_temps[id(call_node)] = disp
         return disp
 
-    def alloc_param(self, name: str, disp: int, ty: "lt.TypeNode") -> int:
+    def alloc_param(self, name: str, disp: int, ty: "_ltypes.TypeNode") -> int:
         # cdecl: caller pushed args right-to-left, then `call` pushed the
         # return address, then we pushed EBP. So the first arg lives at
         # [ebp + 8], the second at [ebp + 12], etc. The caller is
@@ -316,7 +316,7 @@ class _FuncCtx:
                 return scope[name]
         raise CodegenError(f"unknown identifier `{name}`")
 
-    def lookup_type(self, name: str) -> "lt.TypeNode":
+    def lookup_type(self, name: str) -> "_ltypes.TypeNode":
         for scope in reversed(self.types):
             if name in scope:
                 return scope[name]
@@ -395,16 +395,16 @@ class CodeGenerator:
         # Map from function name to its declared return type. Lets
         # `_type_of` give a Call expression the right type for downstream
         # pointer-arithmetic decisions.
-        self._func_return_types: dict[str, lt.TypeNode] = {}
+        self._func_return_types: dict[str, _ltypes.TypeNode] = {}
         # Map from function name to its declared parameter types. Used
         # by `_emit_call` to coerce arg widths at the call site (e.g.
         # narrow a `double` literal when the param is `float`).
-        self._func_param_types: dict[str, list[lt.TypeNode]] = {}
+        self._func_param_types: dict[str, list[_ltypes.TypeNode]] = {}
         # Module-level variables declared at top scope. `_globals` carries
         # the resolved type (size filled in for unsized arrays);
         # `_global_inits` holds the initializer expression when one was
         # supplied, so the `.data` emission can produce constants.
-        self._globals: dict[str, lt.TypeNode] = {}
+        self._globals: dict[str, _ltypes.TypeNode] = {}
         self._global_inits: dict[str, ast.Expression] = {}
         # Per-global alignment override from `__attribute__((aligned(N)))`.
         # Keys without an entry use the default (no align directive).
@@ -421,7 +421,7 @@ class CodeGenerator:
         # Struct definitions: name → list of (member_name, member_type,
         # offset). `_struct_sizes` is the corresponding total size in bytes
         # (rounded up to struct alignment).
-        self._structs: dict[str, list[tuple[str, lt.TypeNode, int]]] = {}
+        self._structs: dict[str, list[tuple[str, _ltypes.TypeNode, int]]] = {}
         self._struct_sizes: dict[str, int] = {}
         # Names of structs that were declared with `union` so init/copy
         # paths know members share storage.
@@ -502,7 +502,7 @@ class CodeGenerator:
         for d in top_decls:
             if isinstance(d, ast.FunctionDef) and d.body is None:
                 externs.add(d.name)
-            elif isinstance(d, ast.VarDecl) and isinstance(d.var_type, lt.FunctionType):
+            elif isinstance(d, ast.VarDecl) and isinstance(d.var_type, _ltypes.FunctionType):
                 externs.add(d.name)
         externs -= defined_names
         # gnu_inline functions are never extern symbols — they're
@@ -520,7 +520,7 @@ class CodeGenerator:
         # File-scope compound literals get private globals appended after
         # the normal data section. Each entry: (label, target_type, init).
         self._compound_globals: list[
-            tuple[str, lt.TypeNode, ast.Expression]
+            tuple[str, _ltypes.TypeNode, ast.Expression]
         ] = []
         # Set transiently during brace-elision so the recursive consumer
         # can ask `_type_of` whether a value is itself a struct
@@ -561,13 +561,13 @@ class CodeGenerator:
             ("__builtin_conj", "double"),
             ("__builtin_conjl", "long double"),
         ):
-            ct = lt.ComplexType(base_type=base)
+            ct = _ltypes.ComplexType(base_type=base)
             self._func_return_types[name] = ct
             self._func_param_types[name] = [ct]
         # 64-bit builtins return `unsigned long long` (EDX:EAX). Without
         # this registration, `_return` would `cdq` after the call,
         # smashing the high half.
-        ull = lt.BasicType(name="long long", is_signed=False)
+        ull = _ltypes.BasicType(name="long long", is_signed=False)
         for name in ("__builtin_bswap64",):
             self._func_return_types[name] = ull
             self._func_param_types[name] = [ull]
@@ -576,10 +576,10 @@ class CodeGenerator:
         # a `float`-typed value passed to `__builtin_isinff` would push
         # 8 bytes (default double width) and the callee would see
         # garbage in the low 4.
-        flt = lt.BasicType(name="float")
-        dbl = lt.BasicType(name="double")
-        ldbl = lt.BasicType(name="long double")
-        intt = lt.BasicType(name="int")
+        flt = _ltypes.BasicType(name="float")
+        dbl = _ltypes.BasicType(name="double")
+        ldbl = _ltypes.BasicType(name="long double")
+        intt = _ltypes.BasicType(name="int")
         for name in ("__builtin_isinff", "__builtin_isnanf",
                      "__builtin_isfinitef", "__builtin_signbitf"):
             self._func_return_types[name] = intt
@@ -601,7 +601,7 @@ class CodeGenerator:
                 fa = getattr(d, "alignment", None)
                 if fa is not None:
                     self._func_alignments[d.name] = fa
-            elif isinstance(d, ast.VarDecl) and isinstance(d.var_type, lt.FunctionType):
+            elif isinstance(d, ast.VarDecl) and isinstance(d.var_type, _ltypes.FunctionType):
                 self._func_return_types[d.name] = d.var_type.return_type
                 fa = getattr(d, "alignment", None)
                 if fa is not None:
@@ -629,7 +629,7 @@ class CodeGenerator:
                 self._register_enum(d)
             elif (
                 isinstance(d, ast.VarDecl)
-                and isinstance(d.var_type, lt.StructType)
+                and isinstance(d.var_type, _ltypes.StructType)
                 and d.var_type.name
                 and d.var_type.members
             ):
@@ -640,7 +640,7 @@ class CodeGenerator:
                 self._resolve_struct_name(d.var_type)
             elif (
                 isinstance(d, ast.VarDecl)
-                and isinstance(d.var_type, lt.EnumType)
+                and isinstance(d.var_type, _ltypes.EnumType)
                 and d.var_type.values
             ):
                 # `extern enum E { A, B } var;` parses as VarDecl(var)
@@ -653,7 +653,7 @@ class CodeGenerator:
                 # Typedef'd enums register their constants at file scope
                 # (e.g. `typedef enum { X, Y } T;` declares X and Y).
                 if (
-                    isinstance(d.target_type, lt.EnumType)
+                    isinstance(d.target_type, _ltypes.EnumType)
                     and d.target_type.values
                 ):
                     self._register_enum_values(d.target_type.values)
@@ -662,7 +662,7 @@ class CodeGenerator:
                 # references via `struct foo *` (e.g. through a forward
                 # decl) can resolve the layout for member access.
                 if (
-                    isinstance(d.target_type, lt.StructType)
+                    isinstance(d.target_type, _ltypes.StructType)
                     and d.target_type.name
                     and d.target_type.members
                 ):
@@ -681,7 +681,7 @@ class CodeGenerator:
         # Extern declarations at file scope: name → declared type. Looked
         # up like globals, but no storage allocated; the linker resolves
         # the symbol. NASM `extern _name` is emitted in the header.
-        self._extern_vars: dict[str, lt.TypeNode] = {}
+        self._extern_vars: dict[str, _ltypes.TypeNode] = {}
         # `__attribute__((alias("target")))` on a VarDecl makes the
         # declared name a NASM-level alias for `_target` — emitted as
         # `_name equ _target` in the output. Both names refer to the
@@ -693,7 +693,7 @@ class CodeGenerator:
         # _start calls preserve their values.)
         self._noinit_globals: set[str] = set()
         for d in top_decls:
-            if isinstance(d, ast.VarDecl) and not isinstance(d.var_type, lt.FunctionType):
+            if isinstance(d, ast.VarDecl) and not isinstance(d.var_type, _ltypes.FunctionType):
                 target = getattr(d, "alias_target", None)
                 if target is not None:
                     self._global_aliases[d.name] = target
@@ -741,7 +741,7 @@ class CodeGenerator:
                     and getattr(d, "no_instrument_function", False)):
                 self._instrument_no_skip.add(d.name)
             elif (isinstance(d, ast.VarDecl)
-                    and isinstance(d.var_type, lt.FunctionType)
+                    and isinstance(d.var_type, _ltypes.FunctionType)
                     and getattr(d, "no_instrument_function", False)):
                 self._instrument_no_skip.add(d.name)
         defined_fn_names = {fn.name for fn in functions}
@@ -916,12 +916,12 @@ class CodeGenerator:
         return label
 
     @staticmethod
-    def _is_float_type(t: lt.TypeNode) -> bool:
-        return isinstance(t, lt.BasicType) and t.name in (
+    def _is_float_type(t: _ltypes.TypeNode) -> bool:
+        return isinstance(t, _ltypes.BasicType) and t.name in (
             "float", "double", "long double",
         )
 
-    def _float_promotion(self, lt: lt.TypeNode, rt: lt.TypeNode) -> lt.TypeNode:
+    def _float_promotion(self, lt: _ltypes.TypeNode, rt: _ltypes.TypeNode) -> _ltypes.TypeNode:
         """C usual-arithmetic-conversions for a float-or-int + float-or-int pair.
 
         If either side is `double`, the result is `double`. Otherwise (at
@@ -929,11 +929,11 @@ class CodeGenerator:
         cases don't reach here.
         """
         if (
-            (isinstance(lt, lt.BasicType) and lt.name == "double")
-            or (isinstance(rt, lt.BasicType) and rt.name == "double")
+            (isinstance(lt, _ltypes.BasicType) and lt.name == "double")
+            or (isinstance(rt, _ltypes.BasicType) and rt.name == "double")
         ):
-            return lt.BasicType(name="double")
-        return lt.BasicType(name="float")
+            return _ltypes.BasicType(name="double")
+        return _ltypes.BasicType(name="float")
 
     def _bss_section(self) -> list[str]:
         uninit_all = sorted(
@@ -980,7 +980,7 @@ class CodeGenerator:
 
     def _emit_global_init(
         self,
-        ty: lt.TypeNode,
+        ty: _ltypes.TypeNode,
         init: ast.Expression,
         name: str,
     ) -> list[str]:
@@ -994,14 +994,14 @@ class CodeGenerator:
         # Scalar globals with optional braces around the value:
         # `int x = {1};` is equivalent to `int x = 1;`.
         if (
-            isinstance(ty, (lt.BasicType, lt.PointerType))
+            isinstance(ty, (_ltypes.BasicType, _ltypes.PointerType))
             and isinstance(init, ast.InitializerList)
             and len(init.values) == 1
             and not isinstance(init.values[0], ast.DesignatedInit)
         ):
             init = init.values[0]
         # Scalar globals with a literal init.
-        if isinstance(ty, lt.BasicType):
+        if isinstance(ty, _ltypes.BasicType):
             if self._is_float_type(ty):
                 # Float globals can initialize from a float or int literal.
                 # NASM accepts the decimal form in `dd` / `dq` and converts
@@ -1094,7 +1094,7 @@ class CodeGenerator:
                 value = 1 if value != 0 else 0
             directive = self._DATA_DIRECTIVE[self._size_of(ty)]
             return [f"        {directive}      {value}"]
-        if isinstance(ty, lt.PointerType):
+        if isinstance(ty, _ltypes.PointerType):
             # Strip any leading casts: pointer init `(char *)&x` is the
             # same address as `&x` for layout purposes.
             while isinstance(init, ast.Cast):
@@ -1157,7 +1157,7 @@ class CodeGenerator:
                 if (
                     resolved_name in self._globals
                     and isinstance(
-                        self._globals[resolved_name], lt.ArrayType,
+                        self._globals[resolved_name], _ltypes.ArrayType,
                     )
                 ):
                     return [f"        dd      _{resolved_name}"]
@@ -1171,7 +1171,7 @@ class CodeGenerator:
                 and init.op in ("+", "-")
                 and isinstance(init.left, ast.StringLiteral)
             ):
-                label = self._intern_string(init.left.value)
+                label = self._intern_string(init.int_value(left))
                 offset = self._const_eval(init.right, name)
                 if init.op == "-":
                     offset = -offset
@@ -1193,7 +1193,7 @@ class CodeGenerator:
                 return [f"        dd      {base_label} {sign} {abs(offset)}"]
             value = self._const_eval(init, name)
             return [f"        dd      {value}"]
-        if isinstance(ty, lt.ArrayType):
+        if isinstance(ty, _ltypes.ArrayType):
             # Compound literal init: `((vec_t){a, b, ...})` — strip
             # the wrapper and use the inner InitializerList directly.
             if (
@@ -1209,13 +1209,13 @@ class CodeGenerator:
                 if isinstance(init, ast.Compound):
                     init = init.init
             return self._emit_global_array_init(ty, init, name)
-        if isinstance(ty, lt.StructType):
+        if isinstance(ty, _ltypes.StructType):
             return self._emit_global_struct_init(ty, init, name)
-        if isinstance(ty, lt.EnumType):
+        if isinstance(ty, _ltypes.EnumType):
             # An enum is int-sized; treat the init as an int literal.
             value = self._const_eval(init, name)
             return [f"        dd      {value}"]
-        if isinstance(ty, lt.ComplexType):
+        if isinstance(ty, _ltypes.ComplexType):
             return self._emit_global_complex_init(ty, init, name)
         raise CodegenError(
             f"global `{name}`: unsupported type {type(ty).__name__}"
@@ -1223,7 +1223,7 @@ class CodeGenerator:
 
     def _emit_global_complex_init(
         self,
-        ty: lt.ComplexType,
+        ty: _ltypes.ComplexType,
         init: ast.Expression,
         name: str,
     ) -> list[str]:
@@ -1306,7 +1306,7 @@ class CodeGenerator:
 
     def _emit_global_struct_init(
         self,
-        struct_ty: lt.StructType,
+        struct_ty: _ltypes.StructType,
         init: ast.Expression,
         name: str,
     ) -> list[str]:
@@ -1314,7 +1314,7 @@ class CodeGenerator:
         # to its inner InitializerList — that way `struct S s = (S){1,2}`
         # is laid out the same as `struct S s = {1,2}`.
         if isinstance(init, ast.Compound) and isinstance(
-            init.target_type, lt.StructType
+            init.target_type, _ltypes.StructType
         ):
             init = init.init
         if not isinstance(init, ast.InitializerList):
@@ -1504,10 +1504,10 @@ class CodeGenerator:
                     not isinstance(value, ast.InitializerList)
                     and not isinstance(value, ast.Compound)
                     and len(init.values) >= 1
-                    and isinstance(first_m_ty, (lt.ArrayType, lt.StructType))
+                    and isinstance(first_m_ty, (_ltypes.ArrayType, _ltypes.StructType))
                 ):
                     if (
-                        isinstance(first_m_ty, lt.ArrayType)
+                        isinstance(first_m_ty, _ltypes.ArrayType)
                         and not isinstance(value, ast.StringLiteral)
                     ):
                         value = ast.InitializerList(values=list(init.values))
@@ -1620,7 +1620,7 @@ class CodeGenerator:
             if (
                 isinstance(actual, ast.InitializerList)
                 and not isinstance(m_ty_check, (
-                    lt.StructType, lt.ArrayType, lt.ComplexType,
+                    _ltypes.StructType, _ltypes.ArrayType, _ltypes.ComplexType,
                 ))
                 and len(actual.values) == 1
             ):
@@ -1676,7 +1676,7 @@ class CodeGenerator:
             # `_size_of` but their length is derived from the initializer
             # — don't skip those.
             is_flex_array = (
-                isinstance(m_ty, lt.ArrayType) and m_ty.size is None
+                isinstance(m_ty, _ltypes.ArrayType) and m_ty.size is None
             )
             if self._size_of(m_ty) == 0 and not is_flex_array:
                 i += 1
@@ -1930,7 +1930,7 @@ class CodeGenerator:
         return out, i
 
     def _consume_one_member(
-        self, values: list, i: int, m_ty: lt.TypeNode,
+        self, values: list, i: int, m_ty: _ltypes.TypeNode,
     ) -> tuple:
         """Take one logical value for a member of type `m_ty`, possibly
         synthesizing an InitializerList by recursively eliding inside.
@@ -1940,11 +1940,11 @@ class CodeGenerator:
         # Already wrapped — pass through.
         if isinstance(v, ast.InitializerList):
             return v, i + 1
-        if isinstance(m_ty, lt.StructType):
+        if isinstance(m_ty, _ltypes.StructType):
             # Compound literal `(T){...}` for the same struct type
             # passes through as-is; the struct emit unwraps it.
             if isinstance(v, ast.Compound) and isinstance(
-                v.target_type, lt.StructType
+                v.target_type, _ltypes.StructType
             ):
                 try:
                     if (
@@ -1964,7 +1964,7 @@ class CodeGenerator:
                     v_ty = self._type_of(v, ctx)
                 except CodegenError:
                     v_ty = None
-                if isinstance(v_ty, lt.StructType):
+                if isinstance(v_ty, _ltypes.StructType):
                     try:
                         if (
                             self._resolve_struct_name(v_ty)
@@ -1994,7 +1994,7 @@ class CodeGenerator:
                 values, i, inner_members,
             )
             return ast.InitializerList(values=inner_vals), new_i
-        if isinstance(m_ty, lt.ArrayType):
+        if isinstance(m_ty, _ltypes.ArrayType):
             # `char a[N] = "..."` — the string is one value satisfying
             # the whole array.
             if isinstance(v, ast.StringLiteral):
@@ -2019,18 +2019,18 @@ class CodeGenerator:
         # Scalar: take one value.
         return v, i + 1
 
-    def _leaf_slot_count(self, t: lt.TypeNode) -> int:
+    def _leaf_slot_count(self, t: _ltypes.TypeNode) -> int:
         """Recursively count scalar leaves in `t`.
 
         Used by the brace-elision pre-pass to know how many flat
         positional values to consume per array element. Anonymous-union
         members at the same offset count once.
         """
-        if isinstance(t, lt.ArrayType):
+        if isinstance(t, _ltypes.ArrayType):
             if not isinstance(t.size, ast.IntLiteral):
                 return 1
             return t.size.value * self._leaf_slot_count(t.base_type)
-        if isinstance(t, lt.StructType):
+        if isinstance(t, _ltypes.StructType):
             try:
                 sname = self._resolve_struct_name(t)
             except CodegenError:
@@ -2049,7 +2049,7 @@ class CodeGenerator:
     def _elide_braces_for_array(
         self,
         values: list,
-        elem_type: lt.TypeNode,
+        elem_type: _ltypes.TypeNode,
         name: str,
     ) -> list:
         """Group flat positional values into per-element InitializerLists.
@@ -2067,7 +2067,7 @@ class CodeGenerator:
         # Only worth doing if the element is a struct/union/array with
         # known layout and there's a flat run that exceeds 1 value per
         # element.
-        if not isinstance(elem_type, (lt.StructType, lt.ArrayType)):
+        if not isinstance(elem_type, (_ltypes.StructType, _ltypes.ArrayType)):
             return values
         leaf_count = self._leaf_slot_count(elem_type)
         if leaf_count <= 1:
@@ -2100,8 +2100,8 @@ class CodeGenerator:
             # because the elem there is the struct, not char[].)
             if (
                 isinstance(v, ast.StringLiteral)
-                and isinstance(elem_type, lt.ArrayType)
-                and isinstance(elem_type.base_type, lt.BasicType)
+                and isinstance(elem_type, _ltypes.ArrayType)
+                and isinstance(elem_type.base_type, _ltypes.BasicType)
                 and elem_type.base_type.name == "char"
             ):
                 out.append(v)
@@ -2137,7 +2137,7 @@ class CodeGenerator:
 
     def _emit_global_array_init(
         self,
-        arr_ty: lt.ArrayType,
+        arr_ty: _ltypes.ArrayType,
         init: ast.Expression,
         name: str,
     ) -> list[str]:
@@ -2149,7 +2149,7 @@ class CodeGenerator:
         # constants. C lets you elide the braces entirely; treat them as
         # equivalent.
         if (
-            isinstance(elem_type, lt.BasicType)
+            isinstance(elem_type, _ltypes.BasicType)
             and elem_type.name == "char"
             and isinstance(init, ast.InitializerList)
             and len(init.values) == 1
@@ -2194,7 +2194,7 @@ class CodeGenerator:
                 )
                 return [f"        {directive}      {', '.join(values)}"]
             if not (
-                isinstance(elem_type, lt.BasicType) and elem_type.name == "char"
+                isinstance(elem_type, _ltypes.BasicType) and elem_type.name == "char"
             ):
                 raise CodegenError(
                     f"global `{name}`: string init requires a char array"
@@ -2287,7 +2287,7 @@ class CodeGenerator:
             # than dword) we emit each element through `_emit_global_init`
             # recursively, with NASM `times N db 0` filling any tail.
             if (
-                isinstance(elem_type, lt.BasicType)
+                isinstance(elem_type, _ltypes.BasicType)
                 and elem_type.name in self._DATA_DIRECTIVE_NAMES
                 and elem_size in self._DATA_DIRECTIVE
             ):
@@ -2402,16 +2402,16 @@ class CodeGenerator:
             if expr.is_arrow:
                 # `p->m`: the base address comes from evaluating p (a
                 # pointer), then plus member offset.
-                if isinstance(obj_ty, lt.PointerType):
+                if isinstance(obj_ty, _ltypes.PointerType):
                     obj_ty = obj_ty.base_type
                 inner = self._resolve_static_addr(expr.obj, name)
             else:
                 inner = self._resolve_static_addr(expr.obj, name)
             if inner is None:
                 return None
-            if isinstance(obj_ty, (lt.ArrayType, lt.PointerType)):
+            if isinstance(obj_ty, (_ltypes.ArrayType, _ltypes.PointerType)):
                 obj_ty = obj_ty.base_type
-            if not isinstance(obj_ty, lt.StructType):
+            if not isinstance(obj_ty, _ltypes.StructType):
                 return None
             sname = self._resolve_struct_name(obj_ty)
             try:
@@ -2429,9 +2429,9 @@ class CodeGenerator:
                 arr_ty = self._type_of(expr.array, _FuncCtx())
             except CodegenError:
                 return None
-            if isinstance(arr_ty, lt.PointerType):
+            if isinstance(arr_ty, _ltypes.PointerType):
                 elem_ty = arr_ty.base_type
-            elif isinstance(arr_ty, lt.ArrayType):
+            elif isinstance(arr_ty, _ltypes.ArrayType):
                 elem_ty = arr_ty.base_type
             else:
                 return None
@@ -2456,7 +2456,7 @@ class CodeGenerator:
                     if e.name in self._globals:
                         gty = self._globals[e.name]
                         return isinstance(
-                            gty, (lt.ArrayType, lt.FunctionType),
+                            gty, (_ltypes.ArrayType, _ltypes.FunctionType),
                         )
                     if e.name in self._func_return_types:
                         return True
@@ -2506,12 +2506,12 @@ class CodeGenerator:
                 arr_ty = self._type_of(addr_side, _FuncCtx())
             except CodegenError:
                 return None
-            if isinstance(arr_ty, lt.PointerType):
+            if isinstance(arr_ty, _ltypes.PointerType):
                 elem_ty = arr_ty.base_type
-            elif isinstance(arr_ty, lt.ArrayType):
+            elif isinstance(arr_ty, _ltypes.ArrayType):
                 elem_ty = arr_ty.base_type
             else:
-                elem_ty = lt.BasicType(name="char")  # byte arithmetic
+                elem_ty = _ltypes.BasicType(name="char")  # byte arithmetic
             base_label, base_off = inner
             return base_label, base_off + offset * self._size_of(elem_ty)
         return None
@@ -2563,7 +2563,7 @@ class CodeGenerator:
             target = expr.target_type
             inner = self._const_eval_float(expr.expr, name)
             if (
-                isinstance(target, lt.BasicType)
+                isinstance(target, _ltypes.BasicType)
                 and target.name == "float"
             ):
                 # Round to 32-bit float precision.
@@ -2693,7 +2693,7 @@ class CodeGenerator:
             # initialize from `(double)3.14159...` end up as 3.0.
             ty = expr.target_type
             if (
-                isinstance(ty, lt.BasicType)
+                isinstance(ty, _ltypes.BasicType)
                 and self._is_float_type(ty)
             ):
                 raise CodegenError(
@@ -2708,7 +2708,7 @@ class CodeGenerator:
                 f_inner = self._const_eval_float(expr.expr, name)
                 # Truncate toward zero for int casts.
                 inner = int(f_inner) if f_inner >= 0 else -int(-f_inner)
-            if isinstance(ty, lt.BasicType):
+            if isinstance(ty, _ltypes.BasicType):
                 size = self._size_of(ty)
                 if size == 1:
                     inner &= 0xFF
@@ -2827,7 +2827,7 @@ class CodeGenerator:
         # arms. Detect the function name directly and synthesize the
         # proper function-pointer type for matching.
         ctrl_expr = expr.controlling_expr
-        ctrl_ty: lt.TypeNode | None = None
+        ctrl_ty: _ltypes.TypeNode | None = None
         if (
             isinstance(ctrl_expr, ast.Identifier)
             and ctrl_expr.name in self._func_return_types
@@ -2836,8 +2836,8 @@ class CodeGenerator:
         ):
             ret_ty = self._func_return_types[ctrl_expr.name]
             param_tys = self._func_param_types.get(ctrl_expr.name, [])
-            ctrl_ty = lt.PointerType(
-                base_type=lt.FunctionType(
+            ctrl_ty = _ltypes.PointerType(
+                base_type=_ltypes.FunctionType(
                     return_type=ret_ty,
                     param_types=list(param_tys),
                 )
@@ -2847,10 +2847,10 @@ class CodeGenerator:
         ctrl_ty = self._strip_qualifiers(ctrl_ty)
         # Decay arrays to pointers and functions to pointers, the way
         # _Generic sees the controlling expression.
-        if isinstance(ctrl_ty, lt.ArrayType):
-            ctrl_ty = lt.PointerType(base_type=ctrl_ty.base_type)
-        elif isinstance(ctrl_ty, lt.FunctionType):
-            ctrl_ty = lt.PointerType(base_type=ctrl_ty)
+        if isinstance(ctrl_ty, _ltypes.ArrayType):
+            ctrl_ty = _ltypes.PointerType(base_type=ctrl_ty.base_type)
+        elif isinstance(ctrl_ty, _ltypes.FunctionType):
+            ctrl_ty = _ltypes.PointerType(base_type=ctrl_ty)
         default_arm: ast.Expression | None = None
         for assoc_ty, arm in expr.associations:
             if assoc_ty is None:
@@ -2865,15 +2865,15 @@ class CodeGenerator:
         return expr.associations[0][1]
 
     @staticmethod
-    def _strip_qualifiers(t: lt.TypeNode) -> lt.TypeNode:
+    def _strip_qualifiers(t: _ltypes.TypeNode) -> _ltypes.TypeNode:
         # Top-level const/volatile are ignored for `_Generic` matching.
         # Inner qualifiers (on a pointer's pointee) stay — that's per
         # the standard.
-        if isinstance(t, lt.BasicType):
-            return lt.BasicType(name=t.name, is_signed=t.is_signed)
+        if isinstance(t, _ltypes.BasicType):
+            return _ltypes.BasicType(name=t.name, is_signed=t.is_signed)
         return t
 
-    def _types_equal(self, a: lt.TypeNode, b: lt.TypeNode) -> bool:
+    def _types_equal(self, a: _ltypes.TypeNode, b: _ltypes.TypeNode) -> bool:
         """Best-effort C type equality for `_Generic` matching.
 
         Compares structural shape: BasicType by name + signedness,
@@ -2882,7 +2882,7 @@ class CodeGenerator:
         """
         if type(a) is not type(b):
             return False
-        if isinstance(a, lt.BasicType):
+        if isinstance(a, _ltypes.BasicType):
             if a.name != b.name:
                 return False
             # Per C11 6.2.5#15, `char`, `signed char`, and `unsigned
@@ -2896,7 +2896,7 @@ class CodeGenerator:
             sa = True if a.is_signed is None else a.is_signed
             sb = True if b.is_signed is None else b.is_signed
             return sa == sb
-        if isinstance(a, lt.PointerType):
+        if isinstance(a, _ltypes.PointerType):
             # Pointee qualifiers matter for _Generic — `int *` and
             # `const int *` are distinct types. Compare with strict
             # qualifier equality on the pointee.
@@ -2907,7 +2907,7 @@ class CodeGenerator:
             av = getattr(a.base_type, "is_volatile", False)
             bv = getattr(b.base_type, "is_volatile", False)
             return ac == bc and av == bv
-        if isinstance(a, lt.ArrayType):
+        if isinstance(a, _ltypes.ArrayType):
             if not self._types_equal(a.base_type, b.base_type):
                 return False
             if a.size is None or b.size is None:
@@ -2915,13 +2915,13 @@ class CodeGenerator:
             if isinstance(a.size, ast.IntLiteral) and isinstance(b.size, ast.IntLiteral):
                 return a.size.value == b.size.value
             return False
-        if isinstance(a, lt.StructType):
+        if isinstance(a, _ltypes.StructType):
             return self._resolve_struct_name(a) == self._resolve_struct_name(b)
-        if isinstance(a, lt.EnumType):
+        if isinstance(a, _ltypes.EnumType):
             return (a.name or "") == (b.name or "")
-        if isinstance(a, lt.ComplexType):
+        if isinstance(a, _ltypes.ComplexType):
             return a.base_type == b.base_type
-        if isinstance(a, lt.FunctionType):
+        if isinstance(a, _ltypes.FunctionType):
             if not self._types_equal(a.return_type, b.return_type):
                 return False
             if len(a.param_types) != len(b.param_types):
@@ -2944,7 +2944,7 @@ class CodeGenerator:
 
     def _intern_compound_global(
         self,
-        target_type: "lt.TypeNode",
+        target_type: "_ltypes.TypeNode",
         init: "ast.Expression",
         owner_name: str,
     ) -> str:
@@ -3067,15 +3067,15 @@ class CodeGenerator:
         """
         if seen is None:
             seen = set()
-        if isinstance(ty, lt.BasicType):
+        if isinstance(ty, _ltypes.BasicType):
             return ty.name in ("float", "double", "long double")
-        if isinstance(ty, lt.ArrayType):
+        if isinstance(ty, _ltypes.ArrayType):
             return self._type_uses_float(ty.base_type, seen)
-        if isinstance(ty, lt.PointerType):
+        if isinstance(ty, _ltypes.PointerType):
             return self._type_uses_float(ty.base_type, seen)
-        if isinstance(ty, lt.ComplexType):
+        if isinstance(ty, _ltypes.ComplexType):
             return True  # always float-family
-        if isinstance(ty, lt.StructType):
+        if isinstance(ty, _ltypes.StructType):
             if ty.name in seen:
                 return False
             seen.add(ty.name)
@@ -3112,7 +3112,7 @@ class CodeGenerator:
             # reads from this slot to find the buf to longjmp through.
             ctx.alloc_local(
                 "__static_link__",
-                lt.PointerType(base_type=lt.BasicType(name="char")),
+                _ltypes.PointerType(base_type=_ltypes.BasicType(name="char")),
             )
             ctx.trampoline_static_link_disp = ctx.lookup("__static_link__")
         # Lift nested function definitions to file scope. Each gets a
@@ -3214,7 +3214,7 @@ class CodeGenerator:
         # normally (they live on the call stack); if a param is
         # captured we copy its value into the global at function entry
         # and route subsequent outer reads/writes through the global.
-        captured_param_copies: list[tuple[str, str, lt.TypeNode]] = []
+        captured_param_copies: list[tuple[str, str, _ltypes.TypeNode]] = []
         # Don't reset ctx.local_captures here — a lifted nested fn
         # already inherited remappings from its outer.
         for name in captured:
@@ -3323,8 +3323,8 @@ class CodeGenerator:
             tramp_slot_name = f"__tramp_{inner_name}"
             ctx.alloc_local(
                 tramp_slot_name,
-                lt.ArrayType(
-                    base_type=lt.BasicType(name="char"), size=12
+                _ltypes.ArrayType(
+                    base_type=_ltypes.BasicType(name="char"), size=12
                 ),
                 size=12,
             )
@@ -3333,8 +3333,8 @@ class CodeGenerator:
             buf_slot_name = f"__nlg_buf_{inner_name}"
             ctx.alloc_local(
                 buf_slot_name,
-                lt.ArrayType(
-                    base_type=lt.BasicType(name="char"), size=buf_size
+                _ltypes.ArrayType(
+                    base_type=_ltypes.BasicType(name="char"), size=buf_size
                 ),
                 size=buf_size,
             )
@@ -3368,18 +3368,18 @@ class CodeGenerator:
         # regular C arrays can't be returned by value (so don't reserve
         # a retptr for them).
         ret_is_vector = (
-            isinstance(fn.return_type, lt.ArrayType)
+            isinstance(fn.return_type, _ltypes.ArrayType)
             and getattr(fn.return_type, "is_vector", False)
         )
         ret_is_int128 = self._is_int128(fn.return_type)
         if (
-            isinstance(fn.return_type, (lt.StructType, lt.ComplexType))
+            isinstance(fn.return_type, (_ltypes.StructType, _ltypes.ComplexType))
             or ret_is_vector
             or ret_is_int128
         ):
             ctx.alloc_param(
                 "__retptr__", disp,
-                lt.PointerType(base_type=fn.return_type),
+                _ltypes.PointerType(base_type=fn.return_type),
             )
             disp += 4
         for param in fn.params:
@@ -3406,7 +3406,7 @@ class CodeGenerator:
                 except CodegenError:
                     pass
                 slot_name = f"__vla_capture_{param.name}_{i}"
-                ctx.alloc_local(slot_name, lt.BasicType(name="int"))
+                ctx.alloc_local(slot_name, _ltypes.BasicType(name="int"))
                 captured[id(size_expr)] = slot_name
             if captured:
                 self._replace_vla_size_with_capture(
@@ -3422,14 +3422,14 @@ class CodeGenerator:
             if isinstance(sub, ast.VarDecl):
                 vt = self._resolved_var_type(sub)
                 if (
-                    isinstance(vt, lt.ArrayType)
+                    isinstance(vt, _ltypes.ArrayType)
                     and self._array_is_directly_vla(vt)
                 ):
                     has_any_vla = True
                     break
         if has_any_vla:
             ctx.alloc_local(
-                "__vla_baseline", lt.BasicType(name="int"),
+                "__vla_baseline", _ltypes.BasicType(name="int"),
             )
             ctx.vla_baseline_disp = ctx.lookup("__vla_baseline")
         # Resolve `typeof(expr)` references in the body BEFORE
@@ -3485,10 +3485,10 @@ class CodeGenerator:
         # leave).
         rt = fn.return_type
         uses_retptr = (
-            isinstance(rt, lt.StructType)
-            or isinstance(rt, lt.ComplexType)
-            or isinstance(rt, lt.ArrayType)  # vectors
-            or (isinstance(rt, lt.BasicType) and rt.name == "int128")
+            isinstance(rt, _ltypes.StructType)
+            or isinstance(rt, _ltypes.ComplexType)
+            or isinstance(rt, _ltypes.ArrayType)  # vectors
+            or (isinstance(rt, _ltypes.BasicType) and rt.name == "int128")
         )
         skip_frame = (
             ctx.frame_size == 0
@@ -3640,7 +3640,7 @@ class CodeGenerator:
             ret_restore: list[str] = []
             rt = fn.return_type
             is_void = (
-                isinstance(rt, lt.BasicType) and rt.name == "void"
+                isinstance(rt, _ltypes.BasicType) and rt.name == "void"
             )
             if not is_void:
                 if self._is_float_type(rt):
@@ -3718,14 +3718,14 @@ class CodeGenerator:
                 stack = [mt]
                 while stack:
                     t = stack.pop()
-                    if isinstance(t, lt.ArrayType):
+                    if isinstance(t, _ltypes.ArrayType):
                         if (
                             t.size is not None
                             and not isinstance(t.size, ast.IntLiteral)
                         ):
                             return True
                         stack.append(t.base_type)
-                    elif isinstance(t, lt.PointerType):
+                    elif isinstance(t, _ltypes.PointerType):
                         stack.append(t.base_type)
             return False
 
@@ -3742,7 +3742,7 @@ class CodeGenerator:
                     self._register_enum(sub)
                 except CodegenError:
                     pass
-        flat_types: dict[str, lt.TypeNode] = {}
+        flat_types: dict[str, _ltypes.TypeNode] = {}
         # Function params live on ctx via alloc_param.
         for scope in ctx.types:
             flat_types.update(scope)
@@ -3756,7 +3756,7 @@ class CodeGenerator:
             if isinstance(sub, ast.VarDecl) and sub.var_type is not None:
                 flat_types[sub.name] = sub.var_type
 
-        def resolve_inner(operand: ast.Expression) -> lt.TypeNode | None:
+        def resolve_inner(operand: ast.Expression) -> _ltypes.TypeNode | None:
             # For an Identifier, look in flat_types first.
             if isinstance(operand, ast.Identifier):
                 t = flat_types.get(operand.name)
@@ -3764,7 +3764,7 @@ class CodeGenerator:
                     # If `t` is itself an unresolved TypeofType (the
                     # ident's VarDecl hasn't been resolved yet), recurse
                     # to resolve through the chain.
-                    while isinstance(t, lt.TypeofType):
+                    while isinstance(t, _ltypes.TypeofType):
                         next_t = resolve_inner(t.operand)
                         if next_t is None or next_t is t:
                             return None
@@ -3780,15 +3780,15 @@ class CodeGenerator:
             # Index: arr[i] → element type of arr's type.
             if isinstance(operand, ast.Index):
                 arr_ty = resolve_inner(operand.array)
-                if isinstance(arr_ty, (lt.ArrayType, lt.PointerType)):
+                if isinstance(arr_ty, (_ltypes.ArrayType, _ltypes.PointerType)):
                     return arr_ty.base_type
                 return None
             # Member: s.m → member's type from struct layout.
             if isinstance(operand, ast.Member):
                 obj_ty = resolve_inner(operand.obj)
-                if operand.is_arrow and isinstance(obj_ty, lt.PointerType):
+                if operand.is_arrow and isinstance(obj_ty, _ltypes.PointerType):
                     obj_ty = obj_ty.base_type
-                if isinstance(obj_ty, lt.StructType):
+                if isinstance(obj_ty, _ltypes.StructType):
                     sname = self._resolve_struct_name(obj_ty)
                     if sname in self._structs:
                         for m_name, m_ty, _m_off in self._structs[sname]:
@@ -3798,14 +3798,14 @@ class CodeGenerator:
             # *p → pointee.
             if isinstance(operand, ast.UnaryOp) and operand.op == "*":
                 ptr_ty = resolve_inner(operand.operand)
-                if isinstance(ptr_ty, (lt.PointerType, lt.ArrayType)):
+                if isinstance(ptr_ty, (_ltypes.PointerType, _ltypes.ArrayType)):
                     return ptr_ty.base_type
                 return None
             # &x → pointer-to.
             if isinstance(operand, ast.UnaryOp) and operand.op == "&":
                 inner_ty = resolve_inner(operand.operand)
                 if inner_ty is not None:
-                    return lt.PointerType(base_type=inner_ty)
+                    return _ltypes.PointerType(base_type=inner_ty)
                 return None
             # Cast → target type.
             if isinstance(operand, ast.Cast):
@@ -3818,7 +3818,7 @@ class CodeGenerator:
             if isinstance(operand, ast.BinaryOp):
                 if operand.op in ("==", "!=", "<", ">", "<=", ">=",
                                   "&&", "||"):
-                    return lt.BasicType(name="int")
+                    return _ltypes.BasicType(name="int")
                 lt = resolve_inner(operand.left)
                 rt = resolve_inner(operand.right)
                 if lt is None and rt is None:
@@ -3830,10 +3830,10 @@ class CodeGenerator:
                 # Pick the wider type. Prefer LL > int, float > int,
                 # int128 > LL.
                 lsize = self._size_of(lt) if isinstance(
-                    lt, lt.BasicType
+                    lt, _ltypes.BasicType
                 ) else 4
                 rsize = self._size_of(rt) if isinstance(
-                    rt, lt.BasicType
+                    rt, _ltypes.BasicType
                 ) else 4
                 return lt if lsize >= rsize else rt
             # UnaryOp other — propagate the operand's type.
@@ -3862,13 +3862,13 @@ class CodeGenerator:
                 continue
             for f in dataclasses.fields(sub):
                 v = getattr(sub, f.name, None)
-                if isinstance(v, lt.TypeofType):
+                if isinstance(v, _ltypes.TypeofType):
                     resolved = resolve_inner(v.operand)
                     if resolved is not None:
                         setattr(sub, f.name, resolved)
                 elif isinstance(v, list):
                     for i, item in enumerate(v):
-                        if isinstance(item, lt.TypeofType):
+                        if isinstance(item, _ltypes.TypeofType):
                             r = resolve_inner(item.operand)
                             if r is not None:
                                 v[i] = r
@@ -3987,7 +3987,7 @@ class CodeGenerator:
                 ret_ty = self._type_of(sub.args[0], ctx)
             except CodegenError:
                 ret_ty = None
-            if isinstance(ret_ty, lt.ArrayType) and getattr(
+            if isinstance(ret_ty, _ltypes.ArrayType) and getattr(
                 ret_ty, "is_vector", False
             ):
                 size = (self._size_of(ret_ty) + 3) & ~3
@@ -4008,7 +4008,7 @@ class CodeGenerator:
             size = self._compound_temp_size(sub)
             ctx.alloc_call_temp(sub, size)
         elif isinstance(sub, ast.Cast) and isinstance(
-            sub.target_type, (lt.StructType,)
+            sub.target_type, (_ltypes.StructType,)
         ):
             # `(struct T) value` — type-pun into a struct/union
             # via a per-cast temp slot.
@@ -4016,7 +4016,7 @@ class CodeGenerator:
             ctx.alloc_call_temp(sub, size)
         elif (
             isinstance(sub, ast.Cast)
-            and isinstance(sub.target_type, lt.ArrayType)
+            and isinstance(sub.target_type, _ltypes.ArrayType)
             and getattr(sub.target_type, "is_vector", False)
         ):
             # `(vec_t) scalar` — type-pun a scalar value into a
@@ -4027,7 +4027,7 @@ class CodeGenerator:
                 src_ty_check = self._type_of(sub.expr, ctx)
             except CodegenError:
                 pass
-            if not isinstance(src_ty_check, lt.ArrayType):
+            if not isinstance(src_ty_check, _ltypes.ArrayType):
                 size = (self._size_of(sub.target_type) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
         elif isinstance(sub, (ast.BinaryOp, ast.UnaryOp, ast.Cast, ast.TernaryOp)):
@@ -4042,11 +4042,11 @@ class CodeGenerator:
                 ty = self._type_of(sub, ctx)
             except CodegenError:
                 ty = self._type_of_complex_expr(sub)
-            if isinstance(ty, lt.ComplexType):
+            if isinstance(ty, _ltypes.ComplexType):
                 size = (self._size_of(ty) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
             elif (
-                isinstance(ty, lt.ArrayType)
+                isinstance(ty, _ltypes.ArrayType)
                 and self._is_vector_op_node(sub)
                 and self._is_genuine_vector_op(sub, ctx)
             ):
@@ -4063,7 +4063,7 @@ class CodeGenerator:
                 ctx.alloc_call_temp(sub, 16)
             elif (
                 isinstance(sub, ast.TernaryOp)
-                and isinstance(ty, lt.StructType)
+                and isinstance(ty, _ltypes.StructType)
             ):
                 # Struct-returning ternary: needs a temp the size of
                 # the struct so the result of `cond ? get_a() : get_b()`
@@ -4073,7 +4073,7 @@ class CodeGenerator:
                 ctx.alloc_call_temp(sub, size)
             elif (
                 isinstance(sub, ast.TernaryOp)
-                and isinstance(ty, lt.ArrayType)
+                and isinstance(ty, _ltypes.ArrayType)
                 and getattr(ty, "is_vector", False)
             ):
                 # Vector-typed ternary needs a temp the size of the
@@ -4086,7 +4086,7 @@ class CodeGenerator:
         ):
             # `1.0i` as a complex value — needs a temp slot.
             ty = self._type_of_complex_expr(sub)
-            if isinstance(ty, lt.ComplexType):
+            if isinstance(ty, _ltypes.ComplexType):
                 size = (self._size_of(ty) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
         elif (
@@ -4105,7 +4105,7 @@ class CodeGenerator:
         path applies.
         """
         ty = node.target_type
-        if isinstance(ty, lt.ArrayType) and ty.size is None:
+        if isinstance(ty, _ltypes.ArrayType) and ty.size is None:
             init = node.init
             if isinstance(init, ast.InitializerList):
                 length = len(init.values)
@@ -4310,7 +4310,7 @@ class CodeGenerator:
             # Local function declaration (`int f(int);` inside a body): no
             # storage, just a forward extern. Record return/param types so
             # subsequent calls type-check the same way as top-level externs.
-            if isinstance(node.var_type, lt.FunctionType):
+            if isinstance(node.var_type, _ltypes.FunctionType):
                 if node.name not in self._func_return_types:
                     self._func_return_types[node.name] = node.var_type.return_type
                     self._func_param_types[node.name] = list(
@@ -4370,7 +4370,7 @@ class CodeGenerator:
             # VLA (`struct S s[2]` where S has VLA member) keep static
             # layout to preserve member-offset calculations.
             is_vla_array = (
-                isinstance(var_type, lt.ArrayType)
+                isinstance(var_type, _ltypes.ArrayType)
                 and self._array_is_directly_vla(var_type)
             )
             if is_vla_array:
@@ -4457,7 +4457,7 @@ class CodeGenerator:
                 # `typedef struct {...} t;` works lazily via
                 # `_resolve_struct_name`, no eager work needed here.
                 if (
-                    isinstance(node.target_type, lt.EnumType)
+                    isinstance(node.target_type, _ltypes.EnumType)
                     and node.target_type.values
                 ):
                     self._register_enum_values(node.target_type.values)
@@ -4500,11 +4500,11 @@ class CodeGenerator:
         # where a is complex) doesn't try to load 16 bytes into EAX.
         if isinstance(expr, ast.BinaryOp) and expr.op == ",":
             lt = self._type_of(expr.left, ctx)
-            if isinstance(lt, lt.ComplexType):
+            if isinstance(lt, _ltypes.ComplexType):
                 out = self._complex_value_address(expr.left, ctx)
             elif self._is_int128(lt):
                 out = self._int128_value_address(expr.left, ctx)
-            elif isinstance(lt, lt.StructType):
+            elif isinstance(lt, _ltypes.StructType):
                 out = self._struct_address(expr.left, ctx)
             elif self._is_long_long(lt):
                 out = self._eval_expr_to_edx_eax(expr.left, ctx)
@@ -4564,7 +4564,7 @@ class CodeGenerator:
             ]
         if (
             isinstance(expr, ast.Compound)
-            and isinstance(expr.target_type, lt.ComplexType)
+            and isinstance(expr.target_type, _ltypes.ComplexType)
             and id(expr) in ctx.call_temps
         ):
             # `(complex T){...}` — evaluate the init into the
@@ -4604,13 +4604,13 @@ class CodeGenerator:
 
     def _complex_part_address(
         self, expr: ast.UnaryOp, ctx: _FuncCtx,
-    ) -> tuple[list[str], lt.TypeNode]:
+    ) -> tuple[list[str], _ltypes.TypeNode]:
         """Compute the address of a `__real__ x` or `__imag__ x`
         expression: returns asm lines that leave EAX = address of the
         half, plus the half's type (a base BasicType)."""
         operand = expr.operand
         operand_ty = self._type_of(operand, ctx)
-        if not isinstance(operand_ty, lt.ComplexType):
+        if not isinstance(operand_ty, _ltypes.ComplexType):
             raise CodegenError(
                 f"`{expr.op}` requires a _Complex operand "
                 f"(got {type(operand_ty).__name__})"
@@ -4656,15 +4656,15 @@ class CodeGenerator:
         offset = 0 if expr.op == "__real__" else half_size
         if offset:
             out.append(f"        add     eax, {offset}")
-        return out, lt.BasicType(name=operand_ty.base_type)
+        return out, _ltypes.BasicType(name=operand_ty.base_type)
 
-    def _complex_struct_name(self, t: lt.ComplexType) -> str:
+    def _complex_struct_name(self, t: _ltypes.ComplexType) -> str:
         """Return (and lazily register) the synthetic struct name we
         use to lay out `_Complex T`. The struct has members `_real`
         and `_imag` of type `T`."""
         key = f"__complex_{t.base_type.replace(' ', '_')}"
         if key not in self._structs:
-            base = lt.BasicType(name=t.base_type)
+            base = _ltypes.BasicType(name=t.base_type)
             size = self._COMPLEX_BASE_SIZES[t.base_type]
             self._structs[key] = [
                 ("_real", base, 0),
@@ -4673,28 +4673,28 @@ class CodeGenerator:
             self._struct_sizes[key] = 2 * size
         return key
 
-    def _check_supported_type(self, t: lt.TypeNode, name: str) -> None:
+    def _check_supported_type(self, t: _ltypes.TypeNode, name: str) -> None:
         # Pointers, and arrays / scalars / structs / enums of supported
         # base types. Slot sizes are rounded up to 4 in `_collect_locals`
         # so adjacent ints stay 4-aligned. Unsized arrays (`int a[]`
         # without an init) are caught by `_resolved_var_type` before they
         # reach this check.
-        if isinstance(t, lt.PointerType):
+        if isinstance(t, _ltypes.PointerType):
             # If the pointee is an inline-defined struct/union, register
             # it under its tag so a sibling `struct foo *` (without a
             # body) can resolve later. We don't need its layout for
             # the pointer itself.
             base = t.base_type
             if (
-                isinstance(base, lt.StructType)
+                isinstance(base, _ltypes.StructType)
                 and base.name
                 and base.members
             ):
                 self._resolve_struct_name(base)
             return
-        if isinstance(t, lt.BasicType) and t.name in self._SLOT_BASIC_NAMES:
+        if isinstance(t, _ltypes.BasicType) and t.name in self._SLOT_BASIC_NAMES:
             return
-        if isinstance(t, lt.EnumType):
+        if isinstance(t, _ltypes.EnumType):
             # Enums are int-sized. If the type carries inline values
             # (which happens when an `enum { X, Y }` is declared in
             # place — e.g. as a struct member type), register the
@@ -4703,7 +4703,7 @@ class CodeGenerator:
             if t.values:
                 self._register_enum_values(t.values)
             return
-        if isinstance(t, lt.ArrayType):
+        if isinstance(t, _ltypes.ArrayType):
             if t.size is not None and not isinstance(t.size, ast.IntLiteral):
                 # Try to const-fold the size (handles `1 && 1`, `MACRO+1`,
                 # enumerator sums, etc.). On success, mutate the AST to
@@ -4723,13 +4723,13 @@ class CodeGenerator:
                     t.size = ast.IntLiteral(value=16)
             self._check_supported_type(t.base_type, name)
             return
-        if isinstance(t, lt.StructType):
+        if isinstance(t, _ltypes.StructType):
             # `_resolve_struct_name` lazily registers typedef'd or
             # otherwise-inline-defined structs and raises if neither a
             # registered name nor inline members are available.
             self._resolve_struct_name(t)
             return
-        if isinstance(t, lt.ComplexType):
+        if isinstance(t, _ltypes.ComplexType):
             # `_Complex T` is laid out as two T's (real, imag). We
             # accept it as a struct-like type; arithmetic ops (+, *,
             # etc.) on complex values are not yet implemented, but
@@ -4744,7 +4744,7 @@ class CodeGenerator:
             f"struct types are supported (got {type(t).__name__})"
         )
 
-    def _resolved_var_type(self, decl: ast.VarDecl) -> lt.TypeNode:
+    def _resolved_var_type(self, decl: ast.VarDecl) -> _ltypes.TypeNode:
         """Return the var's type with any unsized-array size filled in.
 
         `int arr[] = {1, 2, 3}` and `char s[] = "hi"` both leave the
@@ -4762,7 +4762,7 @@ class CodeGenerator:
         the implied size is the max-index-touched + 1, not value count.
         """
         t = decl.var_type
-        if not isinstance(t, lt.ArrayType) or t.size is not None:
+        if not isinstance(t, _ltypes.ArrayType) or t.size is not None:
             return t
         # `extern T arr[];` — size lives in another translation unit,
         # not knowable here. Return as-is; we never need to allocate a
@@ -4845,19 +4845,19 @@ class CodeGenerator:
             raise CodegenError(
                 f"unsized array `{decl.name}` requires an initializer"
             )
-        return lt.ArrayType(
+        return _ltypes.ArrayType(
             base_type=t.base_type,
             size=ast.IntLiteral(value=n),
         )
 
     @staticmethod
-    def _is_pointer_like(t: lt.TypeNode) -> bool:
+    def _is_pointer_like(t: _ltypes.TypeNode) -> bool:
         """True for types that participate in pointer arithmetic.
 
         Arrays decay to pointers in expression context, so they're treated
         the same as pointers anywhere we look at element-step semantics.
         """
-        return isinstance(t, (lt.PointerType, lt.ArrayType))
+        return isinstance(t, (_ltypes.PointerType, _ltypes.ArrayType))
 
     @staticmethod
     def _is_vector_op_node(node) -> bool:
@@ -4889,17 +4889,17 @@ class CodeGenerator:
                 lt = self._type_of(node.left, ctx)
                 rt = self._type_of(node.right, ctx)
                 l_vec = (
-                    isinstance(lt, lt.ArrayType)
+                    isinstance(lt, _ltypes.ArrayType)
                     and getattr(lt, "is_vector", False)
                 )
                 r_vec = (
-                    isinstance(rt, lt.ArrayType)
+                    isinstance(rt, _ltypes.ArrayType)
                     and getattr(rt, "is_vector", False)
                 )
                 # Two-sided vector op (same size).
                 if (
-                    isinstance(lt, lt.ArrayType)
-                    and isinstance(rt, lt.ArrayType)
+                    isinstance(lt, _ltypes.ArrayType)
+                    and isinstance(rt, _ltypes.ArrayType)
                     and self._size_of(lt) == self._size_of(rt)
                     and (l_vec or r_vec)
                 ):
@@ -4910,7 +4910,7 @@ class CodeGenerator:
                 # float, but we still need to allocate a temp so later
                 # routing doesn't KeyError.
                 def _is_scalar(t):
-                    return isinstance(t, lt.BasicType) and t.name in (
+                    return isinstance(t, _ltypes.BasicType) and t.name in (
                         "int", "char", "short", "long", "long long",
                         "bool", "float", "double", "long double",
                     )
@@ -4921,7 +4921,7 @@ class CodeGenerator:
             if isinstance(node, ast.UnaryOp):
                 opt = self._type_of(node.operand, ctx)
                 return (
-                    isinstance(opt, lt.ArrayType)
+                    isinstance(opt, _ltypes.ArrayType)
                     and getattr(opt, "is_vector", False)
                 )
         except CodegenError:
@@ -4945,15 +4945,15 @@ class CodeGenerator:
         "void": 1,          # GCC convention; standard C disallows arithmetic on void*
     }
 
-    def _size_of(self, t: lt.TypeNode) -> int:
-        if isinstance(t, lt.PointerType):
+    def _size_of(self, t: _ltypes.TypeNode) -> int:
+        if isinstance(t, _ltypes.PointerType):
             return 4
-        if isinstance(t, lt.BasicType):
+        if isinstance(t, _ltypes.BasicType):
             try:
                 return self._BASIC_SIZES[t.name]
             except KeyError:
                 raise CodegenError(f"sizeof({t.name}) not known")
-        if isinstance(t, lt.ArrayType):
+        if isinstance(t, _ltypes.ArrayType):
             if t.size is None:
                 # Flexible array member (`struct S s[];`) — sized 0 in
                 # the struct layout.
@@ -4961,16 +4961,16 @@ class CodeGenerator:
             if not isinstance(t.size, ast.IntLiteral):
                 raise CodegenError("sizeof(array): size must be an integer literal")
             return t.size.value * self._size_of(t.base_type)
-        if isinstance(t, lt.StructType):
+        if isinstance(t, _ltypes.StructType):
             return self._struct_sizes[self._resolve_struct_name(t)]
-        if isinstance(t, lt.EnumType):
+        if isinstance(t, _ltypes.EnumType):
             return 4
-        if isinstance(t, lt.ComplexType):
+        if isinstance(t, _ltypes.ComplexType):
             # `_Complex T` is laid out as two T's (real, imag).
             return 2 * self._COMPLEX_BASE_SIZES.get(t.base_type, 8)
         raise CodegenError(f"sizeof not supported for {type(t).__name__}")
 
-    def _resolve_struct_name(self, t: lt.StructType) -> str:
+    def _resolve_struct_name(self, t: _ltypes.StructType) -> str:
         """Return a registry key for `t`, registering its layout if needed.
 
         Top-level `struct point { ... };` definitions are registered
@@ -5062,7 +5062,7 @@ class CodeGenerator:
             self._struct_sizes[key] = 0
         return key
 
-    def _struct_shape_hash(self, t: lt.StructType) -> str:
+    def _struct_shape_hash(self, t: _ltypes.StructType) -> str:
         """Stable structural fingerprint of an anonymous struct.
 
         Used as the registry key for `typedef struct { ... } X;` so that
@@ -5079,23 +5079,23 @@ class CodeGenerator:
         def type_repr(ty) -> str:
             if ty is None:
                 return "?"
-            if isinstance(ty, lt.StructType):
+            if isinstance(ty, _ltypes.StructType):
                 if ty.name and not ty.members:
                     # Tag-only — same name, same identity.
                     return f"S<{'union' if ty.is_union else 'struct'}:{ty.name}>"
                 # Recurse into the nested anon shape.
                 return f"S<{self._struct_shape_hash(ty)}>"
-            if isinstance(ty, lt.PointerType):
+            if isinstance(ty, _ltypes.PointerType):
                 return f"P<{type_repr(ty.base_type)}>"
-            if isinstance(ty, lt.ArrayType):
+            if isinstance(ty, _ltypes.ArrayType):
                 # ArrayType.size may be an Expression; stringify naively.
                 sz = repr(getattr(ty, "size", None))
                 return f"A[{sz}]<{type_repr(ty.base_type)}>"
-            if isinstance(ty, lt.BasicType):
+            if isinstance(ty, _ltypes.BasicType):
                 return f"B<{ty.name},sgn={getattr(ty, 'is_signed', None)}>"
-            if isinstance(ty, lt.EnumType):
+            if isinstance(ty, _ltypes.EnumType):
                 return f"E<{getattr(ty, 'name', None)}>"
-            if isinstance(ty, lt.FunctionType):
+            if isinstance(ty, _ltypes.FunctionType):
                 rt = type_repr(getattr(ty, "return_type", None))
                 params = ",".join(type_repr(p) for p in getattr(ty, "param_types", []))
                 return f"F<{rt}({params})>"
@@ -5109,7 +5109,7 @@ class CodeGenerator:
         sig = "|".join(parts)
         return hashlib.md5(sig.encode("utf-8")).hexdigest()[:16]
 
-    def _anon_member_layout_key(self, t: lt.StructType) -> str:
+    def _anon_member_layout_key(self, t: _ltypes.StructType) -> str:
         """Resolve `t` (a StructType used as an anonymous member) to a
         registered struct/union name in `_structs` so we can copy its
         members up. Registers the inline definition if needed.
@@ -5200,7 +5200,7 @@ class CodeGenerator:
         is_packed = getattr(decl, "is_packed", False)
         # Validate every member up front. Unions and structs share the
         # same per-member checks; only the layout step differs.
-        members: list[tuple[str, lt.TypeNode, int]] = []
+        members: list[tuple[str, _ltypes.TypeNode, int]] = []
         # Parallel list: group id (= original index in decl.members)
         # per flattened member. Anon-promoted entries share the group id
         # of their parent decl member.
@@ -5221,7 +5221,7 @@ class CodeGenerator:
                         max_align = align
                     continue
                 if not (
-                    isinstance(m.member_type, lt.StructType)
+                    isinstance(m.member_type, _ltypes.StructType)
                     and m.member_type.members
                 ):
                     raise CodegenError(
@@ -5412,7 +5412,7 @@ class CodeGenerator:
 
     def _member_layout(
         self, struct_name: str, member: str
-    ) -> tuple[lt.TypeNode, int]:
+    ) -> tuple[_ltypes.TypeNode, int]:
         members = self._structs.get(struct_name)
         if members is None:
             raise CodegenError(f"struct `{struct_name}` not defined")
@@ -5423,7 +5423,7 @@ class CodeGenerator:
             f"struct `{struct_name}` has no member `{member}`"
         )
 
-    def _alignment_of(self, t: lt.TypeNode) -> int:
+    def _alignment_of(self, t: _ltypes.TypeNode) -> int:
         """Required alignment in bytes for a value of type `t`.
 
         Used by struct layout — each member's offset is rounded up to its
@@ -5431,13 +5431,13 @@ class CodeGenerator:
         largest member alignment so an array of structs stays packed
         without internal misalignment.
         """
-        if isinstance(t, lt.PointerType):
+        if isinstance(t, _ltypes.PointerType):
             return 4
-        if isinstance(t, lt.BasicType):
+        if isinstance(t, _ltypes.BasicType):
             return self._BASIC_SIZES.get(t.name, 1)
-        if isinstance(t, lt.ArrayType):
+        if isinstance(t, _ltypes.ArrayType):
             return self._alignment_of(t.base_type)
-        if isinstance(t, lt.StructType):
+        if isinstance(t, _ltypes.StructType):
             sname = self._resolve_struct_name(t)
             if sname in self._struct_packed:
                 return 1
@@ -5450,44 +5450,44 @@ class CodeGenerator:
             if not members:
                 return 1
             return max(self._alignment_of(mt) for _, mt, _ in members)
-        if isinstance(t, lt.EnumType):
+        if isinstance(t, _ltypes.EnumType):
             return 4
-        if isinstance(t, lt.ComplexType):
+        if isinstance(t, _ltypes.ComplexType):
             return self._COMPLEX_BASE_SIZES.get(t.base_type, 8)
         return 1
 
     @staticmethod
-    def _is_unsigned(t: lt.TypeNode) -> bool:
+    def _is_unsigned(t: _ltypes.TypeNode) -> bool:
         # `is_signed=None` is the language default — signed for
         # char/short/int. EnumType is treated as unsigned for bit-field
         # purposes (matches GCC's choice for enums of non-negative
         # values, which is the common case). `_Bool` is always
         # unsigned per C99 6.2.5.
-        if isinstance(t, lt.BasicType):
+        if isinstance(t, _ltypes.BasicType):
             if t.name == "bool":
                 return True
             return t.is_signed is False
-        if isinstance(t, lt.EnumType):
+        if isinstance(t, _ltypes.EnumType):
             return True
         return False
 
-    def _is_unsigned_after_promotion(self, t: lt.TypeNode) -> bool:
+    def _is_unsigned_after_promotion(self, t: _ltypes.TypeNode) -> bool:
         """C usual arithmetic conversions: unsigned char/short are
         promoted to int (signed), so they don't make the surrounding
         comparison or division unsigned. Only unsigned types that are
         at least as wide as int retain unsigned-ness.
         """
-        if isinstance(t, lt.BasicType) and t.is_signed is False:
+        if isinstance(t, _ltypes.BasicType) and t.is_signed is False:
             return t.name in ("int", "long", "long long")
         return False
 
     @staticmethod
-    def _is_long_long(t: lt.TypeNode) -> bool:
-        return isinstance(t, lt.BasicType) and t.name == "long long"
+    def _is_long_long(t: _ltypes.TypeNode) -> bool:
+        return isinstance(t, _ltypes.BasicType) and t.name == "long long"
 
     @staticmethod
-    def _is_int128(t: lt.TypeNode) -> bool:
-        return isinstance(t, lt.BasicType) and t.name == "int128"
+    def _is_int128(t: _ltypes.TypeNode) -> bool:
+        return isinstance(t, _ltypes.BasicType) and t.name == "int128"
 
     def _ll_operand_high_known_zero(
         self, expr: ast.Expression, ctx: _FuncCtx,
@@ -6026,7 +6026,7 @@ class CodeGenerator:
             arm_ty = self._type_of(arm, ctx)
             if not self._is_int128(arm_ty):
                 synth_cast = ast.Cast(
-                    target_type=lt.BasicType(name="int128"), expr=arm,
+                    target_type=_ltypes.BasicType(name="int128"), expr=arm,
                 )
                 ctx.alloc_call_temp(synth_cast, 16)
                 return synth_cast
@@ -6508,7 +6508,7 @@ class CodeGenerator:
 
         # Materialize both as 16-byte values on the stack so we can
         # address them by ESP-offset.
-        def push_as_int128(e: ast.Expression, ty: lt.TypeNode) -> list[str]:
+        def push_as_int128(e: ast.Expression, ty: _ltypes.TypeNode) -> list[str]:
             o: list[str] = []
             if self._is_int128(ty):
                 # Copy 16 bytes of the value onto the stack.
@@ -6614,7 +6614,7 @@ class CodeGenerator:
         count_expr: ast.Expression,
         dest_disp: int,
         op: str,
-        lt: lt.TypeNode,
+        lt: _ltypes.TypeNode,
         ctx: _FuncCtx,
     ) -> list[str]:
         """Lower `int128 op count` where count is a runtime int (not a
@@ -6666,7 +6666,7 @@ class CodeGenerator:
         dest_disp: int,
         n: int,
         op: str,
-        lt: lt.TypeNode,
+        lt: _ltypes.TypeNode,
         ctx: _FuncCtx,
     ) -> list[str]:
         """Lower `int128_value op N` (op is `<<` or `>>`) into dest."""
@@ -6838,8 +6838,8 @@ class CodeGenerator:
         bool-aware path (which uses `_eval_to_bool_eax`).
         """
         addr_slot_name = f"__compbool_addr_{id(expr)}"
-        bool_ty = lt.BasicType(name="bool", is_signed=False)
-        ptr_ty = lt.PointerType(base_type=bool_ty)
+        bool_ty = _ltypes.BasicType(name="bool", is_signed=False)
+        ptr_ty = _ltypes.PointerType(base_type=bool_ty)
         addr_disp = ctx.alloc_local(addr_slot_name, ptr_ty, size=4)
         out: list[str] = []
         # 1. Compute &lvalue once into addr_slot.
@@ -6873,7 +6873,7 @@ class CodeGenerator:
         self,
         expr: ast.BinaryOp,
         op: str,
-        cplx_ty: lt.ComplexType,
+        cplx_ty: _ltypes.ComplexType,
         ctx: _FuncCtx,
     ) -> list[str]:
         """`complex_lvalue OP= rhs`. For Identifier lvalues use the
@@ -6895,7 +6895,7 @@ class CodeGenerator:
         snap_slot_name = f"__compcx_snap_{id(expr)}"
         addr_disp = ctx.alloc_local(
             addr_slot_name,
-            lt.PointerType(base_type=cplx_ty),
+            _ltypes.PointerType(base_type=cplx_ty),
             size=4,
         )
         snap_disp = ctx.alloc_local(snap_slot_name, cplx_ty, size=size)
@@ -6943,7 +6943,7 @@ class CodeGenerator:
         self,
         expr: ast.BinaryOp,
         op: str,
-        vec_ty: lt.ArrayType,
+        vec_ty: _ltypes.ArrayType,
         ctx: _FuncCtx,
     ) -> list[str]:
         """`vec_lvalue OP= rhs` for non-Identifier vector lvalues
@@ -6953,7 +6953,7 @@ class CodeGenerator:
         size = (self._size_of(vec_ty) + 3) & ~3
         addr_disp = ctx.alloc_local(
             addr_slot_name,
-            lt.PointerType(base_type=vec_ty),
+            _ltypes.PointerType(base_type=vec_ty),
             size=4,
         )
         snap_disp = ctx.alloc_local(snap_slot_name, vec_ty, size=size)
@@ -7014,12 +7014,12 @@ class CodeGenerator:
         snap_slot_name = f"__compi128_snap_{id(expr)}"
         addr_disp = ctx.alloc_local(
             addr_slot_name,
-            lt.PointerType(base_type=lt.BasicType(name="int128")),
+            _ltypes.PointerType(base_type=_ltypes.BasicType(name="int128")),
             size=4,
         )
         snap_disp = ctx.alloc_local(
             snap_slot_name,
-            lt.BasicType(name="int128"),
+            _ltypes.BasicType(name="int128"),
             size=16,
         )
         out: list[str] = []
@@ -7083,7 +7083,7 @@ class CodeGenerator:
         rhs_ty = self._type_of(rhs, ctx)
         if not self._is_int128(rhs_ty):
             synth_cast = ast.Cast(
-                target_type=lt.BasicType(name="int128"), expr=rhs,
+                target_type=_ltypes.BasicType(name="int128"), expr=rhs,
             )
             ctx.alloc_call_temp(synth_cast, 16)
             rhs = synth_cast
@@ -7101,21 +7101,21 @@ class CodeGenerator:
         if expr.is_arrow:
             obj_ty = self._type_of(expr.obj, ctx)
             if (
-                isinstance(obj_ty, lt.ArrayType)
-                and isinstance(obj_ty.base_type, lt.StructType)
+                isinstance(obj_ty, _ltypes.ArrayType)
+                and isinstance(obj_ty.base_type, _ltypes.StructType)
             ):
                 # Array of struct decays to pointer; `&arr[0]` is the
                 # array's storage base, which `_struct_address` returns.
                 struct_name = self._resolve_struct_name(obj_ty.base_type)
                 out = self._struct_address(expr.obj, ctx)
             elif (
-                isinstance(obj_ty, lt.PointerType)
-                and isinstance(obj_ty.base_type, lt.StructType)
+                isinstance(obj_ty, _ltypes.PointerType)
+                and isinstance(obj_ty.base_type, _ltypes.StructType)
             ):
                 struct_name = self._resolve_struct_name(obj_ty.base_type)
                 # eax = the pointer's value, i.e. the struct's address.
                 out = self._eval_expr_to_eax(expr.obj, ctx)
-            elif isinstance(obj_ty, lt.StructType):
+            elif isinstance(obj_ty, _ltypes.StructType):
                 # Permissive: typedef chains around function-pointer
                 # return types may surface a bare StructType where C
                 # would have a PointerType. Treat the struct's address
@@ -7130,7 +7130,7 @@ class CodeGenerator:
                 )
         else:
             obj_ty = self._type_of(expr.obj, ctx)
-            if not isinstance(obj_ty, lt.StructType):
+            if not isinstance(obj_ty, _ltypes.StructType):
                 raise CodegenError(
                     f"`.` requires a struct value "
                     f"(got {type(obj_ty).__name__})"
@@ -7177,7 +7177,7 @@ class CodeGenerator:
             # leave `&s` (the lhs's address) in EAX. `_struct_copy_assign`
             # already does exactly that.
             target_ty = self._type_of(expr.left, ctx)
-            if isinstance(target_ty, lt.StructType):
+            if isinstance(target_ty, _ltypes.StructType):
                 return self._struct_copy_assign(expr, target_ty, ctx)
         if isinstance(expr, ast.BinaryOp) and expr.op == ",":
             # `(side_effect, struct_expr)` — eval lhs for side effects,
@@ -7191,13 +7191,13 @@ class CodeGenerator:
             # (allocated in `_collect_call_temps`) and return its
             # address.
             ty = self._type_of(expr, ctx)
-            if isinstance(ty, lt.StructType):
+            if isinstance(ty, _ltypes.StructType):
                 temp_disp = ctx.call_temps[id(expr)]
                 return self._struct_ternary_into(
                     expr, temp_disp, ty, ctx,
                 )
         if isinstance(expr, ast.Cast) and isinstance(
-            expr.target_type, lt.StructType
+            expr.target_type, _ltypes.StructType
         ):
             # `(struct T) value` — if the source is already a struct of
             # the same type, the cast is a no-op (GCC ext): just return
@@ -7206,7 +7206,7 @@ class CodeGenerator:
                 src_ty = self._type_of(expr.expr, ctx)
             except CodegenError:
                 src_ty = None
-            if isinstance(src_ty, lt.StructType):
+            if isinstance(src_ty, _ltypes.StructType):
                 try:
                     if (
                         self._resolve_struct_name(src_ty)
@@ -7224,7 +7224,7 @@ class CodeGenerator:
         self,
         expr: ast.TernaryOp,
         dest_disp: int,
-        ty: lt.StructType,
+        ty: _ltypes.StructType,
         ctx: _FuncCtx,
     ) -> list[str]:
         """Lower `cond ? T : F` for struct-typed arms. Evaluates the
@@ -7266,7 +7266,7 @@ class CodeGenerator:
         in EAX (matches `_complex_value_address` contract).
         """
         ty = self._type_of(expr, ctx)
-        if not isinstance(ty, lt.ComplexType):
+        if not isinstance(ty, _ltypes.ComplexType):
             raise CodegenError(
                 "complex ternary helper called on non-complex result"
             )
@@ -7319,7 +7319,7 @@ class CodeGenerator:
             out += self._eval_expr_to_eax(expr.expr, ctx)
             out += self._store_from_eax(_ebp_addr(disp), src_ty)
             written = self._size_of(src_ty) if not isinstance(
-                src_ty, (lt.PointerType, lt.ArrayType)
+                src_ty, (_ltypes.PointerType, _ltypes.ArrayType)
             ) else 4
             if size > written:
                 out += self._zero_fill_at(disp + written, size - written)
@@ -7328,7 +7328,7 @@ class CodeGenerator:
 
     def _bitfield_info(
         self, expr: ast.Member, ctx: _FuncCtx
-    ) -> tuple[int, int, lt.TypeNode, int] | None:
+    ) -> tuple[int, int, _ltypes.TypeNode, int] | None:
         """If `expr` is a bit-field, return
         `(bit_offset, bit_width, type, unit_size)`.
 
@@ -7343,9 +7343,9 @@ class CodeGenerator:
         # Pointer / array decays to the struct (or struct-pointer) for
         # member access purposes — `s->m` where `s` is array-of-struct
         # is the same as `(&s[0])->m`.
-        if isinstance(obj_ty, (lt.PointerType, lt.ArrayType)):
+        if isinstance(obj_ty, (_ltypes.PointerType, _ltypes.ArrayType)):
             obj_ty = obj_ty.base_type
-        if not isinstance(obj_ty, lt.StructType):
+        if not isinstance(obj_ty, _ltypes.StructType):
             return None
         struct_name = self._resolve_struct_name(obj_ty)
         bf = self._struct_bitfields.get(struct_name, {})
@@ -7370,10 +7370,10 @@ class CodeGenerator:
             return self._bitfield_load(expr, bf, ctx)
         member_ty = self._type_of(expr, ctx)
         addr = self._member_address(expr, ctx)
-        if isinstance(member_ty, lt.ArrayType):
+        if isinstance(member_ty, _ltypes.ArrayType):
             # Array decay — leave the address in eax.
             return addr
-        if isinstance(member_ty, lt.StructType):
+        if isinstance(member_ty, _ltypes.StructType):
             # Struct value as expression result — return its address,
             # like array decay. Consumers that need to copy the struct
             # (assignment, by-value pass, return) go through
@@ -7386,7 +7386,7 @@ class CodeGenerator:
     def _bitfield_load(
         self,
         expr: ast.Member,
-        bf: tuple[int, int, lt.TypeNode, int],
+        bf: tuple[int, int, _ltypes.TypeNode, int],
         ctx: _FuncCtx,
     ) -> list[str]:
         """Read a bit-field: load the storage unit, shift, mask,
@@ -7414,7 +7414,7 @@ class CodeGenerator:
     def _bitfield_load_ll(
         self,
         expr: ast.Member,
-        bf: tuple[int, int, lt.TypeNode, int],
+        bf: tuple[int, int, _ltypes.TypeNode, int],
         ctx: _FuncCtx,
     ) -> list[str]:
         """Read a 64-bit-storage bit-field, returning EDX:EAX with the
@@ -7477,7 +7477,7 @@ class CodeGenerator:
     def _bitfield_store(
         self,
         expr: ast.Member,
-        bf: tuple[int, int, lt.TypeNode, int],
+        bf: tuple[int, int, _ltypes.TypeNode, int],
         rhs: ast.Expression,
         ctx: _FuncCtx,
     ) -> list[str]:
@@ -7516,7 +7516,7 @@ class CodeGenerator:
     def _bitfield_store_ll(
         self,
         expr: ast.Member,
-        bf: tuple[int, int, lt.TypeNode, int],
+        bf: tuple[int, int, _ltypes.TypeNode, int],
         rhs: ast.Expression,
         ctx: _FuncCtx,
     ) -> list[str]:
@@ -7571,7 +7571,7 @@ class CodeGenerator:
     def _compound_assign_bitfield_ll(
         self,
         expr: ast.BinaryOp,
-        bf: tuple[int, int, lt.TypeNode, int],
+        bf: tuple[int, int, _ltypes.TypeNode, int],
         ctx: _FuncCtx,
     ) -> list[str]:
         """`s.bf op= rhs` for a long-long-storage bit-field.
@@ -7597,10 +7597,10 @@ class CodeGenerator:
         snap_slot_name = f"__cmpd_bf_snap_{id(expr)}"
         addr_disp = ctx.alloc_local(
             addr_slot_name,
-            lt.PointerType(base_type=lt.BasicType(name="long long")),
+            _ltypes.PointerType(base_type=_ltypes.BasicType(name="long long")),
             size=4,
         )
-        snap_ty = lt.BasicType(
+        snap_ty = _ltypes.BasicType(
             name="long long",
             is_signed=False if is_unsigned else None,
         )
@@ -7697,7 +7697,7 @@ class CodeGenerator:
     def _bitfield_store_ll_simple(
         self,
         expr: ast.Member,
-        bf: tuple[int, int, lt.TypeNode, int],
+        bf: tuple[int, int, _ltypes.TypeNode, int],
         rhs: ast.Expression,
         ctx: _FuncCtx,
     ) -> list[str]:
@@ -7766,12 +7766,12 @@ class CodeGenerator:
 
     # ---- identifier resolution (local vs global) ----------------------
 
-    def _identifier_type(self, name: str, ctx: _FuncCtx) -> lt.TypeNode:
+    def _identifier_type(self, name: str, ctx: _FuncCtx) -> _ltypes.TypeNode:
         # `__func__` / `__FUNCTION__` (C99 / GCC) — a const char*
         # pointing to the current function's name.
         if name in ("__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"):
-            return lt.PointerType(
-                base_type=lt.BasicType(name="char", is_const=True),
+            return _ltypes.PointerType(
+                base_type=_ltypes.BasicType(name="char", is_const=True),
             )
         # A `static` local lives as a global under a mangled name; route
         # through the remapping table so callers don't need to know.
@@ -7796,10 +7796,10 @@ class CodeGenerator:
             # pointer. We don't compute pointer arithmetic on functions, so
             # the exact pointee type doesn't matter — represent it as
             # `void *` (4 bytes, no scaling).
-            return lt.PointerType(base_type=lt.BasicType(name="void"))
+            return _ltypes.PointerType(base_type=_ltypes.BasicType(name="void"))
         if name in self._enum_constants:
             # Enum constants are int-typed in C.
-            return lt.BasicType(name="int")
+            return _ltypes.BasicType(name="int")
         raise CodegenError(f"unknown identifier `{name}`")
 
     def _is_extern_redirect(self, name: str, ctx: _FuncCtx) -> bool:
@@ -7808,7 +7808,7 @@ class CodeGenerator:
         return ctx.lookup(name) == _EXTERN_REDIRECT
 
     def _types_compatible(
-        self, a: lt.TypeNode, b: lt.TypeNode,
+        self, a: _ltypes.TypeNode, b: _ltypes.TypeNode,
         check_quals: bool = False,
     ) -> bool:
         """C type compatibility for `__builtin_types_compatible_p`.
@@ -7830,7 +7830,7 @@ class CodeGenerator:
             )
             if qa != qb:
                 return False
-        if isinstance(a, lt.BasicType) and isinstance(b, lt.BasicType):
+        if isinstance(a, _ltypes.BasicType) and isinstance(b, _ltypes.BasicType):
             # `int` and `signed int` are compatible. `signed` is the
             # default for int but not for char — and that distinction
             # matters here. We model "default signedness" via
@@ -7840,33 +7840,33 @@ class CodeGenerator:
             sa = a.is_signed if a.is_signed is not None else (a.name != "char")
             sb = b.is_signed if b.is_signed is not None else (b.name != "char")
             return sa == sb
-        if isinstance(a, lt.PointerType) and isinstance(b, lt.PointerType):
+        if isinstance(a, _ltypes.PointerType) and isinstance(b, _ltypes.PointerType):
             return self._types_compatible(
                 a.base_type, b.base_type, check_quals=True,
             )
-        if isinstance(a, lt.ArrayType) and isinstance(b, lt.ArrayType):
+        if isinstance(a, _ltypes.ArrayType) and isinstance(b, _ltypes.ArrayType):
             return self._types_compatible(
                 a.base_type, b.base_type, check_quals=True,
             )
-        if isinstance(a, lt.StructType) and isinstance(b, lt.StructType):
+        if isinstance(a, _ltypes.StructType) and isinstance(b, _ltypes.StructType):
             try:
                 ka = self._resolve_struct_name(a)
                 kb = self._resolve_struct_name(b)
                 return ka == kb
             except CodegenError:
                 return False
-        if isinstance(a, lt.EnumType) and isinstance(b, lt.EnumType):
+        if isinstance(a, _ltypes.EnumType) and isinstance(b, _ltypes.EnumType):
             # Named enums compare by tag; anonymous enums are only
             # compatible with themselves (same node).
             if a.name and b.name:
                 return a.name == b.name
             return a is b
         # Enum is compatible with its underlying integer type.
-        if isinstance(a, lt.EnumType) and isinstance(b, lt.BasicType):
+        if isinstance(a, _ltypes.EnumType) and isinstance(b, _ltypes.BasicType):
             return b.name in ("int", "long")
-        if isinstance(b, lt.EnumType) and isinstance(a, lt.BasicType):
+        if isinstance(b, _ltypes.EnumType) and isinstance(a, _ltypes.BasicType):
             return a.name in ("int", "long")
-        if isinstance(a, lt.FunctionType) and isinstance(b, lt.FunctionType):
+        if isinstance(a, _ltypes.FunctionType) and isinstance(b, _ltypes.FunctionType):
             if not self._types_compatible(a.return_type, b.return_type):
                 return False
             if len(a.param_types) != len(b.param_types):
@@ -7910,9 +7910,9 @@ class CodeGenerator:
         cur_ty = expr.target_type
         for step in steps:
             if isinstance(step, ast.Member):
-                if isinstance(cur_ty, lt.PointerType):
+                if isinstance(cur_ty, _ltypes.PointerType):
                     cur_ty = cur_ty.base_type
-                if not isinstance(cur_ty, lt.StructType):
+                if not isinstance(cur_ty, _ltypes.StructType):
                     raise CodegenError(
                         f"offsetof: `.{step.member}` of non-struct"
                     )
@@ -7921,7 +7921,7 @@ class CodeGenerator:
                 out.append(f"        add     esi, {m_off}")
                 cur_ty = m_ty
             elif isinstance(step, ast.Index):
-                if isinstance(cur_ty, (lt.ArrayType, lt.PointerType)):
+                if isinstance(cur_ty, (_ltypes.ArrayType, _ltypes.PointerType)):
                     elem_ty = cur_ty.base_type
                 else:
                     raise CodegenError(
@@ -7961,7 +7961,7 @@ class CodeGenerator:
         return self._offsetof_walk(expr.designator, expr.target_type)
 
     def _offsetof_walk(
-        self, node: ast.Expression, root_ty: lt.TypeNode,
+        self, node: ast.Expression, root_ty: _ltypes.TypeNode,
     ) -> int:
         if isinstance(node, ast.Identifier):
             # `__offsetof_root` — base case, offset 0.
@@ -7969,9 +7969,9 @@ class CodeGenerator:
         if isinstance(node, ast.Member):
             base = self._offsetof_walk(node.obj, root_ty)
             base_ty = self._offsetof_type_walk(node.obj, root_ty)
-            if isinstance(base_ty, lt.PointerType):
+            if isinstance(base_ty, _ltypes.PointerType):
                 base_ty = base_ty.base_type
-            if not isinstance(base_ty, lt.StructType):
+            if not isinstance(base_ty, _ltypes.StructType):
                 raise CodegenError(
                     f"offsetof: cannot apply `.{node.member}` to "
                     f"{type(base_ty).__name__}"
@@ -7982,7 +7982,7 @@ class CodeGenerator:
         if isinstance(node, ast.Index):
             base = self._offsetof_walk(node.array, root_ty)
             base_ty = self._offsetof_type_walk(node.array, root_ty)
-            if isinstance(base_ty, (lt.ArrayType, lt.PointerType)):
+            if isinstance(base_ty, (_ltypes.ArrayType, _ltypes.PointerType)):
                 elem_ty = base_ty.base_type
             else:
                 raise CodegenError(
@@ -7995,15 +7995,15 @@ class CodeGenerator:
         )
 
     def _offsetof_type_walk(
-        self, node: ast.Expression, root_ty: lt.TypeNode,
-    ) -> lt.TypeNode:
+        self, node: ast.Expression, root_ty: _ltypes.TypeNode,
+    ) -> _ltypes.TypeNode:
         if isinstance(node, ast.Identifier):
             return root_ty
         if isinstance(node, ast.Member):
             obj_ty = self._offsetof_type_walk(node.obj, root_ty)
-            if isinstance(obj_ty, lt.PointerType):
+            if isinstance(obj_ty, _ltypes.PointerType):
                 obj_ty = obj_ty.base_type
-            if not isinstance(obj_ty, lt.StructType):
+            if not isinstance(obj_ty, _ltypes.StructType):
                 raise CodegenError(
                     f"offsetof: cannot apply `.{node.member}` to non-struct"
                 )
@@ -8012,7 +8012,7 @@ class CodeGenerator:
             return m_ty
         if isinstance(node, ast.Index):
             obj_ty = self._offsetof_type_walk(node.array, root_ty)
-            if isinstance(obj_ty, (lt.ArrayType, lt.PointerType)):
+            if isinstance(obj_ty, (_ltypes.ArrayType, _ltypes.PointerType)):
                 return obj_ty.base_type
             raise CodegenError("offsetof: index of non-array")
         raise CodegenError(
@@ -8162,7 +8162,7 @@ class CodeGenerator:
         if ctx.has_local(name) and not self._is_extern_redirect(name, ctx):
             ty = ctx.lookup_type(name)
             disp = ctx.lookup(name)
-            if isinstance(ty, lt.ArrayType):
+            if isinstance(ty, _ltypes.ArrayType):
                 if name in ctx.vla_backed:
                     # VLA: slot holds a pointer to malloc'd storage.
                     return [f"        mov     eax, {_ebp_addr(disp)}"]
@@ -8172,7 +8172,7 @@ class CodeGenerator:
         if name in self._globals or name in self._extern_vars:
             ty = self._globals.get(name) or self._extern_vars[name]
             label = f"_{name}"
-            if isinstance(ty, lt.ArrayType):
+            if isinstance(ty, _ltypes.ArrayType):
                 # The label IS the address in flat-32; load it as an immediate.
                 return [f"        mov     eax, {label}"]
             return self._load_to_eax(f"[{label}]", ty)
@@ -8220,7 +8220,7 @@ class CodeGenerator:
             return self._store_from_eax(_ebp_addr(ctx.lookup(name)), ty)
         return self._store_from_eax(f"[_{name}]", ty)
 
-    def _load_to_eax(self, addr: str, ty: lt.TypeNode) -> list[str]:
+    def _load_to_eax(self, addr: str, ty: _ltypes.TypeNode) -> list[str]:
         """Lines that load a value of type `ty` from `addr` into EAX.
 
         Sub-word loads sign- or zero-extend (per signedness) so callers can
@@ -8282,7 +8282,7 @@ class CodeGenerator:
         # paths it already leaves EAX = 0/1. For int sources it just
         # leaves EAX = value, so add the explicit normalization to
         # make the cast's result a true 0/1. Per C 6.3.1.2.
-        if isinstance(target, lt.BasicType) and target.name == "bool":
+        if isinstance(target, _ltypes.BasicType) and target.name == "bool":
             out = self._eval_to_bool_eax(expr.expr, ctx)
             out.append("        test    eax, eax")
             out.append("        setne   al")
@@ -8295,7 +8295,7 @@ class CodeGenerator:
         # bypassed.
         if (
             self._is_float_type(src_ty)
-            and isinstance(target, lt.BasicType)
+            and isinstance(target, _ltypes.BasicType)
             and self._size_of(target) == 4
             and self._is_unsigned(target)
         ):
@@ -8333,7 +8333,7 @@ class CodeGenerator:
         # INT_MIN respectively.
         if (
             self._is_float_type(src_ty)
-            and isinstance(target, lt.BasicType)
+            and isinstance(target, _ltypes.BasicType)
             and self._size_of(target) == 4
             and not self._is_unsigned(target)
         ):
@@ -8383,9 +8383,9 @@ class CodeGenerator:
         # `_eval_expr_to_edx_eax(Cast)` path handles the full LL load
         # for callers that want both halves.)
         if (
-            isinstance(src_ty, lt.ArrayType)
+            isinstance(src_ty, _ltypes.ArrayType)
             and getattr(src_ty, "is_vector", False)
-            and isinstance(target, lt.BasicType)
+            and isinstance(target, _ltypes.BasicType)
             and self._size_of(src_ty) >= self._size_of(target)
         ):
             out = self._vector_value_address(expr.expr, ctx)
@@ -8408,11 +8408,11 @@ class CodeGenerator:
         if self._is_int128(src_ty):
             out = self._int128_value_address(expr.expr, ctx)
             target = expr.target_type
-            if isinstance(target, lt.PointerType):
+            if isinstance(target, _ltypes.PointerType):
                 # Pointer cast from int128: load the low 4 bytes.
                 out.append("        mov     eax, [eax]")
                 return out
-            if isinstance(target, lt.BasicType):
+            if isinstance(target, _ltypes.BasicType):
                 size = self._size_of(target)
                 if size == 4 or size == 8:
                     # int128 → int / long / long long (in EAX context):
@@ -8430,11 +8430,11 @@ class CodeGenerator:
             # Fall through to the generic raise below for other targets.
         out = self._eval_expr_to_eax(expr.expr, ctx)
         target = expr.target_type
-        if isinstance(target, lt.PointerType):
+        if isinstance(target, _ltypes.PointerType):
             return out
-        if isinstance(target, lt.EnumType):
+        if isinstance(target, _ltypes.EnumType):
             return out
-        if isinstance(target, lt.BasicType):
+        if isinstance(target, _ltypes.BasicType):
             size = self._size_of(target)
             if size == 4 or size == 8:
                 # size-8 (long long) is treated as 32-bit in EAX for now;
@@ -8449,7 +8449,7 @@ class CodeGenerator:
                 )
             out.append(f"        {mnem}   eax, {half}")
             return out
-        if isinstance(target, lt.ArrayType):
+        if isinstance(target, _ltypes.ArrayType):
             # `(vec_t) value` in EAX-scalar context: produce the
             # vector's address (consumers reading EAX get a pointer
             # to the temp). Allocated in `_collect_call_temps`.
@@ -8458,7 +8458,7 @@ class CodeGenerator:
             f"cast to {type(target).__name__} not supported"
         )
 
-    def _store_from_eax(self, addr: str, ty: lt.TypeNode) -> list[str]:
+    def _store_from_eax(self, addr: str, ty: _ltypes.TypeNode) -> list[str]:
         """Lines that store EAX (treated as `ty`) to `addr`, then leave
         EAX = the stored-and-reread value (narrowed to `ty`'s width and
         re-extended per `ty`'s signedness). This makes chained
@@ -8476,7 +8476,7 @@ class CodeGenerator:
         """
         size = self._size_of(ty)
         if (
-            isinstance(ty, lt.BasicType)
+            isinstance(ty, _ltypes.BasicType)
             and ty.name == "bool"
         ):
             return [
@@ -8653,7 +8653,7 @@ class CodeGenerator:
                 # in `_collect_locals`'s pre-pass.
                 for slot_name, orig_size in captures:
                     ctx.alloc_local(
-                        slot_name, lt.BasicType(name="int"),
+                        slot_name, _ltypes.BasicType(name="int"),
                         decl=orig_size,
                     )
                     try:
@@ -8959,7 +8959,7 @@ class CodeGenerator:
         if captures:
             for slot_name, orig_size in captures:
                 ctx.alloc_local(
-                    slot_name, lt.BasicType(name="int"),
+                    slot_name, _ltypes.BasicType(name="int"),
                     decl=orig_size,
                 )
         out = self._var_init_inner(decl, ctx)
@@ -8999,7 +8999,7 @@ class CodeGenerator:
     def _var_init_inner(self, decl: ast.VarDecl, ctx: _FuncCtx) -> list[str]:
         # Local function declaration (`int f(int);`): registered as an
         # extern in `_collect_locals`; nothing to emit here.
-        if isinstance(decl.var_type, lt.FunctionType):
+        if isinstance(decl.var_type, _ltypes.FunctionType):
             return []
         # `static` locals were registered as globals during
         # `_collect_locals`; their initializer fires once at program
@@ -9058,12 +9058,12 @@ class CodeGenerator:
         # `expr` (typed-promoted to (val, 0) for scalar rhs).
         if (
             isinstance(decl.init, ast.InitializerList)
-            and not isinstance(var_type, (lt.ArrayType, lt.StructType))
+            and not isinstance(var_type, (_ltypes.ArrayType, _ltypes.StructType))
             and len(decl.init.values) == 1
             and not isinstance(decl.init.values[0], ast.DesignatedInit)
         ):
             decl = dataclasses.replace(decl, init=decl.init.values[0])
-        if isinstance(var_type, lt.ArrayType):
+        if isinstance(var_type, _ltypes.ArrayType):
             # Vector types accept a same-shape vector value (Identifier,
             # BinaryOp, UnaryOp, Call, etc.) as their initializer — copy
             # the bytes from the rhs's address into the local's slot.
@@ -9076,7 +9076,7 @@ class CodeGenerator:
             ):
                 init_ty = self._type_of(decl.init, ctx)
                 if (
-                    isinstance(init_ty, lt.ArrayType)
+                    isinstance(init_ty, _ltypes.ArrayType)
                     and self._size_of(init_ty) == self._size_of(var_type)
                 ):
                     # Vector-returning call: use the local's address as
@@ -9108,7 +9108,7 @@ class CodeGenerator:
                         out.append(f"        mov     [ecx + {offset}], al")
                     return out
             return self._array_init(var_type, decl.init, disp, ctx, decl.name)
-        if isinstance(var_type, lt.StructType):
+        if isinstance(var_type, _ltypes.StructType):
             # `struct T s = make(...)` — call `make` with &s as the hidden
             # retptr instead of allocating a temp and copying.
             if (
@@ -9133,7 +9133,7 @@ class CodeGenerator:
             # copy from src to s rather than expecting `{...}`.
             if not isinstance(decl.init, ast.InitializerList):
                 rhs_ty = self._type_of(decl.init, ctx)
-                if isinstance(rhs_ty, lt.StructType):
+                if isinstance(rhs_ty, _ltypes.StructType):
                     return self._struct_copy_from_expr(
                         decl.init, disp, var_type, ctx,
                     )
@@ -9163,7 +9163,7 @@ class CodeGenerator:
             return self._int128_copy_assign(
                 ast.Identifier(name=decl.name), rhs, ctx,
             )
-        if isinstance(var_type, lt.ComplexType):
+        if isinstance(var_type, _ltypes.ComplexType):
             # Complex local init — `__complex__ T r = expr` lowers via
             # the complex-eval engine, which writes (real, imag) into
             # the slot directly.
@@ -9175,12 +9175,12 @@ class CodeGenerator:
             if (
                 isinstance(decl.init, ast.Call)
                 and self._is_complex_returning_call(decl.init, ctx)
-                and isinstance(init_ty, lt.ComplexType)
+                and isinstance(init_ty, _ltypes.ComplexType)
                 and init_ty.base_type == var_type.base_type
             ):
                 return self._call_into_address(decl.init, dest, ctx)
             # If rhs is itself a complex expression, eval directly.
-            if isinstance(init_ty, lt.ComplexType):
+            if isinstance(init_ty, _ltypes.ComplexType):
                 synth = ast.BinaryOp(op="=", left=ast.Identifier(name=decl.name), right=decl.init)
                 return self._complex_copy_assign(synth, var_type, ctx)
             # Scalar init — promote to (val, 0).
@@ -9192,7 +9192,7 @@ class CodeGenerator:
         # complex, and other types convert per C 6.3.1.2 (any non-zero
         # value becomes 1) — not via integer truncation. `_eval_to_bool_eax`
         # already knows about float/LL/int128/complex/int/pointer.
-        if isinstance(var_type, lt.BasicType) and var_type.name == "bool":
+        if isinstance(var_type, _ltypes.BasicType) and var_type.name == "bool":
             return self._eval_to_bool_eax(decl.init, ctx) + self._store_from_eax(
                 _ebp_addr(disp), var_type
             )
@@ -9206,7 +9206,7 @@ class CodeGenerator:
 
     def _array_init(
         self,
-        arr_type: lt.ArrayType,
+        arr_type: _ltypes.ArrayType,
         init: ast.Expression,
         base_disp: int,
         ctx: _FuncCtx,
@@ -9280,7 +9280,7 @@ class CodeGenerator:
                     )
                 return out
             if not (
-                isinstance(elem_type, lt.BasicType)
+                isinstance(elem_type, _ltypes.BasicType)
                 and elem_type.name == "char"
             ):
                 raise CodegenError(
@@ -9428,7 +9428,7 @@ class CodeGenerator:
                     if (
                         isinstance(elem_actual, ast.InitializerList)
                         and not isinstance(elem_type, (
-                            lt.StructType, lt.ArrayType, lt.ComplexType,
+                            _ltypes.StructType, _ltypes.ArrayType, _ltypes.ComplexType,
                         ))
                         and len(elem_actual.values) == 1
                         and not isinstance(
@@ -9437,7 +9437,7 @@ class CodeGenerator:
                     ):
                         elem_actual = elem_actual.values[0]
                     if (
-                        isinstance(elem_type, lt.StructType)
+                        isinstance(elem_type, _ltypes.StructType)
                         and isinstance(elem_actual, ast.InitializerList)
                     ):
                         out += self._struct_init(
@@ -9445,9 +9445,9 @@ class CodeGenerator:
                             f"{name}[{idx}]",
                         )
                     elif (
-                        isinstance(elem_type, lt.StructType)
+                        isinstance(elem_type, _ltypes.StructType)
                         and isinstance(elem_actual, ast.Compound)
-                        and isinstance(elem_actual.target_type, lt.StructType)
+                        and isinstance(elem_actual.target_type, _ltypes.StructType)
                         and isinstance(elem_actual.init, ast.InitializerList)
                     ):
                         # `((struct T){...})` as a struct array element:
@@ -9457,7 +9457,7 @@ class CodeGenerator:
                             f"{name}[{idx}]",
                         )
                     elif (
-                        isinstance(elem_type, lt.ArrayType)
+                        isinstance(elem_type, _ltypes.ArrayType)
                         and isinstance(elem_actual, (ast.InitializerList, ast.StringLiteral))
                     ):
                         # Multi-dim array element: recurse.
@@ -9498,7 +9498,7 @@ class CodeGenerator:
                             out.append(
                                 f"        mov     [edi + {byte_off}], eax"
                             )
-                    elif isinstance(elem_type, lt.ComplexType):
+                    elif isinstance(elem_type, _ltypes.ComplexType):
                         # _Complex element: evaluate into the element
                         # slot via _eval_complex_into_top with &slot
                         # on the stack as the destination.
@@ -9511,7 +9511,7 @@ class CodeGenerator:
                         )
                         out.append("        add     esp, 4")
                     elif (
-                        isinstance(elem_type, lt.BasicType)
+                        isinstance(elem_type, _ltypes.BasicType)
                         and elem_type.name == "bool"
                     ):
                         # `_Bool` element: normalize per C 6.3.1.2 so a
@@ -9538,7 +9538,7 @@ class CodeGenerator:
 
     def _struct_init(
         self,
-        struct_ty: lt.StructType,
+        struct_ty: _ltypes.StructType,
         init: ast.Expression,
         base_disp: int,
         ctx: _FuncCtx,
@@ -9671,8 +9671,8 @@ class CodeGenerator:
             # inner brace targets a promoted scalar member by name.
             if (
                 isinstance(actual, ast.InitializerList)
-                and not isinstance(m_ty, (lt.StructType, lt.ArrayType,
-                                          lt.ComplexType))
+                and not isinstance(m_ty, (_ltypes.StructType, _ltypes.ArrayType,
+                                          _ltypes.ComplexType))
                 and len(actual.values) == 1
             ):
                 inner = actual.values[0]
@@ -9699,22 +9699,22 @@ class CodeGenerator:
                 else:
                     actual = inner
             if (
-                isinstance(m_ty, lt.StructType)
+                isinstance(m_ty, _ltypes.StructType)
                 and isinstance(actual, ast.InitializerList)
             ):
                 out += self._struct_init(
                     m_ty, actual, m_disp, ctx, f"{name}.{m_name_i}"
                 )
             elif (
-                isinstance(m_ty, lt.ArrayType)
+                isinstance(m_ty, _ltypes.ArrayType)
                 and isinstance(actual, (ast.InitializerList, ast.StringLiteral))
             ):
                 out += self._array_init(
                     m_ty, actual, m_disp, ctx, f"{name}.{m_name_i}"
                 )
             elif (
-                isinstance(m_ty, lt.StructType)
-                and isinstance(self._type_of(actual, ctx), lt.StructType)
+                isinstance(m_ty, _ltypes.StructType)
+                and isinstance(self._type_of(actual, ctx), _ltypes.StructType)
             ):
                 # Struct-typed value (an Identifier, a *p, a member, etc.)
                 # being assigned to a struct member: per-dword copy.
@@ -9753,7 +9753,7 @@ class CodeGenerator:
                     out.append(f"        mov     eax, [esi + {byte_off}]")
                     out.append(f"        mov     [edi + {byte_off}], eax")
             elif (
-                isinstance(m_ty, lt.ComplexType)
+                isinstance(m_ty, _ltypes.ComplexType)
                 and m_name_i not in bitfields
             ):
                 # _Complex member: route through `_complex_copy_assign`
@@ -9841,7 +9841,7 @@ class CodeGenerator:
                     store.append(f"        mov     {unit_addr}, ecx")
                     out += store
             elif (
-                isinstance(m_ty, lt.BasicType)
+                isinstance(m_ty, _ltypes.BasicType)
                 and m_ty.name == "bool"
             ):
                 # `_Bool` member: normalize per C 6.3.1.2 so a float /
@@ -9964,7 +9964,7 @@ class CodeGenerator:
             ):
                 _, m_ty_pre, _ = members[cursor_pre]
                 if not isinstance(m_ty_pre, (
-                    lt.StructType, lt.ArrayType, lt.ComplexType,
+                    _ltypes.StructType, _ltypes.ArrayType, _ltypes.ComplexType,
                 )) and cursor_pre < len(groups):
                     my_group = groups[cursor_pre]
                     run_end = cursor_pre
@@ -10047,8 +10047,8 @@ class CodeGenerator:
                                     if (
                                         isinstance(v, ast.InitializerList)
                                         and not isinstance(cur_ty, (
-                                            lt.StructType, lt.ArrayType,
-                                            lt.ComplexType,
+                                            _ltypes.StructType, _ltypes.ArrayType,
+                                            _ltypes.ComplexType,
                                         ))
                                     ):
                                         walk(v)
@@ -10205,7 +10205,7 @@ class CodeGenerator:
             # `_Complex T` value uses the same retptr / struct-copy
             # mechanism with a per-half load via the existing complex
             # address helper.
-            if isinstance(ret_ty, lt.ComplexType):
+            if isinstance(ret_ty, _ltypes.ComplexType):
                 return self._copy_complex_to_retptr(
                     stmt.value, ret_ty, retptr_disp, ctx
                 ) + ["        jmp     .epilogue"]
@@ -10213,7 +10213,7 @@ class CodeGenerator:
             # address comes from `_vector_value_address` since vector
             # ops don't dispatch through `_struct_address`.
             if (
-                isinstance(ret_ty, lt.ArrayType)
+                isinstance(ret_ty, _ltypes.ArrayType)
                 and getattr(ret_ty, "is_vector", False)
             ):
                 return self._copy_vector_to_retptr(
@@ -10270,7 +10270,7 @@ class CodeGenerator:
         # long-long / float / int128 / complex return value also
         # works correctly.
         if (
-            isinstance(rt, lt.BasicType)
+            isinstance(rt, _ltypes.BasicType)
             and rt.name == "bool"
         ):
             out = self._eval_to_bool_eax(stmt.value, ctx)
@@ -10280,7 +10280,7 @@ class CodeGenerator:
             out.append("        jmp     .epilogue")
             return out
         out = self._eval_expr_to_eax(stmt.value, ctx)
-        if isinstance(rt, lt.BasicType):
+        if isinstance(rt, _ltypes.BasicType):
             size = self._size_of(rt)
             if size == 1:
                 mnem = "movzx" if self._is_unsigned(rt) else "movsx"
@@ -10292,8 +10292,8 @@ class CodeGenerator:
         return out
 
     def _complex_promotion(
-        self, lt: lt.TypeNode, rt: lt.TypeNode,
-    ) -> lt.ComplexType:
+        self, lt: _ltypes.TypeNode, rt: _ltypes.TypeNode,
+    ) -> _ltypes.ComplexType:
         """Result type of a complex-arithmetic op.
 
         Per C: if either operand is `_Complex double`, the result is
@@ -10302,15 +10302,15 @@ class CodeGenerator:
         """
         bases = []
         for t in (lt, rt):
-            if isinstance(t, lt.ComplexType):
+            if isinstance(t, _ltypes.ComplexType):
                 bases.append(t.base_type)
-            elif isinstance(t, lt.BasicType) and t.name == "double":
+            elif isinstance(t, _ltypes.BasicType) and t.name == "double":
                 bases.append("double")
         if "long double" in bases:
-            return lt.ComplexType(base_type="long double")
+            return _ltypes.ComplexType(base_type="long double")
         if "double" in bases:
-            return lt.ComplexType(base_type="double")
-        return lt.ComplexType(base_type="float")
+            return _ltypes.ComplexType(base_type="double")
+        return _ltypes.ComplexType(base_type="float")
 
     def _expr_is_complex(self, expr: ast.Expression) -> bool:
         """Cheap probe: does this expression yield a `_Complex T`?"""
@@ -10319,7 +10319,7 @@ class CodeGenerator:
 
     def _type_of_complex_expr(
         self, expr: ast.Expression,
-    ) -> lt.ComplexType | None:
+    ) -> _ltypes.ComplexType | None:
         """Return `ComplexType` for a complex-valued expression, else
         None. Used to decide whether to allocate a temp and route
         through the complex codegen path.
@@ -10331,11 +10331,11 @@ class CodeGenerator:
         """
         if isinstance(expr, ast.FloatLiteral) and expr.is_imaginary:
             # `1.0i` — `_Imaginary T` ≡ `_Complex T` with real=0.
-            return lt.ComplexType(
+            return _ltypes.ComplexType(
                 base_type="float" if expr.is_float else "double",
             )
         if isinstance(expr, ast.Cast):
-            if isinstance(expr.target_type, lt.ComplexType):
+            if isinstance(expr.target_type, _ltypes.ComplexType):
                 return expr.target_type
             return None
         if isinstance(expr, ast.UnaryOp):
@@ -10376,7 +10376,7 @@ class CodeGenerator:
 
     def _eval_complex_into_top(
         self, expr: ast.Expression, ctx: _FuncCtx,
-        dest_ty: lt.ComplexType | None = None,
+        dest_ty: _ltypes.ComplexType | None = None,
     ) -> list[str]:
         """Helper: store a complex value into `[esp]`'s pointed-to
         slot (the top of stack is the destination address; we leave
@@ -10390,21 +10390,21 @@ class CodeGenerator:
         own type.
         """
         ty = self._type_of(expr, ctx)
-        if dest_ty is None and isinstance(ty, lt.ComplexType):
+        if dest_ty is None and isinstance(ty, _ltypes.ComplexType):
             dest_ty = ty
         # `(_Complex T) scalar` cast — store scalar as real, 0 as imag.
         if isinstance(expr, ast.Cast) and isinstance(
-            expr.target_type, lt.ComplexType
+            expr.target_type, _ltypes.ComplexType
         ):
             return self._cast_to_complex_into_top(expr, ctx, dest_ty)
-        if not isinstance(ty, lt.ComplexType):
+        if not isinstance(ty, _ltypes.ComplexType):
             # Real-valued expression in complex context: promote to
             # (real, 0) using the destination's complex type if known.
             if dest_ty is None:
-                dest_ty = lt.ComplexType(
+                dest_ty = _ltypes.ComplexType(
                     base_type=(
                         "double"
-                        if isinstance(ty, lt.BasicType) and ty.name == "double"
+                        if isinstance(ty, _ltypes.BasicType) and ty.name == "double"
                         else "float"
                     ),
                 )
@@ -10426,7 +10426,7 @@ class CodeGenerator:
         ):
             if (
                 dest_ty is not None
-                and isinstance(ty, lt.ComplexType)
+                and isinstance(ty, _ltypes.ComplexType)
                 and dest_ty.base_type != ty.base_type
             ):
                 return self._convert_complex_into_top(expr, ty, dest_ty, ctx)
@@ -10445,11 +10445,11 @@ class CodeGenerator:
                 # try to load 16 bytes into EAX), then eval rhs into
                 # the dest at TOS.
                 lt = self._type_of(expr.left, ctx)
-                if isinstance(lt, lt.ComplexType):
+                if isinstance(lt, _ltypes.ComplexType):
                     out = self._complex_value_address(expr.left, ctx)
                 elif self._is_int128(lt):
                     out = self._int128_value_address(expr.left, ctx)
-                elif isinstance(lt, lt.StructType):
+                elif isinstance(lt, _ltypes.StructType):
                     out = self._struct_address(expr.left, ctx)
                 elif self._is_long_long(lt):
                     out = self._eval_expr_to_edx_eax(expr.left, ctx)
@@ -10541,8 +10541,8 @@ class CodeGenerator:
     def _convert_complex_into_top(
         self,
         src_expr: ast.Expression,
-        src_ty: lt.ComplexType,
-        dest_ty: lt.ComplexType,
+        src_ty: _ltypes.ComplexType,
+        dest_ty: _ltypes.ComplexType,
         ctx: _FuncCtx,
     ) -> list[str]:
         """Copy `src_expr` (a complex lvalue or call) into the
@@ -10583,15 +10583,15 @@ class CodeGenerator:
         dst_half = self._COMPLEX_BASE_SIZES[dest_ty.base_type]
         if src_int and dst_int:
             # Integer → integer. Load with sign-extend, store narrow.
-            src_basic = lt.BasicType(name=src_ty.base_type)
-            dst_basic = lt.BasicType(name=dest_ty.base_type)
+            src_basic = _ltypes.BasicType(name=src_ty.base_type)
+            dst_basic = _ltypes.BasicType(name=dest_ty.base_type)
             out += self._load_to_eax(f"[{src_reg} + {src_off}]", src_basic)
             out += self._store_from_eax(f"[{dst_reg} + {dst_off}]", dst_basic)
             return
         # FPU-mediated: load src half, store dst half.
         if src_int:
             # Integer source: fild from a stack scratch.
-            src_basic = lt.BasicType(name=src_ty.base_type)
+            src_basic = _ltypes.BasicType(name=src_ty.base_type)
             out += self._load_to_eax(f"[{src_reg} + {src_off}]", src_basic)
             out.append("        sub     esp, 4")
             out.append("        mov     [esp], eax")
@@ -10605,7 +10605,7 @@ class CodeGenerator:
             out.append("        sub     esp, 4")
             out.append("        fistp   dword [esp]")
             out.append("        pop     eax")
-            dst_basic = lt.BasicType(name=dest_ty.base_type)
+            dst_basic = _ltypes.BasicType(name=dest_ty.base_type)
             out += self._store_from_eax(f"[{dst_reg} + {dst_off}]", dst_basic)
         else:
             width = "dword" if dst_half == 4 else "qword"
@@ -10614,7 +10614,7 @@ class CodeGenerator:
     def _copy_complex_lvalue_into_top(
         self,
         expr: ast.Expression,
-        ty: lt.ComplexType,
+        ty: _ltypes.ComplexType,
         ctx: _FuncCtx,
     ) -> list[str]:
         """Copy from a complex-valued lvalue/Call into the top-of-stack
@@ -10628,7 +10628,7 @@ class CodeGenerator:
 
     def _cast_to_complex_into_top(
         self, expr: ast.Cast, ctx: _FuncCtx,
-        dest_ty: lt.ComplexType | None = None,
+        dest_ty: _ltypes.ComplexType | None = None,
     ) -> list[str]:
         """`(_Complex T) scalar` — store scalar as real part, 0 as imag."""
         ty = dest_ty if dest_ty is not None else expr.target_type
@@ -10637,7 +10637,7 @@ class CodeGenerator:
     def _scalar_to_complex_into_top(
         self,
         scalar_expr: ast.Expression,
-        ty: lt.ComplexType,
+        ty: _ltypes.ComplexType,
         ctx: _FuncCtx,
     ) -> list[str]:
         """Promote a real-typed expression to (real, 0)."""
@@ -10645,7 +10645,7 @@ class CodeGenerator:
         if ty.base_type in self._COMPLEX_INT_BASES:
             # Integer destination: evaluate via the regular int eval
             # path (or via float→int fistp if the rhs is float-typed).
-            half_basic = lt.BasicType(name=ty.base_type)
+            half_basic = _ltypes.BasicType(name=ty.base_type)
             scalar_ty = self._type_of(scalar_expr, ctx)
             out: list[str] = []
             if self._is_float_type(scalar_ty):
@@ -10677,7 +10677,7 @@ class CodeGenerator:
         return out
 
     def _complex_neg_into_top(
-        self, expr: ast.UnaryOp, ty: lt.ComplexType, ctx: _FuncCtx,
+        self, expr: ast.UnaryOp, ty: _ltypes.ComplexType, ctx: _FuncCtx,
     ) -> list[str]:
         """`-x` for complex x: (-real, -imag)."""
         half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
@@ -10698,7 +10698,7 @@ class CodeGenerator:
         return out
 
     def _complex_conj_into_top(
-        self, expr: ast.UnaryOp, ty: lt.ComplexType, ctx: _FuncCtx,
+        self, expr: ast.UnaryOp, ty: _ltypes.ComplexType, ctx: _FuncCtx,
     ) -> list[str]:
         """`~x` for complex x: (real, -imag) — complex conjugate."""
         half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
@@ -11032,7 +11032,7 @@ class CodeGenerator:
             out.append(f"        neg     byte [{addr_reg} + {off}]")
 
     def _complex_const_into_top(
-        self, real: float, imag: float, ty: lt.ComplexType,
+        self, real: float, imag: float, ty: _ltypes.ComplexType,
     ) -> list[str]:
         """Constant `(real, imag)` complex value — interned via the
         float-constant table for each half. For int-base complex,
@@ -11072,7 +11072,7 @@ class CodeGenerator:
         ]
 
     def _complex_int_arith_into_top(
-        self, expr: ast.BinaryOp, ty: lt.ComplexType, ctx: _FuncCtx,
+        self, expr: ast.BinaryOp, ty: _ltypes.ComplexType, ctx: _FuncCtx,
     ) -> list[str]:
         """`a + b`, `a - b`, `a * b` for complex-int values via integer
         ops. Halves are loaded as integers (not floats) so the result
@@ -11085,7 +11085,7 @@ class CodeGenerator:
         is_signed = ty.base_type in ("char", "short", "int", "long", "long long")
         # Sub-word halves use the regular integer load helpers via
         # _load_to_eax with a synthesized half-type.
-        half_ty = lt.BasicType(name=ty.base_type)
+        half_ty = _ltypes.BasicType(name=ty.base_type)
         # Two scratch slots: left at [esp] and right at [esp + size].
         # Same shape as the FPU paths.
         out = [f"        sub     esp, {2 * size}"]
@@ -11173,13 +11173,13 @@ class CodeGenerator:
         return out
 
     def _complex_int_mul_into_top_simple(
-        self, expr: ast.BinaryOp, ty: lt.ComplexType, ctx: _FuncCtx,
+        self, expr: ast.BinaryOp, ty: _ltypes.ComplexType, ctx: _FuncCtx,
     ) -> list[str]:
         """Complex-int multiply via four imuls into stack scratch."""
         half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
         size = self._size_of(ty)
         is_signed = True  # use signed mul; result truncates the same way
-        half_ty = lt.BasicType(name=ty.base_type)
+        half_ty = _ltypes.BasicType(name=ty.base_type)
         # Layout: [esp + 0] = left scratch (size bytes),
         # [esp + size] = right scratch (size bytes).
         out = [f"        sub     esp, {2 * size}"]
@@ -11244,7 +11244,7 @@ class CodeGenerator:
         return out
 
     def _complex_addsub_into_top(
-        self, expr: ast.BinaryOp, ty: lt.ComplexType, ctx: _FuncCtx,
+        self, expr: ast.BinaryOp, ty: _ltypes.ComplexType, ctx: _FuncCtx,
     ) -> list[str]:
         """`a + b` or `a - b` for complex values. Component-wise.
 
@@ -11293,7 +11293,7 @@ class CodeGenerator:
         return out
 
     def _complex_mul_into_top(
-        self, expr: ast.BinaryOp, ty: lt.ComplexType, ctx: _FuncCtx,
+        self, expr: ast.BinaryOp, ty: _ltypes.ComplexType, ctx: _FuncCtx,
     ) -> list[str]:
         """`a * b` for complex values:
             real = ar*br - ai*bi
@@ -11339,7 +11339,7 @@ class CodeGenerator:
         return out
 
     def _complex_div_into_top(
-        self, expr: ast.BinaryOp, ty: lt.ComplexType, ctx: _FuncCtx,
+        self, expr: ast.BinaryOp, ty: _ltypes.ComplexType, ctx: _FuncCtx,
     ) -> list[str]:
         """`a / b` for complex values:
             denom = br*br + bi*bi
@@ -11409,7 +11409,7 @@ class CodeGenerator:
         lt = self._type_of(expr.left, ctx)
         rt = self._type_of(expr.right, ctx)
         # Use whichever side is complex to determine the precision.
-        cty = lt if isinstance(lt, lt.ComplexType) else rt
+        cty = lt if isinstance(lt, _ltypes.ComplexType) else rt
         half_size = self._COMPLEX_BASE_SIZES[cty.base_type]
         is_int = cty.base_type in self._COMPLEX_INT_BASES
         size = self._size_of(cty)
@@ -11420,7 +11420,7 @@ class CodeGenerator:
         out.append(f"        lea     eax, [esp + {size}]")
         out.append("        push    eax")
         out += self._eval_complex_into_top(
-            expr.left if isinstance(lt, lt.ComplexType)
+            expr.left if isinstance(lt, _ltypes.ComplexType)
             else ast.Cast(target_type=cty, expr=expr.left),
             ctx, cty,
         )
@@ -11429,7 +11429,7 @@ class CodeGenerator:
         out.append("        mov     eax, esp")
         out.append("        push    eax")
         out += self._eval_complex_into_top(
-            expr.right if isinstance(rt, lt.ComplexType)
+            expr.right if isinstance(rt, _ltypes.ComplexType)
             else ast.Cast(target_type=cty, expr=expr.right),
             ctx, cty,
         )
@@ -11503,7 +11503,7 @@ class CodeGenerator:
         return out
 
     def _complex_assign_into_top(
-        self, expr: ast.BinaryOp, ty: lt.ComplexType, ctx: _FuncCtx,
+        self, expr: ast.BinaryOp, ty: _ltypes.ComplexType, ctx: _FuncCtx,
     ) -> list[str]:
         """`lhs = rhs` for complex types. The result is the new value
         of lhs; we copy lhs's content into the destination."""
@@ -11520,7 +11520,7 @@ class CodeGenerator:
         self,
         lhs: ast.Expression,
         rhs: ast.Expression,
-        ty: lt.ComplexType,
+        ty: _ltypes.ComplexType,
         ctx: _FuncCtx,
     ) -> list[str]:
         """`c = scalar` for `_Complex T c` — store scalar as the real
@@ -11533,7 +11533,7 @@ class CodeGenerator:
         out = self._complex_value_address(lhs, ctx)
         out.append("        push    eax")
         if ty.base_type in self._COMPLEX_INT_BASES:
-            half_basic = lt.BasicType(name=ty.base_type)
+            half_basic = _ltypes.BasicType(name=ty.base_type)
             scalar_ty = self._type_of(rhs, ctx)
             if self._is_float_type(scalar_ty):
                 out += self._eval_float_to_st0(rhs, ctx)
@@ -11581,10 +11581,10 @@ class CodeGenerator:
         `_Complex T`? Recognizes both direct calls (lookup by name)
         and indirect calls (walk the function pointer's type)."""
         rt = self._call_return_type(call, ctx)
-        return isinstance(rt, lt.ComplexType)
+        return isinstance(rt, _ltypes.ComplexType)
 
     def _complex_copy_assign(
-        self, expr: ast.BinaryOp, ty: lt.ComplexType, ctx: _FuncCtx,
+        self, expr: ast.BinaryOp, ty: _ltypes.ComplexType, ctx: _FuncCtx,
     ) -> list[str]:
         """`dst = src` where both are `_Complex T`. The src may be an
         lvalue (Identifier, Member, etc.) or a complex sub-expression
@@ -11600,7 +11600,7 @@ class CodeGenerator:
             isinstance(rhs, (ast.BinaryOp, ast.UnaryOp, ast.Cast))
             and not (
                 isinstance(rhs, ast.Cast)
-                and isinstance(rhs.target_type, lt.ComplexType) is False
+                and isinstance(rhs.target_type, _ltypes.ComplexType) is False
             )
         ):
             # Evaluate rhs into &dst directly. Pass the destination's
@@ -11613,7 +11613,7 @@ class CodeGenerator:
         # Lvalue / Call / FloatLiteral source.
         rhs_ty = self._type_of(rhs, ctx)
         if (
-            isinstance(rhs_ty, lt.ComplexType)
+            isinstance(rhs_ty, _ltypes.ComplexType)
             and rhs_ty.base_type != ty.base_type
         ):
             # Cross-precision: per-half conversion.
@@ -11632,7 +11632,7 @@ class CodeGenerator:
     def _copy_complex_to_retptr(
         self,
         src_expr: ast.Expression,
-        ret_ty: lt.ComplexType,
+        ret_ty: _ltypes.ComplexType,
         retptr_disp: int,
         ctx: _FuncCtx,
     ) -> list[str]:
@@ -11655,7 +11655,7 @@ class CodeGenerator:
     def _copy_vector_to_retptr(
         self,
         src_expr: ast.Expression,
-        ret_ty: lt.ArrayType,
+        ret_ty: _ltypes.ArrayType,
         retptr_disp: int,
         ctx: _FuncCtx,
     ) -> list[str]:
@@ -11688,7 +11688,7 @@ class CodeGenerator:
     def _copy_struct_to_retptr(
         self,
         src_expr: ast.Expression,
-        ret_ty: lt.TypeNode,
+        ret_ty: _ltypes.TypeNode,
         retptr_disp: int,
         ctx: _FuncCtx,
     ) -> list[str]:
@@ -11809,7 +11809,7 @@ class CodeGenerator:
         # the third argument. Use that type's signedness to pick the
         # right flag (CF for unsigned, OF for signed).
         dest_ty = self._type_of(args[2], ctx)
-        if isinstance(dest_ty, lt.PointerType):
+        if isinstance(dest_ty, _ltypes.PointerType):
             dest_ty = dest_ty.base_type
         unsigned = self._is_unsigned(dest_ty)
         dest_is_ll = self._is_long_long(dest_ty)
@@ -12069,14 +12069,14 @@ class CodeGenerator:
                 break
             # Function-typed: stripping is the function-decay
             # idempotent rule.
-            if isinstance(inner_ty, lt.FunctionType):
+            if isinstance(inner_ty, _ltypes.FunctionType):
                 callee = callee.operand
                 continue
             # Function-pointer-typed: the `*` is idempotent because
             # the dereferenced function value re-decays to a fn-ptr.
             if (
-                isinstance(inner_ty, lt.PointerType)
-                and isinstance(inner_ty.base_type, lt.FunctionType)
+                isinstance(inner_ty, _ltypes.PointerType)
+                and isinstance(inner_ty.base_type, _ltypes.FunctionType)
             ):
                 callee = callee.operand
                 continue
@@ -12129,7 +12129,7 @@ class CodeGenerator:
 
     def _call_return_type(
         self, call: ast.Call, ctx: _FuncCtx | None,
-    ) -> lt.TypeNode | None:
+    ) -> _ltypes.TypeNode | None:
         """Resolve a Call's return type — directly when the callee is a
         named function, or by walking the indirect callee's function-
         pointer type.
@@ -12145,11 +12145,11 @@ class CodeGenerator:
             return None
         # Strip leading `*`s that the user may have layered on a fn
         # pointer — `(*fp)()` and `(***fp)()` are idempotent.
-        if isinstance(ty, lt.PointerType) and isinstance(
-            ty.base_type, lt.FunctionType
+        if isinstance(ty, _ltypes.PointerType) and isinstance(
+            ty.base_type, _ltypes.FunctionType
         ):
             return ty.base_type.return_type
-        if isinstance(ty, lt.FunctionType):
+        if isinstance(ty, _ltypes.FunctionType):
             return ty.return_type
         return None
 
@@ -12157,12 +12157,12 @@ class CodeGenerator:
         """True iff `call` returns a struct (direct or via known
         function-pointer type)."""
         rt = self._call_return_type(call, ctx)
-        return isinstance(rt, lt.StructType)
+        return isinstance(rt, _ltypes.StructType)
 
     def _is_vector_returning_call(self, call: ast.Call, ctx) -> bool:
         """True iff `call` returns a vector (ArrayType, by-value)."""
         rt = self._call_return_type(call, ctx)
-        return isinstance(rt, lt.ArrayType)
+        return isinstance(rt, _ltypes.ArrayType)
 
     def _is_int128_returning_call(self, call: ast.Call, ctx) -> bool:
         """True iff `call` returns __int128. Uses the same retptr ABI
@@ -12180,7 +12180,7 @@ class CodeGenerator:
         "==", "!=", "<", ">", "<=", ">=", "&&", "||",
     })
 
-    def _type_of(self, expr: ast.Expression, ctx: _FuncCtx) -> lt.TypeNode:
+    def _type_of(self, expr: ast.Expression, ctx: _FuncCtx) -> _ltypes.TypeNode:
         """Best-effort static type of `expr`.
 
         Used to drive pointer-arithmetic scaling. Falls back to `int` for
@@ -12197,11 +12197,8 @@ class CodeGenerator:
             # with int width-wise; we set the BasicType name based on the
             # ranks the value/suffix imply.
             name = "int"
-            v = expr.value
-            unsigned = getattr(expr, "is_unsigned", False)
-            is_long = getattr(expr, "is_long", False)
-            is_long_long = getattr(expr, "is_long_long", False)
-            is_hex = getattr(expr, "is_hex", False)
+            v = int_value(expr)
+            is_long, is_long_long, unsigned, is_hex = int_flags(expr)
             if is_long_long:
                 name = "long long"
                 # Hex/octal can promote to unsigned ll if value > LL_MAX.
@@ -12240,29 +12237,29 @@ class CodeGenerator:
                         name = "long long"
                 elif v < -0x80000000:
                     name = "long long"
-            return lt.BasicType(
+            return _ltypes.BasicType(
                 name=name,
                 is_signed=(False if unsigned else None),
             )
         if isinstance(expr, ast.CharLiteral):
             # Per C, a character constant has type `int`, not `char`.
-            return lt.BasicType(name="int")
+            return _ltypes.BasicType(name="int")
         if isinstance(expr, ast.NullptrLiteral):
-            return lt.PointerType(base_type=lt.BasicType(name="void"))
+            return _ltypes.PointerType(base_type=_ltypes.BasicType(name="void"))
         if isinstance(expr, ast.LabelAddr):
-            return lt.PointerType(base_type=lt.BasicType(name="void"))
+            return _ltypes.PointerType(base_type=_ltypes.BasicType(name="void"))
         if isinstance(expr, ast.OffsetofExpr):
             # `__builtin_offsetof` is a constant of type `size_t`. We
             # use unsigned long (4 bytes on i386).
-            return lt.BasicType(name="unsigned long")
+            return _ltypes.BasicType(name="unsigned long")
         if isinstance(expr, ast.TypesCompatibleP):
-            return lt.BasicType(name="int")
+            return _ltypes.BasicType(name="int")
         if isinstance(expr, ast.FloatLiteral):
             base = "float" if expr.is_float else "double"
             if expr.is_imaginary:
                 # GCC: `_Imaginary T` ≡ `_Complex T` with real=0.
-                return lt.ComplexType(base_type=base)
-            return lt.BasicType(name=base)
+                return _ltypes.ComplexType(base_type=base)
+            return _ltypes.BasicType(name=base)
         if isinstance(expr, ast.StringLiteral):
             # Per C99 6.4.5#6 string literals are `char[N+1]` (non-const).
             # The implicit array-to-pointer decay gives `char *`. C++
@@ -12270,13 +12267,13 @@ class CodeGenerator:
             # `_Generic("...", char *: ..., const char *: ...)` must
             # match the non-const arm to be C-conformant.
             if getattr(expr, "is_wide", False):
-                return lt.PointerType(
-                    base_type=lt.BasicType(name="short", is_signed=False)
+                return _ltypes.PointerType(
+                    base_type=_ltypes.BasicType(name="short", is_signed=False)
                 )
-            return lt.PointerType(base_type=lt.BasicType(name="char"))
+            return _ltypes.PointerType(base_type=_ltypes.BasicType(name="char"))
         if isinstance(expr, ast.UnaryOp):
             if expr.op == "&":
-                return lt.PointerType(base_type=self._type_of(expr.operand, ctx))
+                return _ltypes.PointerType(base_type=self._type_of(expr.operand, ctx))
             if expr.op == "*":
                 inner = self._type_of(expr.operand, ctx)
                 if not self._is_pointer_like(inner):
@@ -12289,8 +12286,8 @@ class CodeGenerator:
                 return self._type_of(expr.operand, ctx)
             if expr.op in ("__real__", "__imag__"):
                 inner = self._type_of(expr.operand, ctx)
-                if isinstance(inner, lt.ComplexType):
-                    return lt.BasicType(name=inner.base_type)
+                if isinstance(inner, _ltypes.ComplexType):
+                    return _ltypes.BasicType(name=inner.base_type)
                 # On a non-complex operand, __real__ is identity and
                 # __imag__ is zero (per gcc semantics).
                 return inner
@@ -12299,9 +12296,9 @@ class CodeGenerator:
             # produces int.
             if expr.op in ("+", "-", "~"):
                 inner = self._type_of(expr.operand, ctx)
-                if isinstance(inner, lt.ComplexType):
+                if isinstance(inner, _ltypes.ComplexType):
                     return inner
-                if isinstance(inner, lt.ArrayType):
+                if isinstance(inner, _ltypes.ArrayType):
                     # Vector componentwise unary.
                     return inner
                 if self._is_float_type(inner):
@@ -12311,8 +12308,8 @@ class CodeGenerator:
                 if self._is_long_long(inner):
                     return inner
                 if self._is_unsigned(inner):
-                    return lt.BasicType(name="int", is_signed=False)
-            return lt.BasicType(name="int")
+                    return _ltypes.BasicType(name="int", is_signed=False)
+            return _ltypes.BasicType(name="int")
         if isinstance(expr, ast.Index):
             arr_type = self._type_of(expr.array, ctx)
             # C allows `int[ptr]` swapped form. If `array` isn't pointer-
@@ -12336,16 +12333,16 @@ class CodeGenerator:
                 # function-pointer return chains drop a Pointer wrap and
                 # the call result presents as the struct directly.
                 if (
-                    isinstance(obj_ty, lt.ArrayType)
-                    and isinstance(obj_ty.base_type, lt.StructType)
+                    isinstance(obj_ty, _ltypes.ArrayType)
+                    and isinstance(obj_ty.base_type, _ltypes.StructType)
                 ):
                     struct_name = self._resolve_struct_name(obj_ty.base_type)
                 elif (
-                    isinstance(obj_ty, lt.PointerType)
-                    and isinstance(obj_ty.base_type, lt.StructType)
+                    isinstance(obj_ty, _ltypes.PointerType)
+                    and isinstance(obj_ty.base_type, _ltypes.StructType)
                 ):
                     struct_name = self._resolve_struct_name(obj_ty.base_type)
-                elif isinstance(obj_ty, lt.StructType):
+                elif isinstance(obj_ty, _ltypes.StructType):
                     struct_name = self._resolve_struct_name(obj_ty)
                 else:
                     raise CodegenError(
@@ -12353,7 +12350,7 @@ class CodeGenerator:
                         f"(got {type(obj_ty).__name__})"
                     )
             else:
-                if not isinstance(obj_ty, lt.StructType):
+                if not isinstance(obj_ty, _ltypes.StructType):
                     raise CodegenError(
                         f"`.` requires a struct (got {type(obj_ty).__name__})"
                     )
@@ -12369,9 +12366,9 @@ class CodeGenerator:
                 bit_width = bf[1]
                 unit_size = bf[2] if len(bf) >= 3 else 4
                 if bit_width < 32:
-                    return lt.BasicType(name="int")
+                    return _ltypes.BasicType(name="int")
                 if bit_width == 32 and not self._is_unsigned(ty):
-                    return lt.BasicType(name="int")
+                    return _ltypes.BasicType(name="int")
             return ty
         if isinstance(expr, ast.BinaryOp):
             if expr.op == "=":
@@ -12389,7 +12386,7 @@ class CodeGenerator:
             # Complex promotion: any arithmetic with a complex operand
             # yields complex.
             if expr.op in ("+", "-", "*", "/") and (
-                isinstance(lt, lt.ComplexType) or isinstance(rt, lt.ComplexType)
+                isinstance(lt, _ltypes.ComplexType) or isinstance(rt, _ltypes.ComplexType)
             ):
                 return self._complex_promotion(lt, rt)
             # Vector arithmetic: two ArrayTypes of the same shape combine
@@ -12400,22 +12397,22 @@ class CodeGenerator:
             # the scalar is replicated to every element.
             if expr.op in ("+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>"):
                 l_vec = (
-                    isinstance(lt, lt.ArrayType)
+                    isinstance(lt, _ltypes.ArrayType)
                     and getattr(lt, "is_vector", False)
                 )
                 r_vec = (
-                    isinstance(rt, lt.ArrayType)
+                    isinstance(rt, _ltypes.ArrayType)
                     and getattr(rt, "is_vector", False)
                 )
                 if (
-                    isinstance(lt, lt.ArrayType)
-                    and isinstance(rt, lt.ArrayType)
+                    isinstance(lt, _ltypes.ArrayType)
+                    and isinstance(rt, _ltypes.ArrayType)
                     and self._size_of(lt) == self._size_of(rt)
                 ):
                     return lt
-                if l_vec and isinstance(rt, lt.BasicType):
+                if l_vec and isinstance(rt, _ltypes.BasicType):
                     return lt
-                if r_vec and isinstance(lt, lt.BasicType):
+                if r_vec and isinstance(lt, _ltypes.BasicType):
                     return rt
             if expr.op in self._INT_RESULT_BINOPS:
                 # Pointer-arithmetic promotion above doesn't apply here,
@@ -12434,34 +12431,34 @@ class CodeGenerator:
                 # int-result ops keep long-long promotion if either
                 # operand is long long.
                 if expr.op in ("==", "!=", "<", ">", "<=", ">=", "&&", "||"):
-                    return lt.BasicType(name="int")
+                    return _ltypes.BasicType(name="int")
                 # Per C99 6.5.7#3, shifts use the promoted LEFT operand
                 # type for the result — the right operand's signedness
                 # doesn't matter. Other int-result ops follow the usual
                 # arithmetic conversions (unsigned wins).
                 if expr.op in ("<<", ">>"):
                     if self._is_int128(lt):
-                        return lt.BasicType(
+                        return _ltypes.BasicType(
                             name="int128",
                             is_signed=(False if self._is_unsigned(lt) else None),
                         )
                     if self._is_long_long(lt):
-                        return lt.BasicType(
+                        return _ltypes.BasicType(
                             name="long long",
                             is_signed=(False if self._is_unsigned(lt) else None),
                         )
                     if self._is_unsigned(lt):
-                        return lt.BasicType(name="int", is_signed=False)
-                    return lt.BasicType(name="int")
+                        return _ltypes.BasicType(name="int", is_signed=False)
+                    return _ltypes.BasicType(name="int")
                 if self._is_int128(lt) or self._is_int128(rt):
-                    return lt.BasicType(
+                    return _ltypes.BasicType(
                         name="int128",
                         is_signed=(False if (
                             self._is_unsigned(lt) or self._is_unsigned(rt)
                         ) else None),
                     )
                 if self._is_long_long(lt) or self._is_long_long(rt):
-                    return lt.BasicType(
+                    return _ltypes.BasicType(
                         name="long long",
                         is_signed=(False if (
                             self._is_unsigned(lt) or self._is_unsigned(rt)
@@ -12472,26 +12469,26 @@ class CodeGenerator:
                 # signed-vs-unsigned dispatch in `_binary` for div / mod
                 # / shr / comparisons.
                 if self._is_unsigned(lt) or self._is_unsigned(rt):
-                    return lt.BasicType(name="int", is_signed=False)
-                return lt.BasicType(name="int")
+                    return _ltypes.BasicType(name="int", is_signed=False)
+                return _ltypes.BasicType(name="int")
             # `+` and `-`: pointer ± int → pointer; pointer - pointer → int.
             # Arrays count as pointer-like via decay. (Vector componentwise
             # arithmetic on two ArrayType operands is handled above.)
             l_ptr = self._is_pointer_like(lt)
             r_ptr = self._is_pointer_like(rt)
             if l_ptr and r_ptr:
-                return lt.BasicType(name="int")
+                return _ltypes.BasicType(name="int")
             if l_ptr:
                 # Decay ArrayType → PointerType per C — the arithmetic
                 # result is always a pointer, never an array. Without
                 # this, `sizeof(arr + 1)` would return the full array
                 # size instead of pointer size (4).
-                if isinstance(lt, lt.ArrayType):
-                    return lt.PointerType(base_type=lt.base_type)
+                if isinstance(lt, _ltypes.ArrayType):
+                    return _ltypes.PointerType(base_type=lt.base_type)
                 return lt
             if r_ptr:
-                if isinstance(rt, lt.ArrayType):
-                    return lt.PointerType(base_type=rt.base_type)
+                if isinstance(rt, _ltypes.ArrayType):
+                    return _ltypes.PointerType(base_type=rt.base_type)
                 return rt
             # Float promotion: if either operand is float, the result is
             # float (or double if either is double).
@@ -12500,7 +12497,7 @@ class CodeGenerator:
             # __int128 promotion: if either operand is int128, the
             # result is int128 (rank above long long).
             if self._is_int128(lt) or self._is_int128(rt):
-                return lt.BasicType(
+                return _ltypes.BasicType(
                     name="int128",
                     is_signed=(False if (
                         self._is_unsigned(lt) or self._is_unsigned(rt)
@@ -12509,7 +12506,7 @@ class CodeGenerator:
             # Long-long promotion: if either operand is long long, the
             # result is long long.
             if self._is_long_long(lt) or self._is_long_long(rt):
-                return lt.BasicType(
+                return _ltypes.BasicType(
                     name="long long",
                     is_signed=(False if (
                         self._is_unsigned(lt) or self._is_unsigned(rt)
@@ -12518,10 +12515,10 @@ class CodeGenerator:
             # Long propagation: per C usual arithmetic conversions, the
             # higher-ranked type wins. On i386 long and int have the
             # same width, but they're distinct types for _Generic.
-            l_long = isinstance(lt, lt.BasicType) and lt.name == "long"
-            r_long = isinstance(rt, lt.BasicType) and rt.name == "long"
+            l_long = isinstance(lt, _ltypes.BasicType) and lt.name == "long"
+            r_long = isinstance(rt, _ltypes.BasicType) and rt.name == "long"
             if l_long or r_long:
-                return lt.BasicType(
+                return _ltypes.BasicType(
                     name="long",
                     is_signed=(False if (
                         self._is_unsigned(lt) or self._is_unsigned(rt)
@@ -12529,8 +12526,8 @@ class CodeGenerator:
                 )
             # Unsigned propagation for `+`/`-`.
             if self._is_unsigned(lt) or self._is_unsigned(rt):
-                return lt.BasicType(name="int", is_signed=False)
-            return lt.BasicType(name="int")
+                return _ltypes.BasicType(name="int", is_signed=False)
+            return _ltypes.BasicType(name="int")
         if isinstance(expr, ast.TernaryOp):
             # Per C99 6.5.15, if both arms have arithmetic type, the
             # result type is determined by the usual arithmetic
@@ -12548,17 +12545,17 @@ class CodeGenerator:
             # match per C — just return the true arm's type. (Vector
             # is ArrayType with is_vector; struct is StructType;
             # complex is ComplexType.)
-            if isinstance(lt, (lt.StructType, lt.ComplexType)):
+            if isinstance(lt, (_ltypes.StructType, _ltypes.ComplexType)):
                 return lt
-            if isinstance(rt, (lt.StructType, lt.ComplexType)):
+            if isinstance(rt, (_ltypes.StructType, _ltypes.ComplexType)):
                 return rt
             if (
-                isinstance(lt, lt.ArrayType)
+                isinstance(lt, _ltypes.ArrayType)
                 and getattr(lt, "is_vector", False)
             ):
                 return lt
             if (
-                isinstance(rt, lt.ArrayType)
+                isinstance(rt, _ltypes.ArrayType)
                 and getattr(rt, "is_vector", False)
             ):
                 return rt
@@ -12567,7 +12564,7 @@ class CodeGenerator:
                 return self._float_promotion(lt, rt)
             # __int128 dominates.
             if self._is_int128(lt) or self._is_int128(rt):
-                return lt.BasicType(
+                return _ltypes.BasicType(
                     name="int128",
                     is_signed=(False if (
                         self._is_unsigned(lt) or self._is_unsigned(rt)
@@ -12575,7 +12572,7 @@ class CodeGenerator:
                 )
             # Long long beats long/int.
             if self._is_long_long(lt) or self._is_long_long(rt):
-                return lt.BasicType(
+                return _ltypes.BasicType(
                     name="long long",
                     is_signed=(False if (
                         self._is_unsigned(lt) or self._is_unsigned(rt)
@@ -12590,20 +12587,20 @@ class CodeGenerator:
                 return rt
             if l_ptr and r_ptr:
                 # Both pointer — pick the one with non-void pointee.
-                lp = lt.base_type if isinstance(lt, lt.PointerType) else None
+                lp = lt.base_type if isinstance(lt, _ltypes.PointerType) else None
                 if lp is not None and not (
-                    isinstance(lp, lt.BasicType) and lp.name == "void"
+                    isinstance(lp, _ltypes.BasicType) and lp.name == "void"
                 ):
                     return lt
                 return rt
             # Both arithmetic ints (post-promotion): unsigned wins.
             if self._is_unsigned(lt) or self._is_unsigned(rt):
-                return lt.BasicType(name="int", is_signed=False)
+                return _ltypes.BasicType(name="int", is_signed=False)
             # Default to int (after default int promotion of char/short).
-            return lt.BasicType(name="int")
+            return _ltypes.BasicType(name="int")
         if isinstance(expr, (ast.SizeofExpr, ast.SizeofType)):
             # `sizeof` returns size_t; treat it as int for our flat-32 ABI.
-            return lt.BasicType(name="int")
+            return _ltypes.BasicType(name="int")
         if isinstance(expr, ast.VaArgExpr):
             return expr.target_type
         if isinstance(expr, ast.Cast):
@@ -12632,29 +12629,29 @@ class CodeGenerator:
                     var_ty = self._identifier_type(expr.func.name.text, ctx)
                 except CodegenError:
                     var_ty = None
-                if isinstance(var_ty, lt.PointerType) and isinstance(
-                    var_ty.base_type, lt.FunctionType
+                if isinstance(var_ty, _ltypes.PointerType) and isinstance(
+                    var_ty.base_type, _ltypes.FunctionType
                 ):
                     return var_ty.base_type.return_type
-                if isinstance(var_ty, lt.FunctionType):
+                if isinstance(var_ty, _ltypes.FunctionType):
                     return var_ty.return_type
                 # Unknown identifier — default to int.
-                return lt.BasicType(name="int")
+                return _ltypes.BasicType(name="int")
             # Indirect call: the callee evaluates to a function pointer
             # (or a function — same shape after decay). Recover the
             # return type by introspecting the callee's static type.
             try:
                 callee_ty = self._type_of(expr.func, ctx)
             except CodegenError:
-                return lt.BasicType(name="int")
+                return _ltypes.BasicType(name="int")
             if (
-                isinstance(callee_ty, lt.PointerType)
-                and isinstance(callee_ty.base_type, lt.FunctionType)
+                isinstance(callee_ty, _ltypes.PointerType)
+                and isinstance(callee_ty.base_type, _ltypes.FunctionType)
             ):
                 return callee_ty.base_type.return_type
-            if isinstance(callee_ty, lt.FunctionType):
+            if isinstance(callee_ty, _ltypes.FunctionType):
                 return callee_ty.return_type
-            return lt.BasicType(name="int")
+            return _ltypes.BasicType(name="int")
         if isinstance(expr, ast.StmtExpr):
             # Type of `({ ...; expr; })` is the type of the trailing
             # expression statement; default to int when the body is empty
@@ -12669,7 +12666,7 @@ class CodeGenerator:
                     trailing = item.expr
                     break
             if trailing is None:
-                return lt.BasicType(name="int")
+                return _ltypes.BasicType(name="int")
             ctx.enter_scope()
             try:
                 for item in expr.body.items:
@@ -12678,9 +12675,9 @@ class CodeGenerator:
                 return self._type_of(trailing, ctx)
             finally:
                 ctx.exit_scope()
-        return lt.BasicType(name="int")
+        return _ltypes.BasicType(name="int")
 
-    def _array_is_directly_vla(self, t: lt.ArrayType) -> bool:
+    def _array_is_directly_vla(self, t: _ltypes.ArrayType) -> bool:
         """True if `t` is a VLA-shaped array (size is non-constant or
         marked via `_vla_size`). Doesn't recurse into struct members.
         Used by VLA-backing slot allocation to distinguish a true VLA
@@ -12690,22 +12687,22 @@ class CodeGenerator:
             return True
         if t.size is not None and not isinstance(t.size, ast.IntLiteral):
             return True
-        if isinstance(t.base_type, lt.ArrayType):
+        if isinstance(t.base_type, _ltypes.ArrayType):
             return self._array_is_directly_vla(t.base_type)
         return False
 
-    def _type_has_vla(self, t: lt.TypeNode) -> bool:
+    def _type_has_vla(self, t: _ltypes.TypeNode) -> bool:
         """Does `t` contain a variable-length array? Recognized via
         either a saved `_vla_size` (set by `_check_supported_type`'s
         VLA fallback) or a non-literal `size` expression on a fresh
         ArrayType the codegen hasn't fully resolved yet."""
-        if isinstance(t, lt.ArrayType):
+        if isinstance(t, _ltypes.ArrayType):
             if getattr(t, "_vla_size", None) is not None:
                 return True
             if t.size is not None and not isinstance(t.size, ast.IntLiteral):
                 return True
             return self._type_has_vla(t.base_type)
-        if isinstance(t, lt.StructType):
+        if isinstance(t, _ltypes.StructType):
             # Check inline members first (when the struct is being
             # introduced for the first time and isn't yet registered).
             for m in getattr(t, "members", []) or []:
@@ -12721,7 +12718,7 @@ class CodeGenerator:
         return False
 
     def _emit_runtime_size_of(
-        self, t: lt.TypeNode, ctx: _FuncCtx,
+        self, t: _ltypes.TypeNode, ctx: _FuncCtx,
     ) -> list[str]:
         """Compute sizeof(t) at runtime when t contains a VLA.
 
@@ -12733,7 +12730,7 @@ class CodeGenerator:
         """
         if not self._type_has_vla(t):
             return [f"        mov     eax, {self._size_of(t)}"]
-        if isinstance(t, lt.ArrayType):
+        if isinstance(t, _ltypes.ArrayType):
             vla_size = getattr(t, "_vla_size", None)
             if vla_size is None and t.size is not None and not isinstance(
                 t.size, ast.IntLiteral
@@ -12756,7 +12753,7 @@ class CodeGenerator:
             out = list(inner)
             out.append(f"        imul    eax, eax, {count}")
             return out
-        if isinstance(t, lt.StructType):
+        if isinstance(t, _ltypes.StructType):
             sname = self._resolve_struct_name(t)
             members = self._structs.get(sname, [])
             if not members:
@@ -12911,13 +12908,13 @@ class CodeGenerator:
             disp = ctx.call_temps[id(expr)]
             target_ty = expr.target_type
             out: list[str] = []
-            if isinstance(target_ty, lt.StructType):
+            if isinstance(target_ty, _ltypes.StructType):
                 out += self._struct_init(
                     target_ty, expr.init, disp, ctx, "<compound>",
                 )
                 out.append(f"        lea     eax, {_ebp_addr(disp)}")
                 return out
-            if isinstance(target_ty, lt.ArrayType):
+            if isinstance(target_ty, _ltypes.ArrayType):
                 out += self._array_init(
                     target_ty, expr.init, disp, ctx, "<compound>",
                 )
@@ -13009,7 +13006,7 @@ class CodeGenerator:
                     and tail.expr is not None
                 ):
                     tail_ty = self._type_of(tail.expr, ctx)
-                    if isinstance(tail_ty, lt.StructType):
+                    if isinstance(tail_ty, _ltypes.StructType):
                         out += self._struct_address(tail.expr, ctx)
                         return out
                 out += self._item(tail, ctx)
@@ -13178,7 +13175,7 @@ class CodeGenerator:
                 # 8-byte vector (ArrayType) → long long: type-pun by
                 # loading both halves of the vector's storage.
                 if (
-                    isinstance(src_ty, lt.ArrayType)
+                    isinstance(src_ty, _ltypes.ArrayType)
                     and self._size_of(src_ty) == 8
                 ):
                     out = self._vector_value_address(expr.expr, ctx)
@@ -13325,7 +13322,7 @@ class CodeGenerator:
         try:
             src_ty = self._type_of(expr, ctx)
         except CodegenError:
-            src_ty = lt.BasicType(name="int")
+            src_ty = _ltypes.BasicType(name="int")
         if self._is_unsigned(src_ty):
             out.append("        xor     edx, edx")
         else:
@@ -13333,15 +13330,15 @@ class CodeGenerator:
         return out
 
     def _replace_vla_size_with_capture(
-        self, t: lt.TypeNode, captured: dict[int, str], fn_name: str,
+        self, t: _ltypes.TypeNode, captured: dict[int, str], fn_name: str,
     ) -> None:
         """Walk `t` and replace any ArrayType.size expression whose
         identity matches a captured side-effect with an Identifier
         reading from the captured hidden local."""
-        if isinstance(t, lt.PointerType):
+        if isinstance(t, _ltypes.PointerType):
             self._replace_vla_size_with_capture(t.base_type, captured, fn_name)
             return
-        if isinstance(t, lt.ArrayType):
+        if isinstance(t, _ltypes.ArrayType):
             if t.size is not None and id(t.size) in captured:
                 slot_name = captured[id(t.size)]
                 t.size = ast.Identifier(name=slot_name, location=t.size.location)
@@ -13356,13 +13353,13 @@ class CodeGenerator:
         ArrayType.size in the member with Identifier(slot_name) so
         sizeof reads the captured value. The eval+store happens in
         `_item(StructDecl)` at struct-decl emission time."""
-        captures: list[tuple[lt.ArrayType, ast.Expression, str]] = []
+        captures: list[tuple[_ltypes.ArrayType, ast.Expression, str]] = []
 
-        def walk(t: lt.TypeNode) -> None:
-            if isinstance(t, lt.PointerType):
+        def walk(t: _ltypes.TypeNode) -> None:
+            if isinstance(t, _ltypes.PointerType):
                 walk(t.base_type)
                 return
-            if isinstance(t, lt.ArrayType):
+            if isinstance(t, _ltypes.ArrayType):
                 if (
                     t.size is not None
                     and not isinstance(t.size, ast.IntLiteral)
@@ -13391,7 +13388,7 @@ class CodeGenerator:
                     captures.append((t, t.size, slot_name))
                 walk(t.base_type)
                 return
-            if isinstance(t, lt.StructType):
+            if isinstance(t, _ltypes.StructType):
                 # Don't recurse — that struct has its own captures (or
                 # was already processed).
                 return
@@ -13402,7 +13399,7 @@ class CodeGenerator:
             return
         for arr_t, orig_size, slot_name in captures:
             ctx.alloc_local(
-                slot_name, lt.BasicType(name="int"),
+                slot_name, _ltypes.BasicType(name="int"),
                 decl=orig_size,
             )
         for arr_t, orig_size, slot_name in captures:
@@ -13415,7 +13412,7 @@ class CodeGenerator:
 
     def _capture_vla_sizes(
         self,
-        var_type: lt.TypeNode,
+        var_type: _ltypes.TypeNode,
         var_name: str,
         ctx: _FuncCtx,
         decl: ast.VarDecl,
@@ -13424,10 +13421,10 @@ class CodeGenerator:
         capture slot and replace the size expression with an Identifier
         reading from that slot. The init code emitted by `_var_init`
         will store the captured size into the slot at decl time."""
-        slots: list[tuple[lt.ArrayType, ast.Expression, str]] = []
+        slots: list[tuple[_ltypes.ArrayType, ast.Expression, str]] = []
 
-        def walk(t: lt.TypeNode) -> None:
-            if isinstance(t, lt.ArrayType):
+        def walk(t: _ltypes.TypeNode) -> None:
+            if isinstance(t, _ltypes.ArrayType):
                 # Prefer `_vla_size` (saved by `_check_supported_type`'s
                 # VLA fallback when it mutated `size` to IntLiteral(16)).
                 # Otherwise capture a non-literal `size`.
@@ -13444,7 +13441,7 @@ class CodeGenerator:
         walk(var_type)
         for arr_t, orig_size, slot_name in slots:
             ctx.alloc_local(
-                slot_name, lt.BasicType(name="int"),
+                slot_name, _ltypes.BasicType(name="int"),
                 decl=orig_size,
             )
         if slots:
@@ -13869,12 +13866,12 @@ class CodeGenerator:
         snap_slot_name = f"__compll_snap_{id(expr)}"
         addr_disp = ctx.alloc_local(
             addr_slot_name,
-            lt.PointerType(base_type=lt.BasicType(name="long long")),
+            _ltypes.PointerType(base_type=_ltypes.BasicType(name="long long")),
             size=4,
         )
         snap_disp = ctx.alloc_local(
             snap_slot_name,
-            lt.BasicType(name="long long"),
+            _ltypes.BasicType(name="long long"),
             size=8,
         )
         out: list[str] = []
@@ -14127,7 +14124,7 @@ class CodeGenerator:
                 return out
             if expr.op in ("__real__", "__imag__"):
                 operand_ty = self._type_of(expr.operand, ctx)
-                if isinstance(operand_ty, lt.ComplexType):
+                if isinstance(operand_ty, _ltypes.ComplexType):
                     out, _ = self._complex_part_address(expr, ctx)
                     size = self._COMPLEX_BASE_SIZES[operand_ty.base_type]
                     width = "dword" if size == 4 else "qword"
@@ -14321,7 +14318,7 @@ class CodeGenerator:
         out.append(f"{end_label}:")
         return out
 
-    def _store_st0_to(self, addr: str, ty: lt.TypeNode) -> list[str]:
+    def _store_st0_to(self, addr: str, ty: _ltypes.TypeNode) -> list[str]:
         """`fstp` the top of the FPU stack into memory at `addr`."""
         size = self._size_of(ty)
         width = "dword" if size == 4 else "qword"
@@ -14518,7 +14515,7 @@ class CodeGenerator:
             out.append("        or      eax, [ecx + 12]")
             return out
         if (
-            isinstance(ty, lt.ArrayType)
+            isinstance(ty, _ltypes.ArrayType)
             and getattr(ty, "is_vector", False)
         ):
             # GCC vector in boolean context — true if any element is
@@ -14533,7 +14530,7 @@ class CodeGenerator:
             out.append("        setne   al")
             out.append("        movzx   eax, al")
             return out
-        if isinstance(ty, lt.ComplexType):
+        if isinstance(ty, _ltypes.ComplexType):
             # `if (c)` for complex — true if either half is non-zero.
             # Materialize into a stack temp, then OR-or-FUCOMP both halves.
             half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
@@ -14669,7 +14666,7 @@ class CodeGenerator:
         # don't load aggregates into EAX.
         elem_ty = self._type_of(expr, ctx)
         addr = self._index_address(expr, ctx)
-        if isinstance(elem_ty, (lt.ArrayType, lt.StructType)):
+        if isinstance(elem_ty, (_ltypes.ArrayType, _ltypes.StructType)):
             return addr
         return addr + self._load_to_eax("[eax]", elem_ty)
 
@@ -14931,7 +14928,7 @@ class CodeGenerator:
             and callee.name not in self._extern_vars
             and callee.name not in self._enum_constants
         ):
-            self._func_return_types[callee.name] = lt.BasicType(name="int")
+            self._func_return_types[callee.name] = _ltypes.BasicType(name="int")
             self._func_param_types[callee.name] = []
             return self._emit_call(expr.args, ctx, direct=callee.name)
 
@@ -14964,7 +14961,7 @@ class CodeGenerator:
         # we can coerce arg widths (e.g. narrow a `double` literal when
         # the param is declared `float`). Variadic and indirect calls
         # fall through to the arg's own type.
-        param_types: list[lt.TypeNode] | None = None
+        param_types: list[_ltypes.TypeNode] | None = None
         if direct is not None and direct in self._func_param_types:
             param_types = self._func_param_types[direct]
         elif indirect_callee is not None:
@@ -14974,12 +14971,12 @@ class CodeGenerator:
                 callee_ty = self._type_of(indirect_callee, ctx)
             except CodegenError:
                 callee_ty = None
-            ft: lt.FunctionType | None = None
-            if isinstance(callee_ty, lt.FunctionType):
+            ft: _ltypes.FunctionType | None = None
+            if isinstance(callee_ty, _ltypes.FunctionType):
                 ft = callee_ty
             elif (
-                isinstance(callee_ty, lt.PointerType)
-                and isinstance(callee_ty.base_type, lt.FunctionType)
+                isinstance(callee_ty, _ltypes.PointerType)
+                and isinstance(callee_ty.base_type, _ltypes.FunctionType)
             ):
                 ft = callee_ty.base_type
             if ft is not None:
@@ -14990,7 +14987,7 @@ class CodeGenerator:
             # `reversed` reverses the list; recompute the original index
             # so we can look up the matching param type.
             real_idx = len(args) - 1 - arg_idx
-            expected_ty: lt.TypeNode | None = None
+            expected_ty: _ltypes.TypeNode | None = None
             if param_types is not None and real_idx < len(param_types):
                 expected_ty = param_types[real_idx]
             arg_ty = self._type_of(arg, ctx)
@@ -14998,18 +14995,18 @@ class CodeGenerator:
             # Regular arrays decay to a pointer at the call site (just
             # push the address).
             arg_is_vector = (
-                isinstance(arg_ty, lt.ArrayType)
+                isinstance(arg_ty, _ltypes.ArrayType)
                 and getattr(arg_ty, "is_vector", False)
             )
             if (
-                isinstance(arg_ty, (lt.StructType, lt.ComplexType))
+                isinstance(arg_ty, (_ltypes.StructType, _ltypes.ComplexType))
                 or arg_is_vector
                 or self._is_int128(arg_ty)
             ):
                 size = self._size_of(arg_ty)
                 padded = (size + 3) & ~3
                 # Compute &arg first; once it's in EDX we can reserve and copy.
-                if isinstance(arg_ty, lt.ComplexType):
+                if isinstance(arg_ty, _ltypes.ComplexType):
                     out += self._complex_value_address(arg, ctx)
                 elif arg_is_vector:
                     out += self._vector_value_address(arg, ctx)
@@ -15049,7 +15046,7 @@ class CodeGenerator:
                         effective_ty = expected_ty
                     else:
                         # Variadic — promote float to double.
-                        effective_ty = lt.BasicType(name="double")
+                        effective_ty = _ltypes.BasicType(name="double")
                     size = self._size_of(effective_ty)
                     width = "dword" if size == 4 else "qword"
                     out += self._eval_float_to_st0(arg, ctx)
@@ -15087,10 +15084,10 @@ class CodeGenerator:
                 # callee's byte-load reads 0 or 1.
                 elif (
                     expected_ty is not None
-                    and isinstance(expected_ty, lt.BasicType)
+                    and isinstance(expected_ty, _ltypes.BasicType)
                     and expected_ty.name == "bool"
                     and not (
-                        isinstance(arg_ty, lt.BasicType)
+                        isinstance(arg_ty, _ltypes.BasicType)
                         and arg_ty.name == "bool"
                     )
                 ):
@@ -15136,7 +15133,7 @@ class CodeGenerator:
             return self._address_of(expr, ctx)
         if expr.op in ("__real__", "__imag__"):
             operand_ty = self._type_of(expr.operand, ctx)
-            if isinstance(operand_ty, lt.ComplexType):
+            if isinstance(operand_ty, _ltypes.ComplexType):
                 # Complex int half: load the integer half from the
                 # appropriate offset and sign- or zero-extend to EAX.
                 if operand_ty.base_type in self._COMPLEX_INT_BASES:
@@ -15152,7 +15149,7 @@ class CodeGenerator:
             # Array (or struct) pointee in value context decays to its
             # address — `*pa` where `pa` has type `T(*)[N]` evaluates to
             # the address of the array, not its contents.
-            if isinstance(pointee_ty, (lt.ArrayType, lt.StructType)):
+            if isinstance(pointee_ty, (_ltypes.ArrayType, _ltypes.StructType)):
                 return self._eval_expr_to_eax(expr.operand, ctx)
             return self._eval_expr_to_eax(expr.operand, ctx) + self._load_to_eax(
                 "[eax]", pointee_ty
@@ -15201,9 +15198,9 @@ class CodeGenerator:
             # to emit the store and yield the temp's address.
             comp = expr.operand
             target_ty = comp.target_type
-            if isinstance(target_ty, (lt.StructType, lt.ArrayType)):
+            if isinstance(target_ty, (_ltypes.StructType, _ltypes.ArrayType)):
                 return self._eval_expr_to_eax(comp, ctx)
-            if isinstance(target_ty, lt.ComplexType):
+            if isinstance(target_ty, _ltypes.ComplexType):
                 return self._complex_value_address(comp, ctx)
             if self._is_int128(target_ty):
                 return self._int128_value_address(comp, ctx)
@@ -15253,7 +15250,7 @@ class CodeGenerator:
         ty = self._identifier_type(expr.operand.name.text, ctx)
         # Array names aren't lvalues — `++arr` is a C error, not "advance the
         # array pointer" (that would only make sense for a pointer variable).
-        if isinstance(ty, lt.ArrayType):
+        if isinstance(ty, _ltypes.ArrayType):
             raise CodegenError(
                 f"cannot {expr.op} array `{expr.operand.name.text}`"
             )
@@ -15265,7 +15262,7 @@ class CodeGenerator:
         # gcc accepts them. Raise a clearer error than "KeyError: 16"
         # for now — extending these is straightforward but rarely
         # needed.
-        if isinstance(ty, lt.ComplexType):
+        if isinstance(ty, _ltypes.ComplexType):
             raise CodegenError(
                 f"`{expr.op}` on _Complex operand `{expr.operand.name.text}` "
                 f"not supported (use `__real__ x {expr.op}` instead)"
@@ -15274,11 +15271,11 @@ class CodeGenerator:
         # On a pointer, ++/-- step by sizeof(*ptr) instead of 1. We still
         # mutate the slot in place — the slot stores the pointer value —
         # so an `add dword [...], N` covers it.
-        if isinstance(ty, lt.PointerType):
+        if isinstance(ty, _ltypes.PointerType):
             step = self._size_of(ty.base_type)
             instr = "add" if expr.op == "++" else "sub"
             bump = [f"        {instr}     dword {addr}, {step}"]
-        elif isinstance(ty, lt.BasicType) and ty.name == "bool":
+        elif isinstance(ty, _ltypes.BasicType) and ty.name == "bool":
             # `_Bool` ++/--: normalize the post-bump value to 0/1 per
             # C 6.3.1.2. Route through load + add 1 / sub 1 + bool-store.
             # Pre/post handled by remembering the load before the bump.
@@ -15346,7 +15343,7 @@ class CodeGenerator:
                 f"`*ptr`, or `s.m` (got {type(expr.operand).__name__})"
             )
         target_ty = self._type_of(expr.operand, ctx)
-        if isinstance(target_ty, lt.ArrayType):
+        if isinstance(target_ty, _ltypes.ArrayType):
             # Vector lvalue: not standard C; not yet supported.
             if getattr(target_ty, "is_vector", False):
                 raise CodegenError(
@@ -15358,7 +15355,7 @@ class CodeGenerator:
         # storage doesn't fit any of the byte/word/dword RMW shapes
         # below. Mirror the Identifier-complex error so the previous
         # KeyError(16) doesn't leak through.
-        if isinstance(target_ty, lt.ComplexType):
+        if isinstance(target_ty, _ltypes.ComplexType):
             raise CodegenError(
                 f"`{expr.op}` on _Complex lvalue not supported "
                 f"(use `__real__ ... {expr.op}` instead)"
@@ -15387,7 +15384,7 @@ class CodeGenerator:
             return out
         # `_Bool` lvalue: bump and normalize per C 6.3.1.2.
         if (
-            isinstance(target_ty, lt.BasicType)
+            isinstance(target_ty, _ltypes.BasicType)
             and target_ty.name == "bool"
         ):
             delta = "1" if expr.op == "++" else "-1"
@@ -15406,7 +15403,7 @@ class CodeGenerator:
             out += self._store_from_eax("[ecx]", target_ty)
             out.append("        pop     eax")
             return out
-        if isinstance(target_ty, lt.PointerType):
+        if isinstance(target_ty, _ltypes.PointerType):
             step = self._size_of(target_ty.base_type)
             width = "dword"
         else:
@@ -15431,7 +15428,7 @@ class CodeGenerator:
     def _inc_dec_bitfield(
         self,
         expr: ast.UnaryOp,
-        bf: tuple[int, int, lt.TypeNode],
+        bf: tuple[int, int, _ltypes.TypeNode],
         ctx: _FuncCtx,
     ) -> list[str]:
         """`++` / `--` on a bit-field member.
@@ -15500,7 +15497,7 @@ class CodeGenerator:
     def _inc_dec_bitfield_ll(
         self,
         expr: ast.UnaryOp,
-        bf: tuple[int, int, lt.TypeNode, int],
+        bf: tuple[int, int, _ltypes.TypeNode, int],
         ctx: _FuncCtx,
     ) -> list[str]:
         """`++` / `--` on a long-long-storage bit-field.
@@ -15528,10 +15525,10 @@ class CodeGenerator:
         snap_slot_name = f"__incdec_bf_snap_{id(expr)}"
         addr_disp = ctx.alloc_local(
             addr_slot_name,
-            lt.PointerType(base_type=lt.BasicType(name="long long")),
+            _ltypes.PointerType(base_type=_ltypes.BasicType(name="long long")),
             size=4,
         )
-        snap_ty = lt.BasicType(
+        snap_ty = _ltypes.BasicType(
             name="long long",
             is_signed=False if is_unsigned else None,
         )
@@ -15625,7 +15622,7 @@ class CodeGenerator:
     def _bitfield_load_ll_via_addr(
         self,
         addr_disp: int,
-        bf: tuple[int, int, lt.TypeNode, int],
+        bf: tuple[int, int, _ltypes.TypeNode, int],
     ) -> list[str]:
         """Same as `_bitfield_load_ll` but the storage-unit address
         is already saved in `[ebp - addr_disp]`. Returns EDX:EAX with
@@ -15682,9 +15679,9 @@ class CodeGenerator:
         bit_offset, bit_width, member_ty = bf[:3]
         unit_size = bf[3] if len(bf) == 4 else 4
         snap_name = f"__compbool_bf_snap_{id(expr)}"
-        bool_ty = lt.BasicType(name="bool", is_signed=False)
+        bool_ty = _ltypes.BasicType(name="bool", is_signed=False)
         addr_name = f"__compbool_bf_addr_{id(expr)}"
-        ptr_ty = lt.PointerType(base_type=bool_ty)
+        ptr_ty = _ltypes.PointerType(base_type=bool_ty)
         addr_disp = ctx.alloc_local(addr_name, ptr_ty, size=4)
         snap_disp = ctx.alloc_local(snap_name, bool_ty, size=4)
         op = self._COMPOUND_OPS[expr.op]
@@ -15724,7 +15721,7 @@ class CodeGenerator:
     def _compound_assign_bitfield(
         self,
         expr: ast.BinaryOp,
-        bf: tuple[int, int, lt.TypeNode],
+        bf: tuple[int, int, _ltypes.TypeNode],
         ctx: _FuncCtx,
     ) -> list[str]:
         """`s.bf op= rhs` on a bit-field member: address-once, read,
@@ -15743,7 +15740,7 @@ class CodeGenerator:
         # Snapshot through a hidden 1-byte bool slot so `_assign`'s
         # bool path runs and uses `_eval_to_bool_eax` on the inner.
         if (
-            isinstance(member_ty, lt.BasicType)
+            isinstance(member_ty, _ltypes.BasicType)
             and member_ty.name == "bool"
         ):
             rhs_ty = self._type_of(expr.right, ctx)
@@ -15751,7 +15748,7 @@ class CodeGenerator:
                 self._is_float_type(rhs_ty)
                 or self._is_long_long(rhs_ty)
                 or self._is_int128(rhs_ty)
-                or isinstance(rhs_ty, lt.ComplexType)
+                or isinstance(rhs_ty, _ltypes.ComplexType)
             ):
                 return self._compound_assign_bool_bitfield(expr, bf, ctx)
         mask = (1 << bit_width) - 1
@@ -15941,7 +15938,7 @@ class CodeGenerator:
         if expr.op in ("==", "!="):
             lt = self._type_of(expr.left, ctx)
             rt = self._type_of(expr.right, ctx)
-            if isinstance(lt, lt.ComplexType) or isinstance(rt, lt.ComplexType):
+            if isinstance(lt, _ltypes.ComplexType) or isinstance(rt, _ltypes.ComplexType):
                 return self._complex_compare(expr, ctx)
         # __int128 comparison: 4-dword chain. Result is int (0 or 1).
         if expr.op in ("==", "!=", "<", ">", "<=", ">="):
@@ -16132,7 +16129,7 @@ class CodeGenerator:
             and expr.left.op in ("__real__", "__imag__")
         ):
             operand_ty = self._type_of(expr.left.operand, ctx)
-            if isinstance(operand_ty, lt.ComplexType):
+            if isinstance(operand_ty, _ltypes.ComplexType):
                 addr_lines, half_ty = self._complex_part_address(expr.left, ctx)
                 if operand_ty.base_type in self._COMPLEX_INT_BASES:
                     # Integer half: store via the regular int store.
@@ -16162,7 +16159,7 @@ class CodeGenerator:
         # cast wraps narrowing/widening at the type level.
         if self._is_int128(target_ty):
             return self._int128_copy_assign(expr.left, expr.right, ctx)
-        if isinstance(target_ty, lt.StructType):
+        if isinstance(target_ty, _ltypes.StructType):
             if (
                 isinstance(expr.right, ast.Call)
                 and self._is_struct_returning_call(expr.right, ctx)
@@ -16181,12 +16178,12 @@ class CodeGenerator:
                     ctx,
                 )
             return self._struct_copy_assign(expr, target_ty, ctx)
-        if isinstance(target_ty, lt.ComplexType):
+        if isinstance(target_ty, _ltypes.ComplexType):
             # `c = c2` — complex-to-complex copy. Same per-dword
             # mechanism as struct copy. The rhs may be a complex-
             # returning call (handled like struct-returning).
             rhs_ty = self._type_of(expr.right, ctx)
-            if isinstance(rhs_ty, lt.ComplexType):
+            if isinstance(rhs_ty, _ltypes.ComplexType):
                 # Same-precision complex-returning call: route the
                 # call directly into &lhs (no temp).
                 if (
@@ -16212,7 +16209,7 @@ class CodeGenerator:
         # complex, long-long, and other types compare against 0
         # directly per C 6.3.1.2 — not via integer truncation that would
         # turn 0.5 into 0.
-        if isinstance(target_ty, lt.BasicType) and target_ty.name == "bool":
+        if isinstance(target_ty, _ltypes.BasicType) and target_ty.name == "bool":
             out = self._eval_to_bool_eax(expr.right, ctx)
             if isinstance(expr.left, ast.Identifier):
                 return out + self._identifier_store(expr.left.name, ctx)
@@ -16259,12 +16256,12 @@ class CodeGenerator:
         # are not lvalues. (rhs ArrayType need not be vector-tagged —
         # casts and `(vec){...}` compounds may strip the flag.)
         if (
-            isinstance(target_ty, lt.ArrayType)
+            isinstance(target_ty, _ltypes.ArrayType)
             and getattr(target_ty, "is_vector", False)
         ):
             rhs_ty = self._type_of(expr.right, ctx)
             if (
-                isinstance(rhs_ty, lt.ArrayType)
+                isinstance(rhs_ty, _ltypes.ArrayType)
                 and self._size_of(rhs_ty) == self._size_of(target_ty)
             ):
                 # Vector-returning call: route the call directly into
@@ -16283,7 +16280,7 @@ class CodeGenerator:
         # `x = rhs` — direct slot store. Array names aren't lvalues in C.
         if isinstance(expr.left, ast.Identifier):
             ty = self._identifier_type(expr.left.name, ctx)
-            if isinstance(ty, lt.ArrayType):
+            if isinstance(ty, _ltypes.ArrayType):
                 raise CodegenError(
                     f"cannot assign to array `{expr.left.name}`"
                 )
@@ -16341,7 +16338,7 @@ class CodeGenerator:
         self,
         src_expr: ast.Expression,
         dest_disp: int,
-        target_ty: lt.StructType,
+        target_ty: _ltypes.StructType,
         ctx: _FuncCtx,
     ) -> list[str]:
         """Copy a struct from `src_expr` into the local at `[ebp + dest_disp]`.
@@ -16371,7 +16368,7 @@ class CodeGenerator:
     def _struct_copy_assign(
         self,
         expr: ast.BinaryOp,
-        target_ty: lt.StructType,
+        target_ty: _ltypes.StructType,
         ctx: _FuncCtx,
     ) -> list[str]:
         """Lower `dst = src` where dst is a struct l-value.
@@ -16383,7 +16380,7 @@ class CodeGenerator:
         aren't first-class in our codegen yet.
         """
         rhs_ty = self._type_of(expr.right, ctx)
-        if not isinstance(rhs_ty, lt.StructType):
+        if not isinstance(rhs_ty, _ltypes.StructType):
             raise CodegenError(
                 f"struct assignment requires both sides be the same "
                 f"struct type (got {type(rhs_ty).__name__} on rhs)"
@@ -16432,7 +16429,7 @@ class CodeGenerator:
     # allocated by `_collect_call_temps`.
     # ------------------------------------------------------------
 
-    def _vector_element_type(self, vec_ty: lt.ArrayType) -> lt.TypeNode:
+    def _vector_element_type(self, vec_ty: _ltypes.ArrayType) -> _ltypes.TypeNode:
         """Element type of a vector (potentially nested ArrayType)."""
         elem = vec_ty.base_type
         # We use the leaf scalar; nested arrays are not vectors here.
@@ -16464,7 +16461,7 @@ class CodeGenerator:
             # (allocated by `_collect_call_temps` for ArrayType targets)
             # so we can hand back a stable address.
             src_ty = self._type_of(expr.expr, ctx)
-            if isinstance(src_ty, lt.ArrayType):
+            if isinstance(src_ty, _ltypes.ArrayType):
                 return self._vector_value_address(expr.expr, ctx)
             if id(expr) in ctx.call_temps:
                 disp = ctx.call_temps[id(expr)]
@@ -16479,7 +16476,7 @@ class CodeGenerator:
                     # Zero-fill the rest of the vector slot.
                     target_size = self._size_of(expr.target_type)
                     src_size = self._size_of(src_ty) if not isinstance(
-                        src_ty, (lt.PointerType, lt.ArrayType)
+                        src_ty, (_ltypes.PointerType, _ltypes.ArrayType)
                     ) else 4
                     if src_size < target_size:
                         out += self._zero_fill_at(
@@ -16495,11 +16492,11 @@ class CodeGenerator:
             disp = ctx.call_temps[id(expr)]
             out: list[str] = []
             target_ty = expr.target_type
-            if isinstance(target_ty, lt.ArrayType):
+            if isinstance(target_ty, _ltypes.ArrayType):
                 out += self._array_init(
                     target_ty, expr.init, disp, ctx, "<vector-compound>",
                 )
-            elif isinstance(target_ty, lt.StructType):
+            elif isinstance(target_ty, _ltypes.StructType):
                 out += self._struct_init(
                     target_ty, expr.init, disp, ctx, "<vector-compound>",
                 )
@@ -16551,7 +16548,7 @@ class CodeGenerator:
         if isinstance(expr, ast.TernaryOp):
             ty = self._type_of(expr, ctx)
             if (
-                isinstance(ty, lt.ArrayType)
+                isinstance(ty, _ltypes.ArrayType)
                 and getattr(ty, "is_vector", False)
                 and id(expr) in ctx.call_temps
             ):
@@ -16583,7 +16580,7 @@ class CodeGenerator:
         self,
         expr: ast.TernaryOp,
         dest_disp: int,
-        ty: lt.ArrayType,
+        ty: _ltypes.ArrayType,
         ctx: _FuncCtx,
     ) -> list[str]:
         """Lower `cond ? T : F` for vector-typed arms. Each arm is
@@ -16630,7 +16627,7 @@ class CodeGenerator:
                 f"__builtin_shuffle: expected 2 or 3 args, got {len(expr.args)}"
             )
         src_ty = self._type_of(src_a, ctx)
-        if not isinstance(src_ty, lt.ArrayType):
+        if not isinstance(src_ty, _ltypes.ArrayType):
             raise CodegenError("__builtin_shuffle: src must be a vector")
         elem_ty = self._vector_element_type(src_ty)
         elem_size = self._size_of(elem_ty)
@@ -16650,7 +16647,7 @@ class CodeGenerator:
         # Mask element size — for the index extraction we just take
         # the low 32 bits of mask[i] (works because n is small).
         mask_ty = self._type_of(mask_arg, ctx)
-        if not isinstance(mask_ty, lt.ArrayType):
+        if not isinstance(mask_ty, _ltypes.ArrayType):
             raise CodegenError("__builtin_shuffle: mask must be a vector")
         mask_elem_size = self._size_of(self._vector_element_type(mask_ty))
         disp = ctx.call_temps[id(expr)]
@@ -16752,7 +16749,7 @@ class CodeGenerator:
         """Evaluate a vector-typed BinaryOp / UnaryOp into the per-node
         temp slot. Returns asm; EAX = address of the temp."""
         vec_ty = self._type_of(expr, ctx)
-        if not isinstance(vec_ty, lt.ArrayType):
+        if not isinstance(vec_ty, _ltypes.ArrayType):
             raise CodegenError("vector eval: expected ArrayType")
         disp = ctx.call_temps[id(expr)]
         elem_ty = self._vector_element_type(vec_ty)
@@ -16763,11 +16760,11 @@ class CodeGenerator:
             lt = self._type_of(expr.left, ctx)
             rt = self._type_of(expr.right, ctx)
             l_vec = (
-                isinstance(lt, lt.ArrayType)
+                isinstance(lt, _ltypes.ArrayType)
                 and getattr(lt, "is_vector", False)
             )
             r_vec = (
-                isinstance(rt, lt.ArrayType)
+                isinstance(rt, _ltypes.ArrayType)
                 and getattr(rt, "is_vector", False)
             )
             # Float-vector path: per-element FPU operations.
@@ -16905,8 +16902,8 @@ class CodeGenerator:
     def _float_vector_binary(
         self,
         expr: ast.BinaryOp,
-        vec_ty: lt.ArrayType,
-        elem_ty: lt.TypeNode,
+        vec_ty: _ltypes.ArrayType,
+        elem_ty: _ltypes.TypeNode,
         elem_size: int,
         count: int,
         disp: int,
@@ -16932,11 +16929,11 @@ class CodeGenerator:
         lt = self._type_of(expr.left, ctx)
         rt = self._type_of(expr.right, ctx)
         l_vec = (
-            isinstance(lt, lt.ArrayType)
+            isinstance(lt, _ltypes.ArrayType)
             and getattr(lt, "is_vector", False)
         )
         r_vec = (
-            isinstance(rt, lt.ArrayType)
+            isinstance(rt, _ltypes.ArrayType)
             and getattr(rt, "is_vector", False)
         )
         out: list[str] = []
@@ -16944,7 +16941,7 @@ class CodeGenerator:
             # vec op float-scalar — store the scalar at a stack slot
             # for repeated load.
             out += self._eval_float_to_st0(expr.right, ctx)
-            scalar_size = self._size_of(rt) if isinstance(rt, lt.BasicType) else 8
+            scalar_size = self._size_of(rt) if isinstance(rt, _ltypes.BasicType) else 8
             scalar_w = "dword" if scalar_size == 4 else "qword"
             out.append(f"        sub     esp, {scalar_size}")
             out.append(f"        fstp    {scalar_w} [esp]")
@@ -16971,7 +16968,7 @@ class CodeGenerator:
             # popping form `fop st1, st0` does `st1 = st1 OP st0`,
             # which is `scalar OP vec[i]` — exactly what we want.
             out += self._eval_float_to_st0(expr.left, ctx)
-            scalar_size = self._size_of(lt) if isinstance(lt, lt.BasicType) else 8
+            scalar_size = self._size_of(lt) if isinstance(lt, _ltypes.BasicType) else 8
             scalar_w = "dword" if scalar_size == 4 else "qword"
             out.append(f"        sub     esp, {scalar_size}")
             out.append(f"        fstp    {scalar_w} [esp]")
@@ -17019,7 +17016,7 @@ class CodeGenerator:
         return out
 
     def _vector_int_binop(
-        self, op: str, elem_ty: lt.TypeNode
+        self, op: str, elem_ty: _ltypes.TypeNode
     ) -> list[str]:
         """Emit eax := eax OP ecx for integer vector elements."""
         out: list[str] = []
@@ -17063,7 +17060,7 @@ class CodeGenerator:
         return out
 
     def _vector_int_unop(
-        self, op: str, elem_ty: lt.TypeNode
+        self, op: str, elem_ty: _ltypes.TypeNode
     ) -> list[str]:
         """Emit eax := OP eax for integer vector elements."""
         if op == "-":
@@ -17075,7 +17072,7 @@ class CodeGenerator:
         raise CodegenError(f"vector unary `{op}` not supported")
 
     def _vector_copy_assign(
-        self, expr: ast.BinaryOp, vec_ty: lt.ArrayType, ctx: _FuncCtx
+        self, expr: ast.BinaryOp, vec_ty: _ltypes.ArrayType, ctx: _FuncCtx
     ) -> list[str]:
         """Copy a vector value to a vector lvalue (memcpy of sizeof bytes)."""
         size = self._size_of(vec_ty)
@@ -17140,7 +17137,7 @@ class CodeGenerator:
         # temp, copy result back to *addr_slot. Side effects in the
         # lvalue's sub-expressions fire exactly once.
         if (
-            isinstance(target_ty_check, lt.ArrayType)
+            isinstance(target_ty_check, _ltypes.ArrayType)
             and getattr(target_ty_check, "is_vector", False)
             and not isinstance(expr.left, ast.Identifier)
         ):
@@ -17150,7 +17147,7 @@ class CodeGenerator:
         # Complex compound assign on any lvalue: snapshot pattern.
         # Identifier path desugars trivially (re-reading is
         # side-effect-free); non-Identifier uses snapshot.
-        if isinstance(target_ty_check, lt.ComplexType):
+        if isinstance(target_ty_check, _ltypes.ComplexType):
             return self._compound_assign_complex_lvalue(
                 expr, op, target_ty_check, ctx,
             )
@@ -17161,7 +17158,7 @@ class CodeGenerator:
         # snapshot pattern so `_assign`'s bool-aware path runs and
         # uses `_eval_to_bool_eax` on the inner BinaryOp result.
         if (
-            isinstance(target_ty_check, lt.BasicType)
+            isinstance(target_ty_check, _ltypes.BasicType)
             and target_ty_check.name == "bool"
             and not isinstance(expr.left, ast.Identifier)
         ):
@@ -17170,7 +17167,7 @@ class CodeGenerator:
                 self._is_float_type(rhs_ty)
                 or self._is_long_long(rhs_ty)
                 or self._is_int128(rhs_ty)
-                or isinstance(rhs_ty, lt.ComplexType)
+                or isinstance(rhs_ty, _ltypes.ComplexType)
             )
             if needs_wide_path:
                 return self._compound_assign_bool_lvalue(
@@ -17179,7 +17176,7 @@ class CodeGenerator:
 
         if isinstance(expr.left, ast.Identifier):
             ty = self._identifier_type(expr.left.name, ctx)
-            if isinstance(ty, lt.ArrayType):
+            if isinstance(ty, _ltypes.ArrayType):
                 # Vector compound assign `v op= rhs` desugars to
                 # `v = v op rhs`. We need to allocate a temp for
                 # the synthesized BinaryOp via `_collect_call_temps`,
@@ -17223,7 +17220,7 @@ class CodeGenerator:
             # call-temp pre-pass already ran.
             mty = self._type_of(expr.left, ctx)
             if (
-                isinstance(mty, lt.ArrayType)
+                isinstance(mty, _ltypes.ArrayType)
                 and getattr(mty, "is_vector", False)
             ):
                 inner = ast.BinaryOp(
@@ -17266,8 +17263,8 @@ class CodeGenerator:
     def _apply_binop_post_eval(
         self,
         op: str,
-        lt: lt.TypeNode,
-        rt: lt.TypeNode,
+        lt: _ltypes.TypeNode,
+        rt: _ltypes.TypeNode,
     ) -> list[str]:
         """Compute `(stack_top OP eax) → eax`, with C semantics.
 
