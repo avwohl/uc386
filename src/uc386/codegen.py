@@ -15220,7 +15220,7 @@ class CodeGenerator:
         # (defined or extern). Emit a `call _name` linker reference.
         if (
             isinstance(callee, ast.Identifier)
-            and callee.name in self._func_return_types
+            and callee.name.text in self._func_return_types
         ):
             return self._emit_call(
                 expr.args, ctx,
@@ -15235,13 +15235,13 @@ class CodeGenerator:
         # what the c-testsuite / GCC torture suite assume.
         if (
             isinstance(callee, ast.Identifier)
-            and not ctx.has_local(callee.name)
-            and callee.name not in self._globals
-            and callee.name not in self._extern_vars
-            and callee.name not in self._enum_constants
+            and not ctx.has_local(callee.name.text)
+            and callee.name.text not in self._globals
+            and callee.name.text not in self._extern_vars
+            and callee.name.text not in self._enum_constants
         ):
-            self._func_return_types[callee.name] = _ltypes.BasicType(name="int")
-            self._func_param_types[callee.name] = []
+            self._func_return_types[callee.name.text] = _ltypes.BasicType(name="int")
+            self._func_param_types[callee.name.text] = []
             return self._emit_call(expr.args, ctx, direct=callee.name.text)
 
         # Indirect call: the callee evaluates to a function address. Push
