@@ -4069,6 +4069,16 @@ class CodeGenerator:
             finally:
                 ctx.exit_scope()
             return
+        # Auto-AST: ast.Declaration carries the storage class + one
+        # or more declarators. Synthesise per-declarator _SynthLocalVars
+        # via the cache so the registered identity matches the emit
+        # pass, and dispatch each through the regular VarDecl handler.
+        if isinstance(node, ast.Declaration):
+            if decl_storage_class(node.decl_specs) == "typedef":
+                return
+            for sv in self._synth_vars_for(node):
+                self._collect_call_temps_walk(sv, ctx)
+            return
         # VarDecl: register the name in the current scope BEFORE
         # recursing into the init expr, so the init can reference the
         # newly-declared name in the right scope (e.g. `int i = i;`
@@ -4121,7 +4131,7 @@ class CodeGenerator:
         elif (
             isinstance(sub, ast.Call)
             and isinstance(sub.func, ast.Identifier)
-            and sub.func.name == "__builtin_shuffle"
+            and sub.func.name.text == "__builtin_shuffle"
             and len(sub.args) >= 1
         ):
             # Vector shuffle result lands in a per-call temp.
@@ -4264,7 +4274,7 @@ class CodeGenerator:
             if (
                 isinstance(n, ast.Call)
                 and isinstance(n.func, ast.Identifier)
-                and n.func.name == "__builtin_va_arg_pack"
+                and n.func.name.text == "__builtin_va_arg_pack"
             ):
                 return True
         return False
@@ -4287,7 +4297,7 @@ class CodeGenerator:
             for a in node.args:
                 if (isinstance(a, ast.Call)
                         and isinstance(a.func, ast.Identifier)
-                        and a.func.name == "__builtin_va_arg_pack"):
+                        and a.func.name.text == "__builtin_va_arg_pack"):
                     for va in va_args:
                         new_args.append(self._substitute_inline(
                             copy.deepcopy(va), param_map, va_args
@@ -12335,7 +12345,7 @@ class CodeGenerator:
         """
         callee = self._stripped_callee(call, ctx)
         if isinstance(callee, ast.Identifier):
-            name = callee.name
+            name = callee.name.text
             if ctx is not None:
                 name = ctx.nested_fn_names.get(name, name)
             if name in self._func_return_types:
