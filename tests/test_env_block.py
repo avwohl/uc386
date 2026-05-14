@@ -17,7 +17,7 @@ from textwrap import dedent
 import pytest
 
 from uc386.codegen import CodeGenerator
-from uc_core.frontend_legacy import parse
+from uc_core.frontend import parse
 from uc_core.preprocessor import Preprocessor
 
 
