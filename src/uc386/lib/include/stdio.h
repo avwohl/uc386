@@ -2,6 +2,14 @@
 #ifndef _STDIO_H
 #define _STDIO_H
 
+/* gcc / clang make <stdint.h>'s fixed-width types and <stdbool.h>'s
+ * `bool` / `true` / `false` macros transitively visible via <stdio.h>
+ * on most platforms. Period code (and corpora like MicroPython's
+ * re1.5) relies on this. Pull both headers in for parity.
+ */
+#include <stdint.h>
+#include <stdbool.h>
+
 /* Size type — track pointer width (matches stddef.h).  Under --int=32
  * --ptr=16 this stays a 16-bit unsigned short so libc's fread/fwrite
  * receive their length args at the offsets they were assembled for.  */

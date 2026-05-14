@@ -115,6 +115,14 @@ I386_DOS_PREDEFINES = {
     "__SIZEOF_PTRDIFF_T__": "4",
     "__SIZEOF_WCHAR_T__": "2",
     "__SIZEOF_WINT_T__": "4",
+    # GCC fall-through attribute. MicroPython's MP_FALLTHROUGH is
+    # conditional on __GNUC__ >= 7; when it's defined to
+    # ``__attribute__((fallthrough));`` the source-level attribute
+    # strip handles it. When source uses the macro without including
+    # mpconfig.h, we'd see the bare identifier mid-switch which the
+    # parser can't recover from — predefine it to nothing here as a
+    # safety net.
+    "MP_FALLTHROUGH": "",
     # Endianness predefines — i386 is little-endian.
     "__BYTE_ORDER__": "1234",
     "__ORDER_LITTLE_ENDIAN__": "1234",
