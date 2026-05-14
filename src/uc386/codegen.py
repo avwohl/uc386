@@ -3161,9 +3161,11 @@ class CodeGenerator:
                 for it in node.items:
                     _collect_nested_decls(it)
                 return
-            if isinstance(node, (ast.IfStmt,)):
+            if isinstance(node, (ast.IfStmt, ast.IfStmtElse)):
                 _collect_nested_decls(node.then_branch)
-                _collect_nested_decls(node.else_branch)
+                else_b = getattr(node, "else_branch", None)
+                if else_b is not None:
+                    _collect_nested_decls(else_b)
                 return
             if isinstance(node, (ast.WhileStmt, ast.DoWhileStmt)):
                 _collect_nested_decls(node.body)
@@ -4224,11 +4226,10 @@ class CodeGenerator:
         cond_expr = None
         e1_expr = None
         e2_expr = None
-        if len(items) == 1 and isinstance(items[0], (ast.ReturnStmt, ast.ReturnStmtValue)):
+        if len(items) == 1 and isinstance(items[0], ast.ReturnStmtValue):
             e1_expr = items[0].value
         elif (len(items) == 2
                 and isinstance(items[0], ast.IfStmt)
-                and items[0].else_branch is None
                 and isinstance(items[1], (ast.ReturnStmt, ast.ReturnStmtValue))):
             then_branch = items[0].then_branch
             if (isinstance(then_branch, ast.CompoundStmt)
@@ -4425,10 +4426,11 @@ class CodeGenerator:
                 self._collect_locals(item, ctx)
             ctx.exit_scope()
             return
-        if isinstance(node, ast.IfStmt):
+        if isinstance(node, (ast.IfStmt, ast.IfStmtElse)):
             self._collect_locals(node.then_branch, ctx)
-            if node.else_branch is not None:
-                self._collect_locals(node.else_branch, ctx)
+            else_b = getattr(node, "else_branch", None)
+            if else_b is not None:
+                self._collect_locals(else_b, ctx)
             return
         if isinstance(node, (ast.WhileStmt, ast.DoWhileStmt)):
             self._collect_locals(node.body, ctx)
@@ -8905,9 +8907,11 @@ class CodeGenerator:
             if isinstance(node, ast.CompoundStmt):
                 for item in node.items:
                     walk(item)
-            elif isinstance(node, ast.IfStmt):
+            elif isinstance(node, (ast.IfStmt, ast.IfStmtElse)):
                 walk(node.then_branch)
-                walk(node.else_branch)
+                else_b = getattr(node, "else_branch", None)
+                if else_b is not None:
+                    walk(else_b)
             elif isinstance(node, (ast.WhileStmt, ast.DoWhileStmt, ast.ForStmt)):
                 walk(node.body)
             elif isinstance(node, ast.LabelStmt):
