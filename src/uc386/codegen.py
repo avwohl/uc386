@@ -15417,7 +15417,7 @@ class CodeGenerator:
         # struct row), evaluating the expression yields the element's
         # address (array-to-pointer decay / struct l-value), since we
         # don't load aggregates into EAX.
-        elem_ty = self._type_of(expr, ctx)
+        elem_ty = self._expand_typedef_type(self._type_of(expr, ctx))
         addr = self._index_address(expr, ctx)
         if isinstance(elem_ty, (_ltypes.ArrayType, _ltypes.StructType)):
             return addr
