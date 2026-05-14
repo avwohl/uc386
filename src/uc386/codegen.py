@@ -8538,21 +8538,52 @@ class CodeGenerator:
     def _compound(self, block: ast.CompoundStmt, ctx: _FuncCtx) -> list[str]:
         ctx.enter_scope()
         out: list[str] = []
-        for item in block.items:
+        for item in block.items or []:
             out += self._item(item, ctx)
         ctx.exit_scope()
         return out
 
+    def _lower_declaration(self, decl, ctx: _FuncCtx) -> list[str]:
+        """Lower an ``ast.Declaration`` to a series of per-declarator
+        var-init operations, matching the legacy ``ast.VarDecl`` flow."""
+        from dataclasses import dataclass as _dc
+        @_dc
+        class _SynthVar:
+            name: str
+            var_type: object
+            init: object = None
+            storage_class: object = None
+            alignment: object = None
+            alias_target: object = None
+            no_instrument_function: bool = False
+            is_noinit: bool = False
+        storage = decl_storage_class(decl.decl_specs)
+        if storage == "typedef":
+            return []
+        out: list[str] = []
+        from uc_core.ast import resolved_to_legacy
+        for name, full, init, is_fn in iter_var_decls(decl):
+            if name is None or is_fn:
+                continue
+            legacy_type = resolved_to_legacy(full)
+            sv = _SynthVar(name=name, var_type=legacy_type, init=init,
+                           storage_class=storage)
+            out += self._var_init(sv, ctx)
+        return out
+
     def _item(self, item, ctx: _FuncCtx) -> list[str]:
-        if isinstance(item, ast.VarDecl):
-            return self._var_init(item, ctx)
+        if isinstance(item, ast.Declaration):
+            # Auto-AST collapses ``T a, b, c;`` into one Declaration
+            # with N declarators. Synthesise a per-declarator VarDecl-
+            # shaped namespace and dispatch each through _var_init.
+            return self._lower_declaration(item, ctx)
         if isinstance(item, (ast.ReturnStmt, ast.ReturnStmtValue)):
             return self._return(item, ctx)
         if isinstance(item, ast.CompoundStmt):
             return self._compound(item, ctx)
         if isinstance(item, ast.ExpressionStmt):
             return self._expr_stmt(item, ctx)
-        if isinstance(item, ast.IfStmt):
+        if isinstance(item, (ast.IfStmt, ast.IfStmtElse)):
             return self._if(item, ctx)
         if isinstance(item, ast.WhileStmt):
             return self._while(item, ctx)
@@ -8688,17 +8719,18 @@ class CodeGenerator:
             f"{type(item).__name__} not implemented yet"
         )
 
-    def _if(self, stmt: ast.IfStmt, ctx: _FuncCtx) -> list[str]:
+    def _if(self, stmt, ctx: _FuncCtx) -> list[str]:
         else_label = ctx.label("else")
         end_label = ctx.label("endif")
         out = self._eval_to_bool_eax(stmt.condition, ctx)
         out.append("        test    eax, eax")
-        out.append(f"        jz      {else_label if stmt.else_branch else end_label}")
+        else_branch = getattr(stmt, "else_branch", None)
+        out.append(f"        jz      {else_label if else_branch is not None else end_label}")
         out += self._item(stmt.then_branch, ctx)
-        if stmt.else_branch is not None:
+        if else_branch is not None:
             out.append(f"        jmp     {end_label}")
             out.append(f"{else_label}:")
-            out += self._item(stmt.else_branch, ctx)
+            out += self._item(else_branch, ctx)
         out.append(f"{end_label}:")
         return out
 
