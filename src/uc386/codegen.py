@@ -118,7 +118,7 @@ from uc_core.codegen_helpers import (
     function_is_variadic, iter_var_decls, make_identifier,
     is_function_type, is_pointer_type, is_array_type, is_struct_type,
     decode_string_literal, string_is_wide, decoded_str_len,
-    rewrite_str_token,
+    rewrite_str_token, typedef_resolver_scope,
 )
 
 
@@ -511,6 +511,56 @@ class CodeGenerator:
         # whose `declarations` are the individual VarDecls. Flatten so
         # the rest of `generate()` can iterate uniformly.
         top_decls = list(self._flatten_decls(unit.items))
+        # Pre-scan for typedef declarations so resolve_base_type can
+        # expand TypedefNameSpec references to their underlying type
+        # while we walk the rest of the AST. The resolver is installed
+        # for the lifetime of generate() via the scope at the bottom.
+        self._build_typedef_table(top_decls)
+        with typedef_resolver_scope(self._resolve_typedef_name):
+            return self._generate_inner(unit, top_decls)
+
+    def _build_typedef_table(self, top_decls) -> None:
+        """Index typedef declarations by name so the resolver can find them.
+
+        Stores ``(decl_specs, declarator)`` per name. The resolver lazily
+        resolves them on first use and caches the ResolvedType."""
+        self._typedef_decls: dict[str, tuple] = {}
+        self._typedef_resolved_cache: dict[str, "ResolvedType"] = {}
+        for d in top_decls:
+            if not isinstance(d, ast.Declaration):
+                continue
+            if decl_storage_class(d.decl_specs) != "typedef":
+                continue
+            for init_decl in d.declarators or []:
+                if isinstance(init_decl, (ast.InitDeclarator,
+                                          ast.InitDeclaratorWithInit)):
+                    inner = init_decl.declarator
+                else:
+                    inner = init_decl
+                nm = declarator_ident(inner)
+                if nm is None:
+                    continue
+                self._typedef_decls[nm] = (d.decl_specs, inner)
+
+    def _resolve_typedef_name(self, name: str):
+        """Resolver callback for codegen_helpers — returns the underlying
+        ResolvedType for a typedef name, or None if unknown."""
+        cached = self._typedef_resolved_cache.get(name)
+        if cached is not None:
+            return cached
+        entry = self._typedef_decls.get(name)
+        if entry is None:
+            return None
+        decl_specs, declarator = entry
+        # Mark in-progress to break self-referential typedefs.
+        self._typedef_resolved_cache[name] = ResolvedType(
+            kind="typedef", name=name,
+        )
+        _, rt = resolve_type_from_decl(decl_specs, declarator)
+        self._typedef_resolved_cache[name] = rt
+        return rt
+
+    def _generate_inner(self, unit, top_decls) -> str:
         # Auto-AST: `int x, y;` at file scope is one ast.Declaration with
         # two declarators. Expand each non-function declarator into a
         # _SynthLocalVar so the legacy-shaped global / extern / struct /
@@ -5538,6 +5588,8 @@ class CodeGenerator:
         largest member alignment so an array of structs stays packed
         without internal misalignment.
         """
+        if isinstance(t, (ast.TypeName, ast.TypeNameWithDeclarator)):
+            t = _to_legacy_type(t)
         if isinstance(t, _ltypes.PointerType):
             return 4
         if isinstance(t, _ltypes.BasicType):
@@ -8383,7 +8435,7 @@ class CodeGenerator:
         (`al`/`ax`) and re-extends per the target's signedness, so a
         subsequent use of the value sees the right C semantics.
         """
-        target = expr.target_type
+        target = _to_legacy_type(expr.target_type)
         src_ty = self._type_of(expr.expr, ctx)
         # Cast to `_Bool` short-circuits all the source-aware paths
         # via `_eval_to_bool_eax` (handles long-long / float / int128
@@ -8516,7 +8568,7 @@ class CodeGenerator:
         # etc.) by loading the low 4 bytes.
         if self._is_int128(src_ty):
             out = self._int128_value_address(expr.expr, ctx)
-            target = expr.target_type
+            target = _to_legacy_type(expr.target_type)
             if isinstance(target, _ltypes.PointerType):
                 # Pointer cast from int128: load the low 4 bytes.
                 out.append("        mov     eax, [eax]")
@@ -8538,7 +8590,7 @@ class CodeGenerator:
                 return out
             # Fall through to the generic raise below for other targets.
         out = self._eval_expr_to_eax(expr.expr, ctx)
-        target = expr.target_type
+        target = _to_legacy_type(expr.target_type)
         if isinstance(target, _ltypes.PointerType):
             return out
         if isinstance(target, _ltypes.EnumType):
