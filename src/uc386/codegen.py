@@ -4230,7 +4230,8 @@ class CodeGenerator:
             if not isinstance(src_ty_check, _ltypes.ArrayType):
                 size = (self._size_of(sub.target_type) + 3) & ~3
                 ctx.alloc_call_temp(sub, size)
-        elif isinstance(sub, (ast.BinaryOp, ast.UnaryOp, ast.Cast, ast.TernaryOp)):
+        elif isinstance(sub, (ast.BinaryOp, ast.UnaryOp, ast.PostfixOp,
+                              ast.Cast, ast.TernaryOp)):
             # Complex-valued sub-expression: needs a temp slot
             # to hold the (real, imag) result. One per node so
             # `(a+b) + (c+d)` allocates distinct buffers.
@@ -6157,7 +6158,8 @@ class CodeGenerator:
             return out
         # Sub-expressions evaluate into a per-node temp slot.
         if (
-            isinstance(expr, (ast.BinaryOp, ast.UnaryOp, ast.Cast, ast.TernaryOp))
+            isinstance(expr, (ast.BinaryOp, ast.UnaryOp, ast.PostfixOp,
+                              ast.Cast, ast.TernaryOp))
             and id(expr) in ctx.call_temps
         ):
             disp = ctx.call_temps[id(expr)]
@@ -6263,7 +6265,7 @@ class CodeGenerator:
             return self._cast_to_int128(expr, dest_disp, ctx)
         if isinstance(expr, ast.BinaryOp):
             return self._binary_int128(expr, dest_disp, ctx)
-        if isinstance(expr, ast.UnaryOp):
+        if isinstance(expr, (ast.UnaryOp, ast.PostfixOp)):
             return self._unary_int128(expr, dest_disp, ctx)
         if isinstance(expr, ast.TernaryOp):
             return self._int128_ternary(expr, dest_disp, ctx)
@@ -12626,6 +12628,9 @@ class CodeGenerator:
                     base_type=_ltypes.BasicType(name="short", is_signed=False)
                 )
             return _ltypes.PointerType(base_type=_ltypes.BasicType(name="char"))
+        if isinstance(expr, ast.PostfixOp):
+            # `x++` / `x--`: the expression's type matches the operand.
+            return self._type_of(expr.operand, ctx)
         if isinstance(expr, ast.UnaryOp):
             if _opt(expr) == "&":
                 return _ltypes.PointerType(base_type=self._type_of(expr.operand, ctx))
@@ -15497,12 +15502,20 @@ class CodeGenerator:
         if hasattr(expr.op, "text"):
             is_prefix_flag = not isinstance(expr, ast.PostfixOp)
             class _OpView:
-                __slots__ = ("op", "operand", "pos", "is_prefix")
-                def __init__(s, op, operand, pos, is_prefix):
+                __slots__ = ("op", "operand", "pos", "is_prefix", "_orig_id")
+                def __init__(s, op, operand, pos, is_prefix, orig_id):
                     s.op, s.operand, s.pos = op, operand, pos
                     s.is_prefix = is_prefix
+                    s._orig_id = orig_id
             expr = _OpView(expr.op.text, expr.operand, getattr(expr, "pos", None),
-                           is_prefix_flag)
+                           is_prefix_flag, id(expr))
+        # Forward the original-node id so downstream `id(expr) in
+        # ctx.call_temps` lookups (set by _collect_call_temps_node on
+        # the un-wrapped node) still resolve.
+        if hasattr(expr, "_orig_id"):
+            orig_id = expr._orig_id
+            if orig_id in ctx.call_temps and id(expr) not in ctx.call_temps:
+                ctx.call_temps[id(expr)] = ctx.call_temps[orig_id]
         if _opt(expr) in ("++", "--"):
             return self._inc_dec(expr, ctx)
         if _opt(expr) == "&":
@@ -15634,14 +15647,22 @@ class CodeGenerator:
         # the 8-byte RMW with carry/borrow propagation.
         if self._is_long_long(ty):
             return self._inc_dec_ll(expr, ctx)
+        # __int128 Identifier: route through _unary_int128 with a
+        # per-expr temp slot. The temp was reserved by
+        # _collect_call_temps_node's int128-UnaryOp branch.
+        if self._is_int128(ty) and id(expr) in ctx.call_temps:
+            disp = ctx.call_temps[id(expr)]
+            out = self._unary_int128(expr, disp, ctx)
+            out.append(f"        lea     eax, {_ebp_addr(disp)}")
+            return out
         # _Complex / __int128 / vector: not standard C for ++/-- but
         # gcc accepts them. Raise a clearer error than "KeyError: 16"
         # for now — extending these is straightforward but rarely
         # needed.
         if isinstance(ty, _ltypes.ComplexType):
             raise CodegenError(
-                f"`{expr.op}` on _Complex operand `{expr.operand.name.text}` "
-                f"not supported (use `__real__ x {expr.op}` instead)"
+                f"`{_opt(expr)}` on _Complex operand `{expr.operand.name.text}` "
+                f"not supported (use `__real__ x {_opt(expr)}` instead)"
             )
         addr = self._identifier_addr_text(expr.operand.name.text, ctx)
         # On a pointer, ++/-- step by sizeof(*ptr) instead of 1. We still
