@@ -515,6 +515,12 @@ class CodeGenerator:
         # expand TypedefNameSpec references to their underlying type
         # while we walk the rest of the AST. The resolver is installed
         # for the lifetime of generate() via the scope at the bottom.
+        # Names rewritten from __attribute__((vector_size(N))) ride
+        # along on `unit._vector_typedef_names`; the resolver flips
+        # `is_vector=True` on the ArrayType for those names.
+        self._vector_typedef_names: set[str] = getattr(
+            unit, "_vector_typedef_names", None,
+        ) or set()
         self._build_typedef_table(top_decls)
         with typedef_resolver_scope(self._resolve_typedef_name):
             return self._generate_inner(unit, top_decls)
@@ -557,6 +563,11 @@ class CodeGenerator:
             kind="typedef", name=name,
         )
         _, rt = resolve_type_from_decl(decl_specs, declarator)
+        # GCC vector typedefs (rewritten from __attribute__((vector_size)))
+        # mark the resulting array as is_vector so codegens route through
+        # vector-specific paths.
+        if name in self._vector_typedef_names and rt.kind == "array":
+            rt.is_vector = True
         self._typedef_resolved_cache[name] = rt
         return rt
 
