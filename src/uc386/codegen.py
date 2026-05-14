@@ -138,6 +138,16 @@ class _SynthLocalVar:
     is_noinit: bool = False
 
 
+def _opt(node) -> str:
+    """Return the operator string for an UnaryOp/BinaryOp/PostfixOp,
+    handling both legacy str ``.op`` and the auto-AST Token-valued
+    ``.op``. Safe to call on any value (returns "" for non-op nodes)."""
+    op = getattr(node, "op", None)
+    if op is None:
+        return ""
+    return op.text if hasattr(op, "text") else op
+
+
 class CodegenError(NotImplementedError):
     """Raised when the AST contains a construct codegen can't handle yet."""
 
@@ -365,13 +375,13 @@ def _try_simple_int_fold(expr) -> int | None:
         v = _try_simple_int_fold(expr.operand)
         if v is None:
             return None
-        if expr.op == "-":
+        if _opt(expr) == "-":
             return -v
-        if expr.op == "+":
+        if _opt(expr) == "+":
             return v
-        if expr.op == "~":
+        if _opt(expr) == "~":
             return ~v
-        if expr.op == "!":
+        if _opt(expr) == "!":
             return 1 if v == 0 else 0
         return None
     if isinstance(expr, ast.BinaryOp):
@@ -1059,7 +1069,7 @@ class CodeGenerator:
                     return [f"        dd      {label}"]
                 if (
                     isinstance(stripped, ast.UnaryOp)
-                    and stripped.op == "&"
+                    and _opt(stripped) == "&"
                     and isinstance(stripped.operand, ast.Identifier)
                 ):
                     inner_name = self._resolve_static_init_name(
@@ -1122,7 +1132,7 @@ class CodeGenerator:
             # become `dd <label>` so the linker resolves the address.
             if (
                 isinstance(init, ast.UnaryOp)
-                and init.op == "&"
+                and _opt(init) == "&"
                 and isinstance(init.operand, ast.Identifier)
             ):
                 inner_name = self._resolve_static_init_name(init.operand.name)
@@ -1145,7 +1155,7 @@ class CodeGenerator:
             # `<base_label> + <constant_offset>` at link time.
             if (
                 isinstance(init, ast.UnaryOp)
-                and init.op == "&"
+                and _opt(init) == "&"
             ):
                 resolved = self._resolve_static_addr(init.operand, name)
                 if resolved is not None:
@@ -1159,7 +1169,7 @@ class CodeGenerator:
             # address.
             if (
                 isinstance(init, ast.UnaryOp)
-                and init.op == "&"
+                and _opt(init) == "&"
                 and isinstance(init.operand, ast.Compound)
             ):
                 hidden = self._intern_compound_global(
@@ -1186,12 +1196,12 @@ class CodeGenerator:
             # interned string's label plus the integer offset.
             if (
                 isinstance(init, ast.BinaryOp)
-                and init.op in ("+", "-")
+                and _opt(init) in ("+", "-")
                 and isinstance(init.left, ast.StringLiteral)
             ):
                 label = self._intern_string(init.int_value(left))
                 offset = self._const_eval(init.right, name)
-                if init.op == "-":
+                if _opt(init) == "-":
                     offset = -offset
                 if offset == 0:
                     return [f"        dd      {label}"]
@@ -1278,26 +1288,26 @@ class CodeGenerator:
         if isinstance(expr, ast.IntLiteral):
             return (float(int_value(expr)), 0.0)
         if isinstance(expr, ast.UnaryOp):
-            if expr.op in ("+", "-"):
+            if _opt(expr) in ("+", "-"):
                 ar, ai = self._const_eval_complex(expr.operand, name)
-                if expr.op == "-":
+                if _opt(expr) == "-":
                     return (-ar, -ai)
                 return (ar, ai)
-            if expr.op == "~":
+            if _opt(expr) == "~":
                 # Complex conjugate: negate imag.
                 ar, ai = self._const_eval_complex(expr.operand, name)
                 return (ar, -ai)
         if isinstance(expr, ast.BinaryOp):
-            if expr.op in ("+", "-", "*", "/"):
+            if _opt(expr) in ("+", "-", "*", "/"):
                 lr, li = self._const_eval_complex(expr.left, name)
                 rr, ri = self._const_eval_complex(expr.right, name)
-                if expr.op == "+":
+                if _opt(expr) == "+":
                     return (lr + rr, li + ri)
-                if expr.op == "-":
+                if _opt(expr) == "-":
                     return (lr - rr, li - ri)
-                if expr.op == "*":
+                if _opt(expr) == "*":
                     return (lr * rr - li * ri, lr * ri + li * rr)
-                if expr.op == "/":
+                if _opt(expr) == "/":
                     denom = rr * rr + ri * ri
                     if denom == 0:
                         raise CodegenError(
@@ -2398,13 +2408,13 @@ class CodeGenerator:
             if expr.name.text in self._func_return_types:
                 return f"_{expr.name.text}", 0
             return None
-        if isinstance(expr, ast.UnaryOp) and expr.op == "*":
+        if isinstance(expr, ast.UnaryOp) and _opt(expr) == "*":
             # `*p` where p is a pointer-arithmetic expression. Lower as
             # equivalent indexing — only resolves if p is a known
             # global+offset.
             inner = self._resolve_static_addr(expr.operand, name)
             return inner
-        if isinstance(expr, ast.UnaryOp) and expr.op == "&":
+        if isinstance(expr, ast.UnaryOp) and _opt(expr) == "&":
             # `&lvalue`: address-of an l-value. The walker already
             # produces the address of any l-value chain, so `&` here is
             # idempotent — strip and recurse.
@@ -2459,7 +2469,7 @@ class CodeGenerator:
                 return None
             base_label, base_off = inner
             return base_label, base_off + idx * self._size_of(elem_ty)
-        if isinstance(expr, ast.BinaryOp) and expr.op in ("+", "-"):
+        if isinstance(expr, ast.BinaryOp) and _opt(expr) in ("+", "-"):
             # `arr + N` or `arr - N` — pointer arithmetic.
             # In a global initializer, the address-bearing operand
             # must DECAY to a static address (array name, function
@@ -2483,14 +2493,14 @@ class CodeGenerator:
                     return True
                 if (
                     isinstance(e, ast.UnaryOp)
-                    and e.op == "&"
+                    and _opt(e) == "&"
                 ):
                     return True
                 if isinstance(e, ast.Index):
                     return True
                 if isinstance(e, ast.Member):
                     return True
-                if isinstance(e, ast.BinaryOp) and e.op in ("+", "-"):
+                if isinstance(e, ast.BinaryOp) and _opt(e) in ("+", "-"):
                     return _decays_to_static(e.left) or _decays_to_static(e.right)
                 return False
 
@@ -2506,11 +2516,11 @@ class CodeGenerator:
                     offset = self._const_eval(expr.right, name)
                 except CodegenError:
                     return None
-                if expr.op == "-":
+                if _opt(expr) == "-":
                     offset = -offset
                 addr_side = expr.left
             else:
-                if expr.op == "-":
+                if _opt(expr) == "-":
                     return None  # `N - arr` doesn't make sense
                 inner = self._resolve_static_addr(expr.right, name)
                 if inner is None:
@@ -2599,16 +2609,16 @@ class CodeGenerator:
             return float(int_value(expr))
         if isinstance(expr, ast.CharLiteral):
             return float(int_value(expr))
-        if isinstance(expr, ast.UnaryOp) and expr.op in ("+", "-"):
+        if isinstance(expr, ast.UnaryOp) and _opt(expr) in ("+", "-"):
             v = self._const_eval_float(expr.operand, name)
-            return -v if expr.op == "-" else v
-        if isinstance(expr, ast.BinaryOp) and expr.op in ("+", "-", "*", "/"):
+            return -v if _opt(expr) == "-" else v
+        if isinstance(expr, ast.BinaryOp) and _opt(expr) in ("+", "-", "*", "/"):
             lv = self._const_eval_float(expr.left, name)
             rv = self._const_eval_float(expr.right, name)
-            if expr.op == "+": return lv + rv
-            if expr.op == "-": return lv - rv
-            if expr.op == "*": return lv * rv
-            if expr.op == "/":
+            if _opt(expr) == "+": return lv + rv
+            if _opt(expr) == "-": return lv - rv
+            if _opt(expr) == "*": return lv * rv
+            if _opt(expr) == "/":
                 if rv == 0:
                     raise CodegenError(
                         f"global `{name}`: division by zero in float init"
@@ -2752,48 +2762,48 @@ class CodeGenerator:
             )
         if isinstance(expr, ast.UnaryOp) and expr.is_prefix:
             inner = self._const_eval(expr.operand, name)
-            if expr.op == "-":
+            if _opt(expr) == "-":
                 return -inner
-            if expr.op == "+":
+            if _opt(expr) == "+":
                 return inner
-            if expr.op == "~":
+            if _opt(expr) == "~":
                 return ~inner
-            if expr.op == "!":
+            if _opt(expr) == "!":
                 return 0 if inner else 1
         if isinstance(expr, ast.BinaryOp):
             # Short-circuit ops: only evaluate the side actually used,
             # so `0 && undefined` and `1 || undefined` const-fold.
-            if expr.op == "&&":
+            if _opt(expr) == "&&":
                 l = self._const_eval(expr.left, name)
                 if l == 0:
                     return 0
                 return 1 if self._const_eval(expr.right, name) != 0 else 0
-            if expr.op == "||":
+            if _opt(expr) == "||":
                 l = self._const_eval(expr.left, name)
                 if l != 0:
                     return 1
                 return 1 if self._const_eval(expr.right, name) != 0 else 0
             l = self._const_eval(expr.left, name)
             r = self._const_eval(expr.right, name)
-            if expr.op == "+":   return l + r
-            if expr.op == "-":   return l - r
-            if expr.op == "*":   return l * r
+            if _opt(expr) == "+":   return l + r
+            if _opt(expr) == "-":   return l - r
+            if _opt(expr) == "*":   return l * r
             # `/` and `%` for ints in C are truncated toward zero.
-            if expr.op == "/":   return int(l / r) if r != 0 else 0
-            if expr.op == "%":   return l - int(l / r) * r if r != 0 else 0
-            if expr.op == "&":   return l & r
-            if expr.op == "|":   return l | r
-            if expr.op == "^":   return l ^ r
-            if expr.op == "<<":  return l << r
-            if expr.op == ">>":  return l >> r
+            if _opt(expr) == "/":   return int(l / r) if r != 0 else 0
+            if _opt(expr) == "%":   return l - int(l / r) * r if r != 0 else 0
+            if _opt(expr) == "&":   return l & r
+            if _opt(expr) == "|":   return l | r
+            if _opt(expr) == "^":   return l ^ r
+            if _opt(expr) == "<<":  return l << r
+            if _opt(expr) == ">>":  return l >> r
             # Comparison operators: useful inside macros that pack
             # `cond ? FLAG_A : FLAG_B` style constants.
-            if expr.op == "==":  return 1 if l == r else 0
-            if expr.op == "!=":  return 1 if l != r else 0
-            if expr.op == "<":   return 1 if l < r else 0
-            if expr.op == ">":   return 1 if l > r else 0
-            if expr.op == "<=":  return 1 if l <= r else 0
-            if expr.op == ">=":  return 1 if l >= r else 0
+            if _opt(expr) == "==":  return 1 if l == r else 0
+            if _opt(expr) == "!=":  return 1 if l != r else 0
+            if _opt(expr) == "<":   return 1 if l < r else 0
+            if _opt(expr) == ">":   return 1 if l > r else 0
+            if _opt(expr) == "<=":  return 1 if l <= r else 0
+            if _opt(expr) == ">=":  return 1 if l >= r else 0
         if isinstance(expr, ast.TernaryOp):
             # `c ? a : b` is constant if c, a, b all are. Only evaluate
             # the chosen arm — the unchosen side may legitimately not
@@ -3816,13 +3826,13 @@ class CodeGenerator:
                                 return m_ty
                 return None
             # *p → pointee.
-            if isinstance(operand, ast.UnaryOp) and operand.op == "*":
+            if isinstance(operand, ast.UnaryOp) and _opt(operand) == "*":
                 ptr_ty = resolve_inner(operand.operand)
                 if isinstance(ptr_ty, (_ltypes.PointerType, _ltypes.ArrayType)):
                     return ptr_ty.base_type
                 return None
             # &x → pointer-to.
-            if isinstance(operand, ast.UnaryOp) and operand.op == "&":
+            if isinstance(operand, ast.UnaryOp) and _opt(operand) == "&":
                 inner_ty = resolve_inner(operand.operand)
                 if inner_ty is not None:
                     return _ltypes.PointerType(base_type=inner_ty)
@@ -3836,7 +3846,7 @@ class CodeGenerator:
             # taking the type of the wider operand. Comparison and
             # logical ops yield int.
             if isinstance(operand, ast.BinaryOp):
-                if operand.op in ("==", "!=", "<", ">", "<=", ">=",
+                if _opt(operand) in ("==", "!=", "<", ">", "<=", ">=",
                                   "&&", "||"):
                     return _ltypes.BasicType(name="int")
                 lt = resolve_inner(operand.left)
@@ -4517,7 +4527,7 @@ class CodeGenerator:
         """Compute the address of a `_Complex T` value lvalue."""
         if isinstance(expr, ast.Identifier):
             return self._identifier_address(expr.name.text, ctx)
-        if isinstance(expr, ast.UnaryOp) and expr.op == "*":
+        if isinstance(expr, ast.UnaryOp) and _opt(expr) == "*":
             return self._eval_expr_to_eax(expr.operand, ctx)
         if isinstance(expr, ast.Member):
             return self._member_address(expr, ctx)
@@ -4527,7 +4537,7 @@ class CodeGenerator:
         # then yield the rhs's complex address. Use type-aware
         # evaluation for the lhs so a complex-typed lhs (e.g. `a = X`
         # where a is complex) doesn't try to load 16 bytes into EAX.
-        if isinstance(expr, ast.BinaryOp) and expr.op == ",":
+        if isinstance(expr, ast.BinaryOp) and _opt(expr) == ",":
             lt = self._type_of(expr.left, ctx)
             if isinstance(lt, _ltypes.ComplexType):
                 out = self._complex_value_address(expr.left, ctx)
@@ -4652,7 +4662,7 @@ class CodeGenerator:
         # fallback here.
         if isinstance(operand, ast.Identifier):
             out = self._identifier_address(operand.name, ctx)
-        elif isinstance(operand, ast.UnaryOp) and operand.op == "*":
+        elif isinstance(operand, ast.UnaryOp) and _opt(operand) == "*":
             out = self._eval_expr_to_eax(operand.operand, ctx)
         elif isinstance(operand, ast.Member):
             out = self._member_address(operand, ctx)
@@ -4682,7 +4692,7 @@ class CodeGenerator:
                 f"`{expr.op}` operand must be a simple lvalue "
                 f"(got {type(operand).__name__})"
             )
-        offset = 0 if expr.op == "__real__" else half_size
+        offset = 0 if _opt(expr) == "__real__" else half_size
         if offset:
             out.append(f"        add     eax, {offset}")
         return out, _ltypes.BasicType(name=operand_ty.base_type)
@@ -4895,11 +4905,11 @@ class CodeGenerator:
         Distinguishes vector arithmetic from incidental ArrayType results
         (e.g. an Identifier of array type used in arithmetic context)."""
         if isinstance(node, ast.BinaryOp):
-            return node.op in (
+            return _opt(node) in (
                 "+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>",
             )
         if isinstance(node, ast.UnaryOp):
-            return node.op in ("-", "+", "~")
+            return _opt(node) in ("-", "+", "~")
         return False
 
     def _is_genuine_vector_op(self, node, ctx) -> bool:
@@ -5913,7 +5923,7 @@ class CodeGenerator:
         """Lines that produce the address of an `__int128` value in EAX."""
         if isinstance(expr, ast.Identifier):
             return self._identifier_address(expr.name.text, ctx)
-        if isinstance(expr, ast.UnaryOp) and expr.op == "*":
+        if isinstance(expr, ast.UnaryOp) and _opt(expr) == "*":
             return self._eval_expr_to_eax(expr.operand, ctx)
         if isinstance(expr, ast.Member):
             return self._member_address(expr, ctx)
@@ -5942,7 +5952,7 @@ class CodeGenerator:
             return out
         # Comma operator with __int128 result: eval left for side
         # effects, then eval right as the int128 value.
-        if isinstance(expr, ast.BinaryOp) and expr.op == ",":
+        if isinstance(expr, ast.BinaryOp) and _opt(expr) == ",":
             out = self._eval_expr_to_eax(expr.left, ctx)
             out += self._int128_value_address(expr.right, ctx)
             return out
@@ -6878,7 +6888,7 @@ class CodeGenerator:
             out += self._index_address(expr.left, ctx)
         elif (
             isinstance(expr.left, ast.UnaryOp)
-            and expr.left.op == "*"
+            and _opt(expr.left) == "*"
         ):
             out += self._eval_expr_to_eax(expr.left.operand, ctx)
         elif isinstance(expr.left, ast.Member):
@@ -6935,7 +6945,7 @@ class CodeGenerator:
             out += self._index_address(expr.left, ctx)
         elif (
             isinstance(expr.left, ast.UnaryOp)
-            and expr.left.op == "*"
+            and _opt(expr.left) == "*"
         ):
             out += self._eval_expr_to_eax(expr.left.operand, ctx)
         elif isinstance(expr.left, ast.Member):
@@ -6994,7 +7004,7 @@ class CodeGenerator:
             out += self._index_address(expr.left, ctx)
         elif (
             isinstance(expr.left, ast.UnaryOp)
-            and expr.left.op == "*"
+            and _opt(expr.left) == "*"
         ):
             out += self._eval_expr_to_eax(expr.left.operand, ctx)
         elif isinstance(expr.left, ast.Member):
@@ -7059,7 +7069,7 @@ class CodeGenerator:
             out += self._index_address(expr.left, ctx)
         elif (
             isinstance(expr.left, ast.UnaryOp)
-            and expr.left.op == "*"
+            and _opt(expr.left) == "*"
         ):
             out += self._eval_expr_to_eax(expr.left.operand, ctx)
         elif isinstance(expr.left, ast.Member):
@@ -7102,7 +7112,7 @@ class CodeGenerator:
             out += self._member_address(lhs, ctx)
         elif isinstance(lhs, ast.Index):
             out += self._index_address(lhs, ctx)
-        elif isinstance(lhs, ast.UnaryOp) and lhs.op == "*":
+        elif isinstance(lhs, ast.UnaryOp) and _opt(lhs) == "*":
             out += self._eval_expr_to_eax(lhs.operand, ctx)
         else:
             raise CodegenError(
@@ -7186,7 +7196,7 @@ class CodeGenerator:
             return self._member_address(expr, ctx)
         if isinstance(expr, ast.Index):
             return self._index_address(expr, ctx)
-        if isinstance(expr, ast.UnaryOp) and expr.op == "*":
+        if isinstance(expr, ast.UnaryOp) and _opt(expr) == "*":
             return self._eval_expr_to_eax(expr.operand, ctx)
         if isinstance(expr, (ast.Call, ast.CallNoArgs)):
             # For struct-returning calls, evaluating the call leaves EAX
@@ -7203,14 +7213,14 @@ class CodeGenerator:
             # types that's the temp's address in EAX. So evaluating the
             # whole StmtExpr leaves us with what we want.
             return self._eval_expr_to_eax(expr, ctx)
-        if isinstance(expr, ast.BinaryOp) and expr.op == "=":
+        if isinstance(expr, ast.BinaryOp) and _opt(expr) == "=":
             # `s = other_s` as a struct value — perform the copy and
             # leave `&s` (the lhs's address) in EAX. `_struct_copy_assign`
             # already does exactly that.
             target_ty = self._type_of(expr.left, ctx)
             if isinstance(target_ty, _ltypes.StructType):
                 return self._struct_copy_assign(expr, target_ty, ctx)
-        if isinstance(expr, ast.BinaryOp) and expr.op == ",":
+        if isinstance(expr, ast.BinaryOp) and _opt(expr) == ",":
             # `(side_effect, struct_expr)` — eval lhs for side effects,
             # then yield the rhs's struct address.
             out = self._eval_expr_to_eax(expr.left, ctx)
@@ -8085,7 +8095,7 @@ class CodeGenerator:
         `&&label` or address-arithmetic that NASM resolves)?"""
         if isinstance(expr, ast.LabelAddr):
             return True
-        if isinstance(expr, ast.UnaryOp) and expr.op == "&":
+        if isinstance(expr, ast.UnaryOp) and _opt(expr) == "&":
             return True
         if isinstance(expr, ast.BinaryOp):
             return (
@@ -8102,7 +8112,7 @@ class CodeGenerator:
         """
         if (
             isinstance(expr, ast.BinaryOp)
-            and expr.op in ("+", "-")
+            and _opt(expr) in ("+", "-")
             and isinstance(expr.left, ast.LabelAddr)
             and isinstance(expr.right, ast.LabelAddr)
         ):
@@ -8111,7 +8121,7 @@ class CodeGenerator:
                 b = self._global_label_addr_text(expr.right.label)
             except CodegenError:
                 return None
-            sep = " - " if expr.op == "-" else " + "
+            sep = " - " if _opt(expr) == "-" else " + "
             return f"{a}{sep}{b}"
         return None
 
@@ -10421,15 +10431,15 @@ class CodeGenerator:
                 return expr.target_type
             return None
         if isinstance(expr, ast.UnaryOp):
-            if expr.op in ("+", "-", "~"):
+            if _opt(expr) in ("+", "-", "~"):
                 return self._type_of_complex_expr(expr.operand)
-            if expr.op in ("__real__", "__imag__"):
+            if _opt(expr) in ("__real__", "__imag__"):
                 return None
-            if expr.op in ("*", "&"):
+            if _opt(expr) in ("*", "&"):
                 return None
             return None
         if isinstance(expr, ast.BinaryOp):
-            if expr.op in ("+", "-", "*", "/", "="):
+            if _opt(expr) in ("+", "-", "*", "/", "="):
                 lt = self._type_of_complex_expr(expr.left)
                 rt = self._type_of_complex_expr(expr.right)
                 if lt is not None or rt is not None:
@@ -10501,7 +10511,7 @@ class CodeGenerator:
         # convert per-half rather than memcpy; route through the
         # complex-conversion helper.
         if isinstance(expr, (ast.Identifier, ast.Member, ast.Index)) or (
-            isinstance(expr, ast.UnaryOp) and expr.op == "*"
+            isinstance(expr, ast.UnaryOp) and _opt(expr) == "*"
         ) or (
             isinstance(expr, (ast.Call, ast.CallNoArgs))
             and self._is_complex_returning_call(expr, ctx)
@@ -10514,14 +10524,14 @@ class CodeGenerator:
                 return self._convert_complex_into_top(expr, ty, dest_ty, ctx)
             return self._copy_complex_lvalue_into_top(expr, eff_ty, ctx)
         if isinstance(expr, ast.UnaryOp):
-            if expr.op == "+":
+            if _opt(expr) == "+":
                 return self._eval_complex_into_top(expr.operand, ctx, dest_ty)
-            if expr.op == "-":
+            if _opt(expr) == "-":
                 return self._complex_neg_into_top(expr, eff_ty, ctx)
-            if expr.op == "~":
+            if _opt(expr) == "~":
                 return self._complex_conj_into_top(expr, eff_ty, ctx)
         if isinstance(expr, ast.BinaryOp):
-            if expr.op == ",":
+            if _opt(expr) == ",":
                 # Comma operator with complex result: eval lhs for side
                 # effects (type-aware so a complex-typed lhs doesn't
                 # try to load 16 bytes into EAX), then eval rhs into
@@ -10542,13 +10552,13 @@ class CodeGenerator:
                     out = self._eval_expr_to_eax(expr.left, ctx)
                 out += self._eval_complex_into_top(expr.right, ctx, dest_ty)
                 return out
-            if expr.op == "=":
+            if _opt(expr) == "=":
                 return self._complex_assign_into_top(expr, eff_ty, ctx)
             # Complex compound assignment in complex context (`a += b`
             # where both are complex). Execute the compound assign for
             # its side effect (which mutates the lvalue), then copy the
             # lvalue's new value into the destination at TOS.
-            if expr.op in self._COMPOUND_OPS:
+            if _opt(expr) in self._COMPOUND_OPS:
                 inner_op = self._COMPOUND_OPS[expr.op]
                 synth = ast.BinaryOp(op=inner_op, left=expr.left, right=expr.right)
                 ctx.alloc_call_temp(synth, self._size_of(eff_ty))
@@ -10569,7 +10579,7 @@ class CodeGenerator:
             # FPU paths that would mishandle 1/2-byte halves.
             if (
                 eff_ty.base_type in self._COMPLEX_INT_BASES
-                and expr.op in ("+", "-", "*")
+                and _opt(expr) in ("+", "-", "*")
             ):
                 try:
                     real, imag = self._const_eval_complex(expr, "<complex-int>")
@@ -10585,16 +10595,16 @@ class CodeGenerator:
             if (
                 eff_ty.base_type in self._COMPLEX_INT_BASES
                 and self._COMPLEX_BASE_SIZES[eff_ty.base_type] in (1, 2, 4)
-                and expr.op in ("+", "-", "*")
+                and _opt(expr) in ("+", "-", "*")
             ):
                 return self._complex_int_arith_into_top(
                     expr, eff_ty, ctx,
                 )
-            if expr.op in ("+", "-"):
+            if _opt(expr) in ("+", "-"):
                 return self._complex_addsub_into_top(expr, eff_ty, ctx)
-            if expr.op == "*":
+            if _opt(expr) == "*":
                 return self._complex_mul_into_top(expr, eff_ty, ctx)
-            if expr.op == "/":
+            if _opt(expr) == "/":
                 return self._complex_div_into_top(expr, eff_ty, ctx)
         if isinstance(expr, ast.TernaryOp):
             # `cond ? T : F` with both arms complex. The dest address
@@ -10908,7 +10918,7 @@ class CodeGenerator:
             addr_lines = self._index_address(lvalue, ctx)
         elif isinstance(lvalue, ast.Member):
             addr_lines = self._member_address(lvalue, ctx)
-        elif isinstance(lvalue, ast.UnaryOp) and lvalue.op == "*":
+        elif isinstance(lvalue, ast.UnaryOp) and _opt(lvalue) == "*":
             addr_lines = self._eval_expr_to_eax(lvalue.operand, ctx)
         else:
             return []
@@ -11010,7 +11020,7 @@ class CodeGenerator:
             addr_lines = self._index_address(lvalue, ctx)
         elif isinstance(lvalue, ast.Member):
             addr_lines = self._member_address(lvalue, ctx)
-        elif isinstance(lvalue, ast.UnaryOp) and lvalue.op == "*":
+        elif isinstance(lvalue, ast.UnaryOp) and _opt(lvalue) == "*":
             addr_lines = self._eval_expr_to_eax(lvalue.operand, ctx)
         else:
             # Fallback: fstp into a scratch slot, drop.
@@ -11208,8 +11218,8 @@ class CodeGenerator:
                 return [f"        mov     eax, esi", f"        mov     {kw} {addr}, ax"]
             return [f"        mov     {kw} {addr}, {sub}"]
 
-        if expr.op in ("+", "-"):
-            mnem = "add" if expr.op == "+" else "sub"
+        if _opt(expr) in ("+", "-"):
+            mnem = "add" if _opt(expr) == "+" else "sub"
             # real = ar OP br
             out += load("eax", f"[edx]")
             out += load("ebx", f"[edx + {size}]")
@@ -11359,7 +11369,7 @@ class CodeGenerator:
         out.append(f"        mov     ecx, [esp + {size}]")
         out.append("        mov     edx, esp")
         # Apply faddp/fsubp component-wise.
-        op_word = "faddp" if expr.op == "+" else "fsubp"
+        op_word = "faddp" if _opt(expr) == "+" else "fsubp"
         # real
         out.append(f"        fld     {width} [edx]")
         out.append(f"        fld     {width} [ecx]")
@@ -11579,7 +11589,7 @@ class CodeGenerator:
             out.append("        movzx   eax, al")
             # AND the two booleans → eax.
             out.append("        and     eax, ecx")
-        if expr.op == "!=":
+        if _opt(expr) == "!=":
             out.append("        xor     eax, 1")
         out.append(f"        add     esp, {2 * size}")
         return out
@@ -12027,7 +12037,7 @@ class CodeGenerator:
             addr_lines = self._index_address(ap_expr, ctx)
         elif isinstance(ap_expr, ast.Member):
             addr_lines = self._member_address(ap_expr, ctx)
-        elif isinstance(ap_expr, ast.UnaryOp) and ap_expr.op == "*":
+        elif isinstance(ap_expr, ast.UnaryOp) and _opt(ap_expr) == "*":
             addr_lines = self._eval_expr_to_eax(ap_expr.operand, ctx)
         else:
             raise CodegenError(
@@ -12104,7 +12114,7 @@ class CodeGenerator:
                 f"        add     dword {ap_addr}, {advance}",
             ]
         # General lvalue path: compute &ap into EBX, then load+advance.
-        if isinstance(expr.ap, ast.UnaryOp) and expr.ap.op == "*":
+        if isinstance(expr.ap, ast.UnaryOp) and _opt(expr.ap) == "*":
             addr_lines = self._eval_expr_to_eax(expr.ap.operand, ctx)
         elif isinstance(expr.ap, ast.Index):
             addr_lines = self._index_address(expr.ap, ctx)
@@ -12139,7 +12149,7 @@ class CodeGenerator:
         `(**(&ops[0]))()` patterns.
         """
         callee = call.func
-        while isinstance(callee, ast.UnaryOp) and callee.op == "*":
+        while isinstance(callee, ast.UnaryOp) and _opt(callee) == "*":
             # Without ctx we fall back to the old aggressive peel.
             # All real call sites pass ctx, so this should be rare.
             if ctx is None:
@@ -12354,19 +12364,19 @@ class CodeGenerator:
                 )
             return _ltypes.PointerType(base_type=_ltypes.BasicType(name="char"))
         if isinstance(expr, ast.UnaryOp):
-            if expr.op == "&":
+            if _opt(expr) == "&":
                 return _ltypes.PointerType(base_type=self._type_of(expr.operand, ctx))
-            if expr.op == "*":
+            if _opt(expr) == "*":
                 inner = self._type_of(expr.operand, ctx)
                 if not self._is_pointer_like(inner):
                     raise CodegenError(
                         f"`*` operand must be a pointer (got {type(inner).__name__})"
                     )
                 return inner.base_type
-            if expr.op in ("++", "--"):
+            if _opt(expr) in ("++", "--"):
                 # Mutation in place; the expression's type matches the operand.
                 return self._type_of(expr.operand, ctx)
-            if expr.op in ("__real__", "__imag__"):
+            if _opt(expr) in ("__real__", "__imag__"):
                 inner = self._type_of(expr.operand, ctx)
                 if isinstance(inner, _ltypes.ComplexType):
                     return _ltypes.BasicType(name=inner.base_type)
@@ -12376,7 +12386,7 @@ class CodeGenerator:
             # `+` and `-` and `~` propagate float / long long / int128
             # / unsigned / complex / vector through; `!` always
             # produces int.
-            if expr.op in ("+", "-", "~"):
+            if _opt(expr) in ("+", "-", "~"):
                 inner = self._type_of(expr.operand, ctx)
                 if isinstance(inner, _ltypes.ComplexType):
                     return inner
@@ -12453,12 +12463,12 @@ class CodeGenerator:
                     return _ltypes.BasicType(name="int")
             return ty
         if isinstance(expr, ast.BinaryOp):
-            if expr.op == "=":
+            if _opt(expr) == "=":
                 return self._type_of(expr.left, ctx)
-            if expr.op in self._COMPOUND_OPS:
+            if _opt(expr) in self._COMPOUND_OPS:
                 return self._type_of(expr.left, ctx)
             # Comma: the result type is the right operand's type.
-            if expr.op == ",":
+            if _opt(expr) == ",":
                 return self._type_of(expr.right, ctx)
             # `*` `/` (and the relational/bitwise ops) need to know if
             # either operand is float — the result of `1.5 * 2` is float,
@@ -12467,7 +12477,7 @@ class CodeGenerator:
             rt = self._type_of(expr.right, ctx)
             # Complex promotion: any arithmetic with a complex operand
             # yields complex.
-            if expr.op in ("+", "-", "*", "/") and (
+            if _opt(expr) in ("+", "-", "*", "/") and (
                 isinstance(lt, _ltypes.ComplexType) or isinstance(rt, _ltypes.ComplexType)
             ):
                 return self._complex_promotion(lt, rt)
@@ -12477,7 +12487,7 @@ class CodeGenerator:
             # that's int-typed at the C level for our subset). Also
             # supports scalar-broadcast `vec op int` / `int op vec` where
             # the scalar is replicated to every element.
-            if expr.op in ("+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>"):
+            if _opt(expr) in ("+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>"):
                 l_vec = (
                     isinstance(lt, _ltypes.ArrayType)
                     and getattr(lt, "is_vector", False)
@@ -12496,13 +12506,13 @@ class CodeGenerator:
                     return lt
                 if r_vec and isinstance(lt, _ltypes.BasicType):
                     return rt
-            if expr.op in self._INT_RESULT_BINOPS:
+            if _opt(expr) in self._INT_RESULT_BINOPS:
                 # Pointer-arithmetic promotion above doesn't apply here,
                 # but float promotion does for `*` and `/`.
-                if expr.op in ("*", "/", "%") and (
+                if _opt(expr) in ("*", "/", "%") and (
                     self._is_float_type(lt) or self._is_float_type(rt)
                 ):
-                    if expr.op == "%":
+                    if _opt(expr) == "%":
                         # C: % is integer-only; if either side is float
                         # the program is ill-formed.
                         raise CodegenError(
@@ -12512,13 +12522,13 @@ class CodeGenerator:
                 # Comparison/logical/etc. result is always int. Other
                 # int-result ops keep long-long promotion if either
                 # operand is long long.
-                if expr.op in ("==", "!=", "<", ">", "<=", ">=", "&&", "||"):
+                if _opt(expr) in ("==", "!=", "<", ">", "<=", ">=", "&&", "||"):
                     return _ltypes.BasicType(name="int")
                 # Per C99 6.5.7#3, shifts use the promoted LEFT operand
                 # type for the result — the right operand's signedness
                 # doesn't matter. Other int-result ops follow the usual
                 # arithmetic conversions (unsigned wins).
-                if expr.op in ("<<", ">>"):
+                if _opt(expr) in ("<<", ">>"):
                     if self._is_int128(lt):
                         return _ltypes.BasicType(
                             name="int128",
@@ -12922,7 +12932,7 @@ class CodeGenerator:
         # `_compound_assign` apply their own type-based dispatch.
         if self._is_int128(self._type_of(expr, ctx)):
             if isinstance(expr, ast.BinaryOp) and (
-                expr.op == "=" or expr.op in self._COMPOUND_OPS
+                _opt(expr) == "=" or _opt(expr) in self._COMPOUND_OPS
             ):
                 return self._binary(expr, ctx)
             return self._int128_value_address(expr, ctx)
@@ -13293,9 +13303,9 @@ class CodeGenerator:
                 out.append("        cdq")
             return out
         if isinstance(expr, ast.UnaryOp):
-            if expr.op == "+":
+            if _opt(expr) == "+":
                 return self._eval_expr_to_edx_eax(expr.operand, ctx)
-            if expr.op == "-":
+            if _opt(expr) == "-":
                 out = self._eval_expr_to_edx_eax(expr.operand, ctx)
                 # 64-bit negate. `neg eax` sets CF=1 iff l != 0, then we
                 # add CF to h before negating it — matches two's
@@ -13306,10 +13316,10 @@ class CodeGenerator:
                     "        neg     edx",
                 ]
                 return out
-            if expr.op == "~":
+            if _opt(expr) == "~":
                 out = self._eval_expr_to_edx_eax(expr.operand, ctx)
                 return out + ["        not     eax", "        not     edx"]
-            if expr.op == "*":
+            if _opt(expr) == "*":
                 # Dereferencing in long-long context. If the pointee is
                 # itself long-long, load 8 bytes; otherwise load 32 bits
                 # via the standard path and extend per signedness.
@@ -13327,7 +13337,7 @@ class CodeGenerator:
                 else:
                     out.append("        cdq")
                 return out
-            if expr.op in ("++", "--"):
+            if _opt(expr) in ("++", "--"):
                 # ++/-- on a long-long lvalue.
                 return self._inc_dec_ll(expr, ctx)
         if isinstance(expr, ast.BinaryOp):
@@ -13962,7 +13972,7 @@ class CodeGenerator:
             out += self._index_address(expr.left, ctx)
         elif (
             isinstance(expr.left, ast.UnaryOp)
-            and expr.left.op == "*"
+            and _opt(expr.left) == "*"
         ):
             out += self._eval_expr_to_eax(expr.left.operand, ctx)
         elif isinstance(expr.left, ast.Member):
@@ -13998,7 +14008,7 @@ class CodeGenerator:
             addr = self._identifier_addr_text(lhs.name, ctx)
             out += self._store_from_edx_eax(addr)
             return out
-        if isinstance(lhs, ast.UnaryOp) and lhs.op == "*":
+        if isinstance(lhs, ast.UnaryOp) and _opt(lhs) == "*":
             # *p = rhs : eval p → eax push, eval rhs → edx:eax, pop ecx
             out = self._eval_expr_to_eax(lhs.operand, ctx)
             out.append("        push    eax")
@@ -14053,7 +14063,7 @@ class CodeGenerator:
             # Read pre-value if postfix.
             if expr.is_prefix:
                 out: list[str] = []
-                if expr.op == "++":
+                if _opt(expr) == "++":
                     out.append(f"        add     dword {addr}, 1")
                     out.append(f"        adc     dword {high_addr}, 0")
                 else:
@@ -14063,7 +14073,7 @@ class CodeGenerator:
                 return out
             # Postfix: load first, then bump.
             out = self._load_to_edx_eax(addr)
-            if expr.op == "++":
+            if _opt(expr) == "++":
                 out.append(f"        add     dword {addr}, 1")
                 out.append(f"        adc     dword {high_addr}, 0")
             else:
@@ -14074,7 +14084,7 @@ class CodeGenerator:
         # RMW [ecx] (low) and [ecx+4] (high) with carry/borrow.
         if isinstance(expr.operand, ast.Index):
             addr_lines = self._index_address(expr.operand, ctx)
-        elif isinstance(expr.operand, ast.UnaryOp) and expr.operand.op == "*":
+        elif isinstance(expr.operand, ast.UnaryOp) and _opt(expr.operand) == "*":
             addr_lines = self._eval_expr_to_eax(expr.operand.operand, ctx)
         elif isinstance(expr.operand, ast.Member):
             addr_lines = self._member_address(expr.operand, ctx)
@@ -14083,8 +14093,8 @@ class CodeGenerator:
                 f"long-long ++/-- not supported on "
                 f"{type(expr.operand).__name__}"
             )
-        instr0 = "add" if expr.op == "++" else "sub"
-        instrN = "adc" if expr.op == "++" else "sbb"
+        instr0 = "add" if _opt(expr) == "++" else "sub"
+        instrN = "adc" if _opt(expr) == "++" else "sbb"
         out = list(addr_lines)
         out.append("        mov     ecx, eax")
         if expr.is_prefix:
@@ -14187,15 +14197,15 @@ class CodeGenerator:
         if isinstance(expr, ast.Identifier):
             return self._float_identifier_load(expr.name.text, ctx)
         if isinstance(expr, ast.UnaryOp):
-            if expr.op == "+":
+            if _opt(expr) == "+":
                 return self._eval_float_to_st0(expr.operand, ctx)
-            if expr.op == "-":
+            if _opt(expr) == "-":
                 return self._eval_float_to_st0(expr.operand, ctx) + [
                     "        fchs",
                 ]
-            if expr.op in ("++", "--"):
+            if _opt(expr) in ("++", "--"):
                 return self._float_inc_dec(expr, ctx)
-            if expr.op == "*":
+            if _opt(expr) == "*":
                 # Dereferencing a float pointer in a float context:
                 # eval pointer to eax, then `fld` from there. Width
                 # follows the pointee (float vs double).
@@ -14204,7 +14214,7 @@ class CodeGenerator:
                 out = self._eval_expr_to_eax(expr.operand, ctx)
                 out.append(f"        fld     {width} [eax]")
                 return out
-            if expr.op in ("__real__", "__imag__"):
+            if _opt(expr) in ("__real__", "__imag__"):
                 operand_ty = self._type_of(expr.operand, ctx)
                 if isinstance(operand_ty, _ltypes.ComplexType):
                     out, _ = self._complex_part_address(expr, ctx)
@@ -14213,24 +14223,24 @@ class CodeGenerator:
                     out.append(f"        fld     {width} [eax]")
                     return out
                 # Non-complex: __real__ is identity, __imag__ is 0.
-                if expr.op == "__real__":
+                if _opt(expr) == "__real__":
                     return self._eval_float_to_st0(expr.operand, ctx)
                 return ["        fldz"]
             raise CodegenError(
                 f"unary `{expr.op}` not supported on float operand"
             )
         if isinstance(expr, ast.BinaryOp):
-            if expr.op == "=":
+            if _opt(expr) == "=":
                 # `__real__/__imag__ x = rhs` writes to a half of a
                 # complex value; route through _assign so the half-
                 # address path runs.
                 if (
                     isinstance(expr.left, ast.UnaryOp)
-                    and expr.left.op in ("__real__", "__imag__")
+                    and _opt(expr.left) in ("__real__", "__imag__")
                 ):
                     return self._assign(expr, ctx)
                 return self._float_assign(expr, ctx)
-            if expr.op in self._COMPOUND_OPS:
+            if _opt(expr) in self._COMPOUND_OPS:
                 return self._float_compound_assign(expr, ctx)
             return self._float_binop(expr, ctx)
         if isinstance(expr, ast.Cast):
@@ -14326,7 +14336,7 @@ class CodeGenerator:
             "*": "fmulp",
             "/": "fdivrp",
         }
-        if expr.op == ",":
+        if _opt(expr) == ",":
             # Comma operator: eval lhs for side effects, then yield rhs.
             # Lhs may be int or float; we need to drop its value.
             lhs_ty = self._type_of(expr.left, ctx)
@@ -14366,7 +14376,7 @@ class CodeGenerator:
         register-allocation peak when we eval the deeper side first.
         For our purposes, a coarse upper bound suffices.
         """
-        if isinstance(expr, ast.BinaryOp) and expr.op in ("+", "-", "*", "/"):
+        if isinstance(expr, ast.BinaryOp) and _opt(expr) in ("+", "-", "*", "/"):
             l = self._fpu_depth(expr.left, ctx)
             r = self._fpu_depth(expr.right, ctx)
             return max(l, r) + 1
@@ -14427,7 +14437,7 @@ class CodeGenerator:
         # Non-Identifier lvalues: compute address first (clobbers eax),
         # push it, then evaluate the float rhs onto st(0), pop the
         # address into ecx, and `fst` through it.
-        if isinstance(expr.left, ast.UnaryOp) and expr.left.op == "*":
+        if isinstance(expr.left, ast.UnaryOp) and _opt(expr.left) == "*":
             addr_lines = self._eval_expr_to_eax(expr.left.operand, ctx)
         elif isinstance(expr.left, ast.Index):
             addr_lines = self._index_address(expr.left, ctx)
@@ -14452,7 +14462,7 @@ class CodeGenerator:
         Post-form: load the slot twice, bump one copy, store it, leaving
         the original value on st(0) so the expression yields the old.
         """
-        op_mnem = "faddp" if expr.op == "++" else "fsubp"
+        op_mnem = "faddp" if _opt(expr) == "++" else "fsubp"
         if isinstance(expr.operand, ast.Identifier):
             name = expr.operand.name.text
             ty = self._identifier_type(name, ctx)
@@ -14481,7 +14491,7 @@ class CodeGenerator:
             addr_lines = self._index_address(expr.operand, ctx)
         elif (
             isinstance(expr.operand, ast.UnaryOp)
-            and expr.operand.op == "*"
+            and _opt(expr.operand) == "*"
         ):
             addr_lines = self._eval_expr_to_eax(expr.operand.operand, ctx)
         elif isinstance(expr.operand, ast.Member):
@@ -14528,7 +14538,7 @@ class CodeGenerator:
             return self._float_assign(
                 ast.BinaryOp(op="=", left=expr.left, right=inner), ctx,
             )
-        if isinstance(expr.left, ast.UnaryOp) and expr.left.op == "*":
+        if isinstance(expr.left, ast.UnaryOp) and _opt(expr.left) == "*":
             addr_lines = self._eval_expr_to_eax(expr.left.operand, ctx)
         elif isinstance(expr.left, ast.Index):
             addr_lines = self._index_address(expr.left, ctx)
@@ -15219,11 +15229,11 @@ class CodeGenerator:
                     s.is_prefix = is_prefix
             expr = _OpView(expr.op.text, expr.operand, getattr(expr, "pos", None),
                            is_prefix_flag)
-        if expr.op in ("++", "--"):
+        if _opt(expr) in ("++", "--"):
             return self._inc_dec(expr, ctx)
-        if expr.op == "&":
+        if _opt(expr) == "&":
             return self._address_of(expr, ctx)
-        if expr.op in ("__real__", "__imag__"):
+        if _opt(expr) in ("__real__", "__imag__"):
             operand_ty = self._type_of(expr.operand, ctx)
             if isinstance(operand_ty, _ltypes.ComplexType):
                 # Complex int half: load the integer half from the
@@ -15233,7 +15243,7 @@ class CodeGenerator:
                         expr, ctx,
                     )
                     return addr_lines + self._load_to_eax("[eax]", half_ty)
-        if expr.op == "*":
+        if _opt(expr) == "*":
             # Dereference: load the pointer value into EAX, then read from
             # the address it holds. The load width follows the pointee
             # type — `*char_ptr` reads one byte (sign-extended), not four.
@@ -15248,7 +15258,7 @@ class CodeGenerator:
             )
         if not expr.is_prefix:
             raise CodegenError(f"postfix `{expr.op}` not implemented yet")
-        if expr.op == "!":
+        if _opt(expr) == "!":
             # `!x` works for complex / int128 / float / int operands —
             # whatever `_eval_to_bool_eax` knows how to handle. Don't
             # do an upfront EAX load (which would fail for size-16
@@ -15261,11 +15271,11 @@ class CodeGenerator:
                 "        movzx   eax, al",
             ]
         out = self._eval_expr_to_eax(expr.operand, ctx)
-        if expr.op == "+":
+        if _opt(expr) == "+":
             return out
-        if expr.op == "-":
+        if _opt(expr) == "-":
             return out + ["        neg     eax"]
-        if expr.op == "~":
+        if _opt(expr) == "~":
             return out + ["        not     eax"]
         raise CodegenError(f"unary `{expr.op}` not implemented yet")
 
@@ -15315,12 +15325,12 @@ class CodeGenerator:
                 out += self._store_from_eax(_ebp_addr(disp), target_ty)
             out.append(f"        lea     eax, {_ebp_addr(disp)}")
             return out
-        if isinstance(expr.operand, ast.UnaryOp) and expr.operand.op == "*":
+        if isinstance(expr.operand, ast.UnaryOp) and _opt(expr.operand) == "*":
             # &*p is a no-op — just produce p.
             return self._eval_expr_to_eax(expr.operand.operand, ctx)
         if (
             isinstance(expr.operand, ast.UnaryOp)
-            and expr.operand.op in ("__real__", "__imag__")
+            and _opt(expr.operand) in ("__real__", "__imag__")
         ):
             # &__real__ x / &__imag__ x — address of the corresponding
             # half of the _Complex value.
@@ -15365,14 +15375,14 @@ class CodeGenerator:
         # so an `add dword [...], N` covers it.
         if isinstance(ty, _ltypes.PointerType):
             step = self._size_of(ty.base_type)
-            instr = "add" if expr.op == "++" else "sub"
+            instr = "add" if _opt(expr) == "++" else "sub"
             bump = [f"        {instr}     dword {addr}, {step}"]
         elif isinstance(ty, _ltypes.BasicType) and ty.name == "bool":
             # `_Bool` ++/--: normalize the post-bump value to 0/1 per
             # C 6.3.1.2. Route through load + add 1 / sub 1 + bool-store.
             # Pre/post handled by remembering the load before the bump.
             load_pre = self._load_to_eax(addr, ty)
-            delta = "1" if expr.op == "++" else "-1"
+            delta = "1" if _opt(expr) == "++" else "-1"
             if expr.is_prefix:
                 # Bump in EAX, normalize-store, leave new value in EAX.
                 return (
@@ -15395,7 +15405,7 @@ class CodeGenerator:
             # x86 is little-endian.
             size = self._size_of(ty)
             width = {1: "byte", 2: "word", 4: "dword"}[size]
-            instr = "inc" if expr.op == "++" else "dec"
+            instr = "inc" if _opt(expr) == "++" else "dec"
             bump = [f"        {instr}     {width} {addr}"]
         load = self._load_to_eax(addr, ty)
         if expr.is_prefix:
@@ -15425,7 +15435,7 @@ class CodeGenerator:
                 return self._inc_dec_bitfield(expr, bf, ctx)
         if isinstance(expr.operand, ast.Index):
             addr_lines = self._index_address(expr.operand, ctx)
-        elif isinstance(expr.operand, ast.UnaryOp) and expr.operand.op == "*":
+        elif isinstance(expr.operand, ast.UnaryOp) and _opt(expr.operand) == "*":
             addr_lines = self._eval_expr_to_eax(expr.operand.operand, ctx)
         elif isinstance(expr.operand, ast.Member):
             addr_lines = self._member_address(expr.operand, ctx)
@@ -15457,8 +15467,8 @@ class CodeGenerator:
         # callers that ignore the result (statement context) can drop
         # the load.
         if self._is_long_long(target_ty):
-            instr0 = "add" if expr.op == "++" else "sub"
-            instrN = "adc" if expr.op == "++" else "sbb"
+            instr0 = "add" if _opt(expr) == "++" else "sub"
+            instrN = "adc" if _opt(expr) == "++" else "sbb"
             out = list(addr_lines)  # eax = &lvalue
             out.append("        mov     ecx, eax")
             if expr.is_prefix:
@@ -15479,7 +15489,7 @@ class CodeGenerator:
             isinstance(target_ty, _ltypes.BasicType)
             and target_ty.name == "bool"
         ):
-            delta = "1" if expr.op == "++" else "-1"
+            delta = "1" if _opt(expr) == "++" else "-1"
             out = list(addr_lines)  # eax = &lvalue
             out.append("        mov     ecx, eax")
             # Load current value into EAX.
@@ -15502,7 +15512,7 @@ class CodeGenerator:
             step = 1
             size = self._size_of(target_ty)
             width = {1: "byte", 2: "word", 4: "dword"}[size]
-        op_mnem = "add" if expr.op == "++" else "sub"
+        op_mnem = "add" if _opt(expr) == "++" else "sub"
 
         out = list(addr_lines)  # eax = &lvalue
         if expr.is_prefix:
@@ -15541,7 +15551,7 @@ class CodeGenerator:
         mask = (1 << bit_width) - 1
         clear_mask = (~(mask << bit_offset)) & 0xFFFFFFFF
         is_unsigned = self._is_unsigned(member_ty)
-        delta = 1 if expr.op == "++" else -1
+        delta = 1 if _opt(expr) == "++" else -1
         # eax = &unit, save in ebx
         out = self._member_address(expr.operand, ctx)
         out.append("        mov     ebx, eax")
@@ -15604,7 +15614,7 @@ class CodeGenerator:
         and `_eval_expr_to_edx_eax(inner)` for the rhs read).
         """
         bit_offset, bit_width, member_ty, _unit_size = bf
-        op_text = "+" if expr.op == "++" else "-"
+        op_text = "+" if _opt(expr) == "++" else "-"
         is_unsigned = self._is_unsigned(member_ty)
         mask = (1 << bit_width) - 1
         low_m = mask & 0xFFFFFFFF
@@ -15992,9 +16002,9 @@ class CodeGenerator:
                     s.op, s.left, s.right, s.pos = op, left, right, pos
             expr = _OpView(expr.op.text, expr.left, expr.right,
                            getattr(expr, "pos", None))
-        if expr.op == "=":
+        if _opt(expr) == "=":
             return self._assign(expr, ctx)
-        if expr.op in self._COMPOUND_OPS:
+        if _opt(expr) in self._COMPOUND_OPS:
             return self._compound_assign(expr, ctx)
         # Pointer arithmetic short-circuit: `ptr + ll` and `ll + ptr`
         # should NOT route through `_binary_ll` (which would do a
@@ -16005,7 +16015,7 @@ class CodeGenerator:
         # `_add_sub` since pointers aren't long-long-typed.
         lt_for_ptr = self._type_of(expr.left, ctx)
         rt_for_ptr = self._type_of(expr.right, ctx)
-        if expr.op in ("+", "-") and (
+        if _opt(expr) in ("+", "-") and (
             self._is_pointer_like(lt_for_ptr)
             or self._is_pointer_like(rt_for_ptr)
         ):
@@ -16022,26 +16032,26 @@ class CodeGenerator:
             or self._is_long_long(rt_for_ptr)
         ):
             return self._binary_ll(expr, ctx)
-        if expr.op == ",":
+        if _opt(expr) == ",":
             # Comma operator: evaluate left for side effects, then right.
             # The result is the right-hand value.
             out = self._eval_expr_to_eax(expr.left, ctx)
             out += self._eval_expr_to_eax(expr.right, ctx)
             return out
-        if expr.op == "&&":
+        if _opt(expr) == "&&":
             return self._logical_and(expr, ctx)
-        if expr.op == "||":
+        if _opt(expr) == "||":
             return self._logical_or(expr, ctx)
-        if expr.op in ("+", "-"):
+        if _opt(expr) in ("+", "-"):
             return self._add_sub(expr, ctx)
         # Complex equality `a == b` / `a != b`: compare both halves.
-        if expr.op in ("==", "!="):
+        if _opt(expr) in ("==", "!="):
             lt = self._type_of(expr.left, ctx)
             rt = self._type_of(expr.right, ctx)
             if isinstance(lt, _ltypes.ComplexType) or isinstance(rt, _ltypes.ComplexType):
                 return self._complex_compare(expr, ctx)
         # __int128 comparison: 4-dword chain. Result is int (0 or 1).
-        if expr.op in ("==", "!=", "<", ">", "<=", ">="):
+        if _opt(expr) in ("==", "!=", "<", ">", "<=", ">="):
             lt = self._type_of(expr.left, ctx)
             rt = self._type_of(expr.right, ctx)
             if self._is_int128(lt) or self._is_int128(rt):
@@ -16049,7 +16059,7 @@ class CodeGenerator:
         # Float comparisons land here as int-typed expressions (their
         # result fits in EAX), but the operands are floats so the
         # standard "left to eax, right to ecx" path can't compare them.
-        if expr.op in self._FLOAT_CMP_SETCC:
+        if _opt(expr) in self._FLOAT_CMP_SETCC:
             lt = self._type_of(expr.left, ctx)
             rt = self._type_of(expr.right, ctx)
             if self._is_float_type(lt) or self._is_float_type(rt):
@@ -16062,10 +16072,10 @@ class CodeGenerator:
         out.append("        mov     ecx, eax")
         out.append("        pop     eax")
 
-        if expr.op in self._SIMPLE_BINOPS:
+        if _opt(expr) in self._SIMPLE_BINOPS:
             out.append(f"        {self._SIMPLE_BINOPS[expr.op]}")
             return out
-        if expr.op == "/":
+        if _opt(expr) == "/":
             lt = self._type_of(expr.left, ctx)
             rt = self._type_of(expr.right, ctx)
             if (
@@ -16080,7 +16090,7 @@ class CodeGenerator:
                 "        cdq",
                 "        idiv    ecx",
             ]
-        if expr.op == "%":
+        if _opt(expr) == "%":
             lt = self._type_of(expr.left, ctx)
             rt = self._type_of(expr.right, ctx)
             if (
@@ -16097,17 +16107,17 @@ class CodeGenerator:
                 "        idiv    ecx",
                 "        mov     eax, edx",
             ]
-        if expr.op == "<<":
+        if _opt(expr) == "<<":
             return out + [
                 "        shl     eax, cl",
             ]
-        if expr.op == ">>":
+        if _opt(expr) == ">>":
             # Unsigned operand → logical shift; otherwise arithmetic.
             lt = self._type_of(expr.left, ctx)
             if self._is_unsigned_after_promotion(lt):
                 return out + ["        shr     eax, cl"]
             return out + ["        sar     eax, cl"]
-        if expr.op in self._CMP_SETCC:
+        if _opt(expr) in self._CMP_SETCC:
             lt = self._type_of(expr.left, ctx)
             rt = self._type_of(expr.right, ctx)
             # Per C, only types as wide as int retain unsigned-ness;
@@ -16151,7 +16161,7 @@ class CodeGenerator:
         # Post-eval: stack top = left value, eax = right value.
 
         if l_ptr and r_ptr:
-            if expr.op == "+":
+            if _opt(expr) == "+":
                 raise CodegenError("cannot add two pointers")
             # ptr - ptr: byte-difference / sizeof(*left).
             size = self._size_of(lt.base_type)
@@ -16167,12 +16177,12 @@ class CodeGenerator:
             out += self._scale_reg("eax", size)
             out.append("        mov     ecx, eax")
             out.append("        pop     eax")
-            mnem = "add" if expr.op == "+" else "sub"
+            mnem = "add" if _opt(expr) == "+" else "sub"
             out.append(f"        {mnem}     eax, ecx")
             return out
 
         if r_ptr:
-            if expr.op == "-":
+            if _opt(expr) == "-":
                 raise CodegenError("cannot subtract a pointer from an integer")
             # int + ptr: the int is on the stack, the pointer is in eax. Pop
             # the int into ecx, scale ecx, then add to eax (which holds ptr).
@@ -16185,7 +16195,7 @@ class CodeGenerator:
         # int ± int — the original integer path.
         out.append("        mov     ecx, eax")
         out.append("        pop     eax")
-        mnem = "add" if expr.op == "+" else "sub"
+        mnem = "add" if _opt(expr) == "+" else "sub"
         out.append(f"        {mnem}     eax, ecx")
         return out
 
@@ -16226,7 +16236,7 @@ class CodeGenerator:
         # the real or imag half of x.
         if (
             isinstance(expr.left, ast.UnaryOp)
-            and expr.left.op in ("__real__", "__imag__")
+            and _opt(expr.left) in ("__real__", "__imag__")
         ):
             operand_ty = self._type_of(expr.left.operand, ctx)
             if isinstance(operand_ty, _ltypes.ComplexType):
@@ -16313,7 +16323,7 @@ class CodeGenerator:
             out = self._eval_to_bool_eax(expr.right, ctx)
             if isinstance(expr.left, ast.Identifier):
                 return out + self._identifier_store(expr.left.name.text, ctx)
-            if isinstance(expr.left, ast.UnaryOp) and expr.left.op == "*":
+            if isinstance(expr.left, ast.UnaryOp) and _opt(expr.left) == "*":
                 addr = self._eval_expr_to_eax(expr.left.operand, ctx)
                 return (
                     addr
@@ -16398,7 +16408,7 @@ class CodeGenerator:
         # of the whole assignment expression is rhs, as C requires). The
         # store width follows the pointee type so `*char_ptr = 65` writes
         # one byte, not four.
-        if isinstance(expr.left, ast.UnaryOp) and expr.left.op == "*":
+        if isinstance(expr.left, ast.UnaryOp) and _opt(expr.left) == "*":
             pointee_ty = self._type_of(expr.left, ctx)
             out = self._eval_expr_to_eax(expr.left.operand, ctx)
             out.append("        push    eax")
@@ -16551,7 +16561,7 @@ class CodeGenerator:
             return self._index_address(expr, ctx)
         if isinstance(expr, ast.Member):
             return self._member_address(expr, ctx)
-        if isinstance(expr, ast.UnaryOp) and expr.op == "*":
+        if isinstance(expr, ast.UnaryOp) and _opt(expr) == "*":
             # `*p` of pointer-to-vector: just evaluate the pointer.
             return self._eval_expr_to_eax(expr.operand, ctx)
         if isinstance(expr, ast.Cast):
@@ -16602,14 +16612,14 @@ class CodeGenerator:
                 )
             out.append(f"        lea     eax, {_ebp_addr(disp)}")
             return out
-        if isinstance(expr, ast.BinaryOp) and expr.op == "=":
+        if isinstance(expr, ast.BinaryOp) and _opt(expr) == "=":
             # Vector chained assignment in vector-value context (e.g.
             # `b = c = a`). Execute the assignment (which mutates the
             # lhs and returns &lhs in EAX from `_vector_copy_assign`).
             return self._vector_copy_assign(
                 expr, self._type_of(expr.left, ctx), ctx,
             )
-        if isinstance(expr, ast.BinaryOp) and expr.op in self._COMPOUND_OPS:
+        if isinstance(expr, ast.BinaryOp) and _opt(expr) in self._COMPOUND_OPS:
             # Vector compound assign in vector-value context. Execute
             # the compound for its side effect, then return &lhs.
             base_op = self._COMPOUND_OPS[expr.op]
@@ -16973,7 +16983,7 @@ class CodeGenerator:
                         out.append(f"        fld     {width} [edx + {offset}]")
                     else:
                         out.append(f"        fld     {width} [edx]")
-                    if expr.op == "-":
+                    if _opt(expr) == "-":
                         out.append("        fchs")
                     addr = _ebp_addr(disp + offset)
                     out.append(f"        fstp    {width} {addr}")
@@ -17304,7 +17314,7 @@ class CodeGenerator:
 
         if isinstance(expr.left, ast.Index):
             addr_lines = self._index_address(expr.left, ctx)
-        elif isinstance(expr.left, ast.UnaryOp) and expr.left.op == "*":
+        elif isinstance(expr.left, ast.UnaryOp) and _opt(expr.left) == "*":
             # The pointer operand evaluates once into eax — that's the
             # address we'll read from and write back to.
             addr_lines = self._eval_expr_to_eax(expr.left.operand, ctx)
