@@ -10849,9 +10849,12 @@ class CodeGenerator:
                 synth = ast.BinaryOp(op=inner_op, left=expr.left, right=expr.right)
                 ctx.alloc_call_temp(synth, self._size_of(eff_ty))
                 out: list[str] = []
-                # Side-effecting assignment: mutate the lvalue.
+                # Side-effecting assignment: mutate the lvalue. Pass the
+                # compound op as a STRING (`_opt(expr)`), not the Token,
+                # so the inner desugar in _compound_assign_complex_lvalue
+                # extracts the right base-op from _COMPOUND_OPS.
                 out += self._compound_assign_complex_lvalue(
-                    expr, expr.op, eff_ty, ctx,
+                    expr, _opt(expr), eff_ty, ctx,
                 )
                 # Now copy the lvalue's new value into the destination.
                 # `_copy_complex_lvalue_into_top` reads expr.left from
