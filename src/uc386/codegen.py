@@ -10252,8 +10252,20 @@ class CodeGenerator:
         for v in values:
             if isinstance(v, ast.DesignatedInit) and v.designators:
                 first = v.designators[0]
+                # Auto-AST wraps array designators as IndexDesignator
+                # (with `.index`) and field designators as FieldDesignator.
+                # Unwrap IndexDesignator before the int-literal / const-eval
+                # paths below.
+                if isinstance(first, ast.IndexDesignator):
+                    first = first.index
+                if isinstance(first, ast.FieldDesignator):
+                    # Struct-field designator — shouldn't happen for an
+                    # array, but advance the cursor and continue rather
+                    # than crashing.
+                    cursor += 1
+                    continue
                 if isinstance(first, ast.IntLiteral):
-                    cursor = first.value
+                    cursor = int_value(first)
                 elif isinstance(first, ast.RangeDesignator):
                     try:
                         end = self._const_eval(first.end, name)
