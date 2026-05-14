@@ -10411,10 +10411,16 @@ class CodeGenerator:
         first occurrence so all `.s.X` writes share one inner list.
         """
         def outer_key(d):
+            if isinstance(d, ast.FieldDesignator):
+                return ("name", d.field.text)
             if isinstance(d, str):
                 return ("name", d)
+            if isinstance(d, ast.IndexDesignator):
+                idx = d.index
+                if isinstance(idx, ast.IntLiteral):
+                    return ("idx", int_value(idx))
             if isinstance(d, ast.IntLiteral):
-                return ("idx", d.value)
+                return ("idx", int_value(d))
             return None
 
         out: list = []
