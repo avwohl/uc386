@@ -2648,12 +2648,12 @@ class CodeGenerator:
                 while isinstance(e, ast.Cast):
                     e = e.expr
                 if isinstance(e, ast.Identifier):
-                    if e.name in self._globals:
-                        gty = self._globals[e.name]
+                    if e.name.text in self._globals:
+                        gty = self._globals[e.name.text]
                         return isinstance(
                             gty, (_ltypes.ArrayType, _ltypes.FunctionType),
                         )
-                    if e.name in self._func_return_types:
+                    if e.name.text in self._func_return_types:
                         return True
                     return False
                 if isinstance(e, ast.StringLiteral):
