@@ -4291,7 +4291,7 @@ class CodeGenerator:
                 ctx.alloc_call_temp(sub, size)
         elif (
             isinstance(sub, ast.VaArgExpr)
-            and self._is_int128(sub.target_type)
+            and self._is_int128(_to_legacy_type(sub.target_type))
         ):
             # `va_arg(ap, __int128)` materializes into a per-call
             # 16-byte temp; consumers see the temp's address.
@@ -6174,7 +6174,7 @@ class CodeGenerator:
         # pointer into a per-expr temp and return its address.
         if (
             isinstance(expr, ast.VaArgExpr)
-            and self._is_int128(expr.target_type)
+            and self._is_int128(_to_legacy_type(expr.target_type))
             and id(expr) in ctx.call_temps
         ):
             disp = ctx.call_temps[id(expr)]
@@ -13294,6 +13294,11 @@ class CodeGenerator:
             out += self._store_from_eax(_ebp_addr(disp), target_ty)
             return out
         if isinstance(expr, ast.VaArgExpr):
+            # int128 / float / struct va_arg targets need their own
+            # paths — _va_arg_int can only handle EAX-sized values.
+            target_ty = _to_legacy_type(expr.target_type)
+            if self._is_int128(target_ty):
+                return self._int128_value_address(expr, ctx)
             return self._va_arg_int(expr, ctx)
         if isinstance(expr, ast.SizeofType):
             if getattr(expr, "is_alignof", False):
