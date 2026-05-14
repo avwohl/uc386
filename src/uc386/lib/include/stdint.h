@@ -17,6 +17,11 @@ typedef unsigned short uint16_t;
 #elif __SIZEOF_INT__ == 2
 typedef int int16_t;
 typedef unsigned int uint16_t;
+#else
+/* Fallback when the host hasn't set __SIZEOF_*__ — short is 2 bytes
+ * everywhere uc386 cares about. */
+typedef short int16_t;
+typedef unsigned short uint16_t;
 #endif
 
 #if __SIZEOF_INT__ == 4
@@ -25,6 +30,10 @@ typedef unsigned int uint32_t;
 #elif __SIZEOF_LONG__ == 4
 typedef long int32_t;
 typedef unsigned long uint32_t;
+#else
+/* Fallback — i386 has 32-bit int. */
+typedef int int32_t;
+typedef unsigned int uint32_t;
 #endif
 
 #if __SIZEOF_LONG__ == 8

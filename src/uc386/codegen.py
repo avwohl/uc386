@@ -2977,8 +2977,17 @@ class CodeGenerator:
                 # Try float fold if the int fold fails (operand may
                 # contain FloatLiteral).
                 f_inner = self._const_eval_float(expr.expr, name)
-                # Truncate toward zero for int casts.
-                inner = int(f_inner) if f_inner >= 0 else -int(-f_inner)
+                # Truncate toward zero for int casts. INF / NaN don't
+                # convert cleanly — clamp to int range (C says this is
+                # UB; gcc gives a warning and 0 or extreme int; mirror
+                # that to keep the build going).
+                import math
+                if math.isnan(f_inner):
+                    inner = 0
+                elif math.isinf(f_inner):
+                    inner = 0x7FFFFFFF if f_inner > 0 else -0x80000000
+                else:
+                    inner = int(f_inner) if f_inner >= 0 else -int(-f_inner)
             if isinstance(ty, _ltypes.BasicType):
                 size = self._size_of(ty)
                 if size == 1:
@@ -7620,6 +7629,8 @@ class CodeGenerator:
                 )
         else:
             obj_ty = self._type_of(expr.obj, ctx)
+            if isinstance(obj_ty, _ltypes.BasicType):
+                obj_ty = self._expand_typedef_type(obj_ty)
             if not isinstance(obj_ty, _ltypes.StructType):
                 raise CodegenError(
                     f"`.` requires a struct value "
@@ -13024,6 +13035,8 @@ class CodeGenerator:
                         f"(got {type(obj_ty).__name__})"
                     )
             else:
+                if isinstance(obj_ty, _ltypes.BasicType):
+                    obj_ty = self._expand_typedef_type(obj_ty)
                 if not isinstance(obj_ty, _ltypes.StructType):
                     raise CodegenError(
                         f"`.` requires a struct (got {type(obj_ty).__name__})"
