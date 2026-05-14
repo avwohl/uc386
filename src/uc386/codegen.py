@@ -108,7 +108,9 @@ import dataclasses
 
 from uc_core import ast
 from uc_core import ast_legacy as _ltypes
-from uc_core._const import int_value, int_flags, make_int_lit
+from uc_core._const import (
+    int_value, int_flags, make_int_lit, float_value, char_value,
+)
 from uc_core.codegen_helpers import (
     ResolvedType, resolve_type_from_decl, resolve_base_type,
     decl_storage_class, decl_is_inline, declarator_ident,
@@ -386,7 +388,7 @@ def _try_simple_int_fold(expr) -> int | None:
     if isinstance(expr, ast.IntLiteral):
         return int_value(expr)
     if isinstance(expr, ast.CharLiteral):
-        return int_value(expr)
+        return char_value(expr)
     if isinstance(expr, ast.UnaryOp):
         v = _try_simple_int_fold(expr.operand)
         if v is None:
@@ -1354,7 +1356,7 @@ class CodeGenerator:
         while isinstance(expr, ast.Cast):
             expr = expr.expr
         if isinstance(expr, ast.FloatLiteral):
-            v = float(int_value(expr))
+            v = float_value(expr)
             return (0.0, v) if expr.is_imaginary else (v, 0.0)
         if isinstance(expr, ast.IntLiteral):
             return (float(int_value(expr)), 0.0)
@@ -2670,7 +2672,7 @@ class CodeGenerator:
             expr = expr.expr
             return inner
         if isinstance(expr, ast.FloatLiteral):
-            v = float(int_value(expr))
+            v = float_value(expr)
             # `1.0F` is float-typed in C — narrow to 32-bit precision so
             # the decimal-to-double approximation doesn't leak through.
             if getattr(expr, "is_float", False):
@@ -2679,7 +2681,7 @@ class CodeGenerator:
         if isinstance(expr, ast.IntLiteral):
             return float(int_value(expr))
         if isinstance(expr, ast.CharLiteral):
-            return float(int_value(expr))
+            return float(char_value(expr))
         if isinstance(expr, ast.UnaryOp) and _opt(expr) in ("+", "-"):
             v = self._const_eval_float(expr.operand, name)
             return -v if _opt(expr) == "-" else v
@@ -2711,7 +2713,7 @@ class CodeGenerator:
         if isinstance(expr, ast.IntLiteral):
             return int_value(expr)
         if isinstance(expr, ast.CharLiteral):
-            return int_value(expr)
+            return char_value(expr)
         if (
             isinstance(expr, (ast.Call, ast.CallNoArgs))
             and isinstance(expr.func, ast.Identifier)
@@ -4655,7 +4657,7 @@ class CodeGenerator:
             half_size = self._COMPLEX_BASE_SIZES[ty.base_type]
             width = "dword" if half_size == 4 else "qword"
             r_label = self._intern_float(0.0, half_size)
-            i_label = self._intern_float(float(int_value(expr)), half_size)
+            i_label = self._intern_float(float_value(expr), half_size)
             return [
                 f"        fld     {width} [{r_label}]",
                 f"        fstp    {width} {_ebp_addr(disp)}",
@@ -13007,7 +13009,7 @@ class CodeGenerator:
         if isinstance(expr, ast.CharLiteral):
             # `'a'` is an integer constant in C — its parser-level value is
             # already the character code, so it lowers exactly like IntLiteral.
-            return [f"        mov     eax, {int_value(expr)}"]
+            return [f"        mov     eax, {char_value(expr)}"]
         if isinstance(expr, ast.NullptrLiteral):
             # `nullptr` is the integer 0 with pointer type. Loading 0 into
             # EAX gives the right value for both pointer-init and pointer
@@ -13235,7 +13237,7 @@ class CodeGenerator:
                 f"        mov     edx, 0x{high:08X}",
             ]
         if isinstance(expr, ast.CharLiteral):
-            return [f"        mov     eax, {int_value(expr)}", "        xor     edx, edx"]
+            return [f"        mov     eax, {char_value(expr)}", "        xor     edx, edx"]
         if isinstance(expr, ast.NullptrLiteral):
             return ["        xor     eax, eax", "        xor     edx, edx"]
         if isinstance(expr, ast.Identifier):
@@ -14258,7 +14260,7 @@ class CodeGenerator:
         # Float-typed expression. Dispatch by node.
         if isinstance(expr, ast.FloatLiteral):
             size = 4 if ty.name == "float" else 8
-            label = self._intern_float(int_value(expr), size)
+            label = self._intern_float(float_value(expr), size)
             width = "dword" if size == 4 else "qword"
             return [f"        fld     {width} [{label}]"]
         if isinstance(expr, ast.Identifier):
