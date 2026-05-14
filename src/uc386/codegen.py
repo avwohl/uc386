@@ -2304,6 +2304,33 @@ class CodeGenerator:
     ) -> list[str]:
         elem_type = arr_ty.base_type
         elem_size = self._size_of(elem_type)
+        # Auto-AST: adjacent string literals come through as a list
+        # `[StringLiteral, StringLiteral, ...]`. Collapse into a single
+        # decoded `_DecodedString` so the rest of this path treats it
+        # like a single string literal.
+        class _DecodedString:
+            __slots__ = ("value", "is_wide")
+
+            def __init__(self, value, is_wide):
+                self.value = value
+                self.is_wide = is_wide
+
+        if (
+            isinstance(init, list)
+            and init
+            and all(isinstance(p, ast.StringLiteral) for p in init)
+        ):
+            init = _DecodedString(
+                value="".join(
+                    decode_string_literal(p.value.text) for p in init
+                ),
+                is_wide=any(string_is_wide(p.value.text) for p in init),
+            )
+        elif isinstance(init, ast.StringLiteral):
+            init = _DecodedString(
+                value=decode_string_literal(init.value.text),
+                is_wide=string_is_wide(init.value.text),
+            )
         # `char arr[N] = {"string"};` and `char arr[M][N] = { {"row0"}, ... };`
         # — the outer brace wraps a single string literal, which is the
         # idiomatic way period code initializes char arrays from string
@@ -2316,12 +2343,16 @@ class CodeGenerator:
             and len(init.values) == 1
             and isinstance(init.values[0], ast.StringLiteral)
         ):
-            init = init.values[0]
+            inner = init.values[0]
+            init = _DecodedString(
+                value=decode_string_literal(inner.value.text),
+                is_wide=string_is_wide(inner.value.text),
+            )
         # Flexible array member or `int arr[] = {...};` — derive length
         # from the initializer. With designators, length is
         # max(designated_index) + 1.
         if arr_ty.size is None:
-            if isinstance(init, ast.StringLiteral):
+            if isinstance(init, _DecodedString):
                 length = len(init.value) + 1  # include null terminator
             elif isinstance(init, ast.InitializerList):
                 length = self._infer_array_length_from_init(init.values, name)
@@ -2330,8 +2361,8 @@ class CodeGenerator:
         else:
             length = int_value(arr_ty.size)
 
-        if isinstance(init, ast.StringLiteral):
-            is_wide = getattr(init, "is_wide", False) or elem_size > 1
+        if isinstance(init, _DecodedString):
+            is_wide = init.is_wide or elem_size > 1
             if is_wide:
                 # `wchar_t arr[N] = L"..."`: each codepoint is one
                 # `elem_size`-byte slot. Append a null terminator if
