@@ -2558,7 +2558,7 @@ class CodeGenerator:
         import struct
         # Built-in infinity / nan markers.
         if (
-            isinstance(expr, ast.Call)
+            isinstance(expr, (ast.Call, ast.CallNoArgs))
             and isinstance(expr.func, ast.Identifier)
         ):
             fname = expr.func.name.text
@@ -2632,7 +2632,7 @@ class CodeGenerator:
         if isinstance(expr, ast.CharLiteral):
             return int_value(expr)
         if (
-            isinstance(expr, ast.Call)
+            isinstance(expr, (ast.Call, ast.CallNoArgs))
             and isinstance(expr.func, ast.Identifier)
         ):
             if (
@@ -4546,7 +4546,7 @@ class CodeGenerator:
             out += self._complex_value_address(expr.right, ctx)
             return out
         if (
-            isinstance(expr, ast.Call)
+            isinstance(expr, (ast.Call, ast.CallNoArgs))
             and self._is_complex_returning_call(expr, ctx)
         ):
             disp = ctx.call_temps[id(expr)]
@@ -5922,7 +5922,7 @@ class CodeGenerator:
         # int128-returning Call: route through its per-call-site temp
         # via the retptr ABI (same as struct/complex/vector returns).
         if (
-            isinstance(expr, ast.Call)
+            isinstance(expr, (ast.Call, ast.CallNoArgs))
             and self._is_int128_returning_call(expr, ctx)
             and id(expr) in ctx.call_temps
         ):
@@ -7188,7 +7188,7 @@ class CodeGenerator:
             return self._index_address(expr, ctx)
         if isinstance(expr, ast.UnaryOp) and expr.op == "*":
             return self._eval_expr_to_eax(expr.operand, ctx)
-        if isinstance(expr, ast.Call):
+        if isinstance(expr, (ast.Call, ast.CallNoArgs)):
             # For struct-returning calls, evaluating the call leaves EAX
             # holding the temp's address (the callee returns the retptr
             # we passed in) — that's exactly the address `.member` wants.
@@ -10503,7 +10503,7 @@ class CodeGenerator:
         if isinstance(expr, (ast.Identifier, ast.Member, ast.Index)) or (
             isinstance(expr, ast.UnaryOp) and expr.op == "*"
         ) or (
-            isinstance(expr, ast.Call)
+            isinstance(expr, (ast.Call, ast.CallNoArgs))
             and self._is_complex_returning_call(expr, ctx)
         ):
             if (
@@ -12689,7 +12689,7 @@ class CodeGenerator:
             return expr.target_type
         if isinstance(expr, ast.Compound):
             return expr.target_type
-        if isinstance(expr, ast.Call):
+        if isinstance(expr, (ast.Call, ast.CallNoArgs)):
             if isinstance(expr.func, ast.Identifier):
                 fname = ctx.nested_fn_names.get(
                     expr.func.name.text, expr.func.name.text,
@@ -12967,7 +12967,7 @@ class CodeGenerator:
             ):
                 return self._eval_vector_into_temp(expr, ctx)
             return self._binary(expr, ctx)
-        if isinstance(expr, ast.Call):
+        if isinstance(expr, (ast.Call, ast.CallNoArgs)):
             if self._is_struct_returning_call(expr, ctx):
                 # Direct EAX returns can't carry a struct; route the
                 # call into a per-call-site temp slot reserved by
@@ -13358,7 +13358,7 @@ class CodeGenerator:
             out += self._eval_expr_to_edx_eax(expr.false_expr, ctx)
             out.append(f"{end_label}:")
             return out
-        if isinstance(expr, ast.Call):
+        if isinstance(expr, (ast.Call, ast.CallNoArgs)):
             # `llabs(long long)` / `__builtin_llabs`: inline absolute
             # value. The user may have redefined `llabs` to abort
             # (gcc-canonical test pattern); gcc treats it as a builtin
@@ -14241,7 +14241,7 @@ class CodeGenerator:
             return self._float_member_load(expr, ctx)
         if isinstance(expr, ast.Index):
             return self._float_index_load(expr, ctx)
-        if isinstance(expr, ast.Call):
+        if isinstance(expr, (ast.Call, ast.CallNoArgs)):
             # Float-returning calls leave their result on st(0) per
             # cdecl, so we just emit the standard call sequence —
             # `_call`'s post-call cleanup doesn't touch the FPU stack.
@@ -14994,7 +14994,7 @@ class CodeGenerator:
         ):
             return self._emit_call(
                 expr.args, ctx,
-                direct=callee.name,
+                direct=callee.name.text,
                 ecx_setup=ecx_setup,
             )
 
@@ -15012,7 +15012,7 @@ class CodeGenerator:
         ):
             self._func_return_types[callee.name] = _ltypes.BasicType(name="int")
             self._func_param_types[callee.name] = []
-            return self._emit_call(expr.args, ctx, direct=callee.name)
+            return self._emit_call(expr.args, ctx, direct=callee.name.text)
 
         # Indirect call: the callee evaluates to a function address. Push
         # args first (which clobber EAX), then evaluate the callee into
@@ -16632,14 +16632,14 @@ class CodeGenerator:
             return out
         if isinstance(expr, (ast.BinaryOp, ast.UnaryOp)):
             return self._eval_vector_into_temp(expr, ctx)
-        if isinstance(expr, ast.Call) and self._is_vector_returning_call(expr, ctx):
+        if isinstance(expr, (ast.Call, ast.CallNoArgs)) and self._is_vector_returning_call(expr, ctx):
             disp = ctx.call_temps[id(expr)]
             retptr_lines = [f"        lea     eax, {_ebp_addr(disp)}"]
             out = self._call_into_address(expr, retptr_lines, ctx)
             # Callee leaves &temp in EAX; that's already the address.
             return out
         if (
-            isinstance(expr, ast.Call)
+            isinstance(expr, (ast.Call, ast.CallNoArgs))
             and isinstance(expr.func, ast.Identifier)
             and expr.func.name.text == "__builtin_shuffle"
             and id(expr) in ctx.call_temps
