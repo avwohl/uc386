@@ -3833,15 +3833,30 @@ class PeepholeOptimizer:
         or aren't worth tracking (registers — codegen reloads from
         memory, not register-to-register).
         """
-        # Pre-compute labels that are targets of backward jumps.
-        # At those labels, we conservatively reset reg_mem because
-        # the back-edge may have stores that invalidate cached
-        # state before re-entry.
-        label_positions: dict[str, int] = {}
+        # Pre-compute line indices that are targets of backward jumps.
+        # At those positions, we conservatively reset reg_mem because
+        # the back-edge may have stores that invalidate cached state
+        # before re-entry.
+        #
+        # Local NASM labels (starting with `.`) are scoped to the
+        # preceding non-local label. The whole-file asm reuses the
+        # same `.LN_do_top` name across many functions, so a flat
+        # name → position dict would resolve every reference to the
+        # LAST definition in the file — silently missing back-edges
+        # and letting the redundant-load pass nuke a needed reload.
+        # We key labels by (scope_line, label_name); the scope is
+        # the line index of the enclosing non-local label.
+        label_positions: dict[tuple[int, str], int] = {}
+        scope_at: list[int] = []
+        current_scope = 0
         for k, ln in enumerate(lines):
+            if ln.kind == "label" and not ln.label.startswith("."):
+                current_scope = k
+            scope_at.append(current_scope)
             if ln.kind == "label":
-                label_positions[ln.label] = k
-        loop_top_labels: set[str] = set()
+                scope_key = 0 if not ln.label.startswith(".") else current_scope
+                label_positions[(scope_key, ln.label)] = k
+        loop_top_positions: set[int] = set()
         for k, ln in enumerate(lines):
             if ln.kind == "instr" and (
                 ln.op == "jmp" or ln.op.startswith("j")
@@ -3849,9 +3864,10 @@ class PeepholeOptimizer:
                 target = _branch_target(ln)
                 if target is None:
                     continue
-                target_idx = label_positions.get(target)
+                scope_key = 0 if not target.startswith(".") else scope_at[k]
+                target_idx = label_positions.get((scope_key, target))
                 if target_idx is not None and target_idx <= k:
-                    loop_top_labels.add(target)
+                    loop_top_positions.add(target_idx)
 
         # Per-function address-taken set: a register-base write
         # (e.g. `mov [ecx], eax`) cannot alias `[ebp + N]` unless N is
@@ -3885,9 +3901,22 @@ class PeepholeOptimizer:
             if line.kind != "instr":
                 if line.kind == "label":
                     label = line.label
+                    # Non-local label = function boundary. Local
+                    # labels (.X) are scoped to the enclosing
+                    # function, so a leaked jcc_states / reg_mem
+                    # entry from a previous function with the same
+                    # local name would corrupt analysis here.
+                    if not label.startswith("."):
+                        jcc_states.clear()
+                        ext_jcc_states.clear()
+                        reg_mem = None
+                        ext_form = None
+                        prev_unconditional = False
+                        out.append(line)
+                        continue
                     saved = jcc_states.pop(label, None)
                     saved_ext = ext_jcc_states.pop(label, None)
-                    if label in loop_top_labels:
+                    if line_idx in loop_top_positions:
                         # Loop top: a back-edge may store to memory
                         # between iterations, invalidating any cached
                         # reg_mem value. Conservatively reset.
