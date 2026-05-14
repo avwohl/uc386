@@ -2840,7 +2840,7 @@ class CodeGenerator:
         except CodegenError:
             pass
         while isinstance(expr, ast.Cast):
-            target = expr.target_type
+            target = self._expand_typedef_type(expr.target_type)
             inner = self._const_eval_float(expr.expr, name)
             if (
                 isinstance(target, _ltypes.BasicType)
@@ -2962,7 +2962,7 @@ class CodeGenerator:
             # truncate the operand to int, and lift back to a wrong
             # float value — exactly what made `mp_const_float_pi_obj`
             # initialize from `(double)3.14159...` end up as 3.0.
-            ty = expr.target_type
+            ty = self._expand_typedef_type(expr.target_type)
             if (
                 isinstance(ty, _ltypes.BasicType)
                 and self._is_float_type(ty)
