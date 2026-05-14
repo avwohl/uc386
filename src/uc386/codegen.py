@@ -5028,7 +5028,16 @@ class CodeGenerator:
         elif isinstance(decl.init, ast.StringLiteral):
             # +1 reserves a slot for the trailing null byte. Wide
             # strings count by codepoint, not by encoded byte length.
-            n = len(decl.init.value) + 1
+            n = decoded_str_len(decl.init.value.text) + 1
+        elif (
+            isinstance(decl.init, list)
+            and len(decl.init) >= 1
+            and all(isinstance(p, ast.StringLiteral) for p in decl.init)
+        ):
+            # Auto-AST: adjacent string literals concatenate into a list
+            # of StringLiteral pieces (`"ab" "cd"` → [SL("ab"), SL("cd")]).
+            # The concatenated payload length determines the array size.
+            n = sum(decoded_str_len(p.value.text) for p in decl.init) + 1
         else:
             raise CodegenError(
                 f"unsized array `{decl.name}` requires an initializer"
@@ -9503,6 +9512,13 @@ class CodeGenerator:
                 length = self._infer_array_length_from_init(init.values, name)
             elif isinstance(init, ast.StringLiteral):
                 length = decoded_str_len(init.value.text) + 1
+            elif (
+                isinstance(init, list)
+                and all(isinstance(p, ast.StringLiteral) for p in init)
+            ):
+                length = sum(
+                    decoded_str_len(p.value.text) for p in init
+                ) + 1
             else:
                 raise CodegenError(
                     f"`{name}`: unsized array needs a brace or string initializer"
@@ -9510,9 +9526,25 @@ class CodeGenerator:
         else:
             length = int_value(arr_type.size)
 
-        if isinstance(init, ast.StringLiteral):
+        # Adjacent string literals come through as a list of StringLiteral
+        # pieces (`"ab" "cd"`). Decode + concatenate so the downstream
+        # array-init lowering handles them uniformly with single strings.
+        if (
+            isinstance(init, list)
+            and init
+            and all(isinstance(p, ast.StringLiteral) for p in init)
+        ):
+            is_wide = any(string_is_wide(p.value.text) for p in init)
+            init_str = "".join(
+                decode_string_literal(p.value.text) for p in init
+            )
+        elif isinstance(init, ast.StringLiteral):
             is_wide = string_is_wide(init.value.text)
             init_str = decode_string_literal(init.value.text)
+        else:
+            is_wide = False
+            init_str = None
+        if init_str is not None:
             if is_wide:
                 # `wchar_t s[] = L"...";` — each codepoint becomes one
                 # array element of `elem_size` bytes (typically 2 for
