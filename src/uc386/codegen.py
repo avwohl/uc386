@@ -2450,7 +2450,7 @@ class CodeGenerator:
             # produces the address of any l-value chain, so `&` here is
             # idempotent — strip and recurse.
             return self._resolve_static_addr(expr.operand, name)
-        if isinstance(expr, ast.Member):
+        if isinstance(expr, (ast.Member, ast.ArrowMember)):
             # `obj.field` — resolve obj's address, then add field offset.
             try:
                 obj_ty = self._type_of(
@@ -2458,7 +2458,7 @@ class CodeGenerator:
                 )
             except CodegenError:
                 return None
-            if expr.is_arrow:
+            if isinstance(expr, ast.ArrowMember):
                 # `p->m`: the base address comes from evaluating p (a
                 # pointer), then plus member offset.
                 if isinstance(obj_ty, _ltypes.PointerType):
@@ -2474,7 +2474,7 @@ class CodeGenerator:
                 return None
             sname = self._resolve_struct_name(obj_ty)
             try:
-                _, m_off = self._member_layout(sname, expr.member)
+                _, m_off = self._member_layout(sname, expr.member.text)
             except CodegenError:
                 return None
             base_label, base_off = inner
@@ -2529,7 +2529,7 @@ class CodeGenerator:
                     return True
                 if isinstance(e, ast.Index):
                     return True
-                if isinstance(e, ast.Member):
+                if isinstance(e, (ast.Member, ast.ArrowMember)):
                     return True
                 if isinstance(e, ast.BinaryOp) and _opt(e) in ("+", "-"):
                     return _decays_to_static(e.left) or _decays_to_static(e.right)
@@ -3836,15 +3836,15 @@ class CodeGenerator:
                     return arr_ty.base_type
                 return None
             # Member: s.m → member's type from struct layout.
-            if isinstance(operand, ast.Member):
+            if isinstance(operand, (ast.Member, ast.ArrowMember)):
                 obj_ty = resolve_inner(operand.obj)
-                if operand.is_arrow and isinstance(obj_ty, _ltypes.PointerType):
+                if isinstance(operand, ast.ArrowMember) and isinstance(obj_ty, _ltypes.PointerType):
                     obj_ty = obj_ty.base_type
                 if isinstance(obj_ty, _ltypes.StructType):
                     sname = self._resolve_struct_name(obj_ty)
                     if sname in self._structs:
                         for m_name, m_ty, _m_off in self._structs[sname]:
-                            if m_name == operand.member:
+                            if m_name == operand.member.text:
                                 return m_ty
                 return None
             # *p → pointee.
@@ -4551,7 +4551,7 @@ class CodeGenerator:
             return self._identifier_address(expr.name.text, ctx)
         if isinstance(expr, ast.UnaryOp) and _opt(expr) == "*":
             return self._eval_expr_to_eax(expr.operand, ctx)
-        if isinstance(expr, ast.Member):
+        if isinstance(expr, (ast.Member, ast.ArrowMember)):
             return self._member_address(expr, ctx)
         if isinstance(expr, ast.Index):
             return self._index_address(expr, ctx)
@@ -4686,7 +4686,7 @@ class CodeGenerator:
             out = self._identifier_address(operand.name, ctx)
         elif isinstance(operand, ast.UnaryOp) and _opt(operand) == "*":
             out = self._eval_expr_to_eax(operand.operand, ctx)
-        elif isinstance(operand, ast.Member):
+        elif isinstance(operand, (ast.Member, ast.ArrowMember)):
             out = self._member_address(operand, ctx)
         elif isinstance(operand, ast.Index):
             out = self._index_address(operand, ctx)
@@ -5906,7 +5906,7 @@ class CodeGenerator:
                 except CodegenError:
                     pass
         # LL Member: similar.
-        if isinstance(expr, ast.Member):
+        if isinstance(expr, (ast.Member, ast.ArrowMember)):
             mem_ty = self._type_of(expr, ctx)
             if self._is_long_long(mem_ty):
                 try:
@@ -5947,7 +5947,7 @@ class CodeGenerator:
             return self._identifier_address(expr.name.text, ctx)
         if isinstance(expr, ast.UnaryOp) and _opt(expr) == "*":
             return self._eval_expr_to_eax(expr.operand, ctx)
-        if isinstance(expr, ast.Member):
+        if isinstance(expr, (ast.Member, ast.ArrowMember)):
             return self._member_address(expr, ctx)
         if isinstance(expr, ast.Index):
             return self._index_address(expr, ctx)
@@ -6913,7 +6913,7 @@ class CodeGenerator:
             and _opt(expr.left) == "*"
         ):
             out += self._eval_expr_to_eax(expr.left.operand, ctx)
-        elif isinstance(expr.left, ast.Member):
+        elif isinstance(expr.left, (ast.Member, ast.ArrowMember)):
             out += self._member_address(expr.left, ctx)
         else:
             raise CodegenError(
@@ -6970,7 +6970,7 @@ class CodeGenerator:
             and _opt(expr.left) == "*"
         ):
             out += self._eval_expr_to_eax(expr.left.operand, ctx)
-        elif isinstance(expr.left, ast.Member):
+        elif isinstance(expr.left, (ast.Member, ast.ArrowMember)):
             out += self._member_address(expr.left, ctx)
         else:
             raise CodegenError(
@@ -7029,7 +7029,7 @@ class CodeGenerator:
             and _opt(expr.left) == "*"
         ):
             out += self._eval_expr_to_eax(expr.left.operand, ctx)
-        elif isinstance(expr.left, ast.Member):
+        elif isinstance(expr.left, (ast.Member, ast.ArrowMember)):
             out += self._member_address(expr.left, ctx)
         else:
             raise CodegenError(
@@ -7094,7 +7094,7 @@ class CodeGenerator:
             and _opt(expr.left) == "*"
         ):
             out += self._eval_expr_to_eax(expr.left.operand, ctx)
-        elif isinstance(expr.left, ast.Member):
+        elif isinstance(expr.left, (ast.Member, ast.ArrowMember)):
             out += self._member_address(expr.left, ctx)
         else:
             raise CodegenError(
@@ -7130,7 +7130,7 @@ class CodeGenerator:
         out: list[str] = []
         if isinstance(lhs, ast.Identifier):
             out += self._identifier_address(lhs.name, ctx)
-        elif isinstance(lhs, ast.Member):
+        elif isinstance(lhs, (ast.Member, ast.ArrowMember)):
             out += self._member_address(lhs, ctx)
         elif isinstance(lhs, ast.Index):
             out += self._index_address(lhs, ctx)
@@ -7161,7 +7161,7 @@ class CodeGenerator:
 
     def _member_address(self, expr: ast.Member, ctx: _FuncCtx) -> list[str]:
         """Compute the address of `expr` (`.` or `->` member) into eax."""
-        if expr.is_arrow:
+        if isinstance(expr, ast.ArrowMember):
             obj_ty = self._type_of(expr.obj, ctx)
             if (
                 isinstance(obj_ty, _ltypes.ArrayType)
@@ -7200,7 +7200,7 @@ class CodeGenerator:
                 )
             struct_name = self._resolve_struct_name(obj_ty)
             out = self._struct_address(expr.obj, ctx)
-        _, offset = self._member_layout(struct_name, expr.member)
+        _, offset = self._member_layout(struct_name, expr.member.text)
         if offset != 0:
             out.append(f"        add     eax, {offset}")
         return out
@@ -7208,13 +7208,13 @@ class CodeGenerator:
     def _struct_address(self, expr: ast.Expression, ctx: _FuncCtx) -> list[str]:
         """Compute the address of a struct l-value into eax.
 
-        Used as the base for `obj.member`: we don't want to "load" the
+        Used as the base for `obj.member.text`: we don't want to "load" the
         struct's bytes into EAX (it doesn't fit), we want its address so
         we can offset into it.
         """
         if isinstance(expr, ast.Identifier):
             return self._identifier_address(expr.name.text, ctx)
-        if isinstance(expr, ast.Member):
+        if isinstance(expr, (ast.Member, ast.ArrowMember)):
             return self._member_address(expr, ctx)
         if isinstance(expr, ast.Index):
             return self._index_address(expr, ctx)
@@ -7412,7 +7412,7 @@ class CodeGenerator:
             return None
         struct_name = self._resolve_struct_name(obj_ty)
         bf = self._struct_bitfields.get(struct_name, {})
-        info = bf.get(expr.member)
+        info = bf.get(expr.member.text)
         if info is None:
             return None
         # Backwards compatible with the older 2-tuple form (unit_size
@@ -7423,11 +7423,11 @@ class CodeGenerator:
             unit_size = 4
         else:
             bit_offset, bit_width, unit_size = info
-        member_ty, _ = self._member_layout(struct_name, expr.member)
+        member_ty, _ = self._member_layout(struct_name, expr.member.text)
         return bit_offset, bit_width, member_ty, unit_size
 
     def _member_load(self, expr: ast.Member, ctx: _FuncCtx) -> list[str]:
-        """Lower `obj.member` (or `obj->member`) as a value in EAX."""
+        """Lower `obj.member.text` (or `obj->member`) as a value in EAX."""
         bf = self._bitfield_info(expr, ctx)
         if bf is not None:
             return self._bitfield_load(expr, bf, ctx)
@@ -7959,7 +7959,7 @@ class CodeGenerator:
         n = expr.designator
         while not isinstance(n, ast.Identifier):
             steps.append(n)
-            if isinstance(n, ast.Member):
+            if isinstance(n, (ast.Member, ast.ArrowMember)):
                 n = n.obj
             elif isinstance(n, ast.Index):
                 n = n.array
@@ -7972,15 +7972,15 @@ class CodeGenerator:
         # we know each Index's element size.
         cur_ty = expr.target_type
         for step in steps:
-            if isinstance(step, ast.Member):
+            if isinstance(step, (ast.Member, ast.ArrowMember)):
                 if isinstance(cur_ty, _ltypes.PointerType):
                     cur_ty = cur_ty.base_type
                 if not isinstance(cur_ty, _ltypes.StructType):
                     raise CodegenError(
-                        f"offsetof: `.{step.member}` of non-struct"
+                        f"offsetof: `.{step.member.text}` of non-struct"
                     )
                 sname = self._resolve_struct_name(cur_ty)
-                m_ty, m_off = self._member_layout(sname, step.member)
+                m_ty, m_off = self._member_layout(sname, step.member.text)
                 out.append(f"        add     esi, {m_off}")
                 cur_ty = m_ty
             elif isinstance(step, ast.Index):
@@ -8029,18 +8029,18 @@ class CodeGenerator:
         if isinstance(node, ast.Identifier):
             # `__offsetof_root` — base case, offset 0.
             return 0
-        if isinstance(node, ast.Member):
+        if isinstance(node, (ast.Member, ast.ArrowMember)):
             base = self._offsetof_walk(node.obj, root_ty)
             base_ty = self._offsetof_type_walk(node.obj, root_ty)
             if isinstance(base_ty, _ltypes.PointerType):
                 base_ty = base_ty.base_type
             if not isinstance(base_ty, _ltypes.StructType):
                 raise CodegenError(
-                    f"offsetof: cannot apply `.{node.member}` to "
+                    f"offsetof: cannot apply `.{node.member.text}` to "
                     f"{type(base_ty).__name__}"
                 )
             sname = self._resolve_struct_name(base_ty)
-            _m_ty, m_off = self._member_layout(sname, node.member)
+            _m_ty, m_off = self._member_layout(sname, node.member.text)
             return base + m_off
         if isinstance(node, ast.Index):
             base = self._offsetof_walk(node.array, root_ty)
@@ -8062,16 +8062,16 @@ class CodeGenerator:
     ) -> _ltypes.TypeNode:
         if isinstance(node, ast.Identifier):
             return root_ty
-        if isinstance(node, ast.Member):
+        if isinstance(node, (ast.Member, ast.ArrowMember)):
             obj_ty = self._offsetof_type_walk(node.obj, root_ty)
             if isinstance(obj_ty, _ltypes.PointerType):
                 obj_ty = obj_ty.base_type
             if not isinstance(obj_ty, _ltypes.StructType):
                 raise CodegenError(
-                    f"offsetof: cannot apply `.{node.member}` to non-struct"
+                    f"offsetof: cannot apply `.{node.member.text}` to non-struct"
                 )
             sname = self._resolve_struct_name(obj_ty)
-            m_ty, _ = self._member_layout(sname, node.member)
+            m_ty, _ = self._member_layout(sname, node.member.text)
             return m_ty
         if isinstance(node, ast.Index):
             obj_ty = self._offsetof_type_walk(node.array, root_ty)
@@ -10938,7 +10938,7 @@ class CodeGenerator:
             return self._identifier_store(lvalue.name, ctx)
         if isinstance(lvalue, ast.Index):
             addr_lines = self._index_address(lvalue, ctx)
-        elif isinstance(lvalue, ast.Member):
+        elif isinstance(lvalue, (ast.Member, ast.ArrowMember)):
             addr_lines = self._member_address(lvalue, ctx)
         elif isinstance(lvalue, ast.UnaryOp) and _opt(lvalue) == "*":
             addr_lines = self._eval_expr_to_eax(lvalue.operand, ctx)
@@ -11040,7 +11040,7 @@ class CodeGenerator:
         # General lvalue: compute address, fstp through it.
         if isinstance(lvalue, ast.Index):
             addr_lines = self._index_address(lvalue, ctx)
-        elif isinstance(lvalue, ast.Member):
+        elif isinstance(lvalue, (ast.Member, ast.ArrowMember)):
             addr_lines = self._member_address(lvalue, ctx)
         elif isinstance(lvalue, ast.UnaryOp) and _opt(lvalue) == "*":
             addr_lines = self._eval_expr_to_eax(lvalue.operand, ctx)
@@ -11888,7 +11888,7 @@ class CodeGenerator:
         that goes through a runtime pointer might."""
         # Strip a single dereference / index / member chain.
         e = src_expr
-        while isinstance(e, ast.Member):
+        while isinstance(e, (ast.Member, ast.ArrowMember)):
             e = e.obj
         if isinstance(e, ast.Identifier):
             # Local variable: can't alias caller's buffer.
@@ -12057,7 +12057,7 @@ class CodeGenerator:
             return out
         if isinstance(ap_expr, ast.Index):
             addr_lines = self._index_address(ap_expr, ctx)
-        elif isinstance(ap_expr, ast.Member):
+        elif isinstance(ap_expr, (ast.Member, ast.ArrowMember)):
             addr_lines = self._member_address(ap_expr, ctx)
         elif isinstance(ap_expr, ast.UnaryOp) and _opt(ap_expr) == "*":
             addr_lines = self._eval_expr_to_eax(ap_expr.operand, ctx)
@@ -12127,7 +12127,7 @@ class CodeGenerator:
         """Emit code that puts the current va_list pointer into ECX
         and advances the underlying ap slot by `advance`. Supports any
         lvalue form for the ap operand (Identifier / `*p` / arr[i] /
-        struct.member / arr[i].member chains).
+        struct.member.text / arr[i].member chains).
         """
         if isinstance(expr.ap, ast.Identifier):
             ap_addr = self._identifier_addr_text(expr.ap.name, ctx)
@@ -12140,7 +12140,7 @@ class CodeGenerator:
             addr_lines = self._eval_expr_to_eax(expr.ap.operand, ctx)
         elif isinstance(expr.ap, ast.Index):
             addr_lines = self._index_address(expr.ap, ctx)
-        elif isinstance(expr.ap, ast.Member):
+        elif isinstance(expr.ap, (ast.Member, ast.ArrowMember)):
             addr_lines = self._member_address(expr.ap, ctx)
         else:
             raise CodegenError(
@@ -12438,9 +12438,9 @@ class CodeGenerator:
                     f"(got {type(arr_type).__name__})"
                 )
             return arr_type.base_type
-        if isinstance(expr, ast.Member):
+        if isinstance(expr, (ast.Member, ast.ArrowMember)):
             obj_ty = self._type_of(expr.obj, ctx)
-            if expr.is_arrow:
+            if isinstance(expr, ast.ArrowMember):
                 # Arrays decay to pointers in expression context, so
                 # `arr->member` is `(&arr[0])->member`. We also tolerate
                 # a bare StructType obj — it can show up when typedef'd
@@ -12469,13 +12469,13 @@ class CodeGenerator:
                         f"`.` requires a struct (got {type(obj_ty).__name__})"
                     )
                 struct_name = self._resolve_struct_name(obj_ty)
-            ty, _ = self._member_layout(struct_name, expr.member)
+            ty, _ = self._member_layout(struct_name, expr.member.text)
             # Bit-field integer promotion (C 6.3.1.1): a bit-field
             # narrower than int promotes to int (signed). 32-bit unsigned
             # bit-fields stay unsigned (not representable in signed int).
             # 32-bit signed bit-fields stay signed int. Bit-fields with
             # width > 32 keep their declared LL type.
-            bf = self._struct_bitfields.get(struct_name, {}).get(expr.member)
+            bf = self._struct_bitfields.get(struct_name, {}).get(expr.member.text)
             if bf is not None:
                 bit_width = bf[1]
                 unit_size = bf[2] if len(bf) >= 3 else 4
@@ -12986,7 +12986,7 @@ class CodeGenerator:
             return self._identifier_load(expr.name.text, ctx)
         if isinstance(expr, ast.Index):
             return self._index_load(expr, ctx)
-        if isinstance(expr, ast.Member):
+        if isinstance(expr, (ast.Member, ast.ArrowMember)):
             return self._member_load(expr, ctx)
         if isinstance(expr, (ast.UnaryOp, ast.PostfixOp)):
             # Vector unary: returns a temp address.
@@ -13225,7 +13225,7 @@ class CodeGenerator:
             else:
                 out.append("        cdq")
             return out
-        if isinstance(expr, ast.Member):
+        if isinstance(expr, (ast.Member, ast.ArrowMember)):
             mem_ty = self._type_of(expr, ctx)
             # Bit-field member needs the proper load (shrd + mask)
             # rather than a raw 64-bit memcpy. The 32-bit-storage
@@ -13584,7 +13584,7 @@ class CodeGenerator:
         two."""
         max_width = 0
         for operand in operands:
-            if not isinstance(operand, ast.Member):
+            if not isinstance(operand, (ast.Member, ast.ArrowMember)):
                 continue
             bf = self._bitfield_info(operand, ctx)
             if bf is None:
@@ -13970,7 +13970,7 @@ class CodeGenerator:
             )
         # Bit-field LL compound assign goes through the bit-field
         # RMW path which already handles address-once.
-        if isinstance(expr.left, ast.Member):
+        if isinstance(expr.left, (ast.Member, ast.ArrowMember)):
             bf = self._bitfield_info(expr.left, ctx)
             if bf is not None:
                 if len(bf) == 4 and bf[3] == 8:
@@ -13998,7 +13998,7 @@ class CodeGenerator:
             and _opt(expr.left) == "*"
         ):
             out += self._eval_expr_to_eax(expr.left.operand, ctx)
-        elif isinstance(expr.left, ast.Member):
+        elif isinstance(expr.left, (ast.Member, ast.ArrowMember)):
             out += self._member_address(expr.left, ctx)
         else:
             raise CodegenError(
@@ -14048,7 +14048,7 @@ class CodeGenerator:
             out.append("        mov     [ecx], eax")
             out.append("        mov     [ecx + 4], edx")
             return out
-        if isinstance(lhs, ast.Member):
+        if isinstance(lhs, (ast.Member, ast.ArrowMember)):
             # Bit-field LL member: route through the LL bit-field
             # store so we don't smash neighboring fields in the
             # 8-byte storage unit.
@@ -14076,7 +14076,7 @@ class CodeGenerator:
         """++/-- on a long-long Identifier, member, indexed, or *p
         lvalue. Returns the result (pre or post value) in EDX:EAX."""
         # Long-long bit-field: route through the bit-field-aware path.
-        if isinstance(expr.operand, ast.Member):
+        if isinstance(expr.operand, (ast.Member, ast.ArrowMember)):
             bf = self._bitfield_info(expr.operand, ctx)
             if bf is not None and len(bf) == 4 and bf[3] == 8:
                 return self._inc_dec_bitfield_ll(expr, bf, ctx)
@@ -14109,7 +14109,7 @@ class CodeGenerator:
             addr_lines = self._index_address(expr.operand, ctx)
         elif isinstance(expr.operand, ast.UnaryOp) and _opt(expr.operand) == "*":
             addr_lines = self._eval_expr_to_eax(expr.operand.operand, ctx)
-        elif isinstance(expr.operand, ast.Member):
+        elif isinstance(expr.operand, (ast.Member, ast.ArrowMember)):
             addr_lines = self._member_address(expr.operand, ctx)
         else:
             raise CodegenError(
@@ -14270,7 +14270,7 @@ class CodeGenerator:
             return self._float_cast(expr, ctx)
         if isinstance(expr, ast.TernaryOp):
             return self._float_ternary(expr, ctx)
-        if isinstance(expr, ast.Member):
+        if isinstance(expr, (ast.Member, ast.ArrowMember)):
             return self._float_member_load(expr, ctx)
         if isinstance(expr, ast.Index):
             return self._float_index_load(expr, ctx)
@@ -14464,7 +14464,7 @@ class CodeGenerator:
             addr_lines = self._eval_expr_to_eax(expr.left.operand, ctx)
         elif isinstance(expr.left, ast.Index):
             addr_lines = self._index_address(expr.left, ctx)
-        elif isinstance(expr.left, ast.Member):
+        elif isinstance(expr.left, (ast.Member, ast.ArrowMember)):
             addr_lines = self._member_address(expr.left, ctx)
         else:
             raise CodegenError(
@@ -14517,7 +14517,7 @@ class CodeGenerator:
             and _opt(expr.operand) == "*"
         ):
             addr_lines = self._eval_expr_to_eax(expr.operand.operand, ctx)
-        elif isinstance(expr.operand, ast.Member):
+        elif isinstance(expr.operand, (ast.Member, ast.ArrowMember)):
             addr_lines = self._member_address(expr.operand, ctx)
         else:
             raise CodegenError(
@@ -14565,7 +14565,7 @@ class CodeGenerator:
             addr_lines = self._eval_expr_to_eax(expr.left.operand, ctx)
         elif isinstance(expr.left, ast.Index):
             addr_lines = self._index_address(expr.left, ctx)
-        elif isinstance(expr.left, ast.Member):
+        elif isinstance(expr.left, (ast.Member, ast.ArrowMember)):
             addr_lines = self._member_address(expr.left, ctx)
         else:
             raise CodegenError(
@@ -15310,7 +15310,7 @@ class CodeGenerator:
         if isinstance(expr.operand, ast.Index):
             # &arr[i] — same address arithmetic as a load, just no final deref.
             return self._index_address(expr.operand, ctx)
-        if isinstance(expr.operand, ast.Member):
+        if isinstance(expr.operand, (ast.Member, ast.ArrowMember)):
             # &s.m or &p->m — member-address lowering, no deref.
             return self._member_address(expr.operand, ctx)
         if isinstance(expr.operand, ast.Compound):
@@ -15450,7 +15450,7 @@ class CodeGenerator:
         # simple `add dword [...]`. Long-long-storage bit-fields go
         # through the LL variant since the storage RMW spans 8 bytes
         # with carry/shift across the dword boundary.
-        if isinstance(expr.operand, ast.Member):
+        if isinstance(expr.operand, (ast.Member, ast.ArrowMember)):
             bf = self._bitfield_info(expr.operand, ctx)
             if bf is not None:
                 if len(bf) == 4 and bf[3] == 8:
@@ -15460,7 +15460,7 @@ class CodeGenerator:
             addr_lines = self._index_address(expr.operand, ctx)
         elif isinstance(expr.operand, ast.UnaryOp) and _opt(expr.operand) == "*":
             addr_lines = self._eval_expr_to_eax(expr.operand.operand, ctx)
-        elif isinstance(expr.operand, ast.Member):
+        elif isinstance(expr.operand, (ast.Member, ast.ArrowMember)):
             addr_lines = self._member_address(expr.operand, ctx)
         else:
             raise CodegenError(
@@ -16364,7 +16364,7 @@ class CodeGenerator:
                     + ["        pop     ecx"]
                     + self._store_from_eax("[ecx]", target_ty)
                 )
-            if isinstance(expr.left, ast.Member):
+            if isinstance(expr.left, (ast.Member, ast.ArrowMember)):
                 bf = self._bitfield_info(expr.left, ctx)
                 if bf is not None:
                     # Bit-field with bool declared type — go through
@@ -16451,7 +16451,7 @@ class CodeGenerator:
             return out
         # `s.m = rhs` / `pp->m = rhs` — same address-once pattern.
         # (Struct-typed members already short-circuited above.)
-        if isinstance(expr.left, ast.Member):
+        if isinstance(expr.left, (ast.Member, ast.ArrowMember)):
             bf = self._bitfield_info(expr.left, ctx)
             if bf is not None:
                 return self._bitfield_store(expr.left, bf, expr.right, ctx)
@@ -16582,7 +16582,7 @@ class CodeGenerator:
             return self._identifier_address(expr.name.text, ctx)
         if isinstance(expr, ast.Index):
             return self._index_address(expr, ctx)
-        if isinstance(expr, ast.Member):
+        if isinstance(expr, (ast.Member, ast.ArrowMember)):
             return self._member_address(expr, ctx)
         if isinstance(expr, ast.UnaryOp) and _opt(expr) == "*":
             # `*p` of pointer-to-vector: just evaluate the pointer.
@@ -17341,7 +17341,7 @@ class CodeGenerator:
             # The pointer operand evaluates once into eax — that's the
             # address we'll read from and write back to.
             addr_lines = self._eval_expr_to_eax(expr.left.operand, ctx)
-        elif isinstance(expr.left, ast.Member):
+        elif isinstance(expr.left, (ast.Member, ast.ArrowMember)):
             # Bit-field compound assign goes through the bit-field
             # RMW path so we don't smash the other fields in the unit.
             bf = self._bitfield_info(expr.left, ctx)
