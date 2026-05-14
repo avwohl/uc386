@@ -5171,6 +5171,27 @@ class CodeGenerator:
     # Sizes used for pointer-arithmetic scaling. We can compute these for
     # any pointee type the parser produces, even ones we don't yet support
     # as full slot types — `char *p; p + 1;` works without `*p` working.
+    def _expand_typedef_type(self, t):
+        """If ``t`` is a BasicType whose name is in the codegen's
+        typedef table (a leftover from construction-time conversion
+        running before the resolver was installed), return the
+        underlying legacy type. Otherwise return ``t`` unchanged.
+
+        Also normalises ast.TypeName / ast.TypeNameWithDeclarator
+        wrappers via _to_legacy_type at the entry."""
+        if isinstance(t, (ast.TypeName, ast.TypeNameWithDeclarator)):
+            t = _to_legacy_type(t)
+        if (
+            isinstance(t, _ltypes.BasicType)
+            and t.name not in self._BASIC_SIZES
+            and getattr(self, "_typedef_decls", {}).get(t.name) is not None
+        ):
+            from uc_core.ast import resolved_to_legacy
+            resolved = self._resolve_typedef_name(t.name)
+            if resolved is not None:
+                return resolved_to_legacy(resolved)
+        return t
+
     _BASIC_SIZES = {
         "bool": 1,          # C99 _Bool
         "char": 1,
@@ -12999,9 +13020,9 @@ class CodeGenerator:
         if isinstance(expr, ast.VaArgExpr):
             return _to_legacy_type(expr.target_type)
         if isinstance(expr, ast.Cast):
-            return expr.target_type
+            return self._expand_typedef_type(expr.target_type)
         if isinstance(expr, ast.Compound):
-            return expr.target_type
+            return self._expand_typedef_type(expr.target_type)
         if isinstance(expr, (ast.Call, ast.CallNoArgs)):
             if isinstance(expr.func, ast.Identifier):
                 fname = ctx.nested_fn_names.get(
