@@ -15534,7 +15534,16 @@ class CodeGenerator:
             # Dereference: load the pointer value into EAX, then read from
             # the address it holds. The load width follows the pointee
             # type — `*char_ptr` reads one byte (sign-extended), not four.
-            pointee_ty = self._type_of(expr, ctx)
+            # We derive pointee_ty from the operand's type (a pointer or
+            # array) so the _OpView wrap above doesn't fall through to
+            # _type_of's int default.
+            operand_ty = self._type_of(expr.operand, ctx)
+            if isinstance(operand_ty, _ltypes.PointerType):
+                pointee_ty = operand_ty.base_type
+            elif isinstance(operand_ty, _ltypes.ArrayType):
+                pointee_ty = operand_ty.base_type
+            else:
+                pointee_ty = self._type_of(expr, ctx)
             # Array (or struct) pointee in value context decays to its
             # address — `*pa` where `pa` has type `T(*)[N]` evaluates to
             # the address of the array, not its contents.
