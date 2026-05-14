@@ -126,7 +126,7 @@ class _SynthLocalVar:
     code paths inside CodeGenerator after the auto-AST migration. The
     auto-AST collapses ``T a, b, c;`` into one ast.Declaration with N
     declarators; we synthesise one of these per declarator and feed
-    each through the existing `if isinstance(node, ast.VarDecl)`
+    each through the existing `if isinstance(node, (ast.VarDecl, _SynthLocalVar))`
     branches."""
     name: str
     var_type: object
@@ -520,7 +520,7 @@ class CodeGenerator:
         for d in top_decls:
             if isinstance(d, ast.FunctionDef) and d.body is None:
                 externs.add(d.name)
-            elif isinstance(d, ast.VarDecl) and isinstance(d.var_type, _ltypes.FunctionType):
+            elif isinstance(d, (ast.VarDecl, _SynthLocalVar)) and isinstance(d.var_type, _ltypes.FunctionType):
                 externs.add(d.name)
         externs -= defined_names
         # gnu_inline functions are never extern symbols — they're
@@ -619,7 +619,7 @@ class CodeGenerator:
                 fa = getattr(d, "alignment", None)
                 if fa is not None:
                     self._func_alignments[d.name] = fa
-            elif isinstance(d, ast.VarDecl) and isinstance(d.var_type, _ltypes.FunctionType):
+            elif isinstance(d, (ast.VarDecl, _SynthLocalVar)) and isinstance(d.var_type, _ltypes.FunctionType):
                 self._func_return_types[d.name] = d.var_type.return_type
                 fa = getattr(d, "alignment", None)
                 if fa is not None:
@@ -646,7 +646,7 @@ class CodeGenerator:
             elif isinstance(d, ast.EnumDecl) and d.is_definition:
                 self._register_enum(d)
             elif (
-                isinstance(d, ast.VarDecl)
+                isinstance(d, (ast.VarDecl, _SynthLocalVar))
                 and isinstance(d.var_type, _ltypes.StructType)
                 and d.var_type.name
                 and d.var_type.members
@@ -657,7 +657,7 @@ class CodeGenerator:
                 # reference it (e.g. `struct U { struct S s[4]; };`).
                 self._resolve_struct_name(d.var_type)
             elif (
-                isinstance(d, ast.VarDecl)
+                isinstance(d, (ast.VarDecl, _SynthLocalVar))
                 and isinstance(d.var_type, _ltypes.EnumType)
                 and d.var_type.values
             ):
@@ -711,7 +711,7 @@ class CodeGenerator:
         # _start calls preserve their values.)
         self._noinit_globals: set[str] = set()
         for d in top_decls:
-            if isinstance(d, ast.VarDecl) and not isinstance(d.var_type, _ltypes.FunctionType):
+            if isinstance(d, (ast.VarDecl, _SynthLocalVar)) and not isinstance(d.var_type, _ltypes.FunctionType):
                 target = getattr(d, "alias_target", None)
                 if target is not None:
                     self._global_aliases[d.name] = target
@@ -758,7 +758,7 @@ class CodeGenerator:
             if (isinstance(d, ast.FunctionDef)
                     and getattr(d, "no_instrument_function", False)):
                 self._instrument_no_skip.add(d.name)
-            elif (isinstance(d, ast.VarDecl)
+            elif (isinstance(d, (ast.VarDecl, _SynthLocalVar))
                     and isinstance(d.var_type, _ltypes.FunctionType)
                     and getattr(d, "no_instrument_function", False)):
                 self._instrument_no_skip.add(d.name)
@@ -3196,7 +3196,7 @@ class CodeGenerator:
             inner_bound = {p.name for p in nested.params if p.name}
             inner_nested_names: set[str] = set()
             for sub in self._walk_ast(nested.body):
-                if isinstance(sub, ast.VarDecl):
+                if isinstance(sub, (ast.VarDecl, _SynthLocalVar)):
                     inner_bound.add(sub.name)
                 if (
                     isinstance(sub, ast.FunctionDef)
@@ -3437,7 +3437,7 @@ class CodeGenerator:
         # to exist before they run.
         has_any_vla = False
         for sub in self._walk_ast(fn.body):
-            if isinstance(sub, ast.VarDecl):
+            if isinstance(sub, (ast.VarDecl, _SynthLocalVar)):
                 vt = self._resolved_var_type(sub)
                 if (
                     isinstance(vt, _ltypes.ArrayType)
@@ -3771,7 +3771,7 @@ class CodeGenerator:
         # can be resolved transitively (resolve_inner unwraps the
         # TypeofType when found in flat_types).
         for sub in self._walk_ast(node):
-            if isinstance(sub, ast.VarDecl) and sub.var_type is not None:
+            if isinstance(sub, (ast.VarDecl, _SynthLocalVar)) and sub.var_type is not None:
                 flat_types[sub.name] = sub.var_type
 
         def resolve_inner(operand: ast.Expression) -> _ltypes.TypeNode | None:
@@ -3949,7 +3949,7 @@ class CodeGenerator:
         # recursing into the init expr, so the init can reference the
         # newly-declared name in the right scope (e.g. `int i = i;`
         # is technically valid C and reads the outer i).
-        if isinstance(node, ast.VarDecl):
+        if isinstance(node, (ast.VarDecl, _SynthLocalVar)):
             t = ctx.decl_types.get(id(node))
             if t is not None:
                 ctx.slots[-1][node.name] = 0
@@ -4325,19 +4325,12 @@ class CodeGenerator:
         nested-block redeclaration of an existing name raises.
         """
         # Auto-AST: ``T a, b, c;`` is one Declaration with N declarators.
-        # Expand to per-declarator legacy VarDecl-shaped objects and
-        # recurse so the original branch below handles each uniformly.
+        # Use the cached synth list so alloc_local's id(decl) key matches
+        # across pre-pass and emit walks.
         if isinstance(node, ast.Declaration):
-            storage = decl_storage_class(node.decl_specs)
-            if storage == "typedef":
+            if decl_storage_class(node.decl_specs) == "typedef":
                 return
-            from uc_core.ast import resolved_to_legacy
-            for nm, full, init, is_fn in iter_var_decls(node):
-                if nm is None:
-                    continue
-                legacy = resolved_to_legacy(full)
-                sv = _SynthLocalVar(name=nm, var_type=legacy, init=init,
-                                    storage_class=storage)
+            for sv in self._synth_vars_for(node):
                 self._collect_locals(sv, ctx)
             return
         if isinstance(node, (ast.VarDecl, _SynthLocalVar)):
@@ -8580,29 +8573,44 @@ class CodeGenerator:
     def _lower_declaration(self, decl, ctx: _FuncCtx) -> list[str]:
         """Lower an ``ast.Declaration`` to a series of per-declarator
         var-init operations, matching the legacy ``ast.VarDecl`` flow."""
-        from dataclasses import dataclass as _dc
-        @_dc
-        class _SynthVar:
-            name: str
-            var_type: object
-            init: object = None
-            storage_class: object = None
-            alignment: object = None
-            alias_target: object = None
-            no_instrument_function: bool = False
-            is_noinit: bool = False
         storage = decl_storage_class(decl.decl_specs)
         if storage == "typedef":
             return []
         out: list[str] = []
+        for sv in self._synth_vars_for(decl):
+            out += self._var_init(sv, ctx)
+        return out
+
+    def _synth_vars_for(self, decl) -> list:
+        """Return cached _SynthLocalVar list for ``decl``.
+
+        The codegen runs in two phases: a pre-pass (_collect_locals)
+        that calls ctx.alloc_local with the decl object, and an emit
+        pass that calls ctx.lookup later. alloc_local caches the slot
+        by id(decl), so both phases MUST see the same Python object —
+        which means we cache the synth vars keyed by id(decl) so the
+        same _SynthLocalVar instances are reused across walks.
+        """
+        cache = getattr(self, "_synth_var_cache", None)
+        if cache is None:
+            cache = {}
+            self._synth_var_cache = cache
+        key = id(decl)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
         from uc_core.ast import resolved_to_legacy
+        storage = decl_storage_class(decl.decl_specs)
+        out = []
         for name, full, init, is_fn in iter_var_decls(decl):
             if name is None or is_fn:
                 continue
             legacy_type = resolved_to_legacy(full)
-            sv = _SynthVar(name=name, var_type=legacy_type, init=init,
-                           storage_class=storage)
-            out += self._var_init(sv, ctx)
+            out.append(_SynthLocalVar(
+                name=name, var_type=legacy_type, init=init,
+                storage_class=storage,
+            ))
+        cache[key] = out
         return out
 
     def _item(self, item, ctx: _FuncCtx) -> list[str]:
@@ -12740,7 +12748,7 @@ class CodeGenerator:
             ctx.enter_scope()
             try:
                 for item in expr.body.items:
-                    if isinstance(item, ast.VarDecl) and id(item) in ctx.decl_disps:
+                    if isinstance(item, (ast.VarDecl, _SynthLocalVar)) and id(item) in ctx.decl_disps:
                         ctx.alloc_local(item.name, ctx.decl_types[id(item)], decl=item)
                 return self._type_of(trailing, ctx)
             finally:
