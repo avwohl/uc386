@@ -4448,6 +4448,19 @@ class CodeGenerator:
         # Use the cached synth list so alloc_local's id(decl) key matches
         # across pre-pass and emit walks.
         if isinstance(node, ast.Declaration):
+            # Inline struct/enum definitions (`struct S { ... };` or
+            # `struct S { ... } v;` inside a block) need their layout
+            # registered before any local that uses them — mirrors the
+            # top-level Declaration handling.
+            for spec in node.decl_specs or []:
+                if isinstance(spec, (ast.StructDef, ast.StructAnon)):
+                    from uc_core.ast import resolved_to_legacy
+                    from uc_core.codegen_helpers import _resolve_struct_spec
+                    st = resolved_to_legacy(_resolve_struct_spec(spec))
+                    if st is not None and (st.members or st.name):
+                        self._resolve_struct_name(st)
+                elif isinstance(spec, (ast.EnumDef, ast.EnumAnon)):
+                    self._register_enum_values_autoast(spec.values)
             if decl_storage_class(node.decl_specs) == "typedef":
                 return
             for sv in self._synth_vars_for(node):
@@ -5486,7 +5499,7 @@ class CodeGenerator:
                 # through `_const_eval` so things like
                 # `int : sizeof(int) * 8 - 2` work.
                 if isinstance(m.bit_width, ast.IntLiteral):
-                    width = m.bit_width.value
+                    width = int_value(m.bit_width)
                 else:
                     try:
                         width = self._const_eval(
@@ -12896,7 +12909,13 @@ class CodeGenerator:
             ctx.enter_scope()
             try:
                 for item in expr.body.items:
-                    if isinstance(item, (ast.VarDecl, _SynthLocalVar)) and id(item) in ctx.decl_disps:
+                    if isinstance(item, ast.Declaration):
+                        for sv in self._synth_vars_for(item):
+                            if id(sv) in ctx.decl_disps:
+                                ctx.alloc_local(
+                                    sv.name, ctx.decl_types[id(sv)], decl=sv,
+                                )
+                    elif isinstance(item, (ast.VarDecl, _SynthLocalVar)) and id(item) in ctx.decl_disps:
                         ctx.alloc_local(item.name, ctx.decl_types[id(item)], decl=item)
                 return self._type_of(trailing, ctx)
             finally:
