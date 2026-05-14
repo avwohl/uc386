@@ -12950,8 +12950,15 @@ class CodeGenerator:
         if isinstance(expr, ast.LabelAddr):
             return [f"        mov     eax, {self._label_addr_text(expr.label, ctx)}"]
         if isinstance(expr, ast.StringLiteral):
-            is_wide = getattr(expr, "is_wide", False)
-            label = self._intern_string(int_value(expr), is_wide=is_wide)
+            text = expr.value.text
+            label = self._intern_string(decode_string_literal(text),
+                                        is_wide=string_is_wide(text))
+            return [f"        mov     eax, {label}"]
+        if isinstance(expr, list) and expr and all(isinstance(p, ast.StringLiteral) for p in expr):
+            # Adjacent C string literals concat as a list of pieces.
+            decoded = "".join(decode_string_literal(p.value.text) for p in expr)
+            is_wide = any(string_is_wide(p.value.text) for p in expr)
+            label = self._intern_string(decoded, is_wide=is_wide)
             return [f"        mov     eax, {label}"]
         if isinstance(expr, ast.Identifier):
             return self._identifier_load(expr.name.text, ctx)
