@@ -14653,18 +14653,29 @@ class CodeGenerator:
                     return self._compound_assign_bitfield_ll(expr, bf, ctx)
                 return self._compound_assign_bitfield(expr, bf, ctx)
         # Non-Identifier lvalue: address-once via hidden snapshot slot.
+        # Compiler-generated names — if alloc_local would re-raise a
+        # redeclaration error here, fish the cached slot out instead.
+        # This path runs on both the collect-pass and the emit-pass
+        # walk; the second pass needs to get the slots that the first
+        # pass allocated, not a fresh allocation.
         addr_slot_name = f"__compll_addr_{id(expr)}"
         snap_slot_name = f"__compll_snap_{id(expr)}"
-        addr_disp = ctx.alloc_local(
-            addr_slot_name,
-            _ltypes.PointerType(base_type=_ltypes.BasicType(name="long long")),
-            size=4,
-        )
-        snap_disp = ctx.alloc_local(
-            snap_slot_name,
-            _ltypes.BasicType(name="long long"),
-            size=8,
-        )
+        if addr_slot_name in ctx.slots[-1]:
+            addr_disp = ctx.slots[-1][addr_slot_name]
+        else:
+            addr_disp = ctx.alloc_local(
+                addr_slot_name,
+                _ltypes.PointerType(base_type=_ltypes.BasicType(name="long long")),
+                size=4,
+            )
+        if snap_slot_name in ctx.slots[-1]:
+            snap_disp = ctx.slots[-1][snap_slot_name]
+        else:
+            snap_disp = ctx.alloc_local(
+                snap_slot_name,
+                _ltypes.BasicType(name="long long"),
+                size=8,
+            )
         out: list[str] = []
         # 1. Compute &lvalue once into addr_slot.
         if isinstance(expr.left, ast.Index):
