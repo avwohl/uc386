@@ -222,7 +222,39 @@ class _FuncCtx:
         # name in its scope without re-bumping frame_size.
         self.decl_disps: dict[int, int] = {}
         self.decl_types: dict[int, "_ltypes.TypeNode"] = {}
-        self.frame_size: int = 0          # bytes reserved by `sub esp, frame_size`
+        # Two-region stack layout:
+        #
+        #   EBP-4 .. EBP-call_temp_offset       — call temps (compound
+        #                                          literals, struct-return
+        #                                          buffers). Monotonic;
+        #                                          slots live for the
+        #                                          whole function so
+        #                                          their addresses can be
+        #                                          taken / passed by ref.
+        #
+        #   EBP-(call_temp_offset+4) .. EBP-(call_temp_offset+max_frame_size)
+        #                                       — block-scope locals.
+        #                                          Scope-aware: exit_scope
+        #                                          reclaims slots so
+        #                                          mutually-exclusive
+        #                                          sibling scopes (switch
+        #                                          cases) reuse the same
+        #                                          slots. Critical for
+        #                                          axtls's x509_new whose
+        #                                          digest-switch otherwise
+        #                                          allocated all 5
+        #                                          SHA_CTX side-by-side
+        #                                          (1.9 KB frame, blew
+        #                                          past PMODE/W's INT 21h
+        #                                          deep-stack threshold).
+        self.call_temp_offset: int = 0    # monotonic; total bytes used by alloc_call_temp
+        self.frame_size: int = 0          # current per-path bytes used by alloc_local
+        self.max_frame_size: int = 0      # high-water across all paths
+        # Stack of frame_size values captured at each enter_scope. On
+        # exit_scope we pop and restore so locals declared inside a
+        # nested scope have their slots reclaimed for the next sibling
+        # scope's allocations.
+        self._scope_frame_sizes: list[int] = []
         self._next_label: int = 0
         # Stack of (continue_target, break_target) for the enclosing loops.
         # Stack of jump targets for control-flow keywords. Loops push to
@@ -311,6 +343,9 @@ class _FuncCtx:
     def enter_scope(self) -> None:
         self.slots.append({})
         self.types.append({})
+        # Snapshot frame_size so exit_scope can reclaim space allocated
+        # by this scope's locals for the next sibling scope.
+        self._scope_frame_sizes.append(self.frame_size)
         # `_struct_aliases` lives on the CodeGenerator, not on the
         # _FuncCtx — `_codegen_ref` is wired by `_function` so this
         # method can keep the per-block scope chains in sync.
@@ -320,6 +355,15 @@ class _FuncCtx:
     def exit_scope(self) -> None:
         self.slots.pop()
         self.types.pop()
+        # Restore frame_size to the value at enter_scope. max_frame_size
+        # keeps the high-water mark; the prologue uses that. This lets
+        # mutually-exclusive sibling scopes (e.g. switch cases) share
+        # the same stack slots — critical for functions like axtls's
+        # x509_new whose switch over digest type would otherwise
+        # allocate SHA{1,256,384,512}_CTX side-by-side and balloon the
+        # frame to ~2 KB.
+        if self._scope_frame_sizes:
+            self.frame_size = self._scope_frame_sizes.pop()
         if self._codegen_ref is not None:
             self._codegen_ref._struct_aliases.pop()
 
@@ -343,8 +387,12 @@ class _FuncCtx:
             return disp
         if name in self.slots[-1]:
             raise CodegenError(f"redeclaration of `{name}` in same scope")
-        # Each local sits at the next 4-byte slot below EBP.
+        # Locals occupy the region closest to EBP. alloc_call_temp
+        # runs AFTER _collect_locals in _function, so by the time
+        # call temps are placed the locals' max_frame_size is fixed.
         self.frame_size += size
+        if self.frame_size > self.max_frame_size:
+            self.max_frame_size = self.frame_size
         disp = -self.frame_size
         self.slots[-1][name] = disp
         self.types[-1][name] = ty
@@ -354,9 +402,12 @@ class _FuncCtx:
         return disp
 
     def alloc_call_temp(self, call_node: object, size: int) -> int:
-        """Reserve a frame slot for a struct-returning call's destination."""
-        self.frame_size += size
-        disp = -self.frame_size
+        """Reserve a frame slot for a struct-returning call's destination
+        or compound-literal temp. Placed BELOW the locals region (i.e.
+        further from EBP), so the locals' scope-aware slot reuse
+        doesn't disturb addresses that get baked into emitted code."""
+        self.call_temp_offset += size
+        disp = -(self.max_frame_size + self.call_temp_offset)
         self.call_temps[id(call_node)] = disp
         return disp
 
@@ -3783,8 +3834,11 @@ class CodeGenerator:
             or isinstance(rt, _ltypes.ArrayType)  # vectors
             or (isinstance(rt, _ltypes.BasicType) and rt.name == "int128")
         )
+        # Total stack reservation = call-temp region (function-scope) +
+        # locals high-water (block-scope reuse).
+        total_frame = ctx.call_temp_offset + ctx.max_frame_size
         skip_frame = (
-            ctx.frame_size == 0
+            total_frame == 0
             and not ctx.has_vla
             and len(fn.params) == 0
             and ctx.trampoline_static_link_disp is None
@@ -3795,8 +3849,8 @@ class CodeGenerator:
         if not skip_frame:
             out.append("        push    ebp")
             out.append("        mov     ebp, esp")
-            if ctx.frame_size:
-                out.append(f"        sub     esp, {ctx.frame_size}")
+            if total_frame:
+                out.append(f"        sub     esp, {total_frame}")
         # Lifted nested fn with nonlocal gotos: ECX was set by the
         # trampoline (or direct caller) to the address of our outer's
         # buf-array. Save it into the static-link slot before any code
