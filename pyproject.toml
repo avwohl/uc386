@@ -11,6 +11,7 @@ license = "GPL-3.0-or-later"
 requires-python = ">=3.10"
 dependencies = [
     "uc_core>=0.3.6",
+    "uplox>=3.1.0",
 ]
 authors = [
     {name = "uc386 developers"}
