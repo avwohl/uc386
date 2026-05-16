@@ -172,6 +172,7 @@ Via [dosemu](https://github.com/avwohl/dosemu) or similar.
 - [uc_core](https://github.com/avwohl/uc_core) - Shared C23 frontend and AST optimizer used by uc80 and uc386
 - [um80_and_friends](https://github.com/avwohl/um80_and_friends) - Microsoft MACRO-80 compatible toolchain for Linux: assembler, linker, librarian, disassembler (the Z80 analogue of what uc386 needs for i386)
 - [upeepz80](https://github.com/avwohl/upeepz80) - Z80 peephole optimizer (template for an eventual upeep386)
+- [uplox](https://github.com/avwohl/uplox) - Parser/lexer-table generator that produces uc_core's C23 frontend (from `examples/c23.uplox`)
 
 ## License
 
