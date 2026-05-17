@@ -4376,10 +4376,35 @@ class CodeGenerator:
                 t.param_types = [_resolve_tn(p) for p in t.param_types]
             return t
 
-        for sub in self._walk_ast(node):
-            if isinstance(sub, ast.TypesCompatibleP):
-                sub.t1 = _resolve_tn(_to_legacy_type(sub.t1))
-                sub.t2 = _resolve_tn(_to_legacy_type(sub.t2))
+        # Total walk: `_walk_ast` follows the expression/statement
+        # tree but does NOT descend into type sub-trees, and git's
+        # real BARF_* macros bury `__builtin_types_compatible_p`
+        # inside `sizeof(char[1 - 2*!(tcp)])` — i.e. an array
+        # *dimension* in TYPE position. Recurse every dataclass
+        # field / list / tuple so no TypesCompatibleP is missed,
+        # wherever it sits.
+        import dataclasses as _dc
+        seen_ids: set[int] = set()
+
+        def _walk_all(n):
+            if n is None or isinstance(n, (str, bytes, int, float, bool)):
+                return
+            if isinstance(n, (list, tuple)):
+                for it in n:
+                    _walk_all(it)
+                return
+            if not _dc.is_dataclass(n):
+                return
+            if id(n) in seen_ids:
+                return
+            seen_ids.add(id(n))
+            if isinstance(n, ast.TypesCompatibleP):
+                n.t1 = _resolve_tn(_to_legacy_type(n.t1))
+                n.t2 = _resolve_tn(_to_legacy_type(n.t2))
+            for f in _dc.fields(n):
+                _walk_all(getattr(n, f.name, None))
+
+        _walk_all(node)
 
     def _collect_call_temps(self, node, ctx: _FuncCtx) -> None:
         """Pre-allocate a frame slot for every struct-returning Call and
