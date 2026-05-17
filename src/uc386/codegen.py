@@ -4348,6 +4348,33 @@ class CodeGenerator:
                                    _ltypes.PointerType)):
                     return at.base_type
                 return _fallback(e)
+            if isinstance(e, ast.BinaryOp):
+                bop = _opt(e)
+                if bop in ("+", "-"):
+                    # Pointer arithmetic: `p + i` / `p - i` keeps the
+                    # pointer operand's type; an array operand decays
+                    # to a pointer to its element. `p - q` (both
+                    # pointers) is integral — leave it to _fallback.
+                    lt = _oper_ty(e.left)
+                    rt = _oper_ty(e.right)
+                    l_ptr = isinstance(
+                        lt, (_ltypes.PointerType, _ltypes.ArrayType))
+                    r_ptr = isinstance(
+                        rt, (_ltypes.PointerType, _ltypes.ArrayType))
+                    if bop == "-" and l_ptr and r_ptr:
+                        return _fallback(e)
+                    if l_ptr:
+                        return lt \
+                            if isinstance(lt, _ltypes.PointerType) \
+                            else _ltypes.PointerType(
+                                base_type=lt.base_type)
+                    if r_ptr:
+                        return rt \
+                            if isinstance(rt, _ltypes.PointerType) \
+                            else _ltypes.PointerType(
+                                base_type=rt.base_type)
+                    return lt if lt is not None else _fallback(e)
+                return _fallback(e)
             if isinstance(e, (ast.Member, ast.ArrowMember)):
                 ot = _oper_ty(e.obj)
                 if isinstance(e, ast.ArrowMember) and \
