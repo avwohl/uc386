@@ -93,6 +93,12 @@ class Result:
     # every read, simulating a monotonic clock; user code that uses
     # `time.ticks_ms()` / `sleep_ms` exercises this counter.
     _bios_tick: int = 0
+    # Final virtual filesystem state: files the program created/wrote
+    # (path bytes -> contents) and directories it mkdir'd. Lets a test
+    # assert on what a program produced on disk (e.g. `git init`'s
+    # .git/* tree), not just its stdout.
+    vfiles: dict = field(default_factory=dict)
+    vdirs: set = field(default_factory=set)
 
 
 def _read_cstr(uc: Uc, addr: int, max_len: int = 4096, term: bytes = b"\x00") -> bytes:
@@ -107,6 +113,53 @@ def _read_cstr(uc: Uc, addr: int, max_len: int = 4096, term: bytes = b"\x00") ->
     return out
 
 
+# --- DOS 8.3 path policy (see `fs_mode` in run()) -------------------------
+# DOS chars that are illegal in an 8.3 name even on a real FAT volume.
+_DOS83_BAD = set(b'"/\\[]:;|=,<>+ ') | {c for c in range(0x20)}
+
+
+def _is_dos83_component(comp: bytes, *, allow_wild: bool = False) -> bool:
+    """True iff `comp` is a legal DOS 8.3 filename component.
+
+    Enforces the rules git's layout violates on a real FAT/FreeDOS
+    volume *without* an LFN provider: no leading dot (`.git`,
+    `.gitignore`), <=8 char base, <=3 char extension, at most one
+    dot, no illegal chars. `allow_wild` permits `*`/`?` (find-first
+    masks). `.`/`..` are handled by the caller and never reach here.
+    """
+    if not comp or comp in (b".", b".."):
+        return True
+    if comp[:1] == b".":          # leading dot — the `.git` case
+        return False
+    bad = _DOS83_BAD - ({ord("*"), ord("?")} if allow_wild else set())
+    if any(ch in bad for ch in comp):
+        return False
+    if comp.count(b".") > 1:
+        return False
+    if b"." in comp:
+        base, ext = comp.split(b".", 1)
+    else:
+        base, ext = comp, b""
+    if not (1 <= len(base) <= 8) or len(ext) > 3:
+        return False
+    return True
+
+
+def _is_dos83_path(path: bytes, *, allow_wild: bool = False) -> bool:
+    """True iff every component of `path` is legal DOS 8.3.
+
+    Strips an optional `X:` drive prefix; splits on both `/` and
+    `\\`; empty components (leading/duplicate separators) are skipped.
+    """
+    p = path
+    if len(p) >= 2 and p[1:2] == b":":   # drop drive letter
+        p = p[2:]
+    parts = p.replace(b"\\", b"/").split(b"/")
+    return all(
+        _is_dos83_component(c, allow_wild=allow_wild) for c in parts
+    )
+
+
 def run(
     binary: bytes | Path,
     *,
@@ -118,6 +171,7 @@ def run(
     program_path: str | None = None,
     vfiles_init: dict[bytes, bytes] | None = None,
     net=None,
+    fs_mode: str = "lenient",
 ) -> Result:
     """Emulate a flat-binary i386 program; return its stdout + exit code.
 
@@ -137,6 +191,18 @@ def run(
     INT 0x83 packet-driver calls (lib/i386_dos_libc.asm:`ethdrv_*`)
     are routed to it. Without one, INT 0x83 returns AL=1 (error) so
     `ethdrv_init` cleanly fails and the program can detect "no NIC".
+
+    `fs_mode` selects the virtual-FS path policy:
+      - "lenient" (default): paths are used verbatim as vfs keys
+        (long/dotted names work — current behavior, unchanged).
+      - "strict83": the *legacy* INT 21h file API (open/create/
+        mkdir/rmdir/delete/rename/find-first) rejects any path
+        with a non-8.3 component (leading dot, >8 base, >3 ext,
+        >1 dot, illegal chars) by signalling a DOS error — the way
+        a real FreeDOS volume *without* an LFN provider behaves.
+        The DOSLFN INT 21h AX=71xx API still accepts long names,
+        so software that calls LFN works under "strict83" exactly
+        as it would on FreeDOS with DOSLFN loaded.
     """
     if not _UNICORN_AVAILABLE:
         raise RuntimeError(
@@ -286,6 +352,12 @@ def run(
     # DTA address (set by INT 21h AH=0x1A); used by find-first/
     # find-next to write filename matches into the caller's buffer.
     vdta_addr = [0]
+    # DOSLFN (INT 21h AX=71xx) find-handle table: handle -> remaining
+    # [(name_bytes, is_dir), ...]. Independent of the legacy DTA so
+    # LFN and short-name enumeration don't clobber each other (real
+    # DOSLFN uses search handles, not the DTA).
+    vlfn_find: dict[int, list] = {}
+    next_lfn_handle = [1]
     # INT 21h AH=0x4B (EXEC) → AH=0x4D (Get Return Code) handoff: the
     # child process's exit code gets stashed by the EXEC handler and
     # returned by the next AH=0x4D call.
@@ -400,6 +472,68 @@ def run(
             out += b
             addr += 1
         return out
+
+    # Active path policy. The legacy file API routes path reads
+    # through `_dos_path`; the DOSLFN AX=71xx API passes lfn=True
+    # to bypass the 8.3 gate (faithful to FreeDOS+DOSLFN, where
+    # both APIs see the same files but only LFN accepts long names).
+    _fs_mode = fs_mode if fs_mode in ("lenient", "strict83") else "lenient"
+
+    def _dos_path(addr: int, *, lfn: bool = False,
+                  allow_wild: bool = False) -> tuple[bytes, bool]:
+        """Read an ASCIZ path at `addr`; apply the active fs policy.
+
+        Returns ``(name, ok)``. When ``ok`` is False the caller must
+        signal a DOS error (fd=-1 / CF set) — this is how "strict83"
+        models a real FreeDOS volume rejecting a non-8.3 name on the
+        short-name API. The vfs key is always the verbatim path, so
+        a long name created via LFN is read back by either API.
+        """
+        raw = bytes(_read_cstr_local(addr))
+        if lfn or _fs_mode == "lenient":
+            return raw, True
+        return raw, _is_dos83_path(raw, allow_wild=allow_wild)
+
+    def _find_candidates(mask: str) -> list:
+        """Match `mask` against the flat vfs; return
+        ``[(name_bytes, is_dir), ...]``. Shared by the legacy DTA
+        find-first (AH=0x4E/0x4F) and DOSLFN find (AX=714E/714F) so
+        both APIs enumerate identically — the only difference is the
+        result buffer layout, not which entries are seen."""
+        def _m(name: str) -> bool:
+            if mask in ("*", "*.*"):
+                return True
+            if mask.startswith("*.") and "." in mask:
+                return name.lower().endswith("." + mask[2:].lower())
+            if mask.endswith("\\*.*") or mask.endswith("/*.*"):
+                return True
+            return name.lower() == mask.lower()
+        out = []
+        for fname in vfiles:
+            if _m(fname.decode("ascii", errors="replace")):
+                out.append((fname, False))
+        for dname in vdirs:
+            if _m(dname.decode("ascii", errors="replace")):
+                out.append((dname, True))
+        return out
+
+    def _lfn_write_find_data(addr: int, ent: tuple) -> None:
+        """Fill a WIN32_FIND_DATA at `addr` for DOSLFN AX=714E/714F.
+        Layout: +0x00 dwFileAttributes, +0x1C/+0x20 size hi/lo,
+        +0x2C cFileName[260] (ASCIZ long name), +0x130
+        cAlternateFileName[14]. We emit the verbatim vfs key as the
+        long name (the flat vfs has no directory tree; the port's
+        LFN readdir handles full-path names exactly as the M4
+        legacy dirent did)."""
+        name, is_dir = ent
+        attr = 0x10 if is_dir else 0x20
+        size = 0 if is_dir else len(vfiles.get(name, b""))
+        mu.mem_write(addr, b"\x00" * 0x13E)          # clear struct
+        mu.mem_write(addr + 0x00, struct.pack("<I", attr))
+        mu.mem_write(addr + 0x1C, struct.pack("<I", 0))          # hi
+        mu.mem_write(addr + 0x20, struct.pack("<I", size & 0xFFFFFFFF))
+        nm = name[:259]
+        mu.mem_write(addr + 0x2C, nm + b"\x00")
 
     def _printf_format(fmt: bytes, va_ptr: int) -> bytes:
         """Python-side printf formatter. Reads varargs from emulator
@@ -935,6 +1069,160 @@ def run(
             res.error = f"unexpected interrupt {intno:#x}"
             uc.emu_stop()
             return
+        if ah == 0x71:
+            # ---- DOSLFN: INT 21h AX=71xx long-filename API --------
+            # Faithful to the real DOSLFN / Win9x register contract
+            # so the port's LFN backend is real-FreeDOS-portable
+            # (DOSLFN on metal). Pointers are flat-32 linear — same
+            # convention the legacy handlers use (DS:EDX == EDX);
+            # this emulator has no real segmentation. Every LFN call
+            # passes lfn=True to `_dos_path`, so it is exactly the
+            # API that fs_mode="strict83" does NOT gate: it models
+            # the LFN provider that lets long names work on FreeDOS.
+            ebx = uc.reg_read(UC_X86_REG_EBX)
+            ecx = uc.reg_read(UC_X86_REG_ECX)
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            esi = uc.reg_read(UC_X86_REG_ESI)
+            edi = uc.reg_read(UC_X86_REG_EDI)
+
+            def _lfn_ok(ax_val: int | None = None) -> None:
+                uc.reg_write(UC_X86_REG_EFLAGS,
+                             uc.reg_read(UC_X86_REG_EFLAGS) & ~1)
+                if ax_val is not None:
+                    uc.reg_write(UC_X86_REG_EAX,
+                                 (eax & ~0xFFFF) | (ax_val & 0xFFFF))
+
+            def _lfn_err(code: int = 0x02) -> None:
+                uc.reg_write(UC_X86_REG_EFLAGS,
+                             uc.reg_read(UC_X86_REG_EFLAGS) | 1)
+                uc.reg_write(UC_X86_REG_EAX,
+                             (eax & ~0xFFFF) | (code & 0xFFFF))
+
+            if al == 0xA0:
+                # Get Volume Information — the capability probe.
+                # ES:DI=fsname buf, CX=buflen. BX bit14 = LFN
+                # supported; CX=max component; DX=max path.
+                if ecx and edi:
+                    fsname = b"uc386vfs"
+                    uc.mem_write(edi, fsname[:max(ecx - 1, 0)] + b"\x00")
+                uc.reg_write(UC_X86_REG_EBX, (ebx & ~0xFFFF) | 0x4000)
+                uc.reg_write(UC_X86_REG_ECX, (ecx & ~0xFFFF) | 255)
+                uc.reg_write(UC_X86_REG_EDX, (edx & ~0xFFFF) | 260)
+                _lfn_ok()
+                return
+            if al in (0x39, 0x3A):
+                # Make / Remove directory. DS:DX = ASCIZ path.
+                name, _ = _dos_path(edx, lfn=True)
+                if al == 0x39:
+                    if name in vdirs or name in vfiles:
+                        _lfn_err(0x05)
+                    else:
+                        vdirs.add(name)
+                        _lfn_ok()
+                else:
+                    if name in vdirs:
+                        vdirs.discard(name)
+                        _lfn_ok()
+                    else:
+                        _lfn_err(0x03)
+                return
+            if al == 0x41:
+                # Delete File. DS:DX = ASCIZ.
+                name, _ = _dos_path(edx, lfn=True)
+                _lfn_ok() if _vfile_delete(name) == 0 else _lfn_err(0x02)
+                return
+            if al == 0x43:
+                # Get/Set file attributes. BL=0 get / 1 set.
+                # DS:DX=ASCIZ. The port's stat needs exists + dirbit.
+                name, _ = _dos_path(edx, lfn=True)
+                if (ebx & 0xFF) == 0:
+                    if name in vdirs:
+                        attr = 0x10
+                    elif name in vfiles:
+                        attr = 0x20
+                    else:
+                        _lfn_err(0x02)
+                        return
+                    uc.reg_write(UC_X86_REG_ECX,
+                                 (ecx & ~0xFFFF) | attr)
+                    _lfn_ok()
+                else:
+                    if name in vdirs or name in vfiles:
+                        _lfn_ok()
+                    else:
+                        _lfn_err(0x02)
+                return
+            if al == 0x6C:
+                # Extended Open/Create. DS:SI=name, BX=open mode
+                # (bits0-2 access 0=r/1=w/2=rw), CX=attr, DX=action
+                # (0x01 open/0x02 trunc/0x10 create). Returns
+                # AX=handle, CX=action taken (1 opened/2 created/
+                # 3 truncated).
+                name, _ = _dos_path(esi, lfn=True)
+                access = ebx & 0x7
+                act = edx & 0xFFFF
+                exists = name in vfiles
+                if access == 0:
+                    fd = _vfile_open(name, "r")
+                    taken = 1
+                else:
+                    fd = _vfile_open(name, "w")
+                    taken = 2 if not exists else 3
+                if fd < 0:
+                    _lfn_err(0x02)
+                else:
+                    uc.reg_write(UC_X86_REG_ECX,
+                                 (ecx & ~0xFFFF) | taken)
+                    _lfn_ok(fd)
+                return
+            if al == 0x56:
+                # Rename. DS:DX = old, ES:DI = new.
+                old, _ = _dos_path(edx, lfn=True)
+                new, _ = _dos_path(edi, lfn=True)
+                if old in vfiles:
+                    vfiles[new] = vfiles.pop(old)
+                    _lfn_ok()
+                elif old in vdirs:
+                    vdirs.discard(old)
+                    vdirs.add(new)
+                    _lfn_ok()
+                else:
+                    _lfn_err(0x02)
+                return
+            if al == 0x4E:
+                # Find First. DS:DX=pattern, ES:DI=WIN32_FIND_DATA.
+                # Returns AX=search handle; CF + AX=12h on no match.
+                pat, _ = _dos_path(edx, lfn=True)
+                entries = _find_candidates(
+                    pat.decode("ascii", errors="replace"))
+                if not entries:
+                    _lfn_err(0x12)
+                    return
+                h = next_lfn_handle[0]
+                next_lfn_handle[0] += 1
+                vlfn_find[h] = entries[1:]
+                _lfn_write_find_data(edi, entries[0])
+                uc.reg_write(UC_X86_REG_ECX, ecx & ~0xFFFF)
+                _lfn_ok(h)
+                return
+            if al == 0x4F:
+                # Find Next. BX=handle, ES:DI=WIN32_FIND_DATA.
+                lst = vlfn_find.get(ebx & 0xFFFF)
+                if not lst:
+                    _lfn_err(0x12)
+                    return
+                _lfn_write_find_data(edi, lst.pop(0))
+                _lfn_ok()
+                return
+            if al == 0xA1:
+                # Find Close. BX=handle.
+                vlfn_find.pop(ebx & 0xFFFF, None)
+                _lfn_ok()
+                return
+            # Unimplemented LFN subfunction → report "function not
+            # supported" so the port's probe falls back to legacy.
+            _lfn_err(0x7100)
+            return
         if ah == 0x5C:
             # sprintf via harness: EBX=buf, ECX=fmt, EDX=va_ptr
             ebx = uc.reg_read(UC_X86_REG_EBX)
@@ -1126,30 +1414,15 @@ def run(
             # attr, +30 8.3 filename + NUL); CF clear.
             # On no match: CF set.
             edx = uc.reg_read(UC_X86_REG_EDX)
-            mask = bytes(_read_cstr_local(edx)).decode("ascii",
-                                                       errors="replace")
-            # Build candidate list from vfiles + vdirs. Match
-            # the mask trivially — support "*", "*.*", "*.ext",
-            # and exact names.
-            def _match(name: str) -> bool:
-                if mask in ("*", "*.*"):
-                    return True
-                if mask.startswith("*.") and "." in mask:
-                    ext = mask[2:].lower()
-                    return name.lower().endswith("." + ext)
-                # Strip trailing "\*.*" — caller wants dir contents.
-                if mask.endswith("\\*.*") or mask.endswith("/*.*"):
-                    return True
-                return name.lower() == mask.lower()
-            entries = []
-            for fname, _content in vfiles.items():
-                n = fname.decode("ascii", errors="replace")
-                if _match(n):
-                    entries.append((fname, False))
-            for dname in vdirs:
-                n = dname.decode("ascii", errors="replace")
-                if _match(n):
-                    entries.append((dname, True))
+            _mask_raw, _ok = _dos_path(edx, allow_wild=True)
+            if not _ok:
+                # strict83: the legacy find-first cannot enumerate a
+                # directory whose path has a non-8.3 component.
+                eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
+                return
+            mask = _mask_raw.decode("ascii", errors="replace")
+            entries = _find_candidates(mask)
             eflags = uc.reg_read(UC_X86_REG_EFLAGS)
             if not entries:
                 uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
@@ -1182,8 +1455,11 @@ def run(
         if ah == 0x39:
             # mkdir(path): DS:EDX=path. Set CF on error.
             edx = uc.reg_read(UC_X86_REG_EDX)
-            name = bytes(_read_cstr_local(edx))
+            name, _ok = _dos_path(edx)
             eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            if not _ok:
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
+                return
             if name in vdirs or name in vfiles:
                 # Already exists — error.
                 uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
@@ -1194,9 +1470,9 @@ def run(
         if ah == 0x3A:
             # rmdir(path): DS:EDX=path. Set CF on error.
             edx = uc.reg_read(UC_X86_REG_EDX)
-            name = bytes(_read_cstr_local(edx))
+            name, _ok = _dos_path(edx)
             eflags = uc.reg_read(UC_X86_REG_EFLAGS)
-            if name in vdirs:
+            if _ok and name in vdirs:
                 vdirs.discard(name)
                 uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
             else:
@@ -1205,9 +1481,9 @@ def run(
         if ah == 0x3B:
             # chdir(path): DS:EDX=path. Set CF on error.
             edx = uc.reg_read(UC_X86_REG_EDX)
-            name = bytes(_read_cstr_local(edx))
+            name, _ok = _dos_path(edx)
             eflags = uc.reg_read(UC_X86_REG_EFLAGS)
-            if name in vdirs or name == b"." or name == b"..":
+            if _ok and (name in vdirs or name == b"." or name == b".."):
                 # Trivial cwd update — store the requested path
                 # verbatim with a "C:\" prefix if it isn't drive-
                 # qualified yet.
@@ -1222,8 +1498,8 @@ def run(
         if ah == 0x3C:
             # creat(name, mode): create or truncate. DS:EDX=name. Returns fd.
             edx = uc.reg_read(UC_X86_REG_EDX)
-            name = bytes(_read_cstr_local(edx))
-            fd = _vfile_open(name, "w")
+            name, _ok = _dos_path(edx)
+            fd = _vfile_open(name, "w") if _ok else -1
             new_eax = (eax & ~0xFFFFFFFF) | (fd & 0xFFFFFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
             return
@@ -1231,9 +1507,11 @@ def run(
             # open(name, mode): DS:EDX=name, AL=mode (0=r, 1=w, 2=rw).
             # We support 0 (read) and 1/2 (write — truncate).
             edx = uc.reg_read(UC_X86_REG_EDX)
-            name = bytes(_read_cstr_local(edx))
+            name, _ok = _dos_path(edx)
             mode_byte = al
-            if mode_byte == 0:
+            if not _ok:
+                fd = -1
+            elif mode_byte == 0:
                 fd = _vfile_open(name, "r")
             elif mode_byte in (1, 2):
                 fd = _vfile_open(name, "w")
@@ -1258,8 +1536,8 @@ def run(
         if ah == 0x41:
             # unlink(name): DS:EDX=name. Returns 0 on success, -1 on error.
             edx = uc.reg_read(UC_X86_REG_EDX)
-            name = bytes(_read_cstr_local(edx))
-            rc = _vfile_delete(name)
+            name, _ok = _dos_path(edx)
+            rc = _vfile_delete(name) if _ok else -1
             new_eax = (eax & ~0xFFFFFFFF) | (rc & 0xFFFFFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
             return
@@ -1320,9 +1598,12 @@ def run(
             # rename(old, new): DS:EDX=old, ES:EDI=new. Set CF on error.
             edx = uc.reg_read(UC_X86_REG_EDX)
             edi = uc.reg_read(UC_X86_REG_EDI)
-            old_name = bytes(_read_cstr_local(edx))
-            new_name = bytes(_read_cstr_local(edi))
+            old_name, _ok1 = _dos_path(edx)
+            new_name, _ok2 = _dos_path(edi)
             eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            if not (_ok1 and _ok2):
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
+                return
             if old_name in vfiles:
                 vfiles[new_name] = vfiles.pop(old_name)
                 uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
@@ -1427,14 +1708,18 @@ def run(
             # right vfile mode.
             edx = uc.reg_read(UC_X86_REG_EDX)
             ecx = uc.reg_read(UC_X86_REG_ECX)
-            name = bytes(_read_cstr_local(edx))
+            name, _ok = _dos_path(edx)
             flags = ecx & 0xFFFFFFFF
             O_WRONLY = 1
             O_RDWR = 2
             O_CREAT = 0o100
             O_TRUNC = 0o1000
             O_APPEND = 0o2000
-            if flags & O_TRUNC:
+            if not _ok:
+                # strict83: a non-8.3 path is invisible to the legacy
+                # short-name open (this is the libc `_open` path).
+                mode = None
+            elif flags & O_TRUNC:
                 mode = "w"
             elif flags & O_APPEND:
                 mode = "a"
@@ -1444,7 +1729,7 @@ def run(
                 mode = "w"
             else:
                 mode = "r"
-            fd = _vfile_open(name, mode)
+            fd = _vfile_open(name, mode) if mode is not None else -1
             new_eax = (eax & ~0xFFFFFFFF) | (fd & 0xFFFFFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
             return
@@ -1747,9 +2032,11 @@ def run(
             # open(name, mode). Path is DS:DX in real-mode; the bounce
             # buffer that holds the path lives at linear ds_linear.
             name_linear = ds_linear + (edx & 0xFFFF)
-            name = bytes(_read_cstr_local(name_linear))
+            name, _ok = _dos_path(name_linear)
             mode_byte = eax & 0xFF
-            if mode_byte == 0:
+            if not _ok:
+                fd = -1
+            elif mode_byte == 0:
                 fd = _vfile_open(name, "r")
             elif mode_byte in (1, 2):
                 fd = _vfile_open(name, "w")
@@ -1847,6 +2134,8 @@ def run(
             res.timed_out = True
         else:
             res.exit_code = 0
+    res.vfiles = {k: bytes(v) for k, v in vfiles.items()}
+    res.vdirs = set(vdirs)
     return res
 
 

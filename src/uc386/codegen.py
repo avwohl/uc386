@@ -1048,7 +1048,18 @@ class CodeGenerator:
         self._lifted_outer_fn: dict[str, str] = {}
         while self._pending_functions:
             fn = self._pending_functions.pop(0)
-            function_blocks.append(self._function(fn))
+            try:
+                function_blocks.append(self._function(fn))
+            except CodegenError as e:
+                # Annotate with the function under emission — a bare
+                # CodegenError mid-body otherwise gives no locus, which
+                # is unusable on a 60-TU whole-program build.
+                if not getattr(e, "_fn_annotated", False):
+                    msg = f"in function `{fn.name}`: {e.args[0] if e.args else e}"
+                    new = CodegenError(msg)
+                    new._fn_annotated = True
+                    raise new from e
+                raise
         # Now we know what externs the body referenced; merge in
         # auto-collected externs (malloc/free for VLAs, etc.) before
         # building the header.
@@ -2392,12 +2403,21 @@ class CodeGenerator:
                 out.append(v)
                 i += 1
                 continue
-            # When elem_type is a `char[]` directly, a StringLiteral is
+            # When elem_type is a `char[]` directly, a string literal is
             # a complete initializer; don't elision-wrap it. (`{"str"}`
             # initializing struct{char[N]} still gets wrapped below
-            # because the elem there is the struct, not char[].)
+            # because the elem there is the struct, not char[].) The
+            # auto-AST hands a string-literal initializer as either a
+            # bare StringLiteral or a (1+ element, adjacent-literal)
+            # Python list of StringLiteral — accept both, so e.g.
+            # `char rows[][N] = { "a", "b" }` keeps each row whole.
+            is_str_init = isinstance(v, ast.StringLiteral) or (
+                isinstance(v, list)
+                and v
+                and all(isinstance(p, ast.StringLiteral) for p in v)
+            )
             if (
-                isinstance(v, ast.StringLiteral)
+                is_str_init
                 and isinstance(elem_type, _ltypes.ArrayType)
                 and isinstance(elem_type.base_type, _ltypes.BasicType)
                 and elem_type.base_type.name == "char"
@@ -2472,19 +2492,32 @@ class CodeGenerator:
         # — the outer brace wraps a single string literal, which is the
         # idiomatic way period code initializes char arrays from string
         # constants. C lets you elide the braces entirely; treat them as
-        # equivalent.
+        # equivalent. The single element may also be a Python list of
+        # adjacent StringLiteral pieces (`{ "a" "\0" "b" }`, glibc's
+        # __re_error_msgid idiom) — concatenate them.
         if (
             isinstance(elem_type, _ltypes.BasicType)
             and elem_type.name == "char"
             and isinstance(init, ast.InitializerList)
             and len(init.values) == 1
-            and isinstance(init.values[0], ast.StringLiteral)
         ):
             inner = init.values[0]
-            init = _DecodedString(
-                value=decode_string_literal(inner.value.text),
-                is_wide=string_is_wide(inner.value.text),
-            )
+            if isinstance(inner, ast.StringLiteral):
+                init = _DecodedString(
+                    value=decode_string_literal(inner.value.text),
+                    is_wide=string_is_wide(inner.value.text),
+                )
+            elif (
+                isinstance(inner, list)
+                and inner
+                and all(isinstance(p, ast.StringLiteral) for p in inner)
+            ):
+                init = _DecodedString(
+                    value="".join(
+                        decode_string_literal(p.value.text) for p in inner
+                    ),
+                    is_wide=any(string_is_wide(p.value.text) for p in inner),
+                )
         # Flexible array member or `int arr[] = {...};` — derive length
         # from the initializer. With designators, length is
         # max(designated_index) + 1.
@@ -5177,15 +5210,66 @@ class CodeGenerator:
         if getattr(decl, "storage_class", None) == "extern":
             return t
         if isinstance(decl.init, ast.InitializerList):
+            # `char x[] = { "a" "\0" "b" };` (glibc's __re_error_msgid)
+            # or `char x[] = { "str" }`: a single brace-wrapped string
+            # initializer for a char array. Size is the concatenated
+            # decoded byte count plus the trailing NUL — same as the
+            # un-braced `char x[] = "str"` form below.
+            if (
+                isinstance(t.base_type, _ltypes.BasicType)
+                and t.base_type.name == "char"
+                and len(decl.init.values) == 1
+            ):
+                only = decl.init.values[0]
+                if isinstance(only, ast.StringLiteral):
+                    n = decoded_str_len(only.value.text) + 1
+                    return _ltypes.ArrayType(
+                        base_type=t.base_type, size=make_int_lit(n),
+                    )
+                if (
+                    isinstance(only, list)
+                    and only
+                    and all(isinstance(p, ast.StringLiteral) for p in only)
+                ):
+                    n = sum(
+                        decoded_str_len(p.value.text) for p in only
+                    ) + 1
+                    return _ltypes.ArrayType(
+                        base_type=t.base_type, size=make_int_lit(n),
+                    )
             try:
                 leaves = self._leaf_slot_count(t.base_type)
             except (CodegenError, KeyError):
                 leaves = 1
             if leaves < 1:
                 leaves = 1
+            # `char rows[][N] = { "a", "b", ... }`: when the element
+            # type is itself a char array, each string-literal value
+            # fills one whole row, so it consumes one *element* — not
+            # 1/leaves of one like a flat scalar would. The auto-AST
+            # delivers a string initializer as a bare StringLiteral or
+            # a (1+ adjacent-literal) Python list of StringLiteral.
+            elem_is_char_arr = (
+                isinstance(t.base_type, _ltypes.ArrayType)
+                and isinstance(t.base_type.base_type, _ltypes.BasicType)
+                and t.base_type.base_type.name == "char"
+            )
+
+            def _is_string_init(v):
+                return isinstance(v, ast.StringLiteral) or (
+                    isinstance(v, list)
+                    and v
+                    and all(isinstance(p, ast.StringLiteral) for p in v)
+                )
+
             cursor = 0
             max_idx = -1
             for value in decl.init.values:
+                if elem_is_char_arr and _is_string_init(value):
+                    if cursor > max_idx:
+                        max_idx = cursor
+                    cursor += 1
+                    continue
                 if isinstance(value, ast.DesignatedInit):
                     if value.designators:
                         d0 = value.designators[0]
@@ -5248,6 +5332,7 @@ class CodeGenerator:
                 not isinstance(
                     v, (ast.DesignatedInit, ast.InitializerList, ast.Compound)
                 )
+                and not (elem_is_char_arr and _is_string_init(v))
                 for v in decl.init.values
             )
             if all_flat and leaves > 1:
