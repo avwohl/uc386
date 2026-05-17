@@ -4311,6 +4311,16 @@ class CodeGenerator:
             return self._globals.get(nm) or self._extern_vars.get(nm) \
                 or self._globals.get(name) or self._extern_vars.get(name)
 
+        def _fallback(e):
+            # Robust, ctx-aware oracle for any shape the structural
+            # rules can't resolve. Decay here is fine: it only differs
+            # from the declared type for bare array/function lvalues,
+            # which the Identifier branch already handles non-decayed.
+            try:
+                return self._type_of(e, ctx)
+            except CodegenError:
+                return None
+
         def _oper_ty(e):
             if isinstance(e, ast.Identifier):
                 n = e.name
@@ -4318,7 +4328,7 @@ class CodeGenerator:
                 t = _decl_ty(nm)
                 while isinstance(t, _ltypes.TypeofType):
                     t = _oper_ty(t.operand)
-                return t
+                return t if t is not None else _fallback(e)
             if isinstance(e, ast.UnaryOp):
                 op = _opt(e)
                 if op == "*":
@@ -4326,17 +4336,18 @@ class CodeGenerator:
                     if isinstance(bt, (_ltypes.PointerType,
                                        _ltypes.ArrayType)):
                         return bt.base_type
-                    return None
+                    return _fallback(e)
                 if op == "&":
                     it = _oper_ty(e.operand)
                     return _ltypes.PointerType(base_type=it) \
-                        if it is not None else None
+                        if it is not None else _fallback(e)
+                return _fallback(e)
             if isinstance(e, ast.Index):
                 at = _oper_ty(e.array)
                 if isinstance(at, (_ltypes.ArrayType,
                                    _ltypes.PointerType)):
                     return at.base_type
-                return None
+                return _fallback(e)
             if isinstance(e, (ast.Member, ast.ArrowMember)):
                 ot = _oper_ty(e.obj)
                 if isinstance(e, ast.ArrowMember) and \
@@ -4347,13 +4358,10 @@ class CodeGenerator:
                     for mn, mt, _mo in self._structs.get(sn, []):
                         if mn == e.member.text:
                             return mt
-                return None
+                return _fallback(e)
             if isinstance(e, ast.Cast):
                 return _to_legacy_type(e.target_type)
-            try:
-                return self._type_of(e, ctx)
-            except CodegenError:
-                return None
+            return _fallback(e)
 
         def _resolve_tn(t):
             if isinstance(t, _ltypes.TypeofType):
