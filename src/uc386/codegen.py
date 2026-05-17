@@ -883,6 +883,7 @@ class CodeGenerator:
                         st = resolved_to_legacy(_resolve_struct_spec(spec))
                         if st is not None and (st.members or st.name):
                             self._resolve_struct_name(st)
+                        self._register_inline_enums(spec)
                     elif isinstance(spec, (ast.EnumDef, ast.EnumAnon)):
                         # File-scope `enum [tag] { A, B = 5, C };` declares
                         # the enumerators as integer constants visible from
@@ -4676,6 +4677,7 @@ class CodeGenerator:
                     st = resolved_to_legacy(_resolve_struct_spec(spec))
                     if st is not None and (st.members or st.name):
                         self._resolve_struct_name(st)
+                    self._register_inline_enums(spec)
                 elif isinstance(spec, (ast.EnumDef, ast.EnumAnon)):
                     self._register_enum_values_autoast(spec.values)
             if decl_storage_class(node.decl_specs) == "typedef":
@@ -5078,6 +5080,15 @@ class CodeGenerator:
             ):
                 self._resolve_struct_name(base)
             return
+        if isinstance(t, _ltypes.FunctionType):
+            # A variable/parameter of function type is a function
+            # pointer — a 4-byte code address (C decays function-type
+            # params, 6.7.6.3p8; a function-pointer typedef like
+            # git's `each_ref_fn` / `each_loose_object_fn` resolves
+            # here as FunctionType). uc386's call machinery already
+            # treats function-typed values as callable addresses, so
+            # accept it like a pointer.
+            return
         if isinstance(t, _ltypes.BasicType) and t.name in self._SLOT_BASIC_NAMES:
             return
         if isinstance(t, _ltypes.BasicType):
@@ -5388,6 +5399,13 @@ class CodeGenerator:
             t = _to_legacy_type(t)
         if isinstance(t, _ltypes.PointerType):
             return 4
+        if isinstance(t, _ltypes.FunctionType):
+            # A value/param of function type is a code address (C
+            # decays function-type params to function pointers,
+            # 6.7.6.3p8). uc386 treats function-typed values as
+            # callable addresses everywhere else; size them as a
+            # pointer so the frame slot / arg width is right.
+            return 4
         if isinstance(t, _ltypes.BasicType):
             try:
                 return self._BASIC_SIZES[t.name]
@@ -5684,6 +5702,31 @@ class CodeGenerator:
             else:
                 self._enum_constants[ev.name] = cursor
             cursor += 1
+
+    def _register_inline_enums(self, spec, _depth: int = 0) -> None:
+        """Register enum constants for `enum { ... }` definitions that
+        appear inline as a struct/union member's type.
+
+        File-scope `enum { A, B }` is registered by the top-level /
+        block scans, but `struct S { enum { A, B } m; };` hides the
+        EnumDef inside the StructDef's member decl_specs, so its
+        enumerators were never added to `_enum_constants` and any use
+        of `A`/`B` later raised `unknown identifier`. C makes those
+        enumerators visible at file/block scope just like a top-level
+        enum (6.7.2.2). Walk struct members (recursing through nested
+        struct/union members) and register every inline enum.
+        """
+        if spec is None or _depth > 64:
+            return
+        for m in getattr(spec, "members", None) or []:
+            for ms in getattr(m, "decl_specs", None) or []:
+                if isinstance(ms, (ast.EnumDef, ast.EnumAnon)):
+                    try:
+                        self._register_enum_values_autoast(ms.values)
+                    except CodegenError:
+                        pass
+                elif isinstance(ms, (ast.StructDef, ast.StructAnon)):
+                    self._register_inline_enums(ms, _depth + 1)
 
     def _register_enum_values_autoast(self, values) -> None:
         """Like `_register_enum_values` but consumes the auto-AST
