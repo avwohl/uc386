@@ -222,6 +222,12 @@ class _FuncCtx:
         # name in its scope without re-bumping frame_size.
         self.decl_disps: dict[int, int] = {}
         self.decl_types: dict[int, "_ltypes.TypeNode"] = {}
+        # Persistent name -> declared (non-decayed) type for every
+        # local/param ever allocated this function. Unlike `types`
+        # (scope-stacked, popped after _collect_locals) this survives
+        # so pre-emit passes — `_resolve_tcp_operands` — can resolve
+        # `__typeof__(localvar)` without scope bookkeeping.
+        self.decl_types_by_name: dict[str, "_ltypes.TypeNode"] = {}
         # Two-region stack layout:
         #
         #   EBP-4 .. EBP-call_temp_offset       — call temps (compound
@@ -384,6 +390,7 @@ class _FuncCtx:
             disp = self.decl_disps[key]
             self.slots[-1][name] = disp
             self.types[-1][name] = self.decl_types[key]
+            self.decl_types_by_name[name] = self.decl_types[key]
             return disp
         if name in self.slots[-1]:
             raise CodegenError(f"redeclaration of `{name}` in same scope")
@@ -396,6 +403,7 @@ class _FuncCtx:
         disp = -self.frame_size
         self.slots[-1][name] = disp
         self.types[-1][name] = ty
+        self.decl_types_by_name[name] = ty
         if key is not None:
             self.decl_disps[key] = disp
             self.decl_types[key] = ty
@@ -421,6 +429,7 @@ class _FuncCtx:
             raise CodegenError(f"duplicate parameter `{name}`")
         self.slots[-1][name] = disp
         self.types[-1][name] = ty
+        self.decl_types_by_name[name] = ty
         return disp
 
     def has_local(self, name: str) -> bool:
@@ -3001,7 +3010,19 @@ class CodeGenerator:
         if isinstance(expr, ast.OffsetofExpr):
             return self._offsetof_value(expr)
         if isinstance(expr, ast.TypesCompatibleP):
-            return 1 if self._types_compatible(expr.t1, expr.t2) else 0
+            # expr.t1/t2 are auto-AST type-names; _types_compatible
+            # only matches resolved _ltypes nodes (every other
+            # type-name consumer goes through _to_legacy_type), so
+            # resolve first — otherwise the isinstance ladder always
+            # falls through to False and __builtin_types_compatible_p
+            # is a constant 0 (which poisoned git's MOVE_ARRAY size via
+            # BUILD_ASSERT_OR_ZERO -> sizeof(char[-1])-1 = -2). Any
+            # `__typeof__` operands were already lowered to concrete,
+            # non-decayed types by `_resolve_typeof_in_body` (this
+            # const-eval path has no ctx of its own).
+            return 1 if self._types_compatible(
+                _to_legacy_type(expr.t1), _to_legacy_type(expr.t2)
+            ) else 0
         if isinstance(expr, ast.SizeofType):
             if getattr(expr, "is_alignof", False):
                 return self._alignment_of(expr.target_type)
@@ -3827,6 +3848,11 @@ class CodeGenerator:
         for sub in self._walk_ast(fn.body):
             if isinstance(sub, ast.StmtExpr):
                 self._collect_locals(sub.body, ctx)
+        # Now ctx knows local declared types: lower
+        # __builtin_types_compatible_p operands to concrete,
+        # non-decayed types (must run after _collect_locals; the
+        # const-eval path that reads them has no ctx of its own).
+        self._resolve_tcp_operands(fn.body, ctx)
         # Second pass: reserve a temp slot for each struct-returning Call
         # in the body. Some call sites have known destinations (var init,
         # struct assignment rhs, return chain) and don't actually use the
@@ -4254,6 +4280,98 @@ class CodeGenerator:
                             r = resolve_inner(item.operand)
                             if r is not None:
                                 v[i] = r
+
+    def _resolve_tcp_operands(self, node, ctx: _FuncCtx) -> None:
+        """Lower `__builtin_types_compatible_p`'s operand type-names to
+        concrete, NON-DECAYED `_ltypes` and store them back on each
+        `TypesCompatibleP` node.
+
+        Runs *after* `_collect_locals`, so `ctx.lookup_type` knows
+        local declared types. `__typeof__(expr)` must keep the
+        operand's declared type with NO lvalue / array→pointer /
+        function→pointer decay (GCC semantics). The generic
+        `_type_of` oracle decays, which would make
+        `tcp(__typeof__(arr), __typeof__(&arr[0]))` wrongly 1 and
+        collapse git's `ARRAY_SIZE`/`BARF_UNLESS_AN_ARRAY`; the raw
+        always-False fallthrough (no resolution) made
+        `BARF_UNLESS_COPYABLE` -2 and corrupted git's `MOVE_ARRAY`.
+        Both are fixed by resolving to the declared type here.
+        """
+        def _decl_ty(name: str):
+            # Persistent name->declared type (locals+params, non-decayed)
+            # recorded by alloc_local/alloc_param; survives scope pops.
+            t = ctx.decl_types_by_name.get(name)
+            if t is not None:
+                return t
+            try:
+                return ctx.lookup_type(name)
+            except CodegenError:
+                pass
+            nm = ctx.local_static_labels.get(name, name)
+            return self._globals.get(nm) or self._extern_vars.get(nm) \
+                or self._globals.get(name) or self._extern_vars.get(name)
+
+        def _oper_ty(e):
+            if isinstance(e, ast.Identifier):
+                n = e.name
+                nm = n.text if hasattr(n, "text") else n
+                t = _decl_ty(nm)
+                while isinstance(t, _ltypes.TypeofType):
+                    t = _oper_ty(t.operand)
+                return t
+            if isinstance(e, ast.UnaryOp):
+                op = _opt(e)
+                if op == "*":
+                    bt = _oper_ty(e.operand)
+                    if isinstance(bt, (_ltypes.PointerType,
+                                       _ltypes.ArrayType)):
+                        return bt.base_type
+                    return None
+                if op == "&":
+                    it = _oper_ty(e.operand)
+                    return _ltypes.PointerType(base_type=it) \
+                        if it is not None else None
+            if isinstance(e, ast.Index):
+                at = _oper_ty(e.array)
+                if isinstance(at, (_ltypes.ArrayType,
+                                   _ltypes.PointerType)):
+                    return at.base_type
+                return None
+            if isinstance(e, (ast.Member, ast.ArrowMember)):
+                ot = _oper_ty(e.obj)
+                if isinstance(e, ast.ArrowMember) and \
+                   isinstance(ot, _ltypes.PointerType):
+                    ot = ot.base_type
+                if isinstance(ot, _ltypes.StructType):
+                    sn = self._resolve_struct_name(ot)
+                    for mn, mt, _mo in self._structs.get(sn, []):
+                        if mn == e.member.text:
+                            return mt
+                return None
+            if isinstance(e, ast.Cast):
+                return _to_legacy_type(e.target_type)
+            try:
+                return self._type_of(e, ctx)
+            except CodegenError:
+                return None
+
+        def _resolve_tn(t):
+            if isinstance(t, _ltypes.TypeofType):
+                r = _oper_ty(t.operand)
+                return _resolve_tn(r) if r is not None else t
+            if isinstance(t, _ltypes.PointerType):
+                t.base_type = _resolve_tn(t.base_type)
+            elif isinstance(t, _ltypes.ArrayType):
+                t.base_type = _resolve_tn(t.base_type)
+            elif isinstance(t, _ltypes.FunctionType):
+                t.return_type = _resolve_tn(t.return_type)
+                t.param_types = [_resolve_tn(p) for p in t.param_types]
+            return t
+
+        for sub in self._walk_ast(node):
+            if isinstance(sub, ast.TypesCompatibleP):
+                sub.t1 = _resolve_tn(_to_legacy_type(sub.t1))
+                sub.t2 = _resolve_tn(_to_legacy_type(sub.t2))
 
     def _collect_call_temps(self, node, ctx: _FuncCtx) -> None:
         """Pre-allocate a frame slot for every struct-returning Call and
@@ -13944,7 +14062,11 @@ class CodeGenerator:
             except CodegenError:
                 return self._emit_runtime_offsetof(expr, ctx)
         if isinstance(expr, ast.TypesCompatibleP):
-            v = 1 if self._types_compatible(expr.t1, expr.t2) else 0
+            # See _const_eval: resolve to concrete _ltypes (the pre-pass
+            # already lowered any __typeof__ operands, non-decayed).
+            v = 1 if self._types_compatible(
+                _to_legacy_type(expr.t1), _to_legacy_type(expr.t2)
+            ) else 0
             return [f"        mov     eax, {v}"]
         if isinstance(expr, ast.SizeofExpr):
             # C: the operand of `sizeof` is *not* evaluated — only its
