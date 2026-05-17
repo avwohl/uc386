@@ -4695,6 +4695,14 @@ class CodeGenerator:
                     )
                 return
             var_type = self._resolved_var_type(node)
+            # `__typeof__(expr) v;` — lower the typeof to its concrete
+            # type now that `ctx` can resolve the operand, and persist
+            # it on the (cached, emit-reused) _SynthLocalVar so every
+            # later consumer sees the real type, not a bare TypeofType.
+            resolved_vt = self._deep_resolve_typeof(var_type, ctx)
+            if resolved_vt is not var_type:
+                var_type = resolved_vt
+                node.var_type = var_type
             self._check_supported_type(var_type, node.name)
             # Captured-by-nested-fn local: promote to a file-scope
             # global with a mangled name so the nested fn (compiled as
@@ -8997,7 +9005,8 @@ class CodeGenerator:
                 return out
             # Fall through to the generic raise below for other targets.
         out = self._eval_expr_to_eax(expr.expr, ctx)
-        target = _to_legacy_type(expr.target_type)
+        target = self._deep_resolve_typeof(
+            _to_legacy_type(expr.target_type), ctx)
         if isinstance(target, _ltypes.PointerType):
             return out
         if isinstance(target, _ltypes.EnumType):
@@ -12898,7 +12907,60 @@ class CodeGenerator:
         "==", "!=", "<", ">", "<=", ">=", "&&", "||",
     })
 
+    def _deep_resolve_typeof(self, t, ctx: _FuncCtx, _depth: int = 0):
+        """Replace every `typeof(expr)` (legacy `TypeofType`) inside a
+        type tree with the concrete type of its operand.
+
+        `typeof` enters codegen as an `ast_legacy.TypeofType` carrying
+        the operand expression (uc_core's resolve_base_type now keeps
+        it instead of silently collapsing to `int`). The operand's
+        real type is only knowable here, with a populated `ctx`, via
+        the authoritative `_type_of` oracle. Resolves through pointer
+        / array / function nesting too, so `(typeof(*p) *)` and
+        `typeof(&x)` — and hence the offsetof / container_of idiom —
+        land as real pointer-to-struct types. Depth-guarded against a
+        self-referential operand chain.
+        """
+        if _depth > 16 or t is None:
+            return t
+        if isinstance(t, _ltypes.TypeofType):
+            try:
+                r = self._type_of(t.operand, ctx)
+            except CodegenError:
+                r = None
+            if r is None or isinstance(r, _ltypes.TypeofType):
+                # Operand type not knowable here (e.g. a not-yet-
+                # collected nested stmt-expr local). Fall back to
+                # `int` — exactly uc386's historical behaviour for
+                # typeof before it was resolved at all, so this is
+                # never worse than before and keeps `typeof` of an
+                # opaque operand from crashing _check_supported_type.
+                return _ltypes.BasicType(name="int")
+            return self._deep_resolve_typeof(r, ctx, _depth + 1)
+        if isinstance(t, _ltypes.PointerType):
+            t.base_type = self._deep_resolve_typeof(t.base_type, ctx, _depth + 1)
+            return t
+        if isinstance(t, _ltypes.ArrayType):
+            t.base_type = self._deep_resolve_typeof(t.base_type, ctx, _depth + 1)
+            return t
+        if isinstance(t, _ltypes.FunctionType):
+            t.return_type = self._deep_resolve_typeof(
+                t.return_type, ctx, _depth + 1)
+            t.param_types = [
+                self._deep_resolve_typeof(p, ctx, _depth + 1)
+                for p in t.param_types
+            ]
+            return t
+        return t
+
     def _type_of(self, expr: ast.Expression, ctx: _FuncCtx) -> _ltypes.TypeNode:
+        """Resolving wrapper around `_type_of_impl`: the codegen must
+        never see an unresolved `typeof` type, so every type the oracle
+        hands back has its `typeof`s lowered to concrete types here.
+        Idempotent on already-concrete types (cheap no-op)."""
+        return self._deep_resolve_typeof(self._type_of_impl(expr, ctx), ctx)
+
+    def _type_of_impl(self, expr: ast.Expression, ctx: _FuncCtx) -> _ltypes.TypeNode:
         """Best-effort static type of `expr`.
 
         Used to drive pointer-arithmetic scaling. Falls back to `int` for
