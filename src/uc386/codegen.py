@@ -3003,7 +3003,7 @@ class CodeGenerator:
                     decoded_str_len(p.value.text) for p in inner_strs
                 ) + 1
                 return total * 2 if is_wide else total
-            ty = self._type_of(inner, _FuncCtx())
+            ty = self._type_of(inner, self._static_init_ctx())
             if getattr(expr, "is_alignof", False):
                 return self._alignment_of(ty)
             if self._type_has_vla(ty):
@@ -8624,6 +8624,22 @@ class CodeGenerator:
             return name
         return self._function_local_static.get(owner, {}).get(name, name)
 
+    def _static_init_ctx(self) -> "_FuncCtx":
+        """A `_FuncCtx` seeded with the static-local label map of the
+        function that owns the global initializer currently being
+        emitted. `_const_eval` consults `_type_of` for `sizeof(x)`;
+        when `x` is a *sibling* function-local static (hoisted to a
+        mangled global, e.g. `f__letters`), an empty ctx can't map the
+        source name and const-eval wrongly bails to the float path
+        (git wrapper.c: `static const int n = ARRAY_SIZE(letters)-1;`).
+        Mirrors `_resolve_static_init_name`'s owner lookup.
+        """
+        c = _FuncCtx()
+        snap = self._function_local_static.get(self._emitting_for_func, {})
+        if snap:
+            c.local_static_labels = dict(snap)
+        return c
+
     def _needs_recursive_init(self, expr: ast.Expression) -> bool:
         """Does `expr` need the recursive `_emit_global_init` path
         rather than a flat `_const_eval` (e.g., it contains a
@@ -13060,9 +13076,18 @@ class CodeGenerator:
             if _opt(expr) == "*":
                 inner = self._type_of(expr.operand, ctx)
                 if not self._is_pointer_like(inner):
-                    raise CodegenError(
-                        f"`*` operand must be a pointer (got {type(inner).__name__})"
-                    )
+                    # `_type_of` is best-effort and "falls back to int
+                    # for anything we can't classify" (see docstring).
+                    # The classic case: `*f()` where `f` has no
+                    # prototype, so C gives it implicit `int` return
+                    # even though the real libc declares it returning a
+                    # pointer (e.g. git compat/mkdtemp.c's `*mktemp()`
+                    # — uc386's <stdlib.h> doesn't declare mktemp).
+                    # Degrade to int instead of aborting the compile;
+                    # the emit path dereferences the value as an
+                    # address regardless (flat-32: int and pointer are
+                    # both 4 bytes).
+                    return _ltypes.BasicType(name="int")
                 return inner.base_type
             if _opt(expr) in ("++", "--"):
                 # Mutation in place; the expression's type matches the operand.
