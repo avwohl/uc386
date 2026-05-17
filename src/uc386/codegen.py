@@ -4374,6 +4374,20 @@ class CodeGenerator:
                             else _ltypes.PointerType(
                                 base_type=rt.base_type)
                     return lt if lt is not None else _fallback(e)
+                if bop in ("=", "+=", "-=", "*=", "/=", "%=",
+                           "<<=", ">>=", "&=", "^=", "|="):
+                    # An assignment expression's type is its left
+                    # operand's type (non-decayed for __typeof__).
+                    # git's COPY_ARRAY/DUP_ARRAY pass
+                    # `ALLOC_ARRAY((dst),n)` — i.e. `(dst) = xmalloc()`
+                    # — as the BARF_UNLESS_COPYABLE dst, so
+                    # `__typeof__(*(dst))` is `*(<assignment>)`.
+                    lt = _oper_ty(e.left)
+                    return lt if lt is not None else _fallback(e)
+                if bop == ",":
+                    # Comma operator: type of the right operand.
+                    rt = _oper_ty(e.right)
+                    return rt if rt is not None else _fallback(e)
                 return _fallback(e)
             if isinstance(e, (ast.Member, ast.ArrowMember)):
                 ot = _oper_ty(e.obj)
