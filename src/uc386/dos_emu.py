@@ -170,6 +170,7 @@ def run(
     env: dict[str, str] | None = None,
     program_path: str | None = None,
     vfiles_init: dict[bytes, bytes] | None = None,
+    vdirs_init: set[bytes] | None = None,
     net=None,
     fs_mode: str = "lenient",
 ) -> Result:
@@ -344,6 +345,27 @@ def run(
     # — chdir validates the dir exists). Always contains "." and
     # the synthetic CWD's parents implicitly.
     vdirs: set[bytes] = set()
+    # Seed directories the caller pre-created (e.g. a prior `git
+    # init` whose Result.vdirs is replayed into a follow-up `git
+    # config` run): models a persistent disk across two process
+    # invocations. Also synthesize each vfile's parent chain so a
+    # seeded file implies its containing directories exist.
+    if vdirs_init:
+        for d in vdirs_init:
+            vdirs.add(d if isinstance(d, bytes) else bytes(d))
+    if vfiles_init:
+        for fname in list(vfiles.keys()):
+            p = fname
+            while True:
+                i = max(p.rfind(b"\\"), p.rfind(b"/"))
+                if i <= 0:
+                    break
+                p = p[:i]
+                # Keep a drive root like b"C:\\" intact.
+                if len(p) == 2 and p[1:2] == b":":
+                    vdirs.add(p + b"\\")
+                    break
+                vdirs.add(p)
     # Synthetic current working directory. Reset to "C:\" at boot.
     # chdir updates this; getcwd reads it. We don't enforce real
     # path resolution here — tests interact with the vfs by full
@@ -486,10 +508,41 @@ def run(
         Returns ``(name, ok)``. When ``ok`` is False the caller must
         signal a DOS error (fd=-1 / CF set) — this is how "strict83"
         models a real FreeDOS volume rejecting a non-8.3 name on the
-        short-name API. The vfs key is always the verbatim path, so
-        a long name created via LFN is read back by either API.
+        short-name API.
+
+        The flat vfs is keyed by an *absolute* path so the same file
+        is one entry whether a program names it relative (joined with
+        the current directory) or absolute. Without this, `git init
+        <dir>` failed: it `mkdir`s the arg relative ("MYDIR") but
+        then probes the worktree absolute ("C:\\MYDIR") — two keys
+        for one directory. Separators are kept verbatim (git mixes a
+        "\\" drive root with "/" components and the vfs is exact-key;
+        normalizing them would desync from how git builds the string).
         """
         raw = bytes(_read_cstr_local(addr))
+
+        def _canon(p: bytes) -> bytes:
+            if len(p) >= 2 and p[1:2] == b":":
+                rest = p[2:]                       # after "X:"
+                if rest[:1] in (b"\\", b"/"):
+                    return b"C:\\" + rest[1:]      # X:\abs  -> C:\abs
+                body, base = rest, b"C:\\"         # X:rel (rare)
+            elif p[:1] in (b"\\", b"/"):
+                return b"C:\\" + p[1:]             # \abs on cur drive
+            else:
+                body = p                            # relative
+                cwd = vcwd[0]
+                if (len(cwd) >= 3 and cwd[1:2] == b":"
+                        and cwd[2:3] in (b"\\", b"/")):
+                    base = b"C:\\" + cwd[3:]
+                else:
+                    base = b"C:\\"
+                if body and base[-1:] not in (b"\\", b"/"):
+                    base += b"\\"
+            return base + body
+
+        if raw:
+            raw = _canon(raw)
         if lfn or _fs_mode == "lenient":
             return raw, True
         return raw, _is_dos83_path(raw, allow_wild=allow_wild)
@@ -1571,6 +1624,32 @@ def run(
             uc.reg_write(UC_X86_REG_EAX, new_eax)
             new_edx = (edx & ~0xFFFF) | ((new_pos >> 16) & 0xFFFF)
             uc.reg_write(UC_X86_REG_EDX, new_edx)
+            return
+        if ah == 0x43:
+            # Get/Set file attributes (legacy, non-LFN). AL=0 get /
+            # 1 set. DS:EDX=ASCIZ path. Unlike AH=0x3D (open), this
+            # works for directories as well as files — real DOS
+            # behaviour, and what a DOS C library's access()/stat()
+            # use so they can probe directories (AH=0x3D can't open
+            # a directory). Returns CX=attr (get), CF clear on
+            # success; CF set + AX=2 (ENOENT) when the path doesn't
+            # exist.
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            name, _ok = _dos_path(edx)
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            if _ok and name in vdirs:
+                attr = 0x10  # FILE_ATTRIBUTE_DIRECTORY
+            elif _ok and name in vfiles:
+                attr = 0x20  # FILE_ATTRIBUTE_ARCHIVE
+            else:
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
+                uc.reg_write(UC_X86_REG_EAX, (eax & ~0xFFFF) | 0x02)
+                return
+            if al == 0:
+                ecx = uc.reg_read(UC_X86_REG_ECX)
+                uc.reg_write(UC_X86_REG_ECX,
+                             (ecx & ~0xFFFF) | attr)
+            uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
             return
         if ah == 0x47:
             # getcwd(drive, buf): DL=drive (0=current, 1=A, 2=B, ...),

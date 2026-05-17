@@ -4387,33 +4387,24 @@ _lstat:
         jmp     _stat                        ; no symlinks under DOS
 ; ---- access(path, mode) ---------------------------------------------------
 ; Return 0 if path exists (mode bits ignored — dos_emu has no real
-; perms). Try to open() the path read-only; on success close + return 0,
-; on fail return -1. Lets period code that probes for files
-; (`access(wad, R_OK)`) actually find them under vfiles_init.
+; perms). Uses INT 21h AH=0x43 AL=0 (get file attributes), which —
+; unlike AH=0x3D (open) — succeeds for directories as well as files.
+; That matches real DOS C libraries (you can't open() a directory)
+; and lets `access(dir, X_OK)` work, e.g. git's worktree probe
+; `access(repo_get_work_tree(), X_OK)` for `git init <dir>`.
 _access:
         push    ebp
         mov     ebp, esp
-        push    ebx
         mov     edx, [ebp + 8]              ; path → DS:EDX for INT 21h
-        mov     al, 0                        ; mode = read-only
-        mov     ah, 0x3D                     ; AH = 0x3D (open)
+        mov     ah, 0x43                     ; get/set file attributes
+        mov     al, 0                        ; AL=0 → get attributes
         int     21h
-        ; Real DOS sets CF=1 + AX=err on failure; dos_emu returns
-        ; EAX=-1 with CF unset. Check both so the libc works under
-        ; either backend.
-        jc      ._fail
-        cmp     eax, -1
-        je      ._fail
-        ; Got a valid fd in EAX (low 16). Close and return 0.
-        mov     ebx, eax
-        mov     ah, 0x3E
-        int     21h
-        xor     eax, eax
+        jc      ._fail                       ; CF set → not found
+        xor     eax, eax                     ; exists (file or dir) → 0
         jmp     ._done
 ._fail:
         mov     eax, -1
 ._done:
-        pop     ebx
         mov     esp, ebp
         pop     ebp
         ret
