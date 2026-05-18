@@ -4331,17 +4331,40 @@ _stat:
         ret
 
 ; int fstat(int fd, struct stat *buf)
-;   Tell current pos, seek to end (= size), seek back, write
-;   st_mode + st_size. Uses ESI/EDI to carry size + saved-pos
-;   across the multiple int 21h calls (see _stat for the
-;   peephole-eats-push/pop-around-int rationale).
+;   First classify the handle with INT 21h AX=4400h (IOCTL — Get
+;   Device Information): DX bit 7 set ⇒ a *character device* (the
+;   console, NUL, or a piped/redirected-through-device stdin), clear
+;   ⇒ a disk file. A char device has no meaningful size and is not
+;   seekable, so report S_IFCHR with st_size 0 and DO NOT run the
+;   lseek dance (seeking a non-seekable handle returns garbage and
+;   makes portable code — e.g. git's index_fd → xmmap(fd) — take a
+;   regular-file path it must not). For a real disk file, behave as
+;   before: tell / seek-to-end (= size) / seek-back, st_mode
+;   S_IFREG. If the IOCTL itself fails (CF) fall back to the file
+;   path (DOS ≥2.0 always supports 4400h; this is just belt-and-
+;   braces and keeps real-file fstat working everywhere).
+;   ESI/EDI carry size + saved-pos across the int 21h calls (see
+;   _stat for the peephole-eats-push/pop-around-int rationale).
 _fstat:
         push    ebp
         mov     ebp, esp
         push    ebx
         push    esi
         push    edi
-        mov     ebx, [ebp + 8]
+        mov     ebx, [ebp + 8]               ; BX = fd (handle)
+        ; classify: AX=4400h IOCTL get-device-info, BX=handle.
+        mov     ax, 0x4400
+        int     21h
+        jc      .fst_file                    ; IOCTL err → treat as file
+        test    dl, 0x80                     ; bit 7 = character device?
+        jz      .fst_file                    ; clear → disk file
+        ; character device (console / pipe stdin): no size, S_IFCHR.
+        mov     edx, [ebp + 12]
+        mov     dword [edx + 8], 0x2000      ; st_mode = S_IFCHR
+        mov     dword [edx + 28], 0          ; st_size  = 0
+        xor     eax, eax
+        jmp     .fst_done
+.fst_file:
         ; tell: lseek(fd, 0, SEEK_CUR=1) → DX:AX
         mov     ah, 0x42
         mov     al, 1
@@ -4373,9 +4396,10 @@ _fstat:
         int     21h
         ; fill struct
         mov     edx, [ebp + 12]
-        mov     dword [edx + 8], 0x8000
-        mov     [edx + 28], esi
+        mov     dword [edx + 8], 0x8000      ; st_mode = S_IFREG
+        mov     [edx + 28], esi              ; st_size
         xor     eax, eax
+.fst_done:
         pop     edi
         pop     esi
         pop     ebx

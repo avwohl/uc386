@@ -1594,6 +1594,36 @@ def run(
             new_eax = (eax & ~0xFFFFFFFF) | (rc & 0xFFFFFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
             return
+        if ah == 0x44 and al == 0x00:
+            # IOCTL AX=4400h — Get Device Information. BX = handle.
+            # Returns (CF=0) DX = device-info word: bit 7 set ⇒ a
+            # character device, clear ⇒ a disk file. This is the
+            # canonical DOS way to tell a stream/console handle from
+            # a real file; uc386's fstat() uses it so portable code
+            # (git's index_fd) takes the streaming path for piped
+            # stdin instead of trying to mmap()/lseek() it.
+            ebx = uc.reg_read(UC_X86_REG_EBX)
+            edx = uc.reg_read(UC_X86_REG_EDX)
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            fd = ebx & 0xFFFF
+            if fd in (0, 1, 2):
+                # std handles model a console / piped byte stream:
+                # char device (bit7), raw (bit5), not-EOF (bit6),
+                # plus the stdin(bit0)/stdout(bit1) role bit.
+                dev = 0x80 | 0x20 | 0x40 | (0x01 if fd == 0 else 0x02)
+                uc.reg_write(UC_X86_REG_EDX,
+                             (edx & 0xFFFF0000) | dev)
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)  # CF=0
+                return
+            if fd in vfd_table:
+                # a real disk file: bit7 clear (block/file), drive 0.
+                uc.reg_write(UC_X86_REG_EDX, edx & 0xFFFF0000)
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)  # CF=0
+                return
+            # invalid handle → CF=1, AX=6 (invalid handle).
+            uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
+            uc.reg_write(UC_X86_REG_EAX, (eax & ~0xFFFF) | 0x06)
+            return
         if ah == 0x42:
             # lseek(fd, off, whence): BX=fd, CX:DX=offset, AL=whence.
             # Real DOS returns DX:AX=new pos / CF on error. The libc
