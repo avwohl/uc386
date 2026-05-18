@@ -4,49 +4,38 @@ C23 compiler targeting the Intel 386 (i386 / x86-32) processor under a
 DOS extender — specifically the **flat 32-bit Watcom / DOS/4GW-era** C
 that early-to-mid-1990s PC games were written in.
 
-**Status: 100% on both reference test suites.** All 1514 executable
-[gcc-c-torture](https://github.com/llvm/llvm-test-suite) tests
-compile, assemble, and run correctly under our DOS emulator;
+**Status: working — in testing ahead of a general release.** Passes
+both reference suites at 100%: all 1514 executable
+[gcc-c-torture](https://github.com/llvm/llvm-test-suite) tests and
 all 220 [c-testsuite](https://github.com/c-testsuite/c-testsuite)
-tests pass. The frontend (parsing, preprocessing, AST-level
-optimization) lives in [uc_core](https://github.com/avwohl/uc_core);
-this repo owns the driver, the x86-32 NASM emitter, and the DOS
-runtime bindings. See `CLAUDE.md` for the per-slice development log.
+tests compile, assemble, and run correctly under our DOS emulator.
+The frontend (parsing, preprocessing, AST-level optimization) lives
+in [uc_core](https://github.com/avwohl/uc_core); this repo owns the
+driver, the x86-32 NASM emitter, and the DOS runtime bindings.
 
-**Highlights**: uc386 also produces real DOS `.exe` files — `addons/harness/exe.py`
-drives `nasm -f obj` → `wlink system pmodew` to build self-contained
-`.exe` (PMODE/W bound, ~12 KB stub overhead) for any in-tree addon.
-Validated end-to-end in CI: `true.exe` boots PMODE/W under DOSBox
-0.74-3, runs the 32-bit code, exits with the correct errorlevel
-(`false.exe` → 1, `true.exe` → 0); `argv_pr.exe alpha beta` parses the
-DOS PSP via the bridge stub's ES-at-entry trick and reports
-`argc=3 / argv[1]='alpha' / argv[2]='beta'`; `factor.exe 2 12 60 97`
-emits multi-arg printf output (`2: 2 / 12: 2 2 3 / 60: 2 2 3 5 /
-97: 97`) via the legacy in-asm format engine; `myecho.exe hello dos`
-writes `hello dos\n` via libc fputs through real DOS handles. All
-14 manifest-driven addons build .exe successfully (basename, cat,
-dirname, echo, factor, false, head, open_test, strtol_test, tail,
-true, wc, yes, argv_probe — sizes ~16 KB).
-See `docs/path-a-mz-le.md`. DOOM boots end-to-end through uc386 → NASM → dos_emu
-(reaches W_InitFiles after V_Init / M_LoadDefaults / Z_Init; exits 1
-at WAD-not-found as expected; smoke-tested via
-`addons/games/doom/test_doom_smoke.py`). MicroPython is a
-fully-functional Python REPL, packaged separately as
-[freedos_micro_python](https://github.com/avwohl/freedos_micro_python)
-(`pip install freedos_micro_python`). The bundled
-`freedos-micropython port` CLI builds an i386 DOS binary that
-evaluates expressions, defines functions and classes, runs list
-comprehensions, handles exceptions, and dispatches ~25 named builtins
-(`print`, `min`, `max`, `sum`, `sorted`, `bin`, `hex`, `oct`, `len`,
-`range`, `repr`, `type`, `isinstance`, ...). The MP smoke test
-(`tests/test_micropython_integration.py`) re-uses uc386's `dos_emu`
-to pin the REPL banner and is the toughest end-to-end exercise we
-have for the compiler. BWK awk runs
-arithmetic, regex, aggregation, and string functions
-(`addons/gnu/awk-bwk/test_awk_smoke.py`). 16 in-tree GNU utilities
-(`true`, `cat`, `wc`, ...) get parametrized regression coverage via
-`addons/test_gnu_addons.py`. See `addons/STATUS.md` for the full
-per-addon report.
+**Highlights** — beyond the reference suites, uc386 compiles real
+third-party C programs into runnable DOS executables:
+
+- **Real `.exe` output.** Produces self-contained, PMODE/W-bound DOS
+  `.exe` files (not just flat binaries), boot-tested under DOSBox in
+  CI: correct errorlevels, command-line argument parsing, and
+  `printf`/file I/O through genuine DOS handles.
+- **DOOM** (id Software's 1993 shooter) compiles and boots
+  end-to-end, running through engine startup until it exits cleanly
+  on the expected "WAD file not found".
+- **MicroPython** (a small Python interpreter) compiles into a
+  working DOS Python REPL — expressions, functions, classes, list
+  comprehensions, exceptions, and the common builtins. Packaged
+  separately as
+  [freedos_micro_python](https://github.com/avwohl/freedos_micro_python).
+  It is our toughest end-to-end test of the compiler.
+- **awk** — Kernighan's "one true awk" runs arithmetic, regexes,
+  aggregation, and string functions.
+- **GNU utilities** — 16 in-tree coreutils-style programs (`cat`,
+  `wc`, `true`, …) build and pass parametrized regression tests.
+
+See `addons/STATUS.md` for the full per-addon report and
+`docs/path-a-mz-le.md` for the `.exe` build path.
 
 ## Goal
 
@@ -110,57 +99,6 @@ macOS (Homebrew) and Fedora/RHEL (dnf) instructions, plus the
 optional toolchains for addon builds (bison/flex) and the
 DJGPP / OpenWatcom comparison columns, are documented in
 [`docs/INSTALL.md`](docs/INSTALL.md).
-
-## Roadmap
-
-### Phase 0 — hello world (current)
-Emit enough assembly for `int main(){return 0;}` and a DOS INT 21h/4Ch
-exit. Pick an assembler target (candidates: NASM, MASM, hand-rolled
-`um386` paralleling `um80`).
-
-### Phase 1 — syntactic tolerance for DOS-era cruft
-Parse-and-ignore the non-standard keywords/pragmas that period headers
-use. In flat-32 these are mostly no-ops — we just need the parser to
-not choke on them. Lands in **uc_core** (shared with uc80). Includes:
-
-- **Type qualifiers to ignore**: `near`, `far`, `huge`, `__near`,
-  `__far`, `__huge`, `_cs`, `_ds`, `_es`, `_ss`, `_seg`, `__based(...)`
-- **Calling-convention keywords**: `__cdecl`, `__pascal`, `__stdcall`,
-  `__fastcall`, `__syscall`, `__watcall` (plus bare and `_`-prefixed
-  variants). Accepted; all compile to the same ABI in Phase 1.
-- **Function attributes**: `__interrupt`, `interrupt`, `__loadds`,
-  `__saveregs`, `__export`
-- **Pragmas to drop**: `hdrstop`, `hdrfile`, `warn`, `warning`,
-  `intrinsic`, `function`, `check_stack`, `code_seg`, `data_seg`,
-  `alloc_text`, `disable_message`, `argsused`, `inline`, `library`,
-  `startup`, `exit`. (`pack` stays honored.)
-
-### Phase 2 — Watcom real (the big one)
-The survey says `#pragma aux` is the single feature that unlocks
-Descent, Duke3D, ROTT, and Heretic/Hexen. It has two forms:
-
-1. Describe calling convention for a named function:
-   `#pragma aux f parm [eax] [edx] value [eax] modify [ecx];`
-2. Define an inline-asm function body:
-   `#pragma aux f = "add eax, edx" parm [eax] [edx] value [eax];`
-
-Also in this phase: `__watcall` as a real ABI (first 4 args in
-`EAX/EDX/EBX/ECX`), `_asm { }` Intel-syntax inline blocks.
-
-### Phase 3 — optional gcc-compat
-If we want Doom's public source (Linux port, DJGPP-style) or Quake
-(also DJGPP): GCC-style `asm(...)`, `__attribute__((...))`, GAS `.S`
-input.
-
-### Phase 4 — integer codegen
-32-bit int, 16-bit short, 32-bit pointer. Reuses
-`uc_core.ast_optimizer` once TypeConfig lands in uc_core.
-
-### Phase 5 — libc subset
-printf / putchar / puts / file I/O via DOS INT 21h.
-
-### Phase 6 — testing
-Via [dosemu](https://github.com/avwohl/dosemu) or similar.
 
 ## Related Projects
 
