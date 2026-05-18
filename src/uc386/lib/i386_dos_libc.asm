@@ -6159,6 +6159,74 @@ _pktdrv_int_invoke:
         ret
 
 ; -----------------------------------------------------------------
+; Stack-switching DPMI fn 0x0301 dispatcher.
+;
+; uint8_t dpmi0301_call_shallow(void *rmcs);
+;
+; Specialized "Simulate Real Mode Procedure with Far Return" (DPMI
+; fn 0x0301) dispatch that switches to a dedicated static stack
+; before the INT 31h. Workaround for PMODE/W: its int 31 handler
+; wedges (no return, no fault) when called from a non-shallow PM
+; stack. Empirically a single Python function frame above main() is
+; enough to trigger it; the production MicroPython interpreter
+; stack is always well past that threshold.
+;
+; The caller fills the rmcs (CS:IP pointing at a real-mode INT 21h
+; thunk, SS:SP=0:0 so DPMI picks a real-mode stack, plus the AX/BX/
+; CX/DX values for the DOS call). Returns CF in AL: 0 on success,
+; 1 on DPMI error.
+;
+; The freedos_micro_python port's `dos_int21_call` uses this as a
+; drop-in replacement for `pktdrv_int_invoke(0x31, dpmi[])` on the
+; DPMI 0x0301 path. Other `pktdrv_int_invoke` callers — DPMI
+; 0x0002 / 0x0006 / 0x0100 setup, packet-driver IRQs — keep using
+; the regular path; they run from shallow stacks already (most from
+; main() entry).
+section .bss
+_dpmi0301_shallow_stack: resb 8192       ; only one label here — libc_split.py
+                                          ; emits BSS labels per-symbol, so a
+                                          ; separate `_top` label would lose
+                                          ; this reservation entirely. Use
+                                          ; `_stack + 8192` instead.
+
+section .text
+_dpmi0301_call_shallow:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        push    edi
+        push    ebx
+        push    es
+        ; ES = DS so the flat-32 EDI lands in our address space.
+        push    ds
+        pop     es
+        ; Save caller's ESP, switch to the top of the dedicated
+        ; shallow stack (grows downward).
+        mov     ebx, esp
+        mov     esp, _dpmi0301_shallow_stack
+        add     esp, 8192
+        ; DPMI 0x0301:
+        ;   AX = 0x0301, BL = INT number (unused, CS:IP in rmcs takes
+        ;   precedence), CX = words to copy from PM stack (0),
+        ;   ES:EDI -> rmcs (32-bit flat pointer in EDI).
+        mov     eax, 0x0301
+        xor     ecx, ecx
+        mov     edi, [ebp + 8]      ; rmcs pointer (caller arg)
+        int     0x31
+        pushfd
+        pop     eax
+        and     eax, 1              ; CF only
+        ; Restore caller's ESP, ES, callee-saved regs.
+        mov     esp, ebx
+        pop     es
+        pop     ebx
+        pop     edi
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; -----------------------------------------------------------------
 ; DPMI 0.9 fn 0x0303 PM callback wrapper.
 ;
 ; uc386 emits a normal cdecl `ret` at the end of every C function,
