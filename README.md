@@ -75,6 +75,8 @@ automatically.
 
 ## Install
 
+> **Note:** not yet ready on PyPI — install from the GitHub repository for now.
+
 From PyPI:
 
 ```
