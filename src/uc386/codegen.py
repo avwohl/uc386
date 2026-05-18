@@ -533,6 +533,14 @@ class CodeGenerator:
         # `_global_inits` holds the initializer expression when one was
         # supplied, so the `.data` emission can produce constants.
         self._globals: dict[str, _ltypes.TypeNode] = {}
+        # `extern`-declared (not defined here) variables, by name →
+        # resolved type. Repopulated each generate() in
+        # _generate_inner, but initialized here too so pre-emit
+        # passes that resolve an identifier's type (e.g.
+        # _identifier_type during typeof/const-eval, before
+        # _generate_inner reaches the extern scan) never see an
+        # uninitialized attribute.
+        self._extern_vars: dict[str, _ltypes.TypeNode] = {}
         self._global_inits: dict[str, ast.Expression] = {}
         # Per-global alignment override from `__attribute__((aligned(N)))`.
         # Keys without an entry use the default (no align directive).
@@ -6056,17 +6064,46 @@ class CodeGenerator:
         if decl.name:
             top = self._struct_aliases[-1]
             if decl.name in top:
-                # Same scope already has a binding — idempotent.
-                return
-            existing_outer = self._resolve_struct_alias(decl.name)
-            if existing_outer is not None:
-                # Outer scope's `struct T` is being shadowed. Mangle the
-                # inner one to a unique key.
+                # Same scope already has a binding. Idempotent ONLY
+                # if the layout matches. File-scope struct tags have
+                # TU (not program) linkage: two different TUs may
+                # legally define `struct T` with *different* members
+                # (e.g. name-hash.c's private `struct dir_entry {
+                # hashmap_entry ent; ... }` vs dir.h's public
+                # `struct dir_entry { unsigned len; ... }`). uc386's
+                # whole-program merge drops them into one alias
+                # scope; silently treating the second as idempotent
+                # bound every TU to the first layout ("struct
+                # dir_entry has no member `ent`"). The merged item
+                # stream is TU-contiguous, so re-registering the
+                # conflicting shape under a fresh key and rebinding
+                # the tag makes the rest of *this* TU resolve to its
+                # own layout; a later TU that re-includes the other
+                # definition rebinds back for its own region.
+                if not decl.members:
+                    return  # forward/opaque ref — keep current bind
+                existing_key = top[decl.name]
+                existing = [
+                    n for n, _, _ in self._structs.get(existing_key, [])
+                ]
+                incoming = [
+                    m.name for m in decl.members if m.name is not None
+                ]
+                if existing == incoming:
+                    return  # identical layout — truly idempotent
                 key = f"{decl.name}#{len(self._structs)}"
+                top[decl.name] = key
+                decl_name = key
             else:
-                key = decl.name
-            top[decl.name] = key
-            decl_name = key
+                existing_outer = self._resolve_struct_alias(decl.name)
+                if existing_outer is not None:
+                    # Outer scope's `struct T` is being shadowed.
+                    # Mangle the inner one to a unique key.
+                    key = f"{decl.name}#{len(self._structs)}"
+                else:
+                    key = decl.name
+                top[decl.name] = key
+                decl_name = key
         else:
             decl_name = None
         if decl_name and decl_name in self._structs:
