@@ -3860,14 +3860,34 @@ class CodeGenerator:
                 self._replace_vla_size_with_capture(
                     param.param_type, captured, fn.name,
                 )
-        # Pre-walk the body for directly-VLA-typed VarDecls. If any
+        # Pre-walk the body for directly-VLA-typed declarations. If any
         # are present, reserve a hidden 4-byte slot at the top of the
         # frame to hold ESP after the fixed-size locals (the VLA
         # baseline). `_collect_locals` and `_var_init` need this slot
         # to exist before they run.
+        #
+        # NB: this runs BEFORE `_collect_locals` synthesises
+        # `_SynthLocalVar`s, so the body still carries parsed
+        # `ast.ArrayDeclarator` nodes — the old `isinstance(sub,
+        # (VarDecl, _SynthLocalVar))` test never matched and the whole
+        # VLA-dealloc mechanism was dead (a goto-back never freed VLAs
+        # and the stack grew without bound). Detect from the parsed
+        # declarator: an array whose size is present and not a
+        # compile-time constant is a VLA. A constant-foldable size
+        # (`int a[ENUM]`) is a fixed array — fold to decide; a
+        # false positive only costs one harmless save/restore.
         has_any_vla = False
         for sub in self._walk_ast(fn.body):
-            if isinstance(sub, (ast.VarDecl, _SynthLocalVar)):
+            if isinstance(sub, ast.ArrayDeclarator):
+                sz = getattr(sub, "size", None)
+                if sz is None or isinstance(sz, ast.IntLiteral):
+                    continue
+                try:
+                    self._const_eval(sz, "<vla-detect>")
+                except CodegenError:
+                    has_any_vla = True
+                    break
+            elif isinstance(sub, (ast.VarDecl, _SynthLocalVar)):
                 vt = self._resolved_var_type(sub)
                 if (
                     isinstance(vt, _ltypes.ArrayType)
