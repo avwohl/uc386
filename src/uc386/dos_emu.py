@@ -113,6 +113,39 @@ def _read_cstr(uc: Uc, addr: int, max_len: int = 4096, term: bytes = b"\x00") ->
     return out
 
 
+def _canon_vfs_path(p: bytes, cwd: bytes) -> bytes:
+    """Canonicalize a DOS path to the absolute form the flat vfs is
+    keyed by: drive letter forced to C:, relative paths joined with
+    `cwd`. Separators are kept verbatim (git mixes a "\\" drive root
+    with "/" components and the vfs is exact-key).
+
+    This is the single source of truth for vfs keying — both the
+    INT 21h path API (`_dos_path`) and the `vfiles_init`/`vdirs_init`
+    seeding go through it, so a test-seeded file behaves exactly like
+    a program-created one. (Before this was shared, `_dos_path`
+    canonicalized "f.txt"→"C:\\f.txt" for lookups but seeding kept
+    the raw "f.txt" key, so `fopen` of a seeded relative name always
+    missed — the cat/sbase-cat regression.)
+    """
+    if len(p) >= 2 and p[1:2] == b":":
+        rest = p[2:]                            # after "X:"
+        if rest[:1] in (b"\\", b"/"):
+            return b"C:\\" + rest[1:]           # X:\abs  -> C:\abs
+        body, base = rest, b"C:\\"              # X:rel (rare)
+    elif p[:1] in (b"\\", b"/"):
+        return b"C:\\" + p[1:]                  # \abs on cur drive
+    else:
+        body = p                                # relative
+        if (len(cwd) >= 3 and cwd[1:2] == b":"
+                and cwd[2:3] in (b"\\", b"/")):
+            base = b"C:\\" + cwd[3:]
+        else:
+            base = b"C:\\"
+        if body and base[-1:] not in (b"\\", b"/"):
+            base += b"\\"
+    return base + body
+
+
 # --- DOS 8.3 path policy (see `fs_mode` in run()) -------------------------
 # DOS chars that are illegal in an 8.3 name even on a real FAT volume.
 _DOS83_BAD = set(b'"/\\[]:;|=,<>+ ') | {c for c in range(0x20)}
@@ -337,8 +370,12 @@ def run(
     # vfs via `vfiles_init` so the program can fopen pre-existing files.
     vfiles: dict[bytes, bytearray] = {}
     if vfiles_init:
+        # Key seeded files by the SAME canonical absolute path the
+        # INT 21h path API resolves to (cwd at boot is C:\), so
+        # fopen("f.txt") — which canonicalizes to C:\f.txt — finds
+        # a vfiles_init["f.txt"] seed. See _canon_vfs_path.
         for name, content in vfiles_init.items():
-            vfiles[name] = bytearray(content)
+            vfiles[_canon_vfs_path(name, b"C:\\")] = bytearray(content)
     # Virtual directory set. Stores directory names that mkdir
     # has created (or that vfiles_init populated for tests). Used
     # by INT 21h AH=0x39 (mkdir), 0x3A (rmdir), and 0x3B (chdir
@@ -352,7 +389,8 @@ def run(
     # seeded file implies its containing directories exist.
     if vdirs_init:
         for d in vdirs_init:
-            vdirs.add(d if isinstance(d, bytes) else bytes(d))
+            d = d if isinstance(d, bytes) else bytes(d)
+            vdirs.add(_canon_vfs_path(d, b"C:\\"))
     if vfiles_init:
         for fname in list(vfiles.keys()):
             p = fname
@@ -520,29 +558,8 @@ def run(
         normalizing them would desync from how git builds the string).
         """
         raw = bytes(_read_cstr_local(addr))
-
-        def _canon(p: bytes) -> bytes:
-            if len(p) >= 2 and p[1:2] == b":":
-                rest = p[2:]                       # after "X:"
-                if rest[:1] in (b"\\", b"/"):
-                    return b"C:\\" + rest[1:]      # X:\abs  -> C:\abs
-                body, base = rest, b"C:\\"         # X:rel (rare)
-            elif p[:1] in (b"\\", b"/"):
-                return b"C:\\" + p[1:]             # \abs on cur drive
-            else:
-                body = p                            # relative
-                cwd = vcwd[0]
-                if (len(cwd) >= 3 and cwd[1:2] == b":"
-                        and cwd[2:3] in (b"\\", b"/")):
-                    base = b"C:\\" + cwd[3:]
-                else:
-                    base = b"C:\\"
-                if body and base[-1:] not in (b"\\", b"/"):
-                    base += b"\\"
-            return base + body
-
         if raw:
-            raw = _canon(raw)
+            raw = _canon_vfs_path(raw, vcwd[0])
         if lfn or _fs_mode == "lenient":
             return raw, True
         return raw, _is_dos83_path(raw, allow_wild=allow_wild)
