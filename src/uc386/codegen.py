@@ -14356,6 +14356,19 @@ class CodeGenerator:
                 "        mov     eax, [ecx]",
                 "        mov     edx, [ecx + 4]",
             ]
+        # `va_arg(ap, long long)` in 64-bit value context: read 8 bytes
+        # and advance the slot by 8 (the EAX-context path `_va_arg_int`
+        # advances 8 too but only keeps the low dword — correct only
+        # when the result is immediately truncated). Evaluated once
+        # here, so the ap side effect happens exactly once.
+        if (
+            isinstance(expr, ast.VaArgExpr)
+            and self._is_long_long(_to_legacy_type(expr.target_type))
+        ):
+            out = self._va_arg_read_and_advance(expr, 8, ctx)
+            out.append("        mov     eax, [ecx]")
+            out.append("        mov     edx, [ecx + 4]")
+            return out
         # Direct loads.
         if isinstance(expr, ast.IntLiteral):
             v = int_value(expr)
