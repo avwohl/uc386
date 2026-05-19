@@ -6197,7 +6197,7 @@ class CodeGenerator:
                             f"`{decl.name}.{m.name}`: bit-field width "
                             f"must be an integer literal"
                         )
-                    width = m.bit_width.value
+                    width = int_value(m.bit_width)
                     if width <= 0 or width > 32:
                         raise CodegenError(
                             f"`{decl.name}.{m.name}`: bit-field width "
