@@ -6727,7 +6727,15 @@ class CodeGenerator:
         ext = "xor     edx, edx" if unsigned else "sar     edx, 31"
         if big_half_in_eax:
             # EAX = source high half already, ready to be the new low.
-            base = [f"        {ext}"]
+            # The signed sign-replicate (`sar edx, 31`) reads EDX, which
+            # the caller left UNSPECIFIED in this fast path — seed it
+            # from the high half (EAX) first, or it sars garbage. The
+            # unsigned `xor edx, edx` ignores EDX's prior value, so it
+            # needs no seed.
+            if unsigned:
+                base = [f"        {ext}"]
+            else:
+                base = ["        mov     edx, eax", f"        {ext}"]
         else:
             # EDX:EAX = full source. Move high → eax, then zero/sign edx.
             base = ["        mov     eax, edx", f"        {ext}"]
