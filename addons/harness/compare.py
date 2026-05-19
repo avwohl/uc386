@@ -204,12 +204,31 @@ def build_uc386_exe(addon: Path) -> int | None:
 
 
 def build_watcom(addon: Path) -> int | None:
-    """Build via Open Watcom wcc386. Linux/Windows hosts only — there is
-    no native macOS build, so this returns None on the dev host and the
-    real numbers come from the CI runner."""
+    """Build via Open Watcom wcc386.
+
+    Native wcc386 (Linux/Windows) is used when present. On macOS — no
+    native Open Watcom build exists — we fall back to running the
+    DOS-hosted wcc386.exe/wlink.exe under DOSBox-X (see
+    `addons.harness.watcom_dosbox`). Either way the measured artifact
+    is the bound DOS `.exe` on disk."""
     wcc = _which_first(WATCOM_CANDIDATES)
     if wcc is None:
-        return None
+        # macOS / no-native-Watcom fallback: DOS-hosted under DOSBox-X.
+        try:
+            from addons.harness.watcom_dosbox import (
+                build_watcom_dos, have_toolchain,
+            )
+        except Exception:
+            return None
+        if not have_toolchain():
+            return None
+        out = REPO_ROOT / "build" / "compare" / addon.name
+        out.mkdir(parents=True, exist_ok=True)
+        exe_path = out / "wcdos.exe"
+        ok, _msg = build_watcom_dos([addon / "main.c"], exe_path)
+        if not ok or not exe_path.is_file():
+            return None
+        return exe_path.stat().st_size
     # wcc386 needs WATCOM env (for h/, lib386/) and INCLUDE for stdio.h
     # etc. If WATCOM isn't already set, default it from the wcc386 path.
     env = os.environ.copy()
@@ -310,26 +329,36 @@ def main() -> int:
         return f"{n:,}" if n is not None else "—"
 
     md = ["# Build comparison: uc386 vs gcc / Watcom / DJGPP", "",
-          "Sizes in bytes of the produced executable. The columns ",
-          "use different output formats — the comparison is about ",
-          "_how big does each compiler's smallest hello-world-class ",
-          "program get_, not strict like-for-like:", "",
-          "- **uc386 (.bin)**: flat i386 binary that runs under ",
-          "  dos_emu. Compile-time libc bundling + asm DCE strip ",
-          "  everything the program doesn't reference.",
-          "- **uc386 (.exe)**: same uc386 codegen, then `nasm -f obj` ",
-          "  → `wlink system pmodew` produces an MZ+LE .exe with the ",
-          "  PMODE/W extender bound (~11 KB stub overhead). Runs ",
-          "  unmodified on FreeDOS / DOSBox / real DOS. Empty cells ",
-          "  on hosts without Open Watcom (no native macOS build).",
-          "- **gcc**: native host ELF (Linux/macOS). Includes glibc ",
-          "  startup machinery — biggest by a wide margin.",
-          "- **Watcom (`wcc386`)**: 32-bit DOS/4GW `.exe` via ",
-          "  Watcom's own clib. Empty cells mean the toolchain wasn't ",
-          "  available in this build environment.",
+          "Sizes in **bytes** of the produced executable. Read the ",
+          "columns honestly — they are not all the same kind of ",
+          "artifact:", "",
+          "- **uc386 (.bin)**: flat i386 image. Smallest by far, but ",
+          "  it is **not a standalone DOS program** — it has no MZ ",
+          "  header and runs only under `uc386.dos_emu` (Unicorn) or ",
+          "  a custom loader. Useful as a pure codegen/DCE metric; ",
+          "  **not** an apples-to-apples row against Watcom/DJGPP.",
+          "- **uc386 (.exe)**: the real DOS-deployable artifact — ",
+          "  same codegen, then `nasm -f obj` + the bundled ",
+          "  pure-Python `pyle` linker emit an MZ+LE .exe with the ",
+          "  PMODE/W extender bound (~16 KB stub floor). Runs ",
+          "  unmodified on FreeDOS / DOSBox / real DOS. Builds on ",
+          "  **macOS too** (pyle needs no Open Watcom). **This is ",
+          "  the honest row to compare against Watcom and DJGPP.**",
+          "- **gcc**: native host ELF (Linux/macOS) — *not a DOS ",
+          "  target*. A sanity baseline only; ignore for DOS size.",
+          "- **Watcom (`wcc386`)**: real Open Watcom V2, 32-bit ",
+          "  DOS/4GW `.exe`, `-otexan` (full opt). Native wcc386 on ",
+          "  Linux/Windows; on macOS the DOS-hosted wcc386.exe/ ",
+          "  wlink.exe run under DOSBox-X (`watcom_dosbox.py`) so ",
+          "  the period reference is *checked, not asserted*.",
           "- **DJGPP**: COFF DOS executable for the go32 DPMI ",
-          "  extender (gcc 12.2.0 cross). Includes the full djgpp ",
-          "  C runtime — explains why even `true` is ~148 KB.", "",
+          "  extender (gcc 12.2.0 cross, `-O2`). The full djgpp C ",
+          "  runtime is baked in — explains the ~148 KB `true`.", "",
+          "Apples-to-apples (real DOS .exe): **uc386 .exe ≈ 17 KB**, ",
+          "**Watcom ≈ 5–8 KB**, **DJGPP ≈ 148–180 KB**. Watcom wins ",
+          "the floor (mature linker + tight DOS/4GW clib); uc386 ",
+          "beats DJGPP by ~9× and gcc-on-host by ~2×, and its .bin ",
+          "codegen floor (no extender) is far smaller still.", "",
           "| Tool | uc386 (.bin) | uc386 (.exe) | gcc (host ELF) | Watcom wcc386 | DJGPP |",
           "|------|--------------|--------------|----------------|---------------|-------|"]
     for name, uc_sz, uc_exe_sz, gcc_sz, wcc_sz, djgpp_sz in rows:
