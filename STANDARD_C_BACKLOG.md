@@ -35,7 +35,8 @@ each is resumable without re-triage.
 | conversion.c | exit 1 | float→int / rounding mode ("SPU float rounds toward zero" — FP conversion semantics). |
 | 970217-1.c | exit 1 | `sub(int i, int array[i++])` — side effect in array-param declarator must be evaluated (i→11). |
 | 20010904-1/2.c | exit 1 | (triage) |
-| 20020227-1.c, 20020423-1.c (PR c/5430), 20020508-3.c, 20020904-1.c (PR c/7102), 20040411-1.c, 20041218-2.c, 960830-1.c, 991216-2.c | exit 1 | individual codegen-corner miscompiles — bisect each with exit-code repro. |
+| ~~20020423-1.c~~ (PR c/5430) | **FIXED** (uc_core) | `_nested_const_fold._new` minted folded constants via `make_int_lit(val)` w/o the unsigned flag: `(x+4)-8U` → bare decimal `4294967292`, which doesn't fit int/32-bit-long and wrongly promoted to **long long** (routed to the broken LL `int 0x80` div path). Now `make_int_lit(val, unsigned=is_unsigned)`, mirroring the main const-fold path (`7e77976`). |
+| 20020227-1.c, 20020508-3.c, 20020904-1.c (PR c/7102), 20040411-1.c, 20041218-2.c, 960830-1.c, 991216-2.c | exit 1 | individual codegen-corner miscompiles — bisect each with exit-code repro. |
 | pr23467.c, pr40386.c, pr43220.c, pr49039.c, pr49279.c, pr28982b.c | exit 1 / unicorn mem fault | per-PR codegen bugs; pr28982b/pr43220 = bad addressing (UC_ERR mem). |
 | 20040811-1.c, 20060412-1.c, vla-dealloc-1.c | unicorn invalid mem/insn | bad codegen output; vla-dealloc-1 = VLA deallocation (C99). |
 | bitfld-4.c | exit 1 | a *second* bitfield bug (not the shape-hash one) — specific width/op. |
