@@ -20,13 +20,16 @@ compiler — tracked, not claimed as passing.
 **K&R / implicit-int compatibility (`--kr`).** Pre-ANSI sources —
 implicit-`int` returns (`main() { … }`) and K&R old-style parameter
 lists (`f(a, b) int a; char *b; { … }`) — are not valid C23 and the
-strict grammar rejects them. Passing `--kr` enables a source-level
-pre-pass (in [uc_core](https://github.com/avwohl/uc_core)) that
-rewrites those two shapes into equivalent ANSI before parsing. It is
-**off by default and only engages on files that fail the strict
-parse**, so modern code is parsed exactly once and pays zero cost.
-Use it for legacy/pre-ANSI codebases; the conformance runners enable
-it for the K&R-heavy torture corpus.
+strict grammar rejects them — as is the GNU **computed-goto /
+labels-as-values** extension (`&&label`, `goto *expr`). Passing
+`--kr` enables a source-level pre-pass (in
+[uc_core](https://github.com/avwohl/uc_core)) that rewrites these
+shapes into equivalent standard C before parsing (computed goto
+lowers to a `switch` dispatch). It is **off by default and only
+engages on files that fail the strict parse**, so modern code is
+parsed exactly once and pays zero cost. Use it for legacy/pre-ANSI
+or GNU-C codebases; the conformance runners enable it for the
+K&R-heavy torture corpus.
 
 The frontend (parsing, preprocessing, AST-level optimization) lives
 in [uc_core](https://github.com/avwohl/uc_core); this repo owns the
