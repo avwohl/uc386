@@ -46,12 +46,17 @@ def find_tests(patterns=None, limit=None):
     return tests
 
 
-def run_test(c_file: Path, *, compile_only: bool = True) -> tuple[str, str]:
+def run_test(c_file: Path, *, compile_only: bool = True,
+              kr: bool = True) -> tuple[str, str]:
     asm_file = Path("/tmp") / c_file.with_suffix(".asm").name
     cc_cmd = [
         sys.executable, "-m", "uc386.main", str(c_file), "-o", str(asm_file),
         "-I", str(LIB_INCLUDE),
     ]
+    # The torture corpus is pre-ANSI (K&R / implicit-int). Enabled by
+    # default here; --no-kr measures the strict-C23 baseline.
+    if kr:
+        cc_cmd.append("--kr")
     try:
         result = subprocess.run(
             cc_cmd, capture_output=True, text=True,
@@ -93,6 +98,10 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--compile-only", action="store_true", default=True)
     parser.add_argument("--full", dest="compile_only", action="store_false")
+    parser.add_argument("--kr", dest="kr", action="store_true", default=True,
+                        help="enable K&R/implicit-int pre-pass (default)")
+    parser.add_argument("--no-kr", dest="kr", action="store_false",
+                        help="strict C23 baseline (no pre-ANSI rewrite)")
     args = parser.parse_args()
 
     if not TORTURE_DIR.exists():
@@ -110,7 +119,8 @@ def main():
 
     buckets: dict[str, list[str]] = {}
     for c_file in tests:
-        status, msg = run_test(c_file, compile_only=args.compile_only)
+        status, msg = run_test(c_file, compile_only=args.compile_only,
+                                kr=args.kr)
         buckets.setdefault(status, []).append(c_file.name)
         if args.verbose or status not in ("pass", "skip"):
             print(f"{c_file.name}: {status.upper()}")

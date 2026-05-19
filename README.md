@@ -4,11 +4,30 @@ C23 compiler targeting the Intel 386 (i386 / x86-32) processor under a
 DOS extender — specifically the **flat 32-bit Watcom / DOS/4GW-era** C
 that early-to-mid-1990s PC games were written in.
 
-**Status: working — in testing ahead of a general release.** Passes
-both reference suites at 100%: all 1514 executable
-[gcc-c-torture](https://github.com/llvm/llvm-test-suite) tests and
-all 220 [c-testsuite](https://github.com/c-testsuite/c-testsuite)
-tests compile, assemble, and run correctly under our DOS emulator.
+**Status: working — in testing ahead of a general release.** Measured
+against two reference suites under our DOS emulator (compile →
+assemble → run → diff): **215 / 220**
+[c-testsuite](https://github.com/c-testsuite/c-testsuite) and, with
+the K&R pre-pass (see below), **1341 / 1514**
+[gcc-c-torture](https://github.com/llvm/llvm-test-suite) executable
+tests passing. The frontend defaults to **strict C23**; the
+gcc-c-torture corpus is pre-ANSI and heavy on K&R-style code, so it
+is run with `--kr` enabled. The remaining gap is unimplemented
+codegen features (vectors, designated initializers, …), missing libc
+headers, and GCC-extension tests out of scope for a DOS i386 C
+compiler — tracked, not claimed as passing.
+
+**K&R / implicit-int compatibility (`--kr`).** Pre-ANSI sources —
+implicit-`int` returns (`main() { … }`) and K&R old-style parameter
+lists (`f(a, b) int a; char *b; { … }`) — are not valid C23 and the
+strict grammar rejects them. Passing `--kr` enables a source-level
+pre-pass (in [uc_core](https://github.com/avwohl/uc_core)) that
+rewrites those two shapes into equivalent ANSI before parsing. It is
+**off by default and only engages on files that fail the strict
+parse**, so modern code is parsed exactly once and pays zero cost.
+Use it for legacy/pre-ANSI codebases; the conformance runners enable
+it for the K&R-heavy torture corpus.
+
 The frontend (parsing, preprocessing, AST-level optimization) lives
 in [uc_core](https://github.com/avwohl/uc_core); this repo owns the
 driver, the x86-32 NASM emitter, and the DOS runtime bindings.

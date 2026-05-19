@@ -336,6 +336,10 @@ def main() -> int:
     ap.add_argument("-D", "--define", action="append", default=[], metavar="NAME[=VALUE]")
     ap.add_argument("-E", "--preprocess-only", action="store_true")
     ap.add_argument("-P", "--no-preprocess", action="store_true")
+    ap.add_argument("--kr", action="store_true",
+                    help="enable the K&R / implicit-int source pre-pass "
+                         "(pre-ANSI sources). Off by default — modern code "
+                         "pays no cost.")
     ap.add_argument("--no-ast-optimize", action="store_true")
     ap.add_argument("--no-peephole", action="store_true",
                     help="Disable asm-level peephole optimization")
@@ -406,7 +410,7 @@ def main() -> int:
                 if args.preprocess_only:
                     print(source)
                     continue
-            asts.append(_frontend_parse(source, str(p)))
+            asts.append(_frontend_parse(source, str(p), kr_prepass=args.kr))
 
         if args.preprocess_only:
             return 0

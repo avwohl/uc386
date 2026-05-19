@@ -77,6 +77,7 @@ def run_test(
     *,
     verbose: bool = False,
     compile_only: bool = True,
+    kr: bool = True,
 ) -> tuple[str, str]:
     """Compile (and optionally assemble/link/run) one test.
 
@@ -93,6 +94,8 @@ def run_test(
         sys.executable, "-m", "uc386.main", str(source), "-o", str(asm_file),
         "-I", str(LIB_INCLUDE),
     ]
+    if kr:
+        cc_cmd.append("--kr")
     try:
         result = subprocess.run(
             cc_cmd, capture_output=True, text=True,
@@ -162,6 +165,10 @@ def main():
              "wired yet; expect 'skip' for each test until the "
              "DOS-extender pipeline lands.",
     )
+    parser.add_argument("--kr", dest="kr", action="store_true", default=True,
+                        help="enable K&R/implicit-int pre-pass (default)")
+    parser.add_argument("--no-kr", dest="kr", action="store_false",
+                        help="strict C23 baseline (no pre-ANSI rewrite)")
     args = parser.parse_args()
 
     if not TEST_SUITE_DIR.exists():
@@ -190,7 +197,7 @@ def main():
             continue
         status, msg = run_test(
             c_file, num, verbose=args.verbose,
-            compile_only=args.compile_only,
+            compile_only=args.compile_only, kr=args.kr,
         )
         buckets[status].append(num)
         if args.verbose or status not in ("pass", "skip"):
