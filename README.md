@@ -8,7 +8,7 @@ that early-to-mid-1990s PC games were written in.
 against two reference suites under our DOS emulator (compile →
 assemble → run → diff): **215 / 220**
 [c-testsuite](https://github.com/c-testsuite/c-testsuite) and, with
-the `--kr` pre-pass (see below), **1357 / 1514**
+the `--kr` pre-pass (see below), **1367 / 1514**
 [gcc-c-torture](https://github.com/llvm/llvm-test-suite) executable
 tests passing. The frontend defaults to **strict C23**; the
 gcc-c-torture corpus is pre-ANSI and GNU-heavy, so it is run with

@@ -2603,21 +2603,23 @@ _printf_legacy:
 .pd_dec:
         mov     eax, [edi]
         add     edi, 4
-        movzx   ebx, byte [ebp - 4]
-        push    ebx
+        movzx   edx, byte [ebp - 4]
+        push    edx
         push    ecx
         call    _printf_emit_dec
         add     esp, 8
+        add     ebx, eax              ; account chars written
         jmp     .next
 
 .pd_udec:
         mov     eax, [edi]
         add     edi, 4
-        movzx   ebx, byte [ebp - 4]
-        push    ebx
+        movzx   edx, byte [ebp - 4]
+        push    edx
         push    ecx
         call    _printf_emit_udec
         add     esp, 8
+        add     ebx, eax              ; account chars written
         jmp     .next
 
 .pd_hex:
@@ -2625,12 +2627,13 @@ _printf_legacy:
         jne     .pd_llhex
         mov     eax, [edi]
         add     edi, 4
-        movzx   ebx, byte [ebp - 4]   ; zero_pad
-        push    ebx
+        movzx   edx, byte [ebp - 4]   ; zero_pad
+        push    edx
         push    ecx                   ; width
         push    0                     ; 0 = lowercase
         call    _printf_emit_hex
         add     esp, 12
+        add     ebx, eax              ; account chars written
         jmp     .next
 
 .pd_HEX:
@@ -2638,12 +2641,13 @@ _printf_legacy:
         jne     .pd_llHEX
         mov     eax, [edi]
         add     edi, 4
-        movzx   ebx, byte [ebp - 4]
-        push    ebx
+        movzx   edx, byte [ebp - 4]
+        push    edx
         push    ecx
         push    1                     ; 1 = uppercase
         call    _printf_emit_hex
         add     esp, 12
+        add     ebx, eax              ; account chars written
         jmp     .next
 
 .pd_llhex:
@@ -2677,11 +2681,12 @@ _printf_legacy:
 .pd_oct:
         mov     eax, [edi]
         add     edi, 4
-        movzx   ebx, byte [ebp - 4]
-        push    ebx
+        movzx   edx, byte [ebp - 4]
+        push    edx
         push    ecx
         call    _printf_emit_oct
         add     esp, 8
+        add     ebx, eax              ; account chars written
         jmp     .next
 
 .pd_ptr:
@@ -3093,6 +3098,17 @@ _emit_padded_digits_wp:
         inc     esi
         jmp     .dl
 .done:
+        ; Return total chars written = max(width, digits + sign).
+        ; EDI still holds the digit count here (digit emit used ESI).
+        mov     eax, edi
+        cmp     dword [ebp + 8], 0       ; sign present?
+        je      .rc_w
+        inc     eax
+.rc_w:
+        cmp     eax, dword [ebp + 16]    ; field width wider?
+        jge     .rc_r
+        mov     eax, [ebp + 16]
+.rc_r:
         pop     ebx
         pop     edi
         pop     esi
