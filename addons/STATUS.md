@@ -225,10 +225,10 @@ header there explains each column. Real `true` row:
 ```
 
 **The earlier "390× smaller than Watcom" claim was wrong** — it
-divided the `.bin` (14 B, *not a DOS executable* — no MZ header,
-runs only under dos_emu) by Watcom's real `.exe` (5,494 B). That
-is a category error. The honest comparison uses the same kind of
-artifact on both sides:
+divided uc386's `.bin` (18 B, *not a DOS executable* — no MZ
+header, runs only under dos_emu) by Watcom's real `.exe` (5,494 B).
+That is a category error. The honest comparison uses the same kind
+of artifact on both sides:
 
 - **Codegen floor (`.bin`, not shippable):** uc386 is in a class
   of its own — tens of bytes vs Watcom's multi-KB. Real, but it
@@ -237,9 +237,9 @@ artifact on both sides:
   has a ~17 KB extender floor. **Open Watcom is ~2–3× smaller**
   on tiny programs (`true` 5,420 vs 16,907; `echo` 11,286 vs
   16,915) and roughly converges as code grows (`factor` 20,538
-  vs 16,989 — uc386 ahead; `wc` 20,158 vs 16,928 — uc386 ahead).
-  So uc386's *codegen* is tighter but its *DOS packaging* loses
-  to Watcom's mature DOS/4GW clib+linker on small binaries.
+  vs 16,989, `wc` 20,158 vs 16,928 — uc386 ahead). uc386's
+  *codegen* is tighter but its *DOS packaging* loses to Watcom's
+  mature DOS/4GW clib+linker on small binaries.
 - **vs DJGPP / gcc:** uc386 `.exe` beats DJGPP **~9×** (148–182 KB
   go32+djgpp runtime) and host gcc **~2×** (gcc isn't a DOS
   target anyway — sanity baseline only).

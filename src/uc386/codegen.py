@@ -219,7 +219,11 @@ class _FuncCtx:
         # `_collect_locals` runs before emit and assigns each VarDecl a
         # frame slot. The (id(decl) → disp) mapping below survives the
         # collect-time scope pop, so the emit-time walk can re-bind the
-        # name in its scope without re-bumping frame_size.
+        # name in its scope without re-bumping frame_size. The re-bind
+        # path still advances frame_size up to `-disp` so compiler-
+        # generated allocs that follow in the same scope (compll temps
+        # for compound assigns, etc.) land below the cached slot
+        # instead of overlapping it.
         self.decl_disps: dict[int, int] = {}
         self.decl_types: dict[int, "_ltypes.TypeNode"] = {}
         # Persistent name -> declared (non-decayed) type for every
@@ -391,6 +395,20 @@ class _FuncCtx:
             self.slots[-1][name] = disp
             self.types[-1][name] = self.decl_types[key]
             self.decl_types_by_name[name] = self.decl_types[key]
+            # Re-bind: advance frame_size past the cached slot so any
+            # subsequent compiler-generated allocs (compound-assign
+            # temps, snapshots) in this scope land below it instead of
+            # colliding with the user-declared local. Without this,
+            # collect-pass bumps frame_size for both the decl and the
+            # temp; emit-pass skips the decl bump (cache hit) and
+            # places the temp at the decl's disp — corrupting the
+            # user local. The slot's lowest byte is at `disp`, so
+            # frame_size must be at least `-disp`.
+            needed = -disp
+            if needed > self.frame_size:
+                self.frame_size = needed
+                if self.frame_size > self.max_frame_size:
+                    self.max_frame_size = self.frame_size
             return disp
         if name in self.slots[-1]:
             raise CodegenError(f"redeclaration of `{name}` in same scope")
