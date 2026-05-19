@@ -14025,6 +14025,26 @@ class CodeGenerator:
             return self._array_is_directly_vla(t.base_type)
         return False
 
+    def _is_genuine_vla_array(self, t: _ltypes.TypeNode) -> bool:
+        """True only for a *genuine* VLA array: some dimension's size
+        expression is present, not an IntLiteral, and does NOT
+        const-fold. Distinguishes `typedef int c[i+2]` (runtime size)
+        from `typedef T a[N+1]` (non-literal but constant — sized
+        statically). Used to gate the runtime-sizeof typedef path so
+        a constant-sized typedef isn't mis-routed there.
+        """
+        if not isinstance(t, _ltypes.ArrayType):
+            return False
+        sz = getattr(t, "_vla_size", None)
+        if sz is None:
+            sz = t.size
+        if sz is not None and not isinstance(sz, ast.IntLiteral):
+            try:
+                self._const_eval(sz, "<vla?>")
+            except CodegenError:
+                return True
+        return self._is_genuine_vla_array(t.base_type)
+
     def _type_has_vla(self, t: _ltypes.TypeNode) -> bool:
         """Does `t` contain a variable-length array? Recognized via
         either a saved `_vla_size` (set by `_check_supported_type`'s
@@ -14068,16 +14088,30 @@ class CodeGenerator:
         # (`typedef int c[i+2]; sizeof(c)`) routes through the runtime
         # path instead of being statically mis-sized. Same typedef-
         # resolution gap as the _cast narrowing fix (34d45ab).
+        #
+        # Adopt the resolved type ONLY when it is a *genuine* VLA (an
+        # array dimension whose size expr won't const-fold). A typedef
+        # to a constant-sized array often has a non-IntLiteral but
+        # foldable size (`typedef T a[N+1]`); `_type_has_vla` would
+        # call that "VLA" and route it into the runtime path, which
+        # raises — whereas the unresolved static path folds it fine.
+        # Leaving `t` untouched there keeps this byte-identical to the
+        # pre-resolution behaviour for every non-genuine-VLA typedef.
         if isinstance(t, (ast.TypeName, ast.TypeNameWithDeclarator)):
-            t = _to_legacy_type(t)
+            legacy = _to_legacy_type(t)
+        else:
+            legacy = t
+        resolved_legacy = legacy
         if (
-            isinstance(t, _ltypes.BasicType)
-            and t.name not in self._BASIC_SIZES
+            isinstance(legacy, _ltypes.BasicType)
+            and legacy.name not in self._BASIC_SIZES
         ):
-            resolved = self._resolve_typedef_name(t.name)
-            if resolved is not None:
+            r = self._resolve_typedef_name(legacy.name)
+            if r is not None:
                 from uc_core.ast import resolved_to_legacy
-                t = resolved_to_legacy(resolved)
+                resolved_legacy = resolved_to_legacy(r)
+        if self._is_genuine_vla_array(resolved_legacy):
+            t = resolved_legacy
         if not self._type_has_vla(t):
             return [f"        mov     eax, {self._size_of(t)}"]
         if isinstance(t, _ltypes.ArrayType):
