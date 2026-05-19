@@ -3483,6 +3483,14 @@ _open:
         movzx   eax, ax
         cmp     ax, 0xFFFF
         jne     .ok
+        ; POSIX: open() must set errno on failure. dos_emu's AH=0xA0
+        ; only fails for "file not found" (mode 'r' on a missing
+        ; vfile), so ENOENT (2) is the correct/only cause here.
+        ; Code like git's config writer relies on errno==ENOENT to
+        ; tell "create it" from a real error; without this it sees a
+        ; stale errno and aborts. Set only on the failure path so a
+        ; successful open leaves errno untouched (also POSIX).
+        mov     dword [_errno], 2           ; ENOENT
         mov     eax, -1
 .ok:
         mov     esp, ebp
@@ -4323,17 +4331,40 @@ _stat:
         ret
 
 ; int fstat(int fd, struct stat *buf)
-;   Tell current pos, seek to end (= size), seek back, write
-;   st_mode + st_size. Uses ESI/EDI to carry size + saved-pos
-;   across the multiple int 21h calls (see _stat for the
-;   peephole-eats-push/pop-around-int rationale).
+;   First classify the handle with INT 21h AX=4400h (IOCTL — Get
+;   Device Information): DX bit 7 set ⇒ a *character device* (the
+;   console, NUL, or a piped/redirected-through-device stdin), clear
+;   ⇒ a disk file. A char device has no meaningful size and is not
+;   seekable, so report S_IFCHR with st_size 0 and DO NOT run the
+;   lseek dance (seeking a non-seekable handle returns garbage and
+;   makes portable code — e.g. git's index_fd → xmmap(fd) — take a
+;   regular-file path it must not). For a real disk file, behave as
+;   before: tell / seek-to-end (= size) / seek-back, st_mode
+;   S_IFREG. If the IOCTL itself fails (CF) fall back to the file
+;   path (DOS ≥2.0 always supports 4400h; this is just belt-and-
+;   braces and keeps real-file fstat working everywhere).
+;   ESI/EDI carry size + saved-pos across the int 21h calls (see
+;   _stat for the peephole-eats-push/pop-around-int rationale).
 _fstat:
         push    ebp
         mov     ebp, esp
         push    ebx
         push    esi
         push    edi
-        mov     ebx, [ebp + 8]
+        mov     ebx, [ebp + 8]               ; BX = fd (handle)
+        ; classify: AX=4400h IOCTL get-device-info, BX=handle.
+        mov     ax, 0x4400
+        int     21h
+        jc      .fst_file                    ; IOCTL err → treat as file
+        test    dl, 0x80                     ; bit 7 = character device?
+        jz      .fst_file                    ; clear → disk file
+        ; character device (console / pipe stdin): no size, S_IFCHR.
+        mov     edx, [ebp + 12]
+        mov     dword [edx + 8], 0x2000      ; st_mode = S_IFCHR
+        mov     dword [edx + 28], 0          ; st_size  = 0
+        xor     eax, eax
+        jmp     .fst_done
+.fst_file:
         ; tell: lseek(fd, 0, SEEK_CUR=1) → DX:AX
         mov     ah, 0x42
         mov     al, 1
@@ -4365,9 +4396,10 @@ _fstat:
         int     21h
         ; fill struct
         mov     edx, [ebp + 12]
-        mov     dword [edx + 8], 0x8000
-        mov     [edx + 28], esi
+        mov     dword [edx + 8], 0x8000      ; st_mode = S_IFREG
+        mov     [edx + 28], esi              ; st_size
         xor     eax, eax
+.fst_done:
         pop     edi
         pop     esi
         pop     ebx
@@ -4379,33 +4411,24 @@ _lstat:
         jmp     _stat                        ; no symlinks under DOS
 ; ---- access(path, mode) ---------------------------------------------------
 ; Return 0 if path exists (mode bits ignored — dos_emu has no real
-; perms). Try to open() the path read-only; on success close + return 0,
-; on fail return -1. Lets period code that probes for files
-; (`access(wad, R_OK)`) actually find them under vfiles_init.
+; perms). Uses INT 21h AH=0x43 AL=0 (get file attributes), which —
+; unlike AH=0x3D (open) — succeeds for directories as well as files.
+; That matches real DOS C libraries (you can't open() a directory)
+; and lets `access(dir, X_OK)` work, e.g. git's worktree probe
+; `access(repo_get_work_tree(), X_OK)` for `git init <dir>`.
 _access:
         push    ebp
         mov     ebp, esp
-        push    ebx
         mov     edx, [ebp + 8]              ; path → DS:EDX for INT 21h
-        mov     al, 0                        ; mode = read-only
-        mov     ah, 0x3D                     ; AH = 0x3D (open)
+        mov     ah, 0x43                     ; get/set file attributes
+        mov     al, 0                        ; AL=0 → get attributes
         int     21h
-        ; Real DOS sets CF=1 + AX=err on failure; dos_emu returns
-        ; EAX=-1 with CF unset. Check both so the libc works under
-        ; either backend.
-        jc      ._fail
-        cmp     eax, -1
-        je      ._fail
-        ; Got a valid fd in EAX (low 16). Close and return 0.
-        mov     ebx, eax
-        mov     ah, 0x3E
-        int     21h
-        xor     eax, eax
+        jc      ._fail                       ; CF set → not found
+        xor     eax, eax                     ; exists (file or dir) → 0
         jmp     ._done
 ._fail:
         mov     eax, -1
 ._done:
-        pop     ebx
         mov     esp, ebp
         pop     ebp
         ret
@@ -4695,6 +4718,362 @@ _dos_dta_filename:
 ;   Returns the attribute byte at DTA+21. Useful for distinguishing
 ;   files vs directories. 0x10 = directory.
 _dos_dta_attr:
+        movzx   eax, byte [__dta_buf + 21]
+        ret
+
+; ============================================================================
+; DOSLFN — INT 21h AX=71xx long-filename API.
+;
+; Faithful to the real DOSLFN / Windows-9x register contract so the
+; git port's LFN backend (dos_lfn_uc386dos.c) is portable to FreeDOS
+; with DOSLFN loaded on real hardware. In uc386's flat 32-bit model
+; DS:DX == EDX, DS:SI == ESI, ES:DI == EDI (no real segmentation —
+; same convention dos_emu and the legacy _rename helper above use).
+;
+; These are NEW symbol names: a user TU never defines them, so they
+; are never stripped by bundle_text's user-symbol precedence and are
+; always linkable. The C policy layer decides LFN-vs-legacy per a
+; one-time AX=71A0 capability probe; the *_legacy_* duplicates below
+; give it a short-name path that survives even though the C layer
+; overrides the public open/mkdir/... symbols.
+; ============================================================================
+
+        section .bss
+__lfn_root:     resb 8                  ; "C:\" ASCIZ (probe arg)
+__lfn_volbuf:   resb 64                 ; AX=71A0 fsname out buffer
+        section .text
+
+; int dos_lfn_probe(void) — AX=71A0 GetVolumeInfo. 1 if CF clear and
+; BX bit14 (LFN supported) set; else 0.
+_dos_lfn_probe:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    edi
+        mov     byte [__lfn_root + 0], 'C'
+        mov     byte [__lfn_root + 1], ':'
+        mov     byte [__lfn_root + 2], '\'
+        mov     byte [__lfn_root + 3], 0
+        mov     edx, __lfn_root
+        mov     edi, __lfn_volbuf
+        mov     ecx, 64
+        mov     ax, 0x71A0
+        int     21h
+        jc      .np_no
+        test    bx, 0x4000
+        jz      .np_no
+        mov     eax, 1
+        jmp     .np_done
+.np_no:
+        xor     eax, eax
+.np_done:
+        pop     edi
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int dos_lfn_open(const char *name, int access, int action)
+;   AX=716C  BX=access(0=r/1=w/2=rw)  CX=0  DX=action  DS:SI=name
+;   DI=0. Returns fd>=0, or -1 on CF.
+_dos_lfn_open:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    esi
+        push    edi
+        mov     esi, [ebp + 8]
+        mov     ebx, [ebp + 12]
+        mov     edx, [ebp + 16]
+        xor     ecx, ecx
+        xor     edi, edi
+        mov     ax, 0x716C
+        int     21h
+        jc      .lo_err
+        movzx   eax, ax
+        jmp     .lo_done
+.lo_err:
+        mov     eax, -1
+.lo_done:
+        pop     edi
+        pop     esi
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int dos_lfn_mkdir(const char *path)  — AX=7139 DS:DX=path
+_dos_lfn_mkdir:
+        push    ebp
+        mov     ebp, esp
+        mov     edx, [ebp + 8]
+        mov     ax, 0x7139
+        int     21h
+        jc      .lmk_err
+        xor     eax, eax
+        jmp     .lmk_done
+.lmk_err:
+        mov     eax, -1
+.lmk_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int dos_lfn_rmdir(const char *path)  — AX=713A DS:DX=path
+_dos_lfn_rmdir:
+        push    ebp
+        mov     ebp, esp
+        mov     edx, [ebp + 8]
+        mov     ax, 0x713A
+        int     21h
+        jc      .lrd_err
+        xor     eax, eax
+        jmp     .lrd_done
+.lrd_err:
+        mov     eax, -1
+.lrd_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int dos_lfn_unlink(const char *path) — AX=7141 DS:DX=path SI=0
+_dos_lfn_unlink:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        mov     edx, [ebp + 8]
+        xor     esi, esi
+        mov     ax, 0x7141
+        int     21h
+        pop     esi
+        jc      .lul_err
+        xor     eax, eax
+        jmp     .lul_done
+.lul_err:
+        mov     eax, -1
+.lul_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int dos_lfn_rename(const char *old, const char *new)
+;   AX=7156 DS:DX=old ES:DI=new
+_dos_lfn_rename:
+        push    ebp
+        mov     ebp, esp
+        push    edi
+        mov     edx, [ebp + 8]
+        mov     edi, [ebp + 12]
+        mov     ax, 0x7156
+        int     21h
+        pop     edi
+        jc      .lrn_err
+        xor     eax, eax
+        jmp     .lrn_done
+.lrn_err:
+        mov     eax, -1
+.lrn_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int dos_lfn_findfirst(const char *pat, void *w32)
+;   AX=714E CX=attr(dirs+sys+hidden) SI=0(DOS time) DS:DX=pat
+;   ES:DI=WIN32_FIND_DATA. Returns search handle>=0, -1 on CF.
+_dos_lfn_findfirst:
+        push    ebp
+        mov     ebp, esp
+        push    esi
+        push    edi
+        mov     edx, [ebp + 8]
+        mov     edi, [ebp + 12]
+        mov     cx, 0x0016
+        xor     esi, esi
+        mov     ax, 0x714E
+        int     21h
+        jc      .lff_err
+        movzx   eax, ax
+        jmp     .lff_done
+.lff_err:
+        mov     eax, -1
+.lff_done:
+        pop     edi
+        pop     esi
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int dos_lfn_findnext(int handle, void *w32) — AX=714F BX=handle
+;   ES:DI=WIN32_FIND_DATA. 0 on success, -1 on CF.
+_dos_lfn_findnext:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    edi
+        mov     ebx, [ebp + 8]
+        mov     edi, [ebp + 12]
+        mov     ax, 0x714F
+        int     21h
+        jc      .lfn_err
+        xor     eax, eax
+        jmp     .lfn_done
+.lfn_err:
+        mov     eax, -1
+.lfn_done:
+        pop     edi
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int dos_lfn_findclose(int handle) — AX=71A1 BX=handle
+_dos_lfn_findclose:
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        mov     ebx, [ebp + 8]
+        mov     ax, 0x71A1
+        int     21h
+        pop     ebx
+        xor     eax, eax
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ---- legacy short-name duplicates (survive C overriding open/...) ----------
+; Same INT 21h bodies as the public _open/_mkdir/... above, under
+; private names so the C policy layer can still reach the short-name
+; API when AX=71A0 reports no LFN provider (real FreeDOS w/o DOSLFN).
+
+; int dos_legacy_open(const char *path, int flags) — AH=0xA0
+_dos_legacy_open:
+        push    ebp
+        mov     ebp, esp
+        mov     edx, [ebp + 8]
+        mov     ecx, [ebp + 12]
+        mov     ah, 0xA0
+        int     21h
+        movzx   eax, ax
+        cmp     ax, 0xFFFF
+        jne     .glo_ok
+        mov     dword [_errno], 2
+        mov     eax, -1
+.glo_ok:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int dos_legacy_mkdir(const char *path) — AH=0x39
+_dos_legacy_mkdir:
+        push    ebp
+        mov     ebp, esp
+        mov     ah, 0x39
+        mov     edx, [ebp + 8]
+        int     21h
+        jc      .glm_err
+        xor     eax, eax
+        jmp     .glm_done
+.glm_err:
+        mov     eax, -1
+.glm_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int dos_legacy_rmdir(const char *path) — AH=0x3A
+_dos_legacy_rmdir:
+        push    ebp
+        mov     ebp, esp
+        mov     ah, 0x3A
+        mov     edx, [ebp + 8]
+        int     21h
+        jc      .glr_err
+        xor     eax, eax
+        jmp     .glr_done
+.glr_err:
+        mov     eax, -1
+.glr_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int dos_legacy_unlink(const char *path) — AH=0x41
+_dos_legacy_unlink:
+        push    ebp
+        mov     ebp, esp
+        mov     ah, 0x41
+        mov     edx, [ebp + 8]
+        int     21h
+        jc      .glu_err
+        xor     eax, eax
+        jmp     .glu_done
+.glu_err:
+        mov     eax, -1
+.glu_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int dos_legacy_rename(const char *old, const char *new) — AH=0x56
+_dos_legacy_rename:
+        push    ebp
+        mov     ebp, esp
+        push    edi
+        mov     ah, 0x56
+        mov     edx, [ebp + 8]
+        mov     edi, [ebp + 12]
+        int     21h
+        pop     edi
+        jc      .glrn_err
+        xor     eax, eax
+        jmp     .glrn_done
+.glrn_err:
+        mov     eax, -1
+.glrn_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int dos_legacy_findfirst(const char *mask) — set DTA + AH=0x4E
+_dos_legacy_findfirst:
+        push    ebp
+        mov     ebp, esp
+        mov     ah, 0x1A
+        mov     edx, __dta_buf
+        int     21h
+        mov     ah, 0x4E
+        mov     edx, [ebp + 8]
+        mov     cx, 0x10
+        int     21h
+        jc      .glff_err
+        xor     eax, eax
+        jmp     .glff_done
+.glff_err:
+        mov     eax, -1
+.glff_done:
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; int dos_legacy_findnext(void) — AH=0x4F
+_dos_legacy_findnext:
+        mov     ah, 0x4F
+        mov     edx, __dta_buf
+        int     21h
+        jc      .glfn_err
+        xor     eax, eax
+        ret
+.glfn_err:
+        mov     eax, -1
+        ret
+
+; const char *dos_legacy_dta_name(void)  — &__dta_buf[30]
+_dos_legacy_dta_name:
+        mov     eax, __dta_buf + 30
+        ret
+
+; int dos_legacy_dta_attr(void)  — byte __dta_buf[21]
+_dos_legacy_dta_attr:
         movzx   eax, byte [__dta_buf + 21]
         ret
 

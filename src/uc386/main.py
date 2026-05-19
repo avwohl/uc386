@@ -133,10 +133,21 @@ I386_DOS_PREDEFINES = {
 
 def _mangling_prefix(path: Path) -> str:
     """Stable per-file prefix used to mangle file-scope statics.
-    Hash collision risk is low; only the basename's stem is used so
-    builds are reproducible regardless of build directory layout."""
-    stem = "".join(c if (c.isalnum() or c == "_") else "_" for c in path.stem)
-    return f"__static_{stem}__"
+
+    The immediate parent directory name is folded in alongside the
+    stem so two TUs with the same basename in different directories
+    (the ubiquitous git `builtin/config.c` vs `config.c` pattern —
+    both stem `config`) get distinct prefixes instead of colliding
+    into one `__static_config__` namespace (nasm: "label
+    inconsistently redefined" for every inlined-header static).
+    Only the *immediate* parent name + stem are used — both are
+    intrinsic to the source tree, not the absolute build location,
+    so builds stay reproducible regardless of build directory."""
+    def _san(s: str) -> str:
+        return "".join(c if (c.isalnum() or c == "_") else "_" for c in s)
+    stem = _san(path.stem)
+    parent = _san(path.parent.name)
+    return f"__static_{parent}_{stem}__" if parent else f"__static_{stem}__"
 
 
 def _mangle_static_globals(unit, prefix: str) -> None:

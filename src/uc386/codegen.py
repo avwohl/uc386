@@ -226,6 +226,12 @@ class _FuncCtx:
         # instead of overlapping it.
         self.decl_disps: dict[int, int] = {}
         self.decl_types: dict[int, "_ltypes.TypeNode"] = {}
+        # Persistent name -> declared (non-decayed) type for every
+        # local/param ever allocated this function. Unlike `types`
+        # (scope-stacked, popped after _collect_locals) this survives
+        # so pre-emit passes — `_resolve_tcp_operands` — can resolve
+        # `__typeof__(localvar)` without scope bookkeeping.
+        self.decl_types_by_name: dict[str, "_ltypes.TypeNode"] = {}
         # Two-region stack layout:
         #
         #   EBP-4 .. EBP-call_temp_offset       — call temps (compound
@@ -388,6 +394,7 @@ class _FuncCtx:
             disp = self.decl_disps[key]
             self.slots[-1][name] = disp
             self.types[-1][name] = self.decl_types[key]
+            self.decl_types_by_name[name] = self.decl_types[key]
             # Re-bind: advance frame_size past the cached slot so any
             # subsequent compiler-generated allocs (compound-assign
             # temps, snapshots) in this scope land below it instead of
@@ -414,6 +421,7 @@ class _FuncCtx:
         disp = -self.frame_size
         self.slots[-1][name] = disp
         self.types[-1][name] = ty
+        self.decl_types_by_name[name] = ty
         if key is not None:
             self.decl_disps[key] = disp
             self.decl_types[key] = ty
@@ -439,6 +447,7 @@ class _FuncCtx:
             raise CodegenError(f"duplicate parameter `{name}`")
         self.slots[-1][name] = disp
         self.types[-1][name] = ty
+        self.decl_types_by_name[name] = ty
         return disp
 
     def has_local(self, name: str) -> bool:
@@ -542,6 +551,14 @@ class CodeGenerator:
         # `_global_inits` holds the initializer expression when one was
         # supplied, so the `.data` emission can produce constants.
         self._globals: dict[str, _ltypes.TypeNode] = {}
+        # `extern`-declared (not defined here) variables, by name →
+        # resolved type. Repopulated each generate() in
+        # _generate_inner, but initialized here too so pre-emit
+        # passes that resolve an identifier's type (e.g.
+        # _identifier_type during typeof/const-eval, before
+        # _generate_inner reaches the extern scan) never see an
+        # uninitialized attribute.
+        self._extern_vars: dict[str, _ltypes.TypeNode] = {}
         self._global_inits: dict[str, ast.Expression] = {}
         # Per-global alignment override from `__attribute__((aligned(N)))`.
         # Keys without an entry use the default (no align directive).
@@ -901,6 +918,7 @@ class CodeGenerator:
                         st = resolved_to_legacy(_resolve_struct_spec(spec))
                         if st is not None and (st.members or st.name):
                             self._resolve_struct_name(st)
+                        self._register_inline_enums(spec)
                     elif isinstance(spec, (ast.EnumDef, ast.EnumAnon)):
                         # File-scope `enum [tag] { A, B = 5, C };` declares
                         # the enumerators as integer constants visible from
@@ -1065,7 +1083,18 @@ class CodeGenerator:
         self._lifted_outer_fn: dict[str, str] = {}
         while self._pending_functions:
             fn = self._pending_functions.pop(0)
-            function_blocks.append(self._function(fn))
+            try:
+                function_blocks.append(self._function(fn))
+            except CodegenError as e:
+                # Annotate with the function under emission — a bare
+                # CodegenError mid-body otherwise gives no locus, which
+                # is unusable on a 60-TU whole-program build.
+                if not getattr(e, "_fn_annotated", False):
+                    msg = f"in function `{fn.name}`: {e.args[0] if e.args else e}"
+                    new = CodegenError(msg)
+                    new._fn_annotated = True
+                    raise new from e
+                raise
         # Now we know what externs the body referenced; merge in
         # auto-collected externs (malloc/free for VLAs, etc.) before
         # building the header.
@@ -2409,12 +2438,21 @@ class CodeGenerator:
                 out.append(v)
                 i += 1
                 continue
-            # When elem_type is a `char[]` directly, a StringLiteral is
+            # When elem_type is a `char[]` directly, a string literal is
             # a complete initializer; don't elision-wrap it. (`{"str"}`
             # initializing struct{char[N]} still gets wrapped below
-            # because the elem there is the struct, not char[].)
+            # because the elem there is the struct, not char[].) The
+            # auto-AST hands a string-literal initializer as either a
+            # bare StringLiteral or a (1+ element, adjacent-literal)
+            # Python list of StringLiteral — accept both, so e.g.
+            # `char rows[][N] = { "a", "b" }` keeps each row whole.
+            is_str_init = isinstance(v, ast.StringLiteral) or (
+                isinstance(v, list)
+                and v
+                and all(isinstance(p, ast.StringLiteral) for p in v)
+            )
             if (
-                isinstance(v, ast.StringLiteral)
+                is_str_init
                 and isinstance(elem_type, _ltypes.ArrayType)
                 and isinstance(elem_type.base_type, _ltypes.BasicType)
                 and elem_type.base_type.name == "char"
@@ -2489,19 +2527,32 @@ class CodeGenerator:
         # — the outer brace wraps a single string literal, which is the
         # idiomatic way period code initializes char arrays from string
         # constants. C lets you elide the braces entirely; treat them as
-        # equivalent.
+        # equivalent. The single element may also be a Python list of
+        # adjacent StringLiteral pieces (`{ "a" "\0" "b" }`, glibc's
+        # __re_error_msgid idiom) — concatenate them.
         if (
             isinstance(elem_type, _ltypes.BasicType)
             and elem_type.name == "char"
             and isinstance(init, ast.InitializerList)
             and len(init.values) == 1
-            and isinstance(init.values[0], ast.StringLiteral)
         ):
             inner = init.values[0]
-            init = _DecodedString(
-                value=decode_string_literal(inner.value.text),
-                is_wide=string_is_wide(inner.value.text),
-            )
+            if isinstance(inner, ast.StringLiteral):
+                init = _DecodedString(
+                    value=decode_string_literal(inner.value.text),
+                    is_wide=string_is_wide(inner.value.text),
+                )
+            elif (
+                isinstance(inner, list)
+                and inner
+                and all(isinstance(p, ast.StringLiteral) for p in inner)
+            ):
+                init = _DecodedString(
+                    value="".join(
+                        decode_string_literal(p.value.text) for p in inner
+                    ),
+                    is_wide=any(string_is_wide(p.value.text) for p in inner),
+                )
         # Flexible array member or `int arr[] = {...};` — derive length
         # from the initializer. With designators, length is
         # max(designated_index) + 1.
@@ -2985,7 +3036,19 @@ class CodeGenerator:
         if isinstance(expr, ast.OffsetofExpr):
             return self._offsetof_value(expr)
         if isinstance(expr, ast.TypesCompatibleP):
-            return 1 if self._types_compatible(expr.t1, expr.t2) else 0
+            # expr.t1/t2 are auto-AST type-names; _types_compatible
+            # only matches resolved _ltypes nodes (every other
+            # type-name consumer goes through _to_legacy_type), so
+            # resolve first — otherwise the isinstance ladder always
+            # falls through to False and __builtin_types_compatible_p
+            # is a constant 0 (which poisoned git's MOVE_ARRAY size via
+            # BUILD_ASSERT_OR_ZERO -> sizeof(char[-1])-1 = -2). Any
+            # `__typeof__` operands were already lowered to concrete,
+            # non-decayed types by `_resolve_typeof_in_body` (this
+            # const-eval path has no ctx of its own).
+            return 1 if self._types_compatible(
+                _to_legacy_type(expr.t1), _to_legacy_type(expr.t2)
+            ) else 0
         if isinstance(expr, ast.SizeofType):
             if getattr(expr, "is_alignof", False):
                 return self._alignment_of(expr.target_type)
@@ -3021,7 +3084,7 @@ class CodeGenerator:
                     decoded_str_len(p.value.text) for p in inner_strs
                 ) + 1
                 return total * 2 if is_wide else total
-            ty = self._type_of(inner, _FuncCtx())
+            ty = self._type_of(inner, self._static_init_ctx())
             if getattr(expr, "is_alignof", False):
                 return self._alignment_of(ty)
             if self._type_has_vla(ty):
@@ -3811,6 +3874,11 @@ class CodeGenerator:
         for sub in self._walk_ast(fn.body):
             if isinstance(sub, ast.StmtExpr):
                 self._collect_locals(sub.body, ctx)
+        # Now ctx knows local declared types: lower
+        # __builtin_types_compatible_p operands to concrete,
+        # non-decayed types (must run after _collect_locals; the
+        # const-eval path that reads them has no ctx of its own).
+        self._resolve_tcp_operands(fn.body, ctx)
         # Second pass: reserve a temp slot for each struct-returning Call
         # in the body. Some call sites have known destinations (var init,
         # struct assignment rhs, return chain) and don't actually use the
@@ -4238,6 +4306,172 @@ class CodeGenerator:
                             r = resolve_inner(item.operand)
                             if r is not None:
                                 v[i] = r
+
+    def _resolve_tcp_operands(self, node, ctx: _FuncCtx) -> None:
+        """Lower `__builtin_types_compatible_p`'s operand type-names to
+        concrete, NON-DECAYED `_ltypes` and store them back on each
+        `TypesCompatibleP` node.
+
+        Runs *after* `_collect_locals`, so `ctx.lookup_type` knows
+        local declared types. `__typeof__(expr)` must keep the
+        operand's declared type with NO lvalue / array→pointer /
+        function→pointer decay (GCC semantics). The generic
+        `_type_of` oracle decays, which would make
+        `tcp(__typeof__(arr), __typeof__(&arr[0]))` wrongly 1 and
+        collapse git's `ARRAY_SIZE`/`BARF_UNLESS_AN_ARRAY`; the raw
+        always-False fallthrough (no resolution) made
+        `BARF_UNLESS_COPYABLE` -2 and corrupted git's `MOVE_ARRAY`.
+        Both are fixed by resolving to the declared type here.
+        """
+        def _decl_ty(name: str):
+            # Persistent name->declared type (locals+params, non-decayed)
+            # recorded by alloc_local/alloc_param; survives scope pops.
+            t = ctx.decl_types_by_name.get(name)
+            if t is not None:
+                return t
+            try:
+                return ctx.lookup_type(name)
+            except CodegenError:
+                pass
+            nm = ctx.local_static_labels.get(name, name)
+            return self._globals.get(nm) or self._extern_vars.get(nm) \
+                or self._globals.get(name) or self._extern_vars.get(name)
+
+        def _fallback(e):
+            # Robust, ctx-aware oracle for any shape the structural
+            # rules can't resolve. Decay here is fine: it only differs
+            # from the declared type for bare array/function lvalues,
+            # which the Identifier branch already handles non-decayed.
+            try:
+                return self._type_of(e, ctx)
+            except CodegenError:
+                return None
+
+        def _oper_ty(e):
+            if isinstance(e, ast.Identifier):
+                n = e.name
+                nm = n.text if hasattr(n, "text") else n
+                t = _decl_ty(nm)
+                while isinstance(t, _ltypes.TypeofType):
+                    t = _oper_ty(t.operand)
+                return t if t is not None else _fallback(e)
+            if isinstance(e, ast.UnaryOp):
+                op = _opt(e)
+                if op == "*":
+                    bt = _oper_ty(e.operand)
+                    if isinstance(bt, (_ltypes.PointerType,
+                                       _ltypes.ArrayType)):
+                        return bt.base_type
+                    return _fallback(e)
+                if op == "&":
+                    it = _oper_ty(e.operand)
+                    return _ltypes.PointerType(base_type=it) \
+                        if it is not None else _fallback(e)
+                return _fallback(e)
+            if isinstance(e, ast.Index):
+                at = _oper_ty(e.array)
+                if isinstance(at, (_ltypes.ArrayType,
+                                   _ltypes.PointerType)):
+                    return at.base_type
+                return _fallback(e)
+            if isinstance(e, ast.BinaryOp):
+                bop = _opt(e)
+                if bop in ("+", "-"):
+                    # Pointer arithmetic: `p + i` / `p - i` keeps the
+                    # pointer operand's type; an array operand decays
+                    # to a pointer to its element. `p - q` (both
+                    # pointers) is integral — leave it to _fallback.
+                    lt = _oper_ty(e.left)
+                    rt = _oper_ty(e.right)
+                    l_ptr = isinstance(
+                        lt, (_ltypes.PointerType, _ltypes.ArrayType))
+                    r_ptr = isinstance(
+                        rt, (_ltypes.PointerType, _ltypes.ArrayType))
+                    if bop == "-" and l_ptr and r_ptr:
+                        return _fallback(e)
+                    if l_ptr:
+                        return lt \
+                            if isinstance(lt, _ltypes.PointerType) \
+                            else _ltypes.PointerType(
+                                base_type=lt.base_type)
+                    if r_ptr:
+                        return rt \
+                            if isinstance(rt, _ltypes.PointerType) \
+                            else _ltypes.PointerType(
+                                base_type=rt.base_type)
+                    return lt if lt is not None else _fallback(e)
+                if bop in ("=", "+=", "-=", "*=", "/=", "%=",
+                           "<<=", ">>=", "&=", "^=", "|="):
+                    # An assignment expression's type is its left
+                    # operand's type (non-decayed for __typeof__).
+                    # git's COPY_ARRAY/DUP_ARRAY pass
+                    # `ALLOC_ARRAY((dst),n)` — i.e. `(dst) = xmalloc()`
+                    # — as the BARF_UNLESS_COPYABLE dst, so
+                    # `__typeof__(*(dst))` is `*(<assignment>)`.
+                    lt = _oper_ty(e.left)
+                    return lt if lt is not None else _fallback(e)
+                if bop == ",":
+                    # Comma operator: type of the right operand.
+                    rt = _oper_ty(e.right)
+                    return rt if rt is not None else _fallback(e)
+                return _fallback(e)
+            if isinstance(e, (ast.Member, ast.ArrowMember)):
+                ot = _oper_ty(e.obj)
+                if isinstance(e, ast.ArrowMember) and \
+                   isinstance(ot, _ltypes.PointerType):
+                    ot = ot.base_type
+                if isinstance(ot, _ltypes.StructType):
+                    sn = self._resolve_struct_name(ot)
+                    for mn, mt, _mo in self._structs.get(sn, []):
+                        if mn == e.member.text:
+                            return mt
+                return _fallback(e)
+            if isinstance(e, ast.Cast):
+                return _to_legacy_type(e.target_type)
+            return _fallback(e)
+
+        def _resolve_tn(t):
+            if isinstance(t, _ltypes.TypeofType):
+                r = _oper_ty(t.operand)
+                return _resolve_tn(r) if r is not None else t
+            if isinstance(t, _ltypes.PointerType):
+                t.base_type = _resolve_tn(t.base_type)
+            elif isinstance(t, _ltypes.ArrayType):
+                t.base_type = _resolve_tn(t.base_type)
+            elif isinstance(t, _ltypes.FunctionType):
+                t.return_type = _resolve_tn(t.return_type)
+                t.param_types = [_resolve_tn(p) for p in t.param_types]
+            return t
+
+        # Total walk: `_walk_ast` follows the expression/statement
+        # tree but does NOT descend into type sub-trees, and git's
+        # real BARF_* macros bury `__builtin_types_compatible_p`
+        # inside `sizeof(char[1 - 2*!(tcp)])` — i.e. an array
+        # *dimension* in TYPE position. Recurse every dataclass
+        # field / list / tuple so no TypesCompatibleP is missed,
+        # wherever it sits.
+        import dataclasses as _dc
+        seen_ids: set[int] = set()
+
+        def _walk_all(n):
+            if n is None or isinstance(n, (str, bytes, int, float, bool)):
+                return
+            if isinstance(n, (list, tuple)):
+                for it in n:
+                    _walk_all(it)
+                return
+            if not _dc.is_dataclass(n):
+                return
+            if id(n) in seen_ids:
+                return
+            seen_ids.add(id(n))
+            if isinstance(n, ast.TypesCompatibleP):
+                n.t1 = _resolve_tn(_to_legacy_type(n.t1))
+                n.t2 = _resolve_tn(_to_legacy_type(n.t2))
+            for f in _dc.fields(n):
+                _walk_all(getattr(n, f.name, None))
+
+        _walk_all(node)
 
     def _collect_call_temps(self, node, ctx: _FuncCtx) -> None:
         """Pre-allocate a frame slot for every struct-returning Call and
@@ -4694,6 +4928,7 @@ class CodeGenerator:
                     st = resolved_to_legacy(_resolve_struct_spec(spec))
                     if st is not None and (st.members or st.name):
                         self._resolve_struct_name(st)
+                    self._register_inline_enums(spec)
                 elif isinstance(spec, (ast.EnumDef, ast.EnumAnon)):
                     self._register_enum_values_autoast(spec.values)
             if decl_storage_class(node.decl_specs) == "typedef":
@@ -5096,6 +5331,15 @@ class CodeGenerator:
             ):
                 self._resolve_struct_name(base)
             return
+        if isinstance(t, _ltypes.FunctionType):
+            # A variable/parameter of function type is a function
+            # pointer — a 4-byte code address (C decays function-type
+            # params, 6.7.6.3p8; a function-pointer typedef like
+            # git's `each_ref_fn` / `each_loose_object_fn` resolves
+            # here as FunctionType). uc386's call machinery already
+            # treats function-typed values as callable addresses, so
+            # accept it like a pointer.
+            return
         if isinstance(t, _ltypes.BasicType) and t.name in self._SLOT_BASIC_NAMES:
             return
         if isinstance(t, _ltypes.BasicType):
@@ -5184,15 +5428,66 @@ class CodeGenerator:
         if getattr(decl, "storage_class", None) == "extern":
             return t
         if isinstance(decl.init, ast.InitializerList):
+            # `char x[] = { "a" "\0" "b" };` (glibc's __re_error_msgid)
+            # or `char x[] = { "str" }`: a single brace-wrapped string
+            # initializer for a char array. Size is the concatenated
+            # decoded byte count plus the trailing NUL — same as the
+            # un-braced `char x[] = "str"` form below.
+            if (
+                isinstance(t.base_type, _ltypes.BasicType)
+                and t.base_type.name == "char"
+                and len(decl.init.values) == 1
+            ):
+                only = decl.init.values[0]
+                if isinstance(only, ast.StringLiteral):
+                    n = decoded_str_len(only.value.text) + 1
+                    return _ltypes.ArrayType(
+                        base_type=t.base_type, size=make_int_lit(n),
+                    )
+                if (
+                    isinstance(only, list)
+                    and only
+                    and all(isinstance(p, ast.StringLiteral) for p in only)
+                ):
+                    n = sum(
+                        decoded_str_len(p.value.text) for p in only
+                    ) + 1
+                    return _ltypes.ArrayType(
+                        base_type=t.base_type, size=make_int_lit(n),
+                    )
             try:
                 leaves = self._leaf_slot_count(t.base_type)
             except (CodegenError, KeyError):
                 leaves = 1
             if leaves < 1:
                 leaves = 1
+            # `char rows[][N] = { "a", "b", ... }`: when the element
+            # type is itself a char array, each string-literal value
+            # fills one whole row, so it consumes one *element* — not
+            # 1/leaves of one like a flat scalar would. The auto-AST
+            # delivers a string initializer as a bare StringLiteral or
+            # a (1+ adjacent-literal) Python list of StringLiteral.
+            elem_is_char_arr = (
+                isinstance(t.base_type, _ltypes.ArrayType)
+                and isinstance(t.base_type.base_type, _ltypes.BasicType)
+                and t.base_type.base_type.name == "char"
+            )
+
+            def _is_string_init(v):
+                return isinstance(v, ast.StringLiteral) or (
+                    isinstance(v, list)
+                    and v
+                    and all(isinstance(p, ast.StringLiteral) for p in v)
+                )
+
             cursor = 0
             max_idx = -1
             for value in decl.init.values:
+                if elem_is_char_arr and _is_string_init(value):
+                    if cursor > max_idx:
+                        max_idx = cursor
+                    cursor += 1
+                    continue
                 if isinstance(value, ast.DesignatedInit):
                     if value.designators:
                         d0 = value.designators[0]
@@ -5255,6 +5550,7 @@ class CodeGenerator:
                 not isinstance(
                     v, (ast.DesignatedInit, ast.InitializerList, ast.Compound)
                 )
+                and not (elem_is_char_arr and _is_string_init(v))
                 for v in decl.init.values
             )
             if all_flat and leaves > 1:
@@ -5405,6 +5701,13 @@ class CodeGenerator:
         if isinstance(t, (ast.TypeName, ast.TypeNameWithDeclarator)):
             t = _to_legacy_type(t)
         if isinstance(t, _ltypes.PointerType):
+            return 4
+        if isinstance(t, _ltypes.FunctionType):
+            # A value/param of function type is a code address (C
+            # decays function-type params to function pointers,
+            # 6.7.6.3p8). uc386 treats function-typed values as
+            # callable addresses everywhere else; size them as a
+            # pointer so the frame slot / arg width is right.
             return 4
         if isinstance(t, _ltypes.BasicType):
             try:
@@ -5703,6 +6006,31 @@ class CodeGenerator:
                 self._enum_constants[ev.name] = cursor
             cursor += 1
 
+    def _register_inline_enums(self, spec, _depth: int = 0) -> None:
+        """Register enum constants for `enum { ... }` definitions that
+        appear inline as a struct/union member's type.
+
+        File-scope `enum { A, B }` is registered by the top-level /
+        block scans, but `struct S { enum { A, B } m; };` hides the
+        EnumDef inside the StructDef's member decl_specs, so its
+        enumerators were never added to `_enum_constants` and any use
+        of `A`/`B` later raised `unknown identifier`. C makes those
+        enumerators visible at file/block scope just like a top-level
+        enum (6.7.2.2). Walk struct members (recursing through nested
+        struct/union members) and register every inline enum.
+        """
+        if spec is None or _depth > 64:
+            return
+        for m in getattr(spec, "members", None) or []:
+            for ms in getattr(m, "decl_specs", None) or []:
+                if isinstance(ms, (ast.EnumDef, ast.EnumAnon)):
+                    try:
+                        self._register_enum_values_autoast(ms.values)
+                    except CodegenError:
+                        pass
+                elif isinstance(ms, (ast.StructDef, ast.StructAnon)):
+                    self._register_inline_enums(ms, _depth + 1)
+
     def _register_enum_values_autoast(self, values) -> None:
         """Like `_register_enum_values` but consumes the auto-AST
         EnumValue / EnumValueWithInit shape: each carries a Token
@@ -5754,17 +6082,46 @@ class CodeGenerator:
         if decl.name:
             top = self._struct_aliases[-1]
             if decl.name in top:
-                # Same scope already has a binding — idempotent.
-                return
-            existing_outer = self._resolve_struct_alias(decl.name)
-            if existing_outer is not None:
-                # Outer scope's `struct T` is being shadowed. Mangle the
-                # inner one to a unique key.
+                # Same scope already has a binding. Idempotent ONLY
+                # if the layout matches. File-scope struct tags have
+                # TU (not program) linkage: two different TUs may
+                # legally define `struct T` with *different* members
+                # (e.g. name-hash.c's private `struct dir_entry {
+                # hashmap_entry ent; ... }` vs dir.h's public
+                # `struct dir_entry { unsigned len; ... }`). uc386's
+                # whole-program merge drops them into one alias
+                # scope; silently treating the second as idempotent
+                # bound every TU to the first layout ("struct
+                # dir_entry has no member `ent`"). The merged item
+                # stream is TU-contiguous, so re-registering the
+                # conflicting shape under a fresh key and rebinding
+                # the tag makes the rest of *this* TU resolve to its
+                # own layout; a later TU that re-includes the other
+                # definition rebinds back for its own region.
+                if not decl.members:
+                    return  # forward/opaque ref — keep current bind
+                existing_key = top[decl.name]
+                existing = [
+                    n for n, _, _ in self._structs.get(existing_key, [])
+                ]
+                incoming = [
+                    m.name for m in decl.members if m.name is not None
+                ]
+                if existing == incoming:
+                    return  # identical layout — truly idempotent
                 key = f"{decl.name}#{len(self._structs)}"
+                top[decl.name] = key
+                decl_name = key
             else:
-                key = decl.name
-            top[decl.name] = key
-            decl_name = key
+                existing_outer = self._resolve_struct_alias(decl.name)
+                if existing_outer is not None:
+                    # Outer scope's `struct T` is being shadowed.
+                    # Mangle the inner one to a unique key.
+                    key = f"{decl.name}#{len(self._structs)}"
+                else:
+                    key = decl.name
+                top[decl.name] = key
+                decl_name = key
         else:
             decl_name = None
         if decl_name and decl_name in self._structs:
@@ -8641,6 +8998,22 @@ class CodeGenerator:
         if not owner:
             return name
         return self._function_local_static.get(owner, {}).get(name, name)
+
+    def _static_init_ctx(self) -> "_FuncCtx":
+        """A `_FuncCtx` seeded with the static-local label map of the
+        function that owns the global initializer currently being
+        emitted. `_const_eval` consults `_type_of` for `sizeof(x)`;
+        when `x` is a *sibling* function-local static (hoisted to a
+        mangled global, e.g. `f__letters`), an empty ctx can't map the
+        source name and const-eval wrongly bails to the float path
+        (git wrapper.c: `static const int n = ARRAY_SIZE(letters)-1;`).
+        Mirrors `_resolve_static_init_name`'s owner lookup.
+        """
+        c = _FuncCtx()
+        snap = self._function_local_static.get(self._emitting_for_func, {})
+        if snap:
+            c.local_static_labels = dict(snap)
+        return c
 
     def _needs_recursive_init(self, expr: ast.Expression) -> bool:
         """Does `expr` need the recursive `_emit_global_init` path
@@ -13078,9 +13451,18 @@ class CodeGenerator:
             if _opt(expr) == "*":
                 inner = self._type_of(expr.operand, ctx)
                 if not self._is_pointer_like(inner):
-                    raise CodegenError(
-                        f"`*` operand must be a pointer (got {type(inner).__name__})"
-                    )
+                    # `_type_of` is best-effort and "falls back to int
+                    # for anything we can't classify" (see docstring).
+                    # The classic case: `*f()` where `f` has no
+                    # prototype, so C gives it implicit `int` return
+                    # even though the real libc declares it returning a
+                    # pointer (e.g. git compat/mkdtemp.c's `*mktemp()`
+                    # — uc386's <stdlib.h> doesn't declare mktemp).
+                    # Degrade to int instead of aborting the compile;
+                    # the emit path dereferences the value as an
+                    # address regardless (flat-32: int and pointer are
+                    # both 4 bytes).
+                    return _ltypes.BasicType(name="int")
                 return inner.base_type
             if _opt(expr) in ("++", "--"):
                 # Mutation in place; the expression's type matches the operand.
@@ -13809,7 +14191,11 @@ class CodeGenerator:
             except CodegenError:
                 return self._emit_runtime_offsetof(expr, ctx)
         if isinstance(expr, ast.TypesCompatibleP):
-            v = 1 if self._types_compatible(expr.t1, expr.t2) else 0
+            # See _const_eval: resolve to concrete _ltypes (the pre-pass
+            # already lowered any __typeof__ operands, non-decayed).
+            v = 1 if self._types_compatible(
+                _to_legacy_type(expr.t1), _to_legacy_type(expr.t2)
+            ) else 0
             return [f"        mov     eax, {v}"]
         if isinstance(expr, ast.SizeofExpr):
             # C: the operand of `sizeof` is *not* evaluated — only its

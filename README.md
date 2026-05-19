@@ -37,6 +37,40 @@ third-party C programs into runnable DOS executables:
 See `addons/STATUS.md` for the full per-addon report and
 `docs/path-a-mz-le.md` for the `.exe` build path.
 
+## Size — measured, not asserted
+
+The "tiny output" claim, checked against the period reference
+compiler instead of asserted. Every column below was **reproduced
+on one macOS/arm64 host** by `python -m addons.harness.compare`
+(Open Watcom V2 has no native macOS build, so its DOS-hosted
+`wcc386`/`wlink` run under DOSBox-X via `addons/harness/
+watcom_dosbox.py`; DJGPP is the gcc-12.2 osx cross under Rosetta).
+Bytes of the on-disk executable; full table in
+[`addons/results.md`](addons/results.md):
+
+| program | uc386 .bin | uc386 .exe | Watcom | DJGPP |
+|---------|-----------:|-----------:|-------:|------:|
+| true    |         18 |     16,907 |  5,420 | 147,914 |
+| echo    |        148 |     16,915 | 11,286 | 150,212 |
+| factor  |      1,858 |     16,989 | 20,538 | 179,614 |
+| wc      |      1,529 |     16,928 | 20,158 | 179,092 |
+
+Reading this honestly:
+
+- **`.bin` is not a DOS program.** It has no MZ header and runs
+  only under `uc386.dos_emu`/a custom loader. It is the right
+  metric for *codegen+DCE tightness* (and there uc386 is in a
+  class of its own — tens of bytes), but it is not what you ship.
+- **`.exe` is what you ship**, and it carries a ~17 KB PMODE/W
+  extender floor. Against that real-DOS artifact, **Open Watcom
+  is ~2–3× smaller on tiny programs** (its DOS/4GW clib + mature
+  linker beat our extender floor); the two converge as real code
+  grows. uc386 beats **DJGPP ~9×** and host **gcc ~2×**.
+- So: uc386's *code generation* is extremely compact; its current
+  *DOS packaging* (PMODE/W) is not yet competitive with Watcom's
+  on small binaries. Both statements are true and the table shows
+  which is which — no single "390× smaller" headline.
+
 ## Goal
 
 Compile representative public-source DOS games **unmodified**:
