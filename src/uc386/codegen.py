@@ -14062,6 +14062,22 @@ class CodeGenerator:
         structs we walk members so a VLA member contributes runtime
         size while regular members fold.
         """
+        # `sizeof(<type-name>)` arrives as an AST TypeName; a typedef
+        # name lowers to BasicType(name=<typedef>) (no _BASIC_SIZES
+        # entry) — resolve it to the underlying type so a VLA typedef
+        # (`typedef int c[i+2]; sizeof(c)`) routes through the runtime
+        # path instead of being statically mis-sized. Same typedef-
+        # resolution gap as the _cast narrowing fix (34d45ab).
+        if isinstance(t, (ast.TypeName, ast.TypeNameWithDeclarator)):
+            t = _to_legacy_type(t)
+        if (
+            isinstance(t, _ltypes.BasicType)
+            and t.name not in self._BASIC_SIZES
+        ):
+            resolved = self._resolve_typedef_name(t.name)
+            if resolved is not None:
+                from uc_core.ast import resolved_to_legacy
+                t = resolved_to_legacy(resolved)
         if not self._type_has_vla(t):
             return [f"        mov     eax, {self._size_of(t)}"]
         if isinstance(t, _ltypes.ArrayType):
