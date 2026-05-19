@@ -8,14 +8,15 @@ that early-to-mid-1990s PC games were written in.
 against two reference suites under our DOS emulator (compile →
 assemble → run → diff): **215 / 220**
 [c-testsuite](https://github.com/c-testsuite/c-testsuite) and, with
-the K&R pre-pass (see below), **1341 / 1514**
+the `--kr` pre-pass (see below), **1357 / 1514**
 [gcc-c-torture](https://github.com/llvm/llvm-test-suite) executable
 tests passing. The frontend defaults to **strict C23**; the
-gcc-c-torture corpus is pre-ANSI and heavy on K&R-style code, so it
-is run with `--kr` enabled. The remaining gap is unimplemented
-codegen features (vectors, designated initializers, …), missing libc
-headers, and GCC-extension tests out of scope for a DOS i386 C
-compiler — tracked, not claimed as passing.
+gcc-c-torture corpus is pre-ANSI and GNU-heavy, so it is run with
+`--kr` enabled. The remaining ~157 are GCC extensions that need a
+static-chain ABI / closure conversion (nested functions, `__label__`),
+a fragmented backlog of unimplemented codegen features (vectors,
+designated initializers, offsetof designators, …), and individual
+run-stage miscompiles — tracked, not claimed as passing.
 
 **K&R / implicit-int compatibility (`--kr`).** Pre-ANSI sources —
 implicit-`int` returns (`main() { … }`) and K&R old-style parameter
