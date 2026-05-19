@@ -3049,6 +3049,10 @@ class CodeGenerator:
             return 1 if self._types_compatible(
                 _to_legacy_type(expr.t1), _to_legacy_type(expr.t2)
             ) else 0
+        if isinstance(expr, ast.AlignofType):
+            # C23 `_Alignof(type-name)` — a distinct grammar node from
+            # `sizeof`; folds to the type's required alignment.
+            return self._alignment_of(expr.target_type)
         if isinstance(expr, ast.SizeofType):
             if getattr(expr, "is_alignof", False):
                 return self._alignment_of(expr.target_type)
@@ -13814,8 +13818,9 @@ class CodeGenerator:
                 return _ltypes.BasicType(name="int", is_signed=False)
             # Default to int (after default int promotion of char/short).
             return _ltypes.BasicType(name="int")
-        if isinstance(expr, (ast.SizeofExpr, ast.SizeofType)):
-            # `sizeof` returns size_t; treat it as int for our flat-32 ABI.
+        if isinstance(expr, (ast.SizeofExpr, ast.SizeofType, ast.AlignofType)):
+            # `sizeof` / `_Alignof` return size_t; treat as int for our
+            # flat-32 ABI.
             return _ltypes.BasicType(name="int")
         if isinstance(expr, ast.VaArgExpr):
             return _to_legacy_type(expr.target_type)
@@ -14179,6 +14184,9 @@ class CodeGenerator:
             if self._is_int128(target_ty):
                 return self._int128_value_address(expr, ctx)
             return self._va_arg_int(expr, ctx)
+        if isinstance(expr, ast.AlignofType):
+            value = self._alignment_of(expr.target_type)
+            return [f"        mov     eax, {value}"]
         if isinstance(expr, ast.SizeofType):
             if getattr(expr, "is_alignof", False):
                 value = self._alignment_of(expr.target_type)
