@@ -912,7 +912,26 @@ class CodeGenerator:
             # or variable decl.
             if isinstance(d, ast.Declaration):
                 for spec in d.decl_specs or []:
-                    if isinstance(spec, (ast.StructDef, ast.StructAnon)):
+                    if isinstance(spec, ast.StructEmpty):
+                        # `struct Tag {};` — an empty (zero-size)
+                        # *definition* (distinct node from the `struct
+                        # Tag;` forward-decl `StructRef`).
+                        # `_resolve_struct_name` can't tell an empty
+                        # definition from an incomplete-type use and
+                        # would raise, so register a zero-size layout
+                        # and tag alias here; later uses then resolve.
+                        from uc_core.ast import resolved_to_legacy
+                        from uc_core.codegen_helpers import _resolve_struct_spec
+                        st = resolved_to_legacy(_resolve_struct_spec(spec))
+                        nm = getattr(st, "name", None) if st else None
+                        if nm:
+                            key = f"__empty_struct_{nm}"
+                            if key not in self._structs:
+                                self._structs[key] = []
+                                self._struct_sizes[key] = 0
+                            self._struct_aliases[-1][nm] = key
+                        self._register_inline_enums(spec)
+                    elif isinstance(spec, (ast.StructDef, ast.StructAnon)):
                         from uc_core.ast import resolved_to_legacy
                         from uc_core.codegen_helpers import _resolve_struct_spec
                         st = resolved_to_legacy(_resolve_struct_spec(spec))
