@@ -13,14 +13,24 @@ Run a test: `.venv/bin/python run_gcc_torture.py --full --kr -v <name>`
 
 gcc-c-torture: 1002 → ~1374/1514 (66% → ~91%); c-testsuite 215/220.
 
-## Remaining genuine standard-C singletons (~30, no clusters)
+## Status (post-grind)
 
-Each is an independent investigation, ~1 test each.
+The quick one-line bugs have largely been fixed (octal escape,
+unsigned const-fold, wide char, bitfield crash, shape-hash,
+printf-return, empty-struct, `_Alignof`). Continued grinding showed
+the **remaining items skew to multi-site features, not singletons** —
+e.g. wide string/char literal typing and 64-bit `va_arg` each span
+several code paths (typing + index + sizeof + storage / dispatch +
+load + consumers). They're best tackled as scoped feature tasks, not
+in-session one-liners. Precise per-item findings recorded below so
+each is resumable without re-triage.
+
+## Remaining genuine standard-C items (~30)
 
 | Test | Symptom | Diagnosis hint |
 |---|---|---|
-| 20010325-1.c | exit 1 | **wide string literals**: `L"a" "b"` concat + indexing + `sizeof`. Wide-string codegen (storage as int[] / element size), separate from the now-fixed wide *char* path. |
-| va-arg-6.c, va-arg-8.c | exit 1 | varargs ABI corner — inspect `va_arg` slot stepping for the types these use. |
+| 20010325-1.c | exit 1 | **wide string/char literals — multi-site, treat as a feature not a singleton.** Findings: storage IS correct (`L"ab"` → `dw 97,98,0`, wide intern works). Broken: (a) `_type_of(StringLiteral wide)` returns `char*` not `wchar_t*` because it checks `getattr(expr,"is_wide")` which is never set — must use `string_is_wide(expr.value.text)`; (b) it doesn't handle the adjacent-concat *list* `[L"a","b"]`; (c) `sizeof(L'x')` returns 4 (int) not 2 (`__SIZEOF_WCHAR_T__`=2) — `_type_of(CharLiteral wide)` must be `wchar_t`; (d) index lowering uses 4-byte stride/`mov eax,[eax]` instead of 2-byte `movzx word`. Fix needs coordinated CharLiteral+StringLiteral+list+Index+sizeof wide typing. uc386 wchar_t = `unsigned short` (2 bytes). |
+| va-arg-6.c, va-arg-8.c, 991216-2.c | exit 1 | **64-bit `va_arg` — multi-site feature, 4-test cluster** (incl. repro `va_arg(ap,long long)`). Finding: `_va_arg_int` advances by `(sizeof+3)&~3` = 8 correctly, but then `_load_to_eax("[ecx]", long long)` only loads the low 32 bits into EAX — the high dword is lost, so the 64-bit compare fails. Fix: route `va_arg(ap,long long)` through uc386's long-long value convention (mirror the `_is_int128` path: `_va_arg_struct_copy` into a per-expr temp + return via the 64-bit value address), wired at the VaArgExpr dispatch + consumers. Not a one-liner. |
 | conversion.c | exit 1 | float→int / rounding mode ("SPU float rounds toward zero" — FP conversion semantics). |
 | 970217-1.c | exit 1 | `sub(int i, int array[i++])` — side effect in array-param declarator must be evaluated (i→11). |
 | 20010904-1/2.c | exit 1 | (triage) |
