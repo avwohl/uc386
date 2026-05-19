@@ -6455,6 +6455,21 @@ class CodeGenerator:
     def _is_int128(t: _ltypes.TypeNode) -> bool:
         return isinstance(t, _ltypes.BasicType) and t.name == "int128"
 
+    @staticmethod
+    def _wide_char_elem_type(text: str):
+        """Element BasicType for a wide char/string literal prefix, or
+        None if not wide. uc386: wchar_t = char16_t = `unsigned short`
+        (2), char32_t (`U`) = `unsigned int` (4), char8_t (`u8`) =
+        `char` (1). Narrow literals return None (caller types a char
+        constant as `int`, a string as `char[]`)."""
+        if text.startswith("u8"):
+            return _ltypes.BasicType(name="char", is_signed=False)
+        if text[:1] == "U":
+            return _ltypes.BasicType(name="int", is_signed=False)
+        if text[:1] in ("L", "u"):
+            return _ltypes.BasicType(name="short", is_signed=False)
+        return None
+
     def _ll_operand_high_known_zero(
         self, expr: ast.Expression, ctx: _FuncCtx,
     ) -> bool:
@@ -13448,8 +13463,11 @@ class CodeGenerator:
                 is_signed=(False if unsigned else None),
             )
         if isinstance(expr, ast.CharLiteral):
-            # Per C, a character constant has type `int`, not `char`.
-            return _ltypes.BasicType(name="int")
+            # Narrow char constant has type `int` (C 6.4.4.4); a wide
+            # one (L/u/U) has type wchar_t/char16_t/char32_t, so e.g.
+            # `sizeof(L'x')` is sizeof(wchar_t), not sizeof(int).
+            we = self._wide_char_elem_type(expr.value.text)
+            return we if we is not None else _ltypes.BasicType(name="int")
         if isinstance(expr, ast.NullptrLiteral):
             return _ltypes.PointerType(base_type=_ltypes.BasicType(name="void"))
         if isinstance(expr, ast.LabelAddr):
@@ -13472,10 +13490,24 @@ class CodeGenerator:
             # would mark them `const char[N+1]` but C does not, and
             # `_Generic("...", char *: ..., const char *: ...)` must
             # match the non-const arm to be C-conformant.
-            if getattr(expr, "is_wide", False):
-                return _ltypes.PointerType(
-                    base_type=_ltypes.BasicType(name="short", is_signed=False)
-                )
+            # `is_wide` is never set on the auto-AST node — derive it
+            # from the token prefix so a wide string decays to
+            # `wchar_t *` (correct element width for index / sizeof).
+            we = self._wide_char_elem_type(expr.value.text)
+            if we is not None:
+                return _ltypes.PointerType(base_type=we)
+            return _ltypes.PointerType(base_type=_ltypes.BasicType(name="char"))
+        if (
+            isinstance(expr, list) and expr
+            and all(isinstance(p, ast.StringLiteral) for p in expr)
+        ):
+            # Adjacent string-literal concatenation (`L"a" "b"`): wide
+            # if any piece is wide. Without this it falls through to the
+            # int* default and indexing uses a 4-byte stride.
+            for p in expr:
+                we = self._wide_char_elem_type(p.value.text)
+                if we is not None:
+                    return _ltypes.PointerType(base_type=we)
             return _ltypes.PointerType(base_type=_ltypes.BasicType(name="char"))
         if isinstance(expr, ast.PostfixOp):
             # `x++` / `x--`: the expression's type matches the operand.
