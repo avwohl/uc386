@@ -26,9 +26,8 @@ emits multi-arg printf output (`2: 2 / 12: 2 2 3 / 60: 2 2 3 5 /
 writes `hello dos\n` via libc fputs through real DOS handles. All
 14 manifest-driven addons build .exe successfully (basename, cat,
 dirname, echo, factor, false, head, open_test, strtol_test, tail,
-true, wc, yes, argv_probe — .exe ~17 KB; 15/17 also pass their
-behavioral manifest test, `cat`/`sbase-cat` have a known dos_emu
-multi-file `fopen` gap — see `addons/STATUS.md`).
+true, wc, yes, argv_probe — .exe ~17 KB; all 17 also pass their
+behavioral manifest test under `addons/test_gnu_addons.py`).
 See `docs/path-a-mz-le.md`. DOOM boots end-to-end through uc386 → NASM → dos_emu
 (reaches W_InitFiles after V_Init / M_LoadDefaults / Z_Init; exits 1
 at WAD-not-found as expected; smoke-tested via

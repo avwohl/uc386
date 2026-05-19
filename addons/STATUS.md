@@ -258,13 +258,15 @@ Toolchain provenance (all on the dev macOS/arm64 host):
   falls back to it when native `wcc386` is absent. The period
   reference is now *measured on macOS*, not asserted from CI.
 
-**Behavioral status:** 15/17 addon manifest tests pass under
-`addons/test_gnu_addons.py`. `cat` and `sbase-cat` compile and
-build `.exe` but fail their behavioral test — a dos_emu
-multi-file-arg `fopen`/vfiles gap (the `-`/stdin path and the
-shared `argv[i][0]=='-'` char comparisons are correct; only
-`fopen` on a vfile returns NULL when interleaved with stdin).
-Tracked as a known runtime gap, distinct from codegen.
+**Behavioral status:** **17/17** addon manifest tests pass under
+`addons/test_gnu_addons.py`. The earlier `cat`/`sbase-cat`
+failures were a dos_emu vfs-keying regression (commit `3e30b18`
+canonicalized INT 21h paths to `C:\\…` for lookups but seeded
+`vfiles_init` with the raw manifest key, so `fopen` of a seeded
+relative name always missed). Fixed by making `_canon_vfs_path`
+the single source of truth for both seeding and lookup
+(`a01dadf`, +2 regression tests). This was a runtime/vfs bug,
+distinct from codegen.
 
 ## ✓ Include the latest MicroPython (2026-05-01 ask)
 
