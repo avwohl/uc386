@@ -11,7 +11,7 @@ Run a test: `.venv/bin/python run_gcc_torture.py --full --kr -v <name>`
 - octal char escape (uc_core `c4aeaba`), unsigned constant-fold UAC
   (`7e77976`), wide char constant value (`4da509b`)
 
-gcc-c-torture: 1002 → ~1374/1514 (66% → ~91%); c-testsuite 215/220.
+gcc-c-torture: 1002 → 1397/1514 (66% → 92%); c-testsuite 215/220.
 
 ## Status (post-grind)
 
