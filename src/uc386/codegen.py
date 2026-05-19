@@ -5984,7 +5984,19 @@ class CodeGenerator:
                  "packed" if getattr(t, "is_packed", False) else "unpacked"]
         for m in t.members:
             mname = m.name if m.name is not None else ""
-            parts.append(f"{mname}:{type_repr(m.member_type)}")
+            # Bit-field width is part of the layout: two otherwise
+            # identical anon structs with different widths (e.g.
+            # `unsigned i:5` vs `unsigned i:16`) are DIFFERENT shapes
+            # and must not collapse to one registry key, or one
+            # struct's members get the other's bit layout.
+            bw = getattr(m, "bit_width", None)
+            if bw is None:
+                bf = ""
+            elif isinstance(bw, ast.IntLiteral):
+                bf = f":bf{int_value(bw)}"
+            else:
+                bf = f":bf{bw!r}"
+            parts.append(f"{mname}:{type_repr(m.member_type)}{bf}")
         sig = "|".join(parts)
         return hashlib.md5(sig.encode("utf-8")).hexdigest()[:16]
 
