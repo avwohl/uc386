@@ -37,11 +37,15 @@ each is resumable without re-triage.
 | 20010904-1/2.c | exit 1 | (triage) |
 | ~~20020423-1.c~~ (PR c/5430) | **FIXED** (uc_core) | `_nested_const_fold._new` minted folded constants via `make_int_lit(val)` w/o the unsigned flag: `(x+4)-8U` → bare decimal `4294967292`, which doesn't fit int/32-bit-long and wrongly promoted to **long long** (routed to the broken LL `int 0x80` div path). Now `make_int_lit(val, unsigned=is_unsigned)`, mirroring the main const-fold path (`7e77976`). |
 | ~~20020508-3.c~~ | **FIXED** (uc386) | `_ll_shift_const` signed `>>` `s≥32` w/ `big_half_in_eax=True`: EAX held the source high half but EDX was caller-unspecified; `sar edx,31` sign-replicated **garbage** (unsigned `xor edx,edx` was unaffected). Seed `mov edx, eax` before the `sar` in the signed fast path. 64-bit rotate `(ll>>60)|(ll<<4)` now correct. |
-| 20020227-1.c, 20020904-1.c (PR c/7102), 20040411-1.c, 20041218-2.c, 960830-1.c, 991216-2.c | exit 1 | individual codegen-corner miscompiles — bisect each with exit-code repro. |
+| ~~20020904-1.c~~ (PR c/7102) | **FIXED** (uc386) | `(u8)255` cast (u8 = `typedef unsigned char`) emitted `movsx eax,al` → sign-extended to −1. `_cast`'s target-type was lowered before the typedef resolver was installed, so it stayed `BasicType(name='u8', is_signed=None)` and the narrowing chose movsx. Resolve the typedef name through `_resolve_typedef_name` (as `_size_of` does) so signedness is the underlying type's → `movzx`. |
+| 20020227-1.c | (out of scope) | needs `__complex__ float` member codegen — see _Complex exclusion below, not a corner miscompile. |
+| ~~991216-2.c~~ | **FIXED** `9f0a307` | stale duplicate of the 64-bit `va_arg` row above; verified PASS. |
+| 20040411-1.c, 20041218-2.c | exit 1 | VLA / variably-modified types (`typedef int c[i+2]`; `struct {char b[n];}`) — C99 VLA feature, multi-site (sizeof of a runtime-sized type), not a one-liner. |
+| 960830-1.c | (out of scope) | GCC extended inline `__asm__` with `=a`/`=d`/`%0`/`rm` operand constraints — GNU extension, not standard C. |
 | pr23467.c, pr40386.c, pr43220.c, pr49039.c, pr49279.c, pr28982b.c | exit 1 / unicorn mem fault | per-PR codegen bugs; pr28982b/pr43220 = bad addressing (UC_ERR mem). |
 | 20040811-1.c, 20060412-1.c, vla-dealloc-1.c | unicorn invalid mem/insn | bad codegen output; vla-dealloc-1 = VLA deallocation (C99). |
-| bitfld-4.c | exit 1 | a *second* bitfield bug (not the shape-hash one) — specific width/op. |
-| eeprof-1.c | exit 1 | (triage) |
+| ~~bitfld-4.c~~ | **FIXED** (uc_core) | not a bitfield bug — `_optimize_unary` folded `-123U` to `make_int_lit(4294967173)` w/o the unsigned flag → bare decimal promoted to **long long**, so `x.a (int:12) != -123U` ran as a 64-bit compare and the sign-extended bitfield mismatched. Now `make_int_lit(result, unsigned=int_flags(operand)[2])` for `-`/`+`/`~` (`!` stays int per C99 6.5.3.3). Same fold-unsignedness class as `7e77976`/`96b0e36`. |
+| eeprof-1.c | (out of scope) | `-finstrument-functions` / `__cyg_profile_func_enter`/`exit` instrumentation hooks — GCC instrumentation feature, not standard C codegen. |
 
 ## Out of scope / excluded (do not count as standard-C bugs)
 - Nested functions / `__label__` (GCC ext, needs closure conversion +

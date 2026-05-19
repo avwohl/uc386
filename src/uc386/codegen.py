@@ -9456,6 +9456,22 @@ class CodeGenerator:
         out = self._eval_expr_to_eax(expr.expr, ctx)
         target = self._deep_resolve_typeof(
             _to_legacy_type(expr.target_type), ctx)
+        # The Cast target_type is lowered to legacy form before the
+        # typedef resolver is installed, so a typedef name survives as
+        # BasicType(name=<typedef>, is_signed=None) with no _BASIC_SIZES
+        # entry. Resolve it through the codegen typedef table (as
+        # _size_of does) so the narrowing below picks movzx/movsx by the
+        # *underlying* type's signedness — `(u8)255` (u8 = unsigned
+        # char) must zero-extend, not sign-extend to -1.
+        if (
+            isinstance(target, _ltypes.BasicType)
+            and target.name not in self._BASIC_SIZES
+        ):
+            resolved = self._resolve_typedef_name(target.name)
+            if resolved is not None:
+                from uc_core.ast import resolved_to_legacy
+                target = self._deep_resolve_typeof(
+                    resolved_to_legacy(resolved), ctx)
         if isinstance(target, _ltypes.PointerType):
             return out
         if isinstance(target, _ltypes.EnumType):
