@@ -215,39 +215,56 @@ list of general compiler / runtime improvements:
 
 ## ✓ Build with competitive compilers
 
-**gcc + DJGPP done; Watcom wired into CI** (no native macOS build).
-`addons/results.md` has the size table — sample row:
+**gcc + DJGPP + Watcom all reproduced on one macOS/arm64 host**
+(2026-05-19). `addons/results.md` has the full 14-addon table; the
+header there explains each column. Real `true` row:
 
 ```
-| true | 14 | 16,840 | (CI) | 147,914 |
+| true | 18 | 16,907 | 16,840 | 5,420 | 147,914 |
+  (.bin) (.exe)  (gcc)  (Watcom) (DJGPP)
 ```
 
-uc386 binaries are 50–1200× smaller than gcc-on-host (full glibc
-startup) and ~100–10,000× smaller than DJGPP (DPMI extender + djgpp
-C runtime baked in).
+**The earlier "390× smaller than Watcom" claim was wrong** — it
+divided the `.bin` (14 B, *not a DOS executable* — no MZ header,
+runs only under dos_emu) by Watcom's real `.exe` (5,494 B). That
+is a category error. The honest comparison uses the same kind of
+artifact on both sides:
 
-DJGPP cross-compiler installed locally at `~/.local/opt/djgpp` from
-`andrewwutw/build-djgpp v3.4` (gcc 12.2.0). `addons/harness/compare.py`
-detects it via the `DJGPP_CANDIDATES` list — works on both macOS
-arm64 and the Linux CI runner.
+- **Codegen floor (`.bin`, not shippable):** uc386 is in a class
+  of its own — tens of bytes vs Watcom's multi-KB. Real, but it
+  measures the code generator, not a deployable program.
+- **Real DOS executable (`.exe`):** uc386's PMODE/W-bound `.exe`
+  has a ~17 KB extender floor. **Open Watcom is ~2–3× smaller**
+  on tiny programs (`true` 5,420 vs 16,907; `echo` 11,286 vs
+  16,915) and roughly converges as code grows (`factor` 20,538
+  vs 16,989 — uc386 ahead; `wc` 20,158 vs 16,928 — uc386 ahead).
+  So uc386's *codegen* is tighter but its *DOS packaging* loses
+  to Watcom's mature DOS/4GW clib+linker on small binaries.
+- **vs DJGPP / gcc:** uc386 `.exe` beats DJGPP **~9×** (148–182 KB
+  go32+djgpp runtime) and host gcc **~2×** (gcc isn't a DOS
+  target anyway — sanity baseline only).
 
-Open Watcom V2 has no macOS build. The upstream Linux x64
-"installer" is actually an ELF stub appended to a regular ZIP
-archive — the release workflow `unzip -d`s it directly, avoiding
-the FPE the installer otherwise triggers under unattended install.
-Watcom column populates on every release run for **all 13 addons**
-(once we converted period sources to C89-compat decl placement and
-added `-ze` to wcc386). Full comparison row sample:
+Toolchain provenance (all on the dev macOS/arm64 host):
 
-```
-| true | 14 | 15,776 | 5,494 | 147,898 |
-```
+- **DJGPP** — `~/.local/opt/djgpp` from `andrewwutw/build-djgpp
+  v3.4` (gcc 12.2.0, osx artifact, runs under Rosetta).
+- **Watcom** — Open Watcom V2 has no macOS build, and its Linux
+  binaries don't run under Rosetta (Rosetta bridges x86_64→arm64
+  user space, not the Linux ABI). The DOS release asset
+  (`open-watcom-2_0-c-dos.exe`) is a plain self-extracting zip;
+  `unzip 'binw/*' 'h/*' 'lib386/*'` → `~/.local/opt/watcom-dos`,
+  and the DOS-hosted `wcc386.exe`/`wlink.exe` run under DOSBox-X.
+  `addons/harness/watcom_dosbox.py` drives this; `compare.py`
+  falls back to it when native `wcc386` is absent. The period
+  reference is now *measured on macOS*, not asserted from CI.
 
-uc386 is **390× smaller than Watcom** for `true`, **1,127×
-smaller than gcc**, and **10,564× smaller than DJGPP**. Watcom
-runs ~2-4× wider than uc386 across the rest of the table because
-DOS/4GW carries its own protected-mode startup; uc386 emits flat
-real-mode-32 binaries that dos_emu loads directly.
+**Behavioral status:** 15/17 addon manifest tests pass under
+`addons/test_gnu_addons.py`. `cat` and `sbase-cat` compile and
+build `.exe` but fail their behavioral test — a dos_emu
+multi-file-arg `fopen`/vfiles gap (the `-`/stdin path and the
+shared `argv[i][0]=='-'` char comparisons are correct; only
+`fopen` on a vfile returns NULL when interleaved with stdin).
+Tracked as a known runtime gap, distinct from codegen.
 
 ## ✓ Include the latest MicroPython (2026-05-01 ask)
 

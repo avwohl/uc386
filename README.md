@@ -15,7 +15,7 @@ runtime bindings. See `CLAUDE.md` for the per-slice development log.
 
 **Highlights**: uc386 also produces real DOS `.exe` files — `addons/harness/exe.py`
 drives `nasm -f obj` → `wlink system pmodew` to build self-contained
-`.exe` (PMODE/W bound, ~12 KB stub overhead) for any in-tree addon.
+`.exe` (PMODE/W bound, ~17 KB stub floor) for any in-tree addon.
 Validated end-to-end in CI: `true.exe` boots PMODE/W under DOSBox
 0.74-3, runs the 32-bit code, exits with the correct errorlevel
 (`false.exe` → 1, `true.exe` → 0); `argv_pr.exe alpha beta` parses the
@@ -26,7 +26,9 @@ emits multi-arg printf output (`2: 2 / 12: 2 2 3 / 60: 2 2 3 5 /
 writes `hello dos\n` via libc fputs through real DOS handles. All
 14 manifest-driven addons build .exe successfully (basename, cat,
 dirname, echo, factor, false, head, open_test, strtol_test, tail,
-true, wc, yes, argv_probe — sizes ~16 KB).
+true, wc, yes, argv_probe — .exe ~17 KB; 15/17 also pass their
+behavioral manifest test, `cat`/`sbase-cat` have a known dos_emu
+multi-file `fopen` gap — see `addons/STATUS.md`).
 See `docs/path-a-mz-le.md`. DOOM boots end-to-end through uc386 → NASM → dos_emu
 (reaches W_InitFiles after V_Init / M_LoadDefaults / Z_Init; exits 1
 at WAD-not-found as expected; smoke-tested via
@@ -47,6 +49,40 @@ arithmetic, regex, aggregation, and string functions
 (`true`, `cat`, `wc`, ...) get parametrized regression coverage via
 `addons/test_gnu_addons.py`. See `addons/STATUS.md` for the full
 per-addon report.
+
+## Size — measured, not asserted
+
+The "tiny output" claim, checked against the period reference
+compiler instead of asserted. Every column below was **reproduced
+on one macOS/arm64 host** by `python -m addons.harness.compare`
+(Open Watcom V2 has no native macOS build, so its DOS-hosted
+`wcc386`/`wlink` run under DOSBox-X via `addons/harness/
+watcom_dosbox.py`; DJGPP is the gcc-12.2 osx cross under Rosetta).
+Bytes of the on-disk executable; full table in
+[`addons/results.md`](addons/results.md):
+
+| program | uc386 .bin | uc386 .exe | Watcom | DJGPP |
+|---------|-----------:|-----------:|-------:|------:|
+| true    |         18 |     16,907 |  5,420 | 147,914 |
+| echo    |        148 |     16,915 | 11,286 | 150,212 |
+| factor  |      1,858 |     16,989 | 20,538 | 179,614 |
+| wc      |      1,529 |     16,928 | 20,158 | 179,092 |
+
+Reading this honestly:
+
+- **`.bin` is not a DOS program.** It has no MZ header and runs
+  only under `uc386.dos_emu`/a custom loader. It is the right
+  metric for *codegen+DCE tightness* (and there uc386 is in a
+  class of its own — tens of bytes), but it is not what you ship.
+- **`.exe` is what you ship**, and it carries a ~17 KB PMODE/W
+  extender floor. Against that real-DOS artifact, **Open Watcom
+  is ~2–3× smaller on tiny programs** (its DOS/4GW clib + mature
+  linker beat our extender floor); the two converge as real code
+  grows. uc386 beats **DJGPP ~9×** and host **gcc ~2×**.
+- So: uc386's *code generation* is extremely compact; its current
+  *DOS packaging* (PMODE/W) is not yet competitive with Watcom's
+  on small binaries. Both statements are true and the table shows
+  which is which — no single "390× smaller" headline.
 
 ## Goal
 
