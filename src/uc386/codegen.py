@@ -10716,7 +10716,18 @@ class CodeGenerator:
                         )
                     elif (
                         isinstance(elem_type, _ltypes.ArrayType)
-                        and isinstance(elem_actual, (ast.InitializerList, ast.StringLiteral))
+                        and (
+                            isinstance(elem_actual, (ast.InitializerList, ast.StringLiteral))
+                            or (
+                                # Auto-AST adjacent-string-concat list,
+                                # incl. single `"…"` wrapped in [Str]
+                                # (cf. `char lva[2][3] = {"123"};`,
+                                # gcc-c-torture strlen-6).
+                                isinstance(elem_actual, list) and elem_actual
+                                and all(isinstance(p, ast.StringLiteral)
+                                        for p in elem_actual)
+                            )
+                        )
                     ):
                         # Multi-dim array element: recurse.
                         out += self._array_init(
