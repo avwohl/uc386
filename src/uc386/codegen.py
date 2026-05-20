@@ -2362,6 +2362,18 @@ class CodeGenerator:
             # the whole array.
             if isinstance(v, ast.StringLiteral):
                 return v, i + 1
+            # Auto-AST adjacent-string-concat shape: even a single
+            # `"hello"` is wrapped as a one-element Python list when it
+            # appears as a struct/array initialiser. Treat the whole
+            # list as the single value covering the array — without
+            # this, the per-element loop below would slurp subsequent
+            # struct values into this member, mis-shifting everything
+            # (c-testsuite 00216's `struct T gt = {"hello", 42};`).
+            if (
+                isinstance(v, list) and v
+                and all(isinstance(p, ast.StringLiteral) for p in v)
+            ):
+                return v, i + 1
             # Build a synthetic InitializerList by consuming one logical
             # value per array element.
             length = (
@@ -2549,9 +2561,24 @@ class CodeGenerator:
         # equivalent. The single element may also be a Python list of
         # adjacent StringLiteral pieces (`{ "a" "\0" "b" }`, glibc's
         # __re_error_msgid idiom) — concatenate them.
+        # `char` here includes typedef aliases — `u8 buf[16] = "hi"`
+        # is just as much a char-array-from-string init as the bare
+        # `char` form. Resolve the typedef on demand so the string
+        # path fires for the (very common) `typedef unsigned char u8`
+        # case. Same typedef-resolution class as the `_cast` (34d45ab)
+        # and `_emit_runtime_size_of` (f9d8fe4) fixes.
+        elem_basic_name = None
+        if isinstance(elem_type, _ltypes.BasicType):
+            elem_basic_name = elem_type.name
+            if elem_basic_name not in self._BASIC_SIZES:
+                resolved = self._resolve_typedef_name(elem_basic_name)
+                if resolved is not None:
+                    from uc_core.ast import resolved_to_legacy
+                    rl = resolved_to_legacy(resolved)
+                    if isinstance(rl, _ltypes.BasicType):
+                        elem_basic_name = rl.name
         if (
-            isinstance(elem_type, _ltypes.BasicType)
-            and elem_type.name == "char"
+            elem_basic_name == "char"
             and isinstance(init, ast.InitializerList)
             and len(init.values) == 1
         ):
