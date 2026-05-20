@@ -14984,7 +14984,9 @@ class CodeGenerator:
         if isinstance(t, _ltypes.ArrayType):
             if t.size is not None and id(t.size) in captured:
                 slot_name = captured[id(t.size)]
-                t.size = make_identifier(slot_name, location=t.size.location)
+                # Auto-AST nodes carry `.pos`, not the legacy `.location`.
+                # The function signature accepts neither — drop the kwarg.
+                t.size = make_identifier(slot_name)
             self._replace_vla_size_with_capture(t.base_type, captured, fn_name)
             return
 
