@@ -1700,17 +1700,25 @@ class CodeGenerator:
             # Walk each designator and emit at its offset; non-overlapping
             # writes accumulate in the byte image. Non-designated leading
             # values fall through to the legacy single-init path.
+            def _designator_name(d):
+                # Auto-AST: `.field` is `FieldDesignator(field=Token)`;
+                # legacy path used a bare str.
+                if isinstance(d, str):
+                    return d
+                if isinstance(d, ast.FieldDesignator):
+                    return d.field.text
+                return None
             if (
                 all(isinstance(v, ast.DesignatedInit)
                     and len(v.designators) == 1
-                    and isinstance(v.designators[0], str)
-                    and v.designators[0] in member_index
+                    and _designator_name(v.designators[0]) is not None
+                    and _designator_name(v.designators[0]) in member_index
                     for v in init.values)
                 and len(init.values) > 1
             ):
                 placed: dict[int, tuple] = {}
                 for v in init.values:
-                    target = v.designators[0]
+                    target = _designator_name(v.designators[0])
                     idx = member_index[target]
                     m_name, m_ty, m_off = members[idx]
                     placed[m_off] = (
@@ -1777,11 +1785,25 @@ class CodeGenerator:
                     for v in first_value.values:
                         if isinstance(v, ast.DesignatedInit):
                             target = v.designators[0]
+                            # Auto-AST wraps `.field` as
+                            # `FieldDesignator(field=Token)`; only the
+                            # legacy path bound a bare str. Accept both
+                            # so union-anon-struct designated init
+                            # actually unwraps the value (otherwise the
+                            # DesignatedInit fell through to the
+                            # positional path and reached
+                            # _emit_global_init raw — c-testsuite 00216
+                            # guv2 / gcc tests with union-anon designators).
+                            target_name = None
+                            if isinstance(target, str):
+                                target_name = target
+                            elif isinstance(target, ast.FieldDesignator):
+                                target_name = target.field.text
                             if (
-                                isinstance(target, str)
-                                and target in name_to_member_idx
+                                target_name is not None
+                                and target_name in name_to_member_idx
                             ):
-                                mi = name_to_member_idx[target]
+                                mi = name_to_member_idx[target_name]
                                 if len(v.designators) > 1:
                                     placed[mi] = ast.InitializerList(
                                         values=[ast.DesignatedInit(
