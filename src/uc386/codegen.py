@@ -10329,6 +10329,18 @@ class CodeGenerator:
             # copy from src to s rather than expecting `{...}`.
             if not isinstance(decl.init, ast.InitializerList):
                 rhs_ty = self._type_of(decl.init, ctx)
+                # Resolve typedef-name BasicType to its underlying type
+                # (`typedef struct { … } obj` → StructType). `_type_of`
+                # returns the typedef name verbatim; without resolution
+                # `isinstance(StructType)` misses `obj z = *(obj*)p;`.
+                if (
+                    isinstance(rhs_ty, _ltypes.BasicType)
+                    and rhs_ty.name not in self._BASIC_SIZES
+                ):
+                    resolved = self._resolve_typedef_name(rhs_ty.name)
+                    if resolved is not None:
+                        from uc_core.ast import resolved_to_legacy
+                        rhs_ty = resolved_to_legacy(resolved)
                 if isinstance(rhs_ty, _ltypes.StructType):
                     return self._struct_copy_from_expr(
                         decl.init, disp, var_type, ctx,
