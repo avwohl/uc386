@@ -2504,7 +2504,18 @@ class CodeGenerator:
                     break
                 group.append(vj)
                 j += 1
-                if isinstance(vj, ast.StringLiteral):
+                # A string literal can fill a whole nested char array
+                # all by itself, so subsequent flat values belong to
+                # the next element. The auto-AST wraps adjacent strings
+                # (even one) in a list, so accept either shape — without
+                # the list case, `struct S arr[N] = {"a", "b", …}` lumps
+                # every source string into the first element's init
+                # (cf. gcc-c-torture 20070919-1).
+                if isinstance(vj, ast.StringLiteral) or (
+                    isinstance(vj, list)
+                    and vj
+                    and all(isinstance(p, ast.StringLiteral) for p in vj)
+                ):
                     break
             if len(group) > 0:
                 # Wrap whatever we collected. Partial groups (fewer
@@ -10655,6 +10666,29 @@ class CodeGenerator:
                         out += self._struct_init(
                             elem_type, elem_actual, elem_disp, ctx,
                             f"{name}[{idx}]",
+                        )
+                    elif (
+                        isinstance(elem_type, _ltypes.StructType)
+                        and (
+                            isinstance(elem_actual, ast.StringLiteral)
+                            or (
+                                isinstance(elem_actual, list)
+                                and elem_actual
+                                and all(isinstance(p, ast.StringLiteral)
+                                        for p in elem_actual)
+                            )
+                        )
+                    ):
+                        # `struct S arr[N] = {"abc", ...};` — each string
+                        # initialises the first compound member of the
+                        # element struct. Wrap as a single-element
+                        # InitializerList; _struct_init's brace-elider
+                        # routes the string to the matching char-array
+                        # member (cf. gcc-c-torture 20070919-1).
+                        out += self._struct_init(
+                            elem_type,
+                            ast.InitializerList(values=[elem_actual]),
+                            elem_disp, ctx, f"{name}[{idx}]",
                         )
                     elif (
                         isinstance(elem_type, _ltypes.StructType)
