@@ -10923,7 +10923,16 @@ class CodeGenerator:
                 )
             elif (
                 isinstance(m_ty, _ltypes.ArrayType)
-                and isinstance(actual, (ast.InitializerList, ast.StringLiteral))
+                and (
+                    isinstance(actual, (ast.InitializerList, ast.StringLiteral))
+                    or (
+                        # Auto-AST adjacent-string-concat list (`{"hello"}`
+                        # wraps to `[StringLiteral]`; the brace-elider
+                        # returns it intact for char-array members).
+                        isinstance(actual, list) and actual
+                        and all(isinstance(p, ast.StringLiteral) for p in actual)
+                    )
+                )
             ):
                 out += self._array_init(
                     m_ty, actual, m_disp, ctx, f"{name}.{m_name_i}"
