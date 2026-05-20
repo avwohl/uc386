@@ -42,20 +42,23 @@ each is resumable without re-triage.
 
 ### Remaining genuine standard-C codegen singletons
 
-**None.** The campaign has exhausted the standard-C codegen-corner
-*miscompiles* — every remaining executable failure is a scoped
-*feature* (C99 VLA / variably-modified types, `_Complex`) or a GNU
-extension, tracked below. Confirmed by per-test triage; not claimed
-as passing.
+**None.** The campaign exhausted the standard-C codegen-corner
+*miscompiles*, then took on the **C99 VLA / variably-modified-types
+feature** end to end — deallocation, `sizeof` of a VLA typedef,
+`sizeof` of a struct with a variably-modified member (6.7.7p2
+evaluate-once), and the VMT-parameter side effect are all now
+fixed (rows below). Every remaining executable failure is a
+larger scoped *feature* (`_Complex`) or a GNU extension. Confirmed
+by per-test triage; not claimed as passing.
 
 ### Feature / out-of-scope (not codegen-corner singletons)
 
 | Test(s) | Class | Note |
 |---|---|---|
 | ~~pr43220, vla-dealloc-1, 20040811-1~~ | **FIXED** (uc386) | C99 VLA *deallocation*. Basic VLA alloc/index/sizeof already worked; the `__vla_baseline` save+goto-restore mechanism existed but was **dead code** — the `has_any_vla` pre-pass tested `isinstance(sub,(VarDecl,_SynthLocalVar))` while running *before* `_collect_locals` synthesises those, so it never saw the parsed `ArrayDeclarator` and `vla_baseline_disp` stayed `None`. A goto-back never freed VLAs → unbounded stack growth → `UC_ERR_WRITE_UNMAPPED`. Now detect a VLA from the parsed `ArrayDeclarator` (size present, non-`IntLiteral`, not const-foldable). |
-| 970217-1 | C99 VMT param (deep, cross-repo) | `sub(int i, int array[i++])` — the `i++` in a variably-modified array parameter must be evaluated on entry (i→11). Triaged: the uc_core frontend decays the param to `PointerType(int)` and **discards** the `i++` expression; the `size_side_effects` field (ast.py:164, ast_legacy.py:435; read at codegen.py 3645/3846/4004) is **vestigial — never populated**. A real fix needs uc_core to retain the VMT-param size side-effects through array→pointer parameter adjustment (shared frontend → also affects uc80/uplm80), then the existing codegen read-sites light up. Deferred: deep cross-repo change for an extremely rare construct. |
+| ~~970217-1~~ | **FIXED** (uc_core) | C99 6.7.6.3p7/6.9.1p10 VMT-parameter side effect: `sub(int i, int array[i++])` must evaluate `i++` on entry (i→11). The size expr survives as `pt.size_expr` on the array `ResolvedType`; only `_decay_for_param` dropped it when collapsing to a pointer. `_fd_params` now collects the non-`IntLiteral` dimension exprs down the array chain into `_ParamView.size_side_effects` (purely additive — that field was vestigial; uc386 codegen read-sites 3645/3846/4004 already consume it; uc80/uplm80 ignore it). `_sub` now emits `inc [esp+4]` then returns 11. |
 | ~~20040411-1~~ | **FIXED** (uc386) | C99 VLA-typedef `sizeof`. `sizeof(<typedef-name>)` passed an unresolved `TypeName(TypedefNameSpec('c'))` to `_emit_runtime_size_of` → `_type_has_vla` False → static `mov eax,4`. Now resolve the typedef (TypeName→legacy; typedef-name→`_resolve_typedef_name`→`resolved_to_legacy`) at the top of `_emit_runtime_size_of`, so a VLA typedef routes through the runtime path (cf. `_cast` fix `34d45ab`). Gated by `_is_genuine_vla_array` (`aa9dc2c`) so only a genuine — non-const-foldable — VLA array typedef is adopted; constant/struct typedefs keep the byte-identical pre-fix static path (the unguarded `f9d8fe4` mis-routed those into the runtime path → compile regression, caught by the sweep). *Known limitation:* re-evaluates the size expr at the `sizeof` site, not C99 6.7.7p2 evaluate-once-at-typedef-decl — correct whenever the size operands are unmodified between typedef and `sizeof` (the normal case + what the test exercises). |
-| 20041218-2 | C99 VMT-in-struct `sizeof` | `struct s{char b[n];}; n++; sizeof(struct s)` — deliberately tests C99 6.7.7p2 evaluate-once (expects 123, not 124). The `_capture_struct_vla_member_sizes` machinery (alloc slot, replace member `ArrayType.size` with `Identifier(slot)`, eval+store at decl point) **exists but only fires for `ast.StructDecl`**; an in-function `struct s{...};` parses as `ast.Declaration` w/ a `StructDef` spec (no declarators), so neither `_collect_locals` nor `_item` runs capture for it (currently reads `n` live at the `sizeof` → 124). Resumable: wire capture into the `_collect_locals`/`_item` `Declaration`+`StructDef` branches, mutating the *registered* (`self._structs[sname]`) member ArrayType objects. Deferred — struct-layout blast radius too high for a blind one-test change. |
+| ~~20041218-2~~ | **FIXED** (uc386) | C99 VMT-in-struct `sizeof` evaluate-once (6.7.7p2): `struct s{char b[n];}; n++; sizeof(struct s)` must be 123 not 124. The `_capture_struct_vla_member_sizes` machinery only fired for `ast.StructDecl`; an in-function `struct s{…};` is `ast.Declaration`+`StructDef`. Wired capture into the `_collect_locals` Declaration/StructDef branch (run on a `SimpleNamespace` shim of `st`, *before* `_resolve_struct_name` so the registered member ArrayType carries `Identifier(slot)`; stash on the Declaration node) and the eval+store into `_lower_declaration` (at the decl point, before later mutation). Also generalised `_is_genuine_vla_array` to recurse `StructType` members so a struct-VMT typedef is adopted for the runtime-sizeof path while const-foldable struct typedefs stay static (keeps the `aa9dc2c` regression fix). The `_collect_locals` wiring is gated on a genuine-VLA member check (`_const_eval`, not the weak `_try_simple_int_fold`) so a constant member (`int a[ENUM]`, `char b[sizeof T]`) is *not* slot-captured — caught by the sweep as a +4 compile regression first, then gated. |
 | pr23467, 20010904-1, 20010904-2 | GNU ext | `__attribute__((aligned(N)))` type-alignment in struct layout/sizeof/stride — multi-site, non-standard. |
 | 20020227-1 | C99 `_Complex` | `__complex__ float` member codegen — full complex feature. |
 | 960830-1, pr49279 | GNU ext | extended inline `__asm__` with operand constraints. |

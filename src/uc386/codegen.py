@@ -5045,6 +5045,66 @@ class CodeGenerator:
                     from uc_core.ast import resolved_to_legacy
                     from uc_core.codegen_helpers import _resolve_struct_spec
                     st = resolved_to_legacy(_resolve_struct_spec(spec))
+                    # C99 6.7.7p2: a struct with a variably-modified
+                    # member fixes its size when the declaration is
+                    # reached, not at each `sizeof`. Capture the member
+                    # dimension(s) into hidden slots BEFORE registering
+                    # the layout (so the registered member ArrayType
+                    # carries Identifier(slot), and a later
+                    # `sizeof(struct s)` reads the captured value, not
+                    # a re-read of a since-mutated variable). Mirrors
+                    # the ast.StructDecl path (`_collect_locals` →
+                    # `_item`); the in-function `struct S {…};` shape
+                    # parses as Declaration+StructDef, not StructDecl,
+                    # so it needs the same wiring here.
+                    # Only wire capture when the struct has a *genuine*
+                    # VLA member (an array dim whose size won't
+                    # const-fold). `_capture_struct_vla_member_sizes`
+                    # uses the weak `_try_simple_int_fold` (IntLiterals
+                    # + arithmetic only), so without this gate a normal
+                    # constant member — `int a[ENUM]`, `char b[sizeof
+                    # T]`, `x[MACRO]` — would be wrongly slot-captured,
+                    # turning a constant-size struct into a runtime one
+                    # (mis-sized layout / eval raises → compile fail).
+                    # `_is_genuine_vla_array` (called only on ArrayType
+                    # members, so no struct-registry side effect) uses
+                    # the full `_const_eval`, restricting this to true
+                    # variably-modified members like `char b[n]`.
+                    # Gate: SKIP typedef'd structs (`typedef struct {…} c;`).
+                    # uc_core's typedef resolution caches by NAME (not by
+                    # function scope), so once sub1 caches its `c` the
+                    # mutation we'd apply here leaks into main's lookup of
+                    # the same-named typedef (gcc-c-torture 20040423-1).
+                    # 20041218-2 uses a tagged `struct s {…};` (not
+                    # typedef), so it still goes through this path. The
+                    # typedef-VMT case is preserved in the backlog and
+                    # depends on a separate per-function typedef scoping
+                    # refactor in uc_core.
+                    is_typedef = (
+                        decl_storage_class(node.decl_specs) == "typedef"
+                    )
+                    if (
+                        not is_typedef
+                        and st is not None and st.members
+                        and any(
+                            isinstance(
+                                getattr(m, "member_type", None),
+                                _ltypes.ArrayType,
+                            )
+                            and self._is_genuine_vla_array(m.member_type)
+                            for m in st.members
+                        )
+                    ):
+                        from types import SimpleNamespace
+                        shim = SimpleNamespace(
+                            name=st.name, members=st.members,
+                        )
+                        self._capture_struct_vla_member_sizes(shim, ctx)
+                        caps = getattr(
+                            shim, "_vla_member_captures", None,
+                        )
+                        if caps:
+                            node._vla_member_captures = caps
                     if st is not None and (st.members or st.name):
                         self._resolve_struct_name(st)
                     self._register_inline_enums(spec)
@@ -9756,9 +9816,29 @@ class CodeGenerator:
         """Lower an ``ast.Declaration`` to a series of per-declarator
         var-init operations, matching the legacy ``ast.VarDecl`` flow."""
         storage = decl_storage_class(decl.decl_specs)
-        if storage == "typedef":
-            return []
         out: list[str] = []
+        # C99 6.7.7p2 struct-VMT capture: evaluate each variably-
+        # modified member dimension once, here at the declaration
+        # point (before any later mutation of the size variable), and
+        # store into the hidden slot `_collect_locals` allocated. The
+        # registered struct's member ArrayType already reads
+        # Identifier(slot), so a subsequent `sizeof(struct S)` uses
+        # this captured value. Same emit as `_item(ast.StructDecl)`.
+        captures = getattr(decl, "_vla_member_captures", None)
+        if captures:
+            for slot_name, orig_size in captures:
+                ctx.alloc_local(
+                    slot_name, _ltypes.BasicType(name="int"),
+                    decl=orig_size,
+                )
+                try:
+                    out += self._eval_expr_to_eax(orig_size, ctx)
+                except CodegenError:
+                    continue
+                cdisp = ctx.lookup(slot_name)
+                out.append(f"        mov     {_ebp_addr(cdisp)}, eax")
+        if storage == "typedef":
+            return out
         for sv in self._synth_vars_for(decl):
             out += self._var_init(sv, ctx)
         return out
@@ -14229,25 +14309,98 @@ class CodeGenerator:
             return self._array_is_directly_vla(t.base_type)
         return False
 
-    def _is_genuine_vla_array(self, t: _ltypes.TypeNode) -> bool:
-        """True only for a *genuine* VLA array: some dimension's size
+    def _is_genuine_vla_array(self, t: _ltypes.TypeNode, _depth: int = 0) -> bool:
+        """True only for a *genuine* VLA: some array dimension's size
         expression is present, not an IntLiteral, and does NOT
-        const-fold. Distinguishes `typedef int c[i+2]` (runtime size)
-        from `typedef T a[N+1]` (non-literal but constant — sized
-        statically). Used to gate the runtime-sizeof typedef path so
-        a constant-sized typedef isn't mis-routed there.
+        const-fold. Distinguishes `typedef int c[i+2]` /
+        `struct s{char b[n];}` (runtime size) from `typedef T a[N+1]`
+        (non-literal but constant — sized statically). Recurses into
+        struct members so a struct-typedef with a variably-modified
+        member is also adopted for the runtime-sizeof path; a struct
+        whose member array sizes all const-fold stays static (keeps
+        the f9d8fe4 compile-regression fix). Used to gate the
+        runtime-sizeof typedef path.
         """
-        if not isinstance(t, _ltypes.ArrayType):
+        if _depth > 16:
             return False
-        sz = getattr(t, "_vla_size", None)
-        if sz is None:
-            sz = t.size
-        if sz is not None and not isinstance(sz, ast.IntLiteral):
-            try:
-                self._const_eval(sz, "<vla?>")
-            except CodegenError:
-                return True
-        return self._is_genuine_vla_array(t.base_type)
+        if isinstance(t, _ltypes.ArrayType):
+            sz = getattr(t, "_vla_size", None)
+            if sz is None:
+                sz = t.size
+            if sz is not None and not isinstance(sz, ast.IntLiteral):
+                try:
+                    self._const_eval(sz, "<vla?>")
+                except CodegenError:
+                    return True
+            return self._is_genuine_vla_array(t.base_type, _depth + 1)
+        if isinstance(t, _ltypes.StructType):
+            # Never call `_resolve_struct_name` here: this runs inside
+            # `_emit_runtime_size_of` for every `sizeof(<typedef>)`,
+            # and that function *registers* the struct as a side
+            # effect — doing so at this point in the flow mis-keys /
+            # duplicates the layout and breaks unrelated compiles
+            # downstream (a non-local +3 compile regression). Inspect
+            # the inline definition on `t.members` first; for a bare
+            # tag ref (members live only in the registry) fall back to
+            # the *pure* alias lookup `_resolve_struct_alias` — no
+            # registration — and read the already-registered layout.
+            members = getattr(t, "members", None) or []
+            if not members and getattr(t, "name", None):
+                # Pure read of the already-registered layout, mirroring
+                # `_resolve_struct_name`'s tag-ref first-chance (alias
+                # chain, then the registry dict by tag) — but WITHOUT
+                # its registration fallback, so no side effect.
+                aliased = self._resolve_struct_alias(t.name)
+                if aliased is not None and aliased in self._structs:
+                    key = aliased
+                elif t.name in self._structs:
+                    key = t.name
+                else:
+                    key = None
+                if key is not None:
+                    # Only adopt the runtime-sizeof path when this
+                    # struct has a *captured* VLA member (an Identifier
+                    # whose name starts with `__vla_capture_struct_`).
+                    # Raw `c[i+2]` references (uncaptured, e.g. from a
+                    # typedef'd VLA-struct cached cross-function) MUST
+                    # NOT trigger runtime eval — the size expr's
+                    # identifiers may not be in scope at the sizeof
+                    # site (uc_core caches typedef resolution by name,
+                    # so sub1's `typedef struct{int c[i+2];} c;` would
+                    # leak into main's `sizeof(c)` and try to eval `i`
+                    # in main's scope — gcc-c-torture 20040423-1).
+                    for _n, mt, _o in self._structs.get(key, []):
+                        if mt is None:
+                            continue
+                        if isinstance(mt, _ltypes.ArrayType):
+                            sz = getattr(mt, "_vla_size", None) or mt.size
+                            if (
+                                isinstance(sz, ast.Identifier)
+                                and sz.name.text.startswith(
+                                    "__vla_capture_struct_"
+                                )
+                            ):
+                                return True
+                    return False
+            # Inline members: only adopt runtime-sizeof if a member's
+            # array size is a captured slot (`__vla_capture_struct_*`).
+            # Raw VLA member refs (uncaptured) reference function-local
+            # identifiers that aren't safely evaluated cross-function
+            # via a typedef-cached lookup — see the alias path above.
+            for m in members:
+                mt = getattr(m, "member_type", None)
+                if mt is None or not isinstance(mt, _ltypes.ArrayType):
+                    continue
+                sz = getattr(mt, "_vla_size", None) or mt.size
+                if (
+                    isinstance(sz, ast.Identifier)
+                    and sz.name.text.startswith("__vla_capture_struct_")
+                ):
+                    return True
+            return False
+        if isinstance(t, _ltypes.PointerType):
+            return False
+        return False
 
     def _type_has_vla(self, t: _ltypes.TypeNode) -> bool:
         """Does `t` contain a variable-length array? Recognized via
