@@ -9025,7 +9025,12 @@ class CodeGenerator:
         `_member_layout` / element-size machinery used by `.field`
         and `arr[i]`.
         """
-        return self._offsetof_walk(expr.designator, expr.target_type)
+        # Convert the AST `TypeName(StructRef(…))` to a legacy
+        # StructType so the walker can resolve member layouts.
+        root = expr.target_type
+        if isinstance(root, (ast.TypeName, ast.TypeNameWithDeclarator)):
+            root = _to_legacy_type(root)
+        return self._offsetof_walk(expr.designator, root)
 
     def _offsetof_walk(
         self, node: ast.Expression, root_ty: _ltypes.TypeNode,
@@ -9033,6 +9038,47 @@ class CodeGenerator:
         if isinstance(node, ast.Identifier):
             # `__offsetof_root` — base case, offset 0.
             return 0
+        # `__builtin_offsetof(T, member)` parses the designator as a
+        # distinct OffsetofMember/OffsetofField/OffsetofIndex tree
+        # (not the generic Member/Index used in `.field`/`[i]`
+        # expressions). Walk those leaf-first against root_ty.
+        if isinstance(node, ast.OffsetofMember):
+            # Leaf: `.member` directly into root_ty.
+            if isinstance(root_ty, _ltypes.PointerType):
+                root_ty = root_ty.base_type
+            if not isinstance(root_ty, _ltypes.StructType):
+                raise CodegenError(
+                    f"offsetof: cannot apply `.{node.name.text}` to "
+                    f"{type(root_ty).__name__}"
+                )
+            sname = self._resolve_struct_name(root_ty)
+            _m_ty, m_off = self._member_layout(sname, node.name.text)
+            return m_off
+        if isinstance(node, ast.OffsetofField):
+            # Chain: `base.field`.
+            base = self._offsetof_walk(node.base, root_ty)
+            base_ty = self._offsetof_type_walk(node.base, root_ty)
+            if isinstance(base_ty, _ltypes.PointerType):
+                base_ty = base_ty.base_type
+            if not isinstance(base_ty, _ltypes.StructType):
+                raise CodegenError(
+                    f"offsetof: cannot apply `.{node.field.text}` to "
+                    f"{type(base_ty).__name__}"
+                )
+            sname = self._resolve_struct_name(base_ty)
+            _m_ty, m_off = self._member_layout(sname, node.field.text)
+            return base + m_off
+        if isinstance(node, ast.OffsetofIndex):
+            base = self._offsetof_walk(node.base, root_ty)
+            base_ty = self._offsetof_type_walk(node.base, root_ty)
+            if isinstance(base_ty, (_ltypes.ArrayType, _ltypes.PointerType)):
+                elem_ty = base_ty.base_type
+            else:
+                raise CodegenError(
+                    f"offsetof: index of {type(base_ty).__name__}"
+                )
+            idx = self._const_eval(node.index, "<offsetof>")
+            return base + idx * self._size_of(elem_ty)
         if isinstance(node, (ast.Member, ast.ArrowMember)):
             base = self._offsetof_walk(node.obj, root_ty)
             base_ty = self._offsetof_type_walk(node.obj, root_ty)
@@ -9066,6 +9112,33 @@ class CodeGenerator:
     ) -> _ltypes.TypeNode:
         if isinstance(node, ast.Identifier):
             return root_ty
+        if isinstance(node, ast.OffsetofMember):
+            obj_ty = root_ty
+            if isinstance(obj_ty, _ltypes.PointerType):
+                obj_ty = obj_ty.base_type
+            if not isinstance(obj_ty, _ltypes.StructType):
+                raise CodegenError(
+                    f"offsetof: cannot apply `.{node.name.text}` to non-struct"
+                )
+            sname = self._resolve_struct_name(obj_ty)
+            m_ty, _ = self._member_layout(sname, node.name.text)
+            return m_ty
+        if isinstance(node, ast.OffsetofField):
+            obj_ty = self._offsetof_type_walk(node.base, root_ty)
+            if isinstance(obj_ty, _ltypes.PointerType):
+                obj_ty = obj_ty.base_type
+            if not isinstance(obj_ty, _ltypes.StructType):
+                raise CodegenError(
+                    f"offsetof: cannot apply `.{node.field.text}` to non-struct"
+                )
+            sname = self._resolve_struct_name(obj_ty)
+            m_ty, _ = self._member_layout(sname, node.field.text)
+            return m_ty
+        if isinstance(node, ast.OffsetofIndex):
+            obj_ty = self._offsetof_type_walk(node.base, root_ty)
+            if isinstance(obj_ty, (_ltypes.ArrayType, _ltypes.PointerType)):
+                return obj_ty.base_type
+            raise CodegenError("offsetof: index of non-array")
         if isinstance(node, (ast.Member, ast.ArrowMember)):
             obj_ty = self._offsetof_type_walk(node.obj, root_ty)
             if isinstance(obj_ty, _ltypes.PointerType):
