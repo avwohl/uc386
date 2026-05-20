@@ -2844,7 +2844,23 @@ class CodeGenerator:
         while isinstance(expr, ast.Cast):
             expr = expr.expr
         if isinstance(expr, ast.StringLiteral):
-            return self._intern_string(int_value(expr)), 0
+            return self._intern_string(
+                decode_string_literal(expr.value.text)
+            ), 0
+        # Auto-AST adjacent-string-concat list (even a single `"…"`
+        # arrives wrapped in a one-element list). Intern the
+        # concatenation and return its label — required for static
+        # inits like `void *p[] = {&("X"[0])};` to resolve as a
+        # `dd <label>` (gcc-c-torture 921019-1).
+        if (
+            isinstance(expr, list)
+            and expr
+            and all(isinstance(p, ast.StringLiteral) for p in expr)
+        ):
+            joined = "".join(
+                decode_string_literal(p.value.text) for p in expr
+            )
+            return self._intern_string(joined), 0
         if isinstance(expr, ast.LabelAddr):
             # `&&label` — yields the label's address. We don't currently
             # have a use case for `&&l + N` arithmetic in static init,
