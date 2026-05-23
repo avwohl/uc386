@@ -921,7 +921,7 @@ def build_exe(
     # needing Open Watcom installed. Verified end-to-end against
     # bit-identical pmodew stub bytes carved from a reference MP.EXE.
     if wlink is None and extender == "pmodew":
-        from . import pyle
+        import pyle
         stub = Path(__file__).resolve().parent / "pmodew_stub.bin"
         if not stub.is_file():
             return False, (
@@ -944,7 +944,7 @@ def build_exe(
     # licensed under zlib that the host project would have to vendor
     # — easier to fetch on demand from archive.org).
     if wlink is None and extender == "dos32a":
-        from . import pyle
+        import pyle
         if dos32a_stub_path is None or not dos32a_stub_path.is_file():
             return False, (
                 f"dos32a: pass --stub-binary <path/to/DOS32A.EXE>. "
