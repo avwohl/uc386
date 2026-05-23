@@ -442,7 +442,7 @@ def main() -> int:
                             peephole=not args.no_peephole)
         code = gen.generate(unit)
         if not args.no_asm_dce:
-            from uc386.asm_dce import dce as asm_dce
+            from upeep386 import dce as asm_dce
             code = asm_dce(code)
         # Embed libc into the asm at compile time so subsequent
         # peephole + asm DCE passes optimize across user + runtime.

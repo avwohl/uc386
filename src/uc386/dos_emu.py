@@ -2424,7 +2424,7 @@ def bundle_text(user_text: str, *, selective_libc: bool = True) -> str:
     user_syms = _user_defined_symbols(user_text)
 
     if selective_libc:
-        from .libc_split import parse_libc
+        from upeep386 import parse_libc
         libc_text = LIBC_ASM_PATH.read_text()
         parsed = parse_libc(libc_text)
         for name in list(parsed.functions):
