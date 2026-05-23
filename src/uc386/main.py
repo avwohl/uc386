@@ -455,7 +455,7 @@ def main() -> int:
             # Re-run peephole over the combined asm so libc functions
             # benefit from the same optimization passes user code does.
             if not args.no_peephole:
-                from uc386.peephole import optimize as peephole_optimize
+                from upeep386 import optimize as peephole_optimize
                 code = peephole_optimize(code)
             # Re-run asm DCE to catch cascades: libc functions whose
             # only callers were dropped by the user-side DCE, or that

@@ -1147,8 +1147,8 @@ class CodeGenerator:
             lines += bss_lines
         asm = "\n".join(lines) + "\n"
         if self.peephole_enabled:
-            from . import peephole as _peephole
-            opt = _peephole.PeepholeOptimizer()
+            from upeep386 import PeepholeOptimizer
+            opt = PeepholeOptimizer()
             asm = opt.optimize(asm)
             self.peephole_stats = opt.stats
         return asm
