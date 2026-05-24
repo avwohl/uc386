@@ -1366,6 +1366,19 @@ def run(
             res.exit_code = al
             uc.emu_stop()
             return
+        if ah == 0x01:
+            # getchar(): read one byte from stdin into AL, echo it
+            # to stdout (real DOS behavior — tested via getchar() loops
+            # in mbasicc's std::getline). When stdin is exhausted,
+            # return 0x1A (^Z = DOS EOF) so callers can detect EOF.
+            if stdin_pos[0] < len(stdin_bytes):
+                ch = stdin_bytes[stdin_pos[0]]
+                stdin_pos[0] += 1
+                _write_stdout(bytes([ch]))
+                uc.reg_write(UC_X86_REG_EAX, (eax & ~0xFF) | ch)
+            else:
+                uc.reg_write(UC_X86_REG_EAX, (eax & ~0xFF) | 0x1A)
+            return
         if ah == 0x02:
             # putchar in DL on real DOS, but we accept AL too for codegen
             # convenience. Look at DL primarily.
