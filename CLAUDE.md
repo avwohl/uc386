@@ -2,8 +2,9 @@
 
 C23 compiler targeting i386 / MS-DOS (flat-32 Watcom-era). The frontend
 lives in [uc_core](https://github.com/avwohl/uc_core) (sibling checkout
-expected at `../uc_core`). This repo owns only the driver, the x86-32
-codegen, and the DOS runtime bindings.
+expected at `../uc_core`). This repo owns the driver, the x86-32 codegen,
+and the DOS runtime bindings; several language-neutral pieces have been
+split out into sibling packages (see **Sibling packages** below).
 
 See `README.md` for the public roadmap (Phase 0–6).
 
@@ -14,14 +15,46 @@ See `README.md` for the public roadmap (Phase 0–6).
 - `src/uc386/runtime.py` — DOS/DPMI runtime bindings (stub)
 - `tests/test_smoke.py` — end-to-end pipeline checks
 
+## Sibling packages (REQUIRED — bootstrap reads this)
+
+uc386 imports these at runtime; **all must be cloned as siblings and
+installed editable** or the driver/tests fail (`ModuleNotFoundError`,
+or a collection error in `tests/test_libc_split_integration.py`):
+
+| Sibling | Imported by | Clone from |
+|---|---|---|
+| `../uc_core` | frontend (lex/parse/AST/const-fold) | `git@github.com:avwohl/uc_core.git` |
+| `../uplox` | uc_core dep | `git@github.com:avwohl/uplox.git` |
+| `../upeep386` | `codegen.py`, `main.py`, `dos_emu.py` (`PeepholeOptimizer`, `dce`, `optimize`, `parse_libc`) | `git@github.com:avwohl/upeep386.git` |
+| `../pyle` | `addons/harness/exe.py` (`parse_omf`, `link`, `write_le`, `bind_dos32a_stub` — the OMF→MZ+LE linker for the `.exe` pipeline) | `git@github.com:avwohl/pyle.git` |
+
+⚠️ **pyle keeps getting "fixed" the wrong way.** It IS on GitHub at
+`github.com/avwohl/pyle` — **clone it.** Do NOT re-recover it from
+uc386 git history (`02f6daf^`); that produces a rootless local-only
+repo with no remote that has to be redone on every machine. If you
+find a `../pyle` with no `origin` remote, replace it with the clone.
+(Same applies to upeep386: it was split out of uc386 in `a7e0a18` /
+`27b1348` and lives at `github.com/avwohl/upeep386` — clone, don't
+copy `peephole.py`/`asm_dce.py`/`libc_split.py` back in.)
+
 ## Toolchain
 
 - Python ≥ 3.10 (uc_core uses `dataclass(kw_only=True)`, added in 3.10).
   Linux ships 3.10+ in current LTSes; on macOS install via
   `brew install python@3.12` (Apple's system 3.9 is too old).
-- Working venv at `.venv/` with `uc_core`, `uc386`, `unicorn` installed.
-  - Create: `python3 -m venv .venv && .venv/bin/pip install pytest unicorn -e ../uc_core -e .`
-- Run tests: `.venv/bin/pytest tests/` (expect 1329 passed).
+- Working venv at `.venv/` with all four siblings + `uc386` + `unicorn`
+  installed editable.
+  - Clone the siblings first (see table above), then create the venv:
+    ```
+    python3 -m venv .venv
+    .venv/bin/pip install pytest unicorn \
+        -e ../uc_core -e ../uplox -e ../upeep386 -e ../pyle -e .
+    ```
+    (The old `-e ../uc_core -e .`-only command is what left every fresh
+    checkout broken — it never installed uplox/upeep386/pyle.)
+- Run tests: `.venv/bin/pytest tests/` (expect 460 passed, 1 skipped).
+  The peephole/dce/libc_split tests now live in upeep386 — run those
+  with `.venv/bin/pytest ../upeep386/tests` (expect 897 passed).
 - Run driver: `.venv/bin/python -m uc386.main examples/hello.c -o /tmp/hello.asm`
 - Assembler target: NASM Intel syntax (`bits 32`, `section .text`).
 - Full per-platform install (brew / apt / dnf), incl. optional bison +
