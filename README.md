@@ -163,15 +163,15 @@ DJGPP / OpenWatcom comparison columns, are documented in
 
 ## Related Projects
 
-- [cpmdroid](https://github.com/avwohl/cpmdroid) - Z80/CP/M emulator for Android with RomWBW HBIOS compatibility and VT100 terminal
-- [cpmemu](https://github.com/avwohl/cpmemu) - CP/M 2.2 emulator with Z80/8080 CPU emulation and BDOS/BIOS translation to Unix filesystem
-- [dosemu](https://github.com/avwohl/dosemu) - MS-DOS emulator for Linux: dosbox-staging CPU + cpmemu-style syscall translation (intended test host for uc386)
-- [qxDOS](https://github.com/avwohl/qxDOS) - DOS emulator for iPad and Mac — DOSBox-based with SwiftUI interface
-- [uc80](https://github.com/avwohl/uc80) - C23 compiler targeting Z80 processor and CP/M; sibling backend sharing the uc_core frontend
-- [uc_core](https://github.com/avwohl/uc_core) - Shared C23 frontend and AST optimizer used by uc80 and uc386
-- [um80_and_friends](https://github.com/avwohl/um80_and_friends) - Microsoft MACRO-80 compatible toolchain for Linux: assembler, linker, librarian, disassembler (the Z80 analogue of what uc386 needs for i386)
-- [upeepz80](https://github.com/avwohl/upeepz80) - Z80 peephole optimizer (template for an eventual upeep386)
-- [uplox](https://github.com/avwohl/uplox) - Parser/lexer-table generator that produces uc_core's C23 frontend (from `examples/c23.uplox`)
+- [cpmdroid](https://github.com/avwohl/cpmdroid) - Z80/CP/M emulator for Android phones and tablets. It emulates the RomWBW HBIOS interface and a VT100 terminal.
+- [cpmemu](https://github.com/avwohl/cpmemu) - Z80/CP/M emulator for Linux and Windows, with Z80 and 8080 CPU cores. It translates the BDOS and BIOS calls of CP/M 2.2 programs to the host file system.
+- [dosemu](https://github.com/avwohl/dosiz) - MS-DOS emulator for Linux. It uses the dosbox-staging CPU core and translates system calls in the manner of cpmemu. It is the intended test host for uc386.
+- [qxDOS](https://github.com/avwohl/qxDOS) - DOS emulator app for iOS and macOS with a SwiftUI interface. DOSBox Staging supplies the emulated i386 hardware.
+- [uc80](https://github.com/avwohl/uc80) - C compiler for the Z80 processor and CP/M. This sibling backend shares the C23 frontend of uc_core.
+- [uc_core](https://github.com/avwohl/uc_core) - Shared C23 frontend and AST optimizer for the uc80 and uc386 compilers.
+- [um80_and_friends](https://github.com/avwohl/um80_and_friends) - Linux toolchain that is compatible with Microsoft MACRO-80. It has an assembler, a linker, a librarian, and a disassembler. It is the Z80 equivalent of what uc386 needs for i386.
+- [upeepz80](https://github.com/avwohl/upeepz80) - Peephole optimizer for Z80 compilers. It is the template for a future upeep386.
+- [uplox](https://github.com/avwohl/uplox) - LR(1) and GLR parser generator. It writes the lexer and parser tables for the C23 frontend of uc_core from `examples/c23.uplox`.
 
 ## License
 
