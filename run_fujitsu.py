@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run the Fujitsu compiler-test-suite C tests against uc386.
 
-Expects the upstream tests at `../external/CompilerTestSuite`:
+Expects the upstream tests at `../external/compiler-test-suite`:
 
-    git clone https://github.com/AcademySoftwareFoundation/CompilerTestSuite.git ../external/CompilerTestSuite
+    git clone https://github.com/fujitsu/compiler-test-suite.git ../external/compiler-test-suite
 
 The suite has ~30K single-source tests grouped under `C/`. Each test
 has a `.reference_output` file with the expected stdout. Tests use
@@ -23,7 +23,7 @@ from pathlib import Path
 
 UC386_DIR = Path(__file__).parent
 LIB_INCLUDE = UC386_DIR / "src" / "uc386" / "lib" / "include"
-FUJITSU_DIR = Path(__file__).resolve().parent.parent / "external" / "CompilerTestSuite" / "C"
+FUJITSU_DIR = Path(__file__).resolve().parent.parent / "external" / "compiler-test-suite" / "C"
 
 DEFAULT_TIMEOUT = 5
 MAX_COM_SIZE = 128_000
@@ -101,7 +101,7 @@ def main():
         sys.exit(
             f"Fujitsu suite not found at {FUJITSU_DIR}.\n"
             f"Clone with:\n"
-            f"  git clone https://github.com/AcademySoftwareFoundation/CompilerTestSuite.git "
+            f"  git clone https://github.com/fujitsu/compiler-test-suite.git "
             f"{FUJITSU_DIR.parent}",
         )
 
