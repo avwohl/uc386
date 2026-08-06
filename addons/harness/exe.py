@@ -740,6 +740,14 @@ if env := os.environ.get("WATCOM"):
     WATCOM_CANDIDATES.insert(0, str(Path(env) / "binl64/wlink"))
     WATCOM_CANDIDATES.insert(1, str(Path(env) / "binl/wlink"))
 
+# Note the install name: `upyle`, not `pyle`. The name `pyle` on PyPI is
+# an unrelated project, so `pip install pyle` gets you the wrong package
+# and a confusing AttributeError on parse_omf rather than this message.
+_NO_UPYLE_MSG = (
+    "wlink not found and the pure-Python `upyle` linker isn't installed. "
+    "Install it with: pip install upyle"
+)
+
 
 def _which_first(candidates: list[str]) -> str | None:
     for c in candidates:
@@ -784,14 +792,14 @@ def build_exe(
         return False, "nasm not found — install with apt/brew"
     wlink = _which_first(WATCOM_CANDIDATES)
     # wlink is OPTIONAL — when missing (typical on macOS, where Open
-    # Watcom has no native build), the linker step falls back to pyle
-    # (pure Python, ships in the same package). The fallback only
-    # supports the pmodew + dos32a extenders; for causeway/dos4g,
-    # wlink is still required so we error out below if it's missing.
+    # Watcom has no native build), the linker step falls back to upyle
+    # (pure Python, a sibling package). The fallback only supports the
+    # pmodew + dos32a extenders; for causeway/dos4g, wlink is still
+    # required so we error out below if it's missing.
     if wlink is None and extender not in ("pmodew", "dos32a"):
         return False, (
             f"wlink not found — extender={extender!r} requires Open Watcom. "
-            f"Use --extender=pmodew or --extender=dos32a to use the pyle "
+            f"Use --extender=pmodew or --extender=dos32a to use the upyle "
             f"fallback (pure Python). "
             f"Or install Open Watcom V2 and set WATCOM=<install-dir>."
         )
@@ -915,36 +923,56 @@ def build_exe(
     if proc.returncode != 0:
         return False, f"nasm bridge rc={proc.returncode}: {proc.stderr[:400]}"
 
-    # If wlink is missing (typical on macOS), fall back to pyle — our
-    # pure-Python OMF→MZ+LE linker. pyle handles the same bridge.obj
+    # If wlink is missing (typical on macOS), fall back to upyle — our
+    # pure-Python OMF→MZ+LE linker. upyle handles the same bridge.obj
     # + user.obj + PMODE/W stub combination wlink does, just without
     # needing Open Watcom installed. Verified end-to-end against
     # bit-identical pmodew stub bytes carved from a reference MP.EXE.
     if wlink is None and extender == "pmodew":
-        import pyle
-        stub = Path(__file__).resolve().parent / "pmodew_stub.bin"
+        # Guarded: this is the no-Watcom path, so a missing linker is an
+        # expected condition, not a bug. Return it through the (ok, msg)
+        # contract every other failure here uses instead of letting a
+        # raw ImportError escape build_exe().
+        try:
+            import upyle
+        except ImportError:
+            return False, _NO_UPYLE_MSG
+        # The stub ships as upyle package data. It moved out of this
+        # directory in 02f6daf (the pyle split) but this lookup was
+        # never updated, so the whole PMODE/W fallback -- the reason
+        # the .exe pipeline works without Open Watcom -- had been dead
+        # since then. Prefer the packaged copy; keep the old in-tree
+        # path as a fallback for checkouts that vendored it.
+        local_stub = Path(__file__).resolve().parent / "pmodew_stub.bin"
+        stub = upyle.STUB_DIR / "pmodew_stub.bin"
+        if not stub.is_file():
+            stub = local_stub
         if not stub.is_file():
             return False, (
-                f"pyle fallback: missing PMODE/W stub at {stub}. "
-                f"Carve from a wlink-built .exe and place there."
+                f"upyle fallback: no PMODE/W stub found (looked in "
+                f"{upyle.STUB_DIR} and {local_stub.parent}). Reinstall "
+                f"upyle, or carve a stub from a wlink-built .exe."
             )
         try:
-            objects = [pyle.parse_omf(p) for p in (obj_path, bridge_obj)]
-            image = pyle.link(objects)
-            pyle.write_le(image, stub.read_bytes(), "_pmodew_start", out_path)
+            objects = [upyle.parse_omf(p) for p in (obj_path, bridge_obj)]
+            image = upyle.link(objects)
+            upyle.write_le(image, stub.read_bytes(), "_pmodew_start", out_path)
         except Exception as exc:
-            return False, f"pyle: {exc}"
+            return False, f"upyle: {exc}"
         return True, ""
 
-    # DOS/32A pyle path. Unlike PMODE/W, DOS/32A's stub isn't a
+    # DOS/32A upyle path. Unlike PMODE/W, DOS/32A's stub isn't a
     # ready-to-prepend blob — it's a standalone DOS32A.EXE that needs
-    # SUNSYS Bind's transform applied first. pyle.bind_dos32a_stub
+    # SUNSYS Bind's transform applied first. upyle.bind_dos32a_stub
     # does that transform in pure Python. The caller supplies the
     # path to DOS32A.EXE (not bundled because it's a 27 KB binary
     # licensed under zlib that the host project would have to vendor
     # — easier to fetch on demand from archive.org).
     if wlink is None and extender == "dos32a":
-        import pyle
+        try:
+            import upyle
+        except ImportError:
+            return False, _NO_UPYLE_MSG
         if dos32a_stub_path is None or not dos32a_stub_path.is_file():
             return False, (
                 f"dos32a: pass --stub-binary <path/to/DOS32A.EXE>. "
@@ -952,15 +980,15 @@ def build_exe(
             )
         try:
             raw_stub = dos32a_stub_path.read_bytes()
-            stub_bytes = pyle.bind_dos32a_stub(raw_stub)
-            objects = [pyle.parse_omf(p) for p in (obj_path, bridge_obj)]
-            image = pyle.link(objects)
-            pyle.write_le(
+            stub_bytes = upyle.bind_dos32a_stub(raw_stub)
+            objects = [upyle.parse_omf(p) for p in (obj_path, bridge_obj)]
+            image = upyle.link(objects)
+            upyle.write_le(
                 image, stub_bytes, "_pmodew_start", out_path,
                 explicit_stack_object=True,
             )
         except Exception as exc:
-            return False, f"pyle (dos32a): {exc}"
+            return False, f"upyle (dos32a): {exc}"
         return True, ""
 
     # wlink wants WATCOM in env so it can find its stub library.

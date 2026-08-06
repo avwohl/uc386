@@ -37,7 +37,7 @@ jobs:
           pip install pytest unicorn
           pip install "uc_core @ git+https://github.com/avwohl/uc_core@main"
           pip install "upeep386 @ git+https://github.com/avwohl/upeep386@main"
-          pip install "pyle @ git+https://github.com/avwohl/pyle@main"
+          pip install "upyle @ git+https://github.com/avwohl/pyle@main"
           pip install -e .
 
       - name: Install DJGPP cross-compiler

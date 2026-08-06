@@ -40,14 +40,16 @@ jobs:
         nasm -v
       shell: bash
     - name: Install dependencies
-      # uc_core and upeep386 are not on PyPI; install them from GitHub
-      # before `pip install -e .` so pip can satisfy pyproject's
-      # `upeep386>=0.1.0` (otherwise the editable install dies with
-      # "No matching distribution found for upeep386").
-      # `pyle` MUST come from git too: the name `pyle` on PyPI belongs
-      # to an unrelated third-party project, not avwohl/pyle. It is not
-      # a pyproject dep (only addons/harness/exe.py imports it) but the
-      # addons/ tests need it present.
+      # The siblings are installed from git@main rather than PyPI on
+      # purpose: this job is also the integration test that uc386 still
+      # works against the TIP of uc_core/upeep386/upyle, so a breaking
+      # change over there shows up here instead of in a user's install.
+      # They must land before `pip install -e .`, which would otherwise
+      # resolve `upeep386>=0.2.0` from PyPI.
+      # `upyle` is the OMF→MZ+LE linker (repo is still named pyle). It
+      # is NOT a pyproject dep -- only addons/harness/exe.py imports it
+      # -- so pip never pulls it on its own, but addons/ needs it. Note
+      # the name: `pyle` on PyPI is an unrelated third-party project.
       # `unicorn`: required by `uc386.dos_emu` so the addon harness +
       # parametrized GNU addon tests can run the assembled binaries.
       run: |
@@ -55,7 +57,7 @@ jobs:
         pip install pytest pytest-cov unicorn
         pip install "uc_core @ git+https://github.com/avwohl/uc_core@main"
         pip install "upeep386 @ git+https://github.com/avwohl/upeep386@main"
-        pip install "pyle @ git+https://github.com/avwohl/pyle@main"
+        pip install "upyle @ git+https://github.com/avwohl/pyle@main"
         pip install -e .
     - name: Run tests
       # tests/ — uc386 unit tests (1320 cases, no external deps).

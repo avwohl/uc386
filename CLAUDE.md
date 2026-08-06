@@ -26,7 +26,16 @@ or a collection error in `tests/test_libc_split_integration.py`):
 | `../uc_core` | frontend (lex/parse/AST/const-fold) | `git@github.com:avwohl/uc_core.git` |
 | `../uplox` | uc_core dep | `git@github.com:avwohl/uplox.git` |
 | `../upeep386` | `codegen.py`, `main.py`, `dos_emu.py` (`PeepholeOptimizer`, `dce`, `optimize`, `parse_libc`) | `git@github.com:avwohl/upeep386.git` |
-| `../pyle` | `addons/harness/exe.py` (`parse_omf`, `link`, `write_le`, `bind_dos32a_stub` — the OMF→MZ+LE linker for the `.exe` pipeline) | `git@github.com:avwohl/pyle.git` |
+| `../pyle` | `addons/harness/exe.py` — imported as **`upyle`** (`parse_omf`, `link`, `write_le`, `bind_dos32a_stub` — the OMF→MZ+LE linker for the `.exe` pipeline) | `git@github.com:avwohl/pyle.git` |
+
+⚠️ **The repo is `pyle`; the package is `upyle`.** Directory
+`../pyle`, but `pip install upyle` and `import upyle`. The bare name
+`pyle` on PyPI belongs to an unrelated project (aljungberg/pyle, a
+shell one-liner tool) that installs a top-level `pyle.py`, so sharing
+the name would mean the two silently shadow each other on `sys.path`.
+Never add a bare `pyle` dependency anywhere, and never `pip install
+pyle` — you get the wrong package and an AttributeError on
+`parse_omf`.
 
 ⚠️ **pyle keeps getting "fixed" the wrong way.** It IS on GitHub at
 `github.com/avwohl/pyle` — **clone it.** Do NOT re-recover it from
