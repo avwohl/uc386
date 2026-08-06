@@ -6651,7 +6651,26 @@ _dpmi0301_shallow_stack: resb 8192       ; only one label here — libc_split.py
                                           ; this reservation entirely. Use
                                           ; `_stack + 8192` instead.
 
+; -----------------------------------------------------------------
+; unsigned int dos_get_ds_selector(void)
+;
+; Returns the current DS as a selector value. Needed so C code can
+; ask DPMI fn 0x0006 for the base of its OWN data selector.
+;
+; That matters because DPMI fn 0x0002/0x0006 report ABSOLUTE linear
+; addresses for a real-mode segment, while a pointer the C code
+; dereferences is an offset within the client's flat segment. Those
+; two are the same number only when the client's base is zero. If it
+; is not, casting an absolute linear address to a pointer silently
+; addresses the wrong memory — and for a conventional-memory bounce
+; buffer that means writing into the program's own image while real
+; mode reads the untouched paragraph.
 section .text
+_dos_get_ds_selector:
+        xor     eax, eax
+        mov     ax, ds
+        ret
+
 _dpmi0301_call_shallow:
         push    ebp
         mov     ebp, esp
