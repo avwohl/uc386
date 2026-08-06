@@ -10,9 +10,14 @@ readme = "README.md"
 license = "GPL-3.0-or-later"
 requires-python = ">=3.10"
 dependencies = [
-    "uc_core>=0.3.6",
-    "uplox>=3.1.0",
-    "upeep386>=0.1.0",
+    # Upper bound is load-bearing, not defensive: uc_core 0.4.0 renamed
+    # TranslationUnit.declarations -> .items, and codegen.py:621 uses
+    # .items. The published uc386 0.1.3 declares an unbounded
+    # uc_core>=0.3.6, so pip gives it uc_core 0.4.0 and every compile
+    # dies with AttributeError. Keep the bound in step with the API.
+    "uc_core>=0.4.0,<0.5",
+    "uplox>=3.2.0",
+    "upeep386>=0.2.0",
 ]
 authors = [
     {name = "uc386 developers"}
