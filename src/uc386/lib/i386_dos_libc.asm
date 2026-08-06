@@ -3486,47 +3486,99 @@ _raise:
 
 ; ---- open / mmap / munmap / mprotect ---------------------------------------
 ; uc386 runs in a flat-32 DOS environment. mmap/mprotect/munmap remain
-; -1 stubs (no protection model under unicorn). open() and creat()
-; route through dos_emu's AH=0xA0 (POSIX open) handler so they back
-; into the virtual file system.
+; -1 stubs (no protection model under unicorn).
+;
+; open() and creat() use the STANDARD DOS calls — AH=0x3D (Open
+; Existing) and AH=0x3C (Create/Truncate) — not dos_emu's private
+; AH=0xA0 "POSIX open" handler that they used to call.
+;
+; AH=0xA0 exists only inside uc386's own emulator. On real DOS it is
+; an undefined function: a DOS extender passes anything it does not
+; translate straight through to the real-mode INT 21h handler
+; (PMODE/W's manual says exactly this), so the call fell through to
+; whatever the DOS kernel does with an unknown AH — while EDX still
+; held a flat 32-bit protected-mode pointer being read as DS:DX. The
+; observable result on FreeDOS was a bogus handle around 0xA000
+; (see rigs/tls-rig/qemu-readsmoke.log "[smoke:opened-fd=]0x0000a000"),
+; and every os.stat / os.path.* / shutil call built on it misbehaved.
+;
+; The rest of libc's file I/O already used the real calls — _read is
+; AH=0x3F, _write AH=0x40, _close AH=0x3E, _lseek AH=0x42 — and those
+; work on real hardware through the extender's translation. open() was
+; the only outlier. dos_emu implements 0x3C/0x3D too, so this is
+; correct in both environments.
 _open:
         push    ebp
         mov     ebp, esp
-        mov     edx, [ebp + 8]              ; path
+        mov     edx, [ebp + 8]              ; path (flat ASCIIZ)
         mov     ecx, [ebp + 12]             ; flags (POSIX)
-        mov     ah, 0xA0
+        ; O_CREAT (0100 = 0x40) or O_TRUNC (01000 = 0x200) means we
+        ; must create-and-truncate; DOS AH=0x3C does both and hands
+        ; back a read/write handle. Anything else opens an existing
+        ; file with AH=0x3D.
+        ;
+        ; Caveat, documented rather than emulated: O_CREAT without
+        ; O_TRUNC on an EXISTING file truncates here, because DOS has
+        ; no single call for "open or create, keep contents". The
+        ; append path (O_APPEND) is handled by the caller seeking to
+        ; the end via _lseek.
+        test    ecx, 0x240                  ; O_CREAT | O_TRUNC
+        jnz     .create
+        mov     eax, ecx
+        and     eax, 3                      ; O_RDONLY/WRONLY/RDWR = 0/1/2
+        mov     ah, 0x3D                    ; AL already holds the mode
         int     21h
-        movzx   eax, ax
-        cmp     ax, 0xFFFF
-        jne     .ok
-        ; POSIX: open() must set errno on failure. dos_emu's AH=0xA0
-        ; only fails for "file not found" (mode 'r' on a missing
-        ; vfile), so ENOENT (2) is the correct/only cause here.
-        ; Code like git's config writer relies on errno==ENOENT to
-        ; tell "create it" from a real error; without this it sees a
-        ; stale errno and aborts. Set only on the failure path so a
-        ; successful open leaves errno untouched (also POSIX).
+        jmp     .check
+.create:
+        xor     ecx, ecx                    ; CX = 0 -> normal attributes
+        mov     ah, 0x3C
+        int     21h
+.check:
+        jc      .err
+        movzx   eax, ax                     ; DOS file handle
+        mov     esp, ebp
+        pop     ebp
+        ret
+.err:
+        ; POSIX: open() must set errno on failure. Code like git's
+        ; config writer relies on errno==ENOENT to tell "create it"
+        ; from a real error; without this it sees a stale errno and
+        ; aborts. Set only on the failure path so a successful open
+        ; leaves errno untouched (also POSIX). DOS returns its own
+        ; code in AX (2 = file not found, 3 = path not found,
+        ; 4 = too many open files, 5 = access denied); ENOENT is the
+        ; overwhelmingly common one and the only value callers here
+        ; branch on.
         mov     dword [_errno], 2           ; ENOENT
         mov     eax, -1
-.ok:
         mov     esp, ebp
         pop     ebp
         ret
 
 _creat:
-        ; creat(path, mode) ≡ open(path, O_WRONLY|O_CREAT|O_TRUNC).
-        ; flags = 1 | 0o100 | 0o1000 = 0x441
+        ; creat(path, mode) is open(path, O_WRONLY|O_CREAT|O_TRUNC),
+        ; which is precisely DOS AH=0x3C.
+        ;
+        ; The old code passed flags 0x441 to AH=0xA0 and described it
+        ; as "1 | 0o100 | 0o1000". With this libc's own fcntl.h
+        ; (O_CREAT=0100=0x40, O_TRUNC=01000=0x200, O_APPEND=02000=0x400)
+        ; that arithmetic is wrong twice over: the intended value is
+        ; 0x241, and 0x441 is O_WRONLY|O_CREAT|O_APPEND — so creat()
+        ; asked to APPEND rather than truncate.
         push    ebp
         mov     ebp, esp
-        mov     edx, [ebp + 8]
-        mov     ecx, 0x441
-        mov     ah, 0xA0
+        mov     edx, [ebp + 8]              ; path (flat ASCIIZ)
+        xor     ecx, ecx                    ; CX = 0 -> normal attributes
+        mov     ah, 0x3C
         int     21h
-        movzx   eax, ax
-        cmp     ax, 0xFFFF
-        jne     .ok
+        jc      .err
+        movzx   eax, ax                     ; DOS file handle
+        mov     esp, ebp
+        pop     ebp
+        ret
+.err:
+        mov     dword [_errno], 2           ; ENOENT
         mov     eax, -1
-.ok:
         mov     esp, ebp
         pop     ebp
         ret
@@ -4961,17 +5013,32 @@ _dos_lfn_findclose:
 ; private names so the C policy layer can still reach the short-name
 ; API when AX=71A0 reports no LFN provider (real FreeDOS w/o DOSLFN).
 
-; int dos_legacy_open(const char *path, int flags) — AH=0xA0
+; int dos_legacy_open(const char *path, int flags) — AH=0x3D / 0x3C
+; Mirrors the public _open above. It previously used dos_emu's private
+; AH=0xA0, which does not exist on real DOS — the same defect that was
+; fixed in _open. Currently unreferenced, but kept in step so wiring it
+; up as the no-LFN fallback cannot reintroduce the bug.
 _dos_legacy_open:
         push    ebp
         mov     ebp, esp
         mov     edx, [ebp + 8]
         mov     ecx, [ebp + 12]
-        mov     ah, 0xA0
+        test    ecx, 0x240                  ; O_CREAT | O_TRUNC
+        jnz     .glo_create
+        mov     eax, ecx
+        and     eax, 3                      ; O_RDONLY/WRONLY/RDWR = 0/1/2
+        mov     ah, 0x3D
         int     21h
+        jmp     .glo_check
+.glo_create:
+        xor     ecx, ecx                    ; CX = 0 -> normal attributes
+        mov     ah, 0x3C
+        int     21h
+.glo_check:
+        jc      .glo_err
         movzx   eax, ax
-        cmp     ax, 0xFFFF
-        jne     .glo_ok
+        jmp     .glo_ok
+.glo_err:
         mov     dword [_errno], 2
         mov     eax, -1
 .glo_ok:
@@ -6596,23 +6663,38 @@ _dpmi0301_call_shallow:
         push    ds
         pop     es
         ; Save caller's ESP, switch to the top of the dedicated
-        ; shallow stack (grows downward).
-        mov     ebx, esp
+        ; shallow stack (grows downward), then keep the saved ESP ON
+        ; that stack rather than in EBX.
+        ;
+        ; EBX must NOT be used as the scratch here: it is an *input*
+        ; to DPMI fn 0x0301. BH is the flags byte (bit 0 = reset the
+        ; interrupt controller and A20 line) and BL must be 0 —
+        ; PMODE/W's own manual (pmodew.doc S2.21) states "BH = must
+        ; be 0". Parking the caller's ESP in EBX handed the host a
+        ; control byte made of stack-pointer bits, different on every
+        ; call. The DPMI 0x0301 path that has always worked — the
+        ; packet driver's INT 0x60 gate — sets EBX = 0 explicitly
+        ; (pktdrv_uc386dos.c), which is the contract we now match.
+        mov     edx, esp
         mov     esp, _dpmi0301_shallow_stack
         add     esp, 8192
+        push    edx                 ; caller's ESP, saved on our stack
         ; DPMI 0x0301:
-        ;   AX = 0x0301, BL = INT number (unused, CS:IP in rmcs takes
-        ;   precedence), CX = words to copy from PM stack (0),
+        ;   AX = 0x0301, BH = flags (must be 0), BL = 0 (the target is
+        ;   taken from CS:IP in the rmcs, not from BL),
+        ;   CX = words to copy from PM stack (0),
         ;   ES:EDI -> rmcs (32-bit flat pointer in EDI).
         mov     eax, 0x0301
+        xor     ebx, ebx
         xor     ecx, ecx
         mov     edi, [ebp + 8]      ; rmcs pointer (caller arg)
         int     0x31
         pushfd
         pop     eax
         and     eax, 1              ; CF only
-        ; Restore caller's ESP, ES, callee-saved regs.
-        mov     esp, ebx
+        ; Restore caller's ESP from the copy on the shallow stack.
+        ; (pushfd/pop above is balanced, so [esp] is still that copy.)
+        pop     esp
         pop     es
         pop     ebx
         pop     edi
