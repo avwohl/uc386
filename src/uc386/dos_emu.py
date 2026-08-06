@@ -442,6 +442,13 @@ def run(
         elif mode == "r":
             if name not in vfiles:
                 return -1
+        elif mode == "r+":
+            # Open an EXISTING file for writing without truncating it.
+            # Real DOS AH=0x3D never truncates; only AH=0x3C does. There
+            # was no mode for this, so AH=0x3D AL=1 was mapped to "w"
+            # and silently discarded the file's contents.
+            if name not in vfiles:
+                return -1
         else:
             return -1
         fd = next_vfd[0]
@@ -477,7 +484,8 @@ def run(
 
     def _vfile_read(fd: int, addr: int, count: int) -> int:
         e = vfd_table.get(fd)
-        if e is None or e["mode"] not in ("r",):
+        # "r+" (AH=0x3D AL=2, read-write) is readable too.
+        if e is None or e["mode"] not in ("r", "r+"):
             return -1
         buf = vfiles.get(e["name"])
         if buf is None:
@@ -492,7 +500,9 @@ def run(
 
     def _vfile_write(fd: int, addr: int, count: int) -> int:
         e = vfd_table.get(fd)
-        if e is None or e["mode"] not in ("w", "a"):
+        # "r+" is open-existing-for-write (INT 21h AH=0x3D with AL=1/2),
+        # which is writable even though it does not truncate.
+        if e is None or e["mode"] not in ("w", "a", "r+"):
             return -1
         buf = vfiles.setdefault(e["name"], bytearray())
         data = bytes(mu.mem_read(addr, count))
@@ -1588,7 +1598,9 @@ def run(
             return
         if ah == 0x3D:
             # open(name, mode): DS:EDX=name, AL=mode (0=r, 1=w, 2=rw).
-            # We support 0 (read) and 1/2 (write — truncate).
+            # AH=0x3D opens an EXISTING file and never truncates — that
+            # is AH=0x3C's job. Mapping 1/2 to "w" here truncated on
+            # every open-for-write, so O_APPEND lost the prior contents.
             edx = uc.reg_read(UC_X86_REG_EDX)
             name, _ok = _dos_path(edx)
             mode_byte = al
@@ -1597,7 +1609,7 @@ def run(
             elif mode_byte == 0:
                 fd = _vfile_open(name, "r")
             elif mode_byte in (1, 2):
-                fd = _vfile_open(name, "w")
+                fd = _vfile_open(name, "r+")
             else:
                 fd = -1
             new_eax = (eax & ~0xFFFFFFFF) | (fd & 0xFFFFFFFF)
@@ -2178,7 +2190,8 @@ def run(
             elif mode_byte == 0:
                 fd = _vfile_open(name, "r")
             elif mode_byte in (1, 2):
-                fd = _vfile_open(name, "w")
+                # Open existing for write; AH=0x3D never truncates.
+                fd = _vfile_open(name, "r+")
             else:
                 fd = -1
             if fd < 0:

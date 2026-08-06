@@ -3510,47 +3510,74 @@ _raise:
 _open:
         push    ebp
         mov     ebp, esp
-        mov     edx, [ebp + 8]              ; path (flat ASCIIZ)
-        mov     ecx, [ebp + 12]             ; flags (POSIX)
-        ; O_CREAT (0100 = 0x40) or O_TRUNC (01000 = 0x200) means we
-        ; must create-and-truncate; DOS AH=0x3C does both and hands
-        ; back a read/write handle. Anything else opens an existing
-        ; file with AH=0x3D.
+        push    ebx
+        push    esi
+        mov     esi, [ebp + 12]             ; POSIX flags, kept in ESI
         ;
-        ; Caveat, documented rather than emulated: O_CREAT without
-        ; O_TRUNC on an EXISTING file truncates here, because DOS has
-        ; no single call for "open or create, keep contents". The
-        ; append path (O_APPEND) is handled by the caller seeking to
-        ; the end via _lseek.
-        test    ecx, 0x240                  ; O_CREAT | O_TRUNC
+        ; POSIX -> DOS mapping. Getting this wrong is easy and the
+        ; failure is silent data loss, so be explicit:
+        ;
+        ;   O_TRUNC              -> AH=0x3C (Create/Truncate), always.
+        ;   O_CREAT (no O_TRUNC) -> AH=0x3D first, and only create if
+        ;                           the file does not exist. Creating
+        ;                           unconditionally would truncate an
+        ;                           existing file, which is exactly what
+        ;                           O_APPEND asks us not to do.
+        ;   neither              -> AH=0x3D (Open Existing).
+        ;   O_APPEND             -> after opening, seek to EOF, because
+        ;                           DOS always hands back offset 0.
+        ;
+        test    esi, 0x200                  ; O_TRUNC (01000)
         jnz     .create
-        mov     eax, ecx
+
+        mov     edx, [ebp + 8]              ; path (flat ASCIIZ)
+        mov     eax, esi
         and     eax, 3                      ; O_RDONLY/WRONLY/RDWR = 0/1/2
-        mov     ah, 0x3D                    ; AL already holds the mode
+        mov     ah, 0x3D
         int     21h
-        jmp     .check
+        jc      .maybe_create
+        ; dos_emu reports failure as AX=0xFFFF with CF clear, real DOS
+        ; uses CF. Accept either: a real handle is never 0xFFFF.
+        cmp     ax, 0xFFFF
+        jne     .opened
+.maybe_create:
+        test    esi, 0x40                   ; O_CREAT (0100)
+        jz      .err                        ; absent and not asked to create
 .create:
+        mov     edx, [ebp + 8]              ; reload: DOS may clobber EDX
         xor     ecx, ecx                    ; CX = 0 -> normal attributes
         mov     ah, 0x3C
         int     21h
-.check:
         jc      .err
+        cmp     ax, 0xFFFF
+        je      .err
+.opened:
         movzx   eax, ax                     ; DOS file handle
+        test    esi, 0x400                  ; O_APPEND (02000)
+        jz      .done
+        ; Seek to end so writes append instead of overwriting.
+        push    eax
+        mov     ebx, eax                    ; BX = handle
+        xor     ecx, ecx                    ; CX:DX = 0 offset
+        xor     edx, edx
+        mov     eax, 0x4202                 ; AH=0x42 LSEEK, AL=2 from end
+        int     21h
+        pop     eax                         ; restore the handle
+.done:
+        pop     esi
+        pop     ebx
         mov     esp, ebp
         pop     ebp
         ret
 .err:
         ; POSIX: open() must set errno on failure. Code like git's
         ; config writer relies on errno==ENOENT to tell "create it"
-        ; from a real error; without this it sees a stale errno and
-        ; aborts. Set only on the failure path so a successful open
-        ; leaves errno untouched (also POSIX). DOS returns its own
-        ; code in AX (2 = file not found, 3 = path not found,
-        ; 4 = too many open files, 5 = access denied); ENOENT is the
-        ; overwhelmingly common one and the only value callers here
-        ; branch on.
+        ; from a real error. Set only on the failure path so a
+        ; successful open leaves errno untouched (also POSIX).
         mov     dword [_errno], 2           ; ENOENT
         mov     eax, -1
+        pop     esi
+        pop     ebx
         mov     esp, ebp
         pop     ebp
         ret
@@ -5019,32 +5046,10 @@ _dos_lfn_findclose:
 ; fixed in _open. Currently unreferenced, but kept in step so wiring it
 ; up as the no-LFN fallback cannot reintroduce the bug.
 _dos_legacy_open:
-        push    ebp
-        mov     ebp, esp
-        mov     edx, [ebp + 8]
-        mov     ecx, [ebp + 12]
-        test    ecx, 0x240                  ; O_CREAT | O_TRUNC
-        jnz     .glo_create
-        mov     eax, ecx
-        and     eax, 3                      ; O_RDONLY/WRONLY/RDWR = 0/1/2
-        mov     ah, 0x3D
-        int     21h
-        jmp     .glo_check
-.glo_create:
-        xor     ecx, ecx                    ; CX = 0 -> normal attributes
-        mov     ah, 0x3C
-        int     21h
-.glo_check:
-        jc      .glo_err
-        movzx   eax, ax
-        jmp     .glo_ok
-.glo_err:
-        mov     dword [_errno], 2
-        mov     eax, -1
-.glo_ok:
-        mov     esp, ebp
-        pop     ebp
-        ret
+        ; Identical semantics to _open; alias rather than duplicate.
+        ; The previous copy-paste is how this ended up still calling
+        ; dos_emu's private AH=0xA0 after _open had moved on.
+        jmp     _open
 
 ; int dos_legacy_mkdir(const char *path) — AH=0x39
 _dos_legacy_mkdir:
