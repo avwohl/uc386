@@ -38,6 +38,7 @@ wired up — see `docs/dosiz-integration.md`).
 from __future__ import annotations
 
 import argparse
+import re
 import os
 import shutil
 import subprocess
@@ -61,6 +62,68 @@ LIB_INCLUDE = REPO_ROOT / "src" / "uc386" / "lib" / "include"
 #
 # Programs that don't read argv work cleanly. Programs that do see
 # argc=1 + a placeholder argv[0].
+# The bridge prints a diagnostic marker at each startup step
+# ([bridge-entered], [mp-...], [esp]=...). They were indispensable while
+# getting PMODE/W entry working and docs/WIP.md still refers to them by
+# name, but in a shipped binary they land on the program's own stdout —
+# roughly twenty lines before a script produces its first byte of
+# output.
+#
+# Off by default; set UC386_BRIDGE_MARKERS=1 (or pass
+# --bridge-markers) to get them back. Marker DATA is always emitted so
+# the labels still resolve; only the calls that print them are removed.
+_MARKER_LOAD_RX = re.compile(
+    r"^[ \t]*mov[ \t]+edx,[ \t]*_bridge_marker_[a-z0-9_]+\b", re.I)
+_MARKER_LEN_RX = re.compile(r"^[ \t]*mov[ \t]+ecx,[ \t]*\d+\s*(;.*)?$", re.I)
+# Any bridge emitter: _bridge_emit, _bridge_emit_str0,
+# _bridge_emit_hex32, _bridge_write_stack, ...
+_MARKER_CALL_RX = re.compile(r"^[ \t]*call[ \t]+_bridge_(emit|write_stack)", re.I)
+# Register setup that only ever feeds one of those emitters.
+_MARKER_ARG_RX = re.compile(
+    r"^[ \t]*mov[ \t]+(ecx,[ \t]*\d+|eax,[ \t]*(esp|ebp|_[a-z0-9_]+))\s*(;.*)?$",
+    re.I)
+
+
+def _strip_bridge_markers(asm: str) -> str:
+    """Comment out the marker-printing sequences, keeping their data.
+
+    Matches the whole three-line shape -- load the marker address, load
+    its length, call the emitter -- and never a line in isolation.
+    `mov ecx, <n>` on its own is ordinary code here: the argv tokenizer
+    starts argc with `mov ecx, 1`, and blanking that silently dropped
+    every command-line argument.
+
+    Commenting rather than deleting keeps the listing line-for-line
+    comparable with an instrumented build, which matters when diffing a
+    working boot against a broken one.
+    """
+    lines = asm.splitlines(keepends=True)
+    out = list(lines)
+    i = 0
+    while i < len(lines):
+        if _MARKER_LOAD_RX.match(lines[i]):
+            # Consume the whole dump sequence: the marker load, any
+            # register setup that only feeds an emitter, and the
+            # emitter calls themselves. Require at least one call, so a
+            # bare marker load is left alone rather than silently eaten.
+            j = i + 1
+            saw_call = False
+            while j < len(lines) and (
+                    _MARKER_LEN_RX.match(lines[j])
+                    or _MARKER_ARG_RX.match(lines[j])
+                    or _MARKER_CALL_RX.match(lines[j])):
+                if _MARKER_CALL_RX.match(lines[j]):
+                    saw_call = True
+                j += 1
+            if saw_call:
+                for k in range(i, j):
+                    out[k] = "; [markers off] " + lines[k].lstrip()
+                i = j
+                continue
+        i += 1
+    return "".join(out)
+
+
 BRIDGE_ASM = """
         section _DATA use32 class=DATA
         global _stdin
@@ -914,7 +977,9 @@ def build_exe(
     # to the codegen-emitted _start. argv parsing (PSP+0x80 via DPMI
     # INT 31h) lands in the same stub once stdout is verified working.
     bridge_asm = out_path.with_suffix(".bridge.asm")
-    bridge_asm.write_text(BRIDGE_ASM)
+    _markers = os.environ.get("UC386_BRIDGE_MARKERS", "") not in ("", "0")
+    bridge_asm.write_text(BRIDGE_ASM if _markers
+                          else _strip_bridge_markers(BRIDGE_ASM))
     bridge_obj = out_path.with_suffix(".bridge.obj")
     proc = subprocess.run(
         ["nasm", "-f", "obj", "-o", str(bridge_obj), str(bridge_asm)],
@@ -1073,7 +1138,16 @@ def main() -> int:
         "--stub-binary", type=Path, default=None,
         help="Path to DOS32A.EXE (required when --extender=dos32a).",
     )
+    ap.add_argument(
+        "--bridge-markers", action="store_true",
+        help="Emit the bridge's startup diagnostic markers "
+             "([bridge-entered], [esp]=..., and friends). Off by "
+             "default because they print on the program's own stdout. "
+             "Same as UC386_BRIDGE_MARKERS=1.",
+    )
     args = ap.parse_args()
+    if args.bridge_markers:
+        os.environ["UC386_BRIDGE_MARKERS"] = "1"
 
     src = Path(args.source).resolve()
     out = Path(args.output).resolve()
