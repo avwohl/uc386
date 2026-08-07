@@ -1072,19 +1072,38 @@ def build_exe(
     # path to DOS32A.EXE (not bundled because it's a 27 KB binary
     # licensed under zlib that the host project would have to vendor
     # — easier to fetch on demand from archive.org).
-    if wlink is None and extender == "dos32a":
+    # DOS/32A always goes through upyle: wlink has no `system dos32a`
+    # and the stub_name table below has no entry for it, so taking the
+    # wlink branch would fail. This used to be gated on `wlink is None`,
+    # which was harmless only while dos32a was opt-in; as the default it
+    # would break every machine with Open Watcom installed.
+    if extender == "dos32a":
         try:
             import upyle
         except ImportError:
             return False, _NO_UPYLE_MSG
-        if dos32a_stub_path is None or not dos32a_stub_path.is_file():
+        # Prefer the stub upyle ships (already bound); --stub-binary
+        # overrides it. Requiring the caller to supply DOS32A.EXE made
+        # the extender that actually works on real DOS the awkward one
+        # to select, so the default silently produced binaries that
+        # could not do disk I/O.
+        bundled = getattr(upyle, "STUB_DIR", None)
+        bundled = (bundled / "dos32a_stub.bin") if bundled else None
+        if dos32a_stub_path is not None and dos32a_stub_path.is_file():
+            try:
+                stub_bytes = upyle.bind_dos32a_stub(dos32a_stub_path.read_bytes())
+            except Exception as exc:
+                return False, f"dos32a: binding {dos32a_stub_path}: {exc}"
+        elif bundled is not None and bundled.is_file():
+            stub_bytes = bundled.read_bytes()
+        else:
             return False, (
-                f"dos32a: pass --stub-binary <path/to/DOS32A.EXE>. "
-                f"Fetch from https://archive.org/details/dos32a-912-bin."
+                "dos32a: no bundled stub in this upyle (needs >= 0.2.0) and "
+                "no --stub-binary given. Pass --stub-binary <path/to/"
+                "DOS32A.EXE>, or fetch it from "
+                "https://archive.org/details/dos32a-912-bin."
             )
         try:
-            raw_stub = dos32a_stub_path.read_bytes()
-            stub_bytes = upyle.bind_dos32a_stub(raw_stub)
             objects = [upyle.parse_omf(p) for p in (obj_path, bridge_obj)]
             image = upyle.link(objects)
             _write_le_with_stack(
@@ -1183,13 +1202,17 @@ def main() -> int:
     ap.add_argument("source", help=".c source to compile, OR .asm to skip uc386")
     ap.add_argument("-o", "--output", required=True, help="output .exe path")
     ap.add_argument(
-        "--extender", default="pmodew",
+        "--extender", default="dos32a",
         choices=["pmodew", "causeway", "dos4g", "dos32a"],
-        help="DOS extender to bundle (default: pmodew)",
+        help="DOS extender to bundle (default: dos32a). PMODE/W's "
+             "real-mode call path hangs on any DOS call that touches a "
+             "physical sector, so a PMODE/W build cannot do disk I/O on "
+             "real DOS -- see freedos_micro_python docs/WIP.md item 2.",
     )
     ap.add_argument(
         "--stub-binary", type=Path, default=None,
-        help="Path to DOS32A.EXE (required when --extender=dos32a).",
+        help="Path to DOS32A.EXE. Optional: upyle ships a pre-bound "
+             "DOS/32A stub, so this is only needed to override it.",
     )
     ap.add_argument(
         "--bridge-markers", action="store_true",
