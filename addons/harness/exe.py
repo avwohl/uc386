@@ -1090,12 +1090,26 @@ def build_exe(
         wlink, "system", extender,
         "name", str(out_path),
         "file", str(obj_path),
-        # `option stack=64k` allocates a 64-KB protected-mode stack
-        # at link time. Without it wlink prints `W1014: stack segment
-        # not found` and the .exe runs with a stack at whatever
-        # garbage address the LE-loader picks — DOSBox reports
-        # "Illegal read from <addr>" when the program tries to push.
-        "option", "stack=64k",
+        # Allocate the protected-mode stack at link time. Without it
+        # wlink prints `W1014: stack segment not found` and the .exe
+        # runs with a stack at whatever garbage address the LE-loader
+        # picks — DOSBox reports "Illegal read from <addr>" when the
+        # program tries to push.
+        #
+        # This ends up in the LE header at offset 0xAC, and it is what
+        # a DOS extender allocates for the client. A runtime that
+        # carries its own stack-overflow guard MUST be told a limit
+        # below this number: freedos_micro_python called
+        # mp_stack_set_limit(0xC0000) — 768 KB — against a 64 KB stack,
+        # so MicroPython's guard never tripped and its recursive
+        # parser/compiler simply ran off the end and corrupted whatever
+        # lay beyond. That is silent and layout-dependent, which is
+        # exactly how it presented: identical sources rebuilt with a
+        # slightly different code layout would work or fail.
+        #
+        # 256 KB gives a recursive-descent parser real room while
+        # staying small next to the extender's arena.
+        "option", "stack=256k",
         # `option start=_pmodew_start` enters via the bridge stub
         # (fixes stdin/out/err sentinels, future home of argv setup),
         # which falls through to the codegen-emitted `_start` (FPU
