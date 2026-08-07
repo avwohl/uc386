@@ -124,6 +124,44 @@ def _strip_bridge_markers(asm: str) -> str:
     return "".join(out)
 
 
+# Protected-mode stack handed to the client. Ends up in the LE header
+# at 0xAC, and is a hard ceiling on the client's real stack.
+#
+# Passed EXPLICITLY to upyle.write_le rather than relying on its
+# default: uc386 does not declare upyle as a dependency (the harness
+# is checkout-only, not part of the installed package), so the two can
+# easily be different versions. An older upyle defaults to 64 KB, and
+# pairing that with a client guard sized for this value is worse than
+# the original bug.
+#
+# A client with its own stack-overflow guard must set it BELOW this.
+_PM_STACK_BYTES = 256 * 1024
+
+
+def _write_le_with_stack(upyle, image, stub, entry, out_path, **kw):
+    """upyle.write_le, forcing our stack size.
+
+    upyle gained `stack_size` when its 64 KB default proved too small.
+    Since uc386 does not pin upyle, tolerate an older one — but say so
+    loudly, because the client's stack-overflow guard is sized against
+    _PM_STACK_BYTES and a 64 KB stack underneath it is exactly the
+    memory-corrupting mismatch this constant exists to prevent.
+    """
+    try:
+        return upyle.write_le(image, stub, entry, out_path,
+                              stack_size=_PM_STACK_BYTES, **kw)
+    except TypeError:
+        print(
+            f"warning: upyle is too old to accept stack_size; the .exe will "
+            f"declare upyle's default stack instead of "
+            f"{_PM_STACK_BYTES // 1024} KB. A runtime whose stack guard is "
+            f"sized for {_PM_STACK_BYTES // 1024} KB can then overrun its "
+            f"stack. Upgrade upyle.",
+            file=sys.stderr,
+        )
+        return upyle.write_le(image, stub, entry, out_path, **kw)
+
+
 BRIDGE_ASM = """
         section _DATA use32 class=DATA
         global _stdin
@@ -1021,7 +1059,8 @@ def build_exe(
         try:
             objects = [upyle.parse_omf(p) for p in (obj_path, bridge_obj)]
             image = upyle.link(objects)
-            upyle.write_le(image, stub.read_bytes(), "_pmodew_start", out_path)
+            _write_le_with_stack(
+                upyle, image, stub.read_bytes(), "_pmodew_start", out_path)
         except Exception as exc:
             return False, f"upyle: {exc}"
         return True, ""
@@ -1048,8 +1087,8 @@ def build_exe(
             stub_bytes = upyle.bind_dos32a_stub(raw_stub)
             objects = [upyle.parse_omf(p) for p in (obj_path, bridge_obj)]
             image = upyle.link(objects)
-            upyle.write_le(
-                image, stub_bytes, "_pmodew_start", out_path,
+            _write_le_with_stack(
+                upyle, image, stub_bytes, "_pmodew_start", out_path,
                 explicit_stack_object=True,
             )
         except Exception as exc:
@@ -1109,7 +1148,7 @@ def build_exe(
         #
         # 256 KB gives a recursive-descent parser real room while
         # staying small next to the extender's arena.
-        "option", "stack=256k",
+        "option", f"stack={_PM_STACK_BYTES // 1024}k",
         # `option start=_pmodew_start` enters via the bridge stub
         # (fixes stdin/out/err sentinels, future home of argv setup),
         # which falls through to the codegen-emitted `_start` (FPU
