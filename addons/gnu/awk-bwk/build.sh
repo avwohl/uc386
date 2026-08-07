@@ -20,7 +20,18 @@ elif [ -x "$REPO/.venv/bin/python" ]; then
 else
     PYTHON="$(command -v python3.12 || command -v python3 || command -v python)"
 fi
-INCLUDE="$REPO/lib/include"
+# The headers moved to src/uc386/lib/include when lib/ was packaged
+# for PyPI; $REPO/lib/include has not existed since. Every addon build
+# script kept pointing at the old path, so uc386 could not find even
+# stdio.h and each build died on its first #include. Fall back to the
+# installed package so this works outside a source checkout too.
+if [ -d "$REPO/src/uc386/lib/include" ]; then
+    INCLUDE="$REPO/src/uc386/lib/include"
+elif [ -d "$REPO/lib/include" ]; then
+    INCLUDE="$REPO/lib/include"          # pre-packaging layout
+else
+    INCLUDE="$("$PYTHON" -c 'import pathlib, uc386; print(pathlib.Path(uc386.__file__).parent / "lib" / "include")')"
+fi
 SHIM="$REPO/addons/gnu/_sbase_shim"
 SRC="$(pwd)/upstream"
 OUT="$(pwd)/build"
