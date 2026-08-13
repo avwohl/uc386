@@ -1,17 +1,6 @@
 # uc386
 
-> ### 🤖 No Primate policy
->
-> **The code in this repository is written by AI. No primate wrote it.**
->
-> Code: AI. Documentation: AI. Deciding what to build, what is correct,
-> and what ships: primate.
->
-> Stated up front so nobody has to work it out later. This is a
-> disclosure, not a boast — and nothing below asks to be taken on trust.
-> Every number is measured, the suites are public, and the whole thing
-> rebuilds from source. Run it yourself and judge the output, not the
-> byline.
+> **AI — no code written by a primate.**
 
 C23 compiler targeting the Intel 386 (i386 / x86-32) processor under a
 DOS extender — specifically the **flat 32-bit Watcom / DOS/4GW-era** C
