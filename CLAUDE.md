@@ -143,10 +143,24 @@ Two workflows, triggered in sequence by one tag push:
    bison + the siblings, runs `pytest tests/`, builds the FOSS and
    games tarballs via `addons.harness.package`, regenerates
    `addons/results.md`, and attaches everything to a GitHub release.
-3. `.github/workflows/publish.yml` fires when that **release is
-   published** (not on the tag itself) and pushes the wheel + sdist to
-   PyPI via trusted publishing — no API token in secrets. So a tag
-   alone does not publish; the GitHub release has to be published.
+3. `.github/workflows/publish.yml` pushes the wheel + sdist to PyPI via
+   trusted publishing (no API token in secrets). ⚠️ **It will not fire
+   on its own.** Its `release: published` trigger is suppressed because
+   release.yml creates the release with the default `GITHUB_TOKEN`, and
+   GitHub does not let workflow-created events trigger further
+   workflows. Releases through v0.1.5 only published because a human
+   created them by hand; v0.2.0 was the first automated one and it
+   stalled. So after the release appears, run:
+
+   ```
+   gh workflow run publish.yml --ref v0.2.0
+   ```
+
+   (or toggle the release draft off/on under a real account, which does
+   emit the event). Verify with
+   `curl -s https://pypi.org/simple/uc386/ | grep 0.2.0` — the JSON API
+   is CDN-cached and lags. The durable fix is to have release.yml
+   create the release with a PAT instead of `GITHUB_TOKEN`.
 
 Keep the `uc_core` upper bound in `pyproject.toml` in step with the
 API actually used — see the comment there. CI installs the siblings

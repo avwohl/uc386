@@ -1,8 +1,27 @@
 name: Publish to PyPI
 
+# ⚠️ The `release: published` trigger does NOT fire when release.yml
+# creates the release. GitHub deliberately suppresses workflow-triggered
+# events for anything created with the default GITHUB_TOKEN, to stop
+# workflows recursing. So a `v*` tag push runs release.yml, which
+# creates a perfectly good published release authored by
+# github-actions[bot] — and nothing happens here.
+#
+# Every release through v0.1.5 worked only because a human published it
+# by hand (release authors: avwohl). v0.2.0 was the first created by
+# release.yml and it stalled, which is how this was found.
+#
+# Two ways forward, hence workflow_dispatch:
+#   gh workflow run publish.yml --ref v0.2.0
+# or re-publish the release under a real account (toggle draft off and
+# on), which does emit the event.
+#
+# The proper fix is for release.yml to create the release with a PAT
+# rather than GITHUB_TOKEN; until then this stays a manual step.
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 jobs:
   publish:
