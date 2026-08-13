@@ -46,16 +46,19 @@ A clean run prints `460 passed, 1 skipped`.
 ## Required tools
 
 	tool	purpose	apt	brew	dnf
-	python ≥ 3.10	driver + uc_core frontend	python3 python3-venv	python@3.12	python3 python3-virtualenv
+	python ≥ 3.11	driver + uc_core frontend	python3 python3-venv	python@3.12	python3 python3-virtualenv
 	nasm	assembler for emitted .asm	nasm	nasm	nasm
 	git	source checkout	git	git	git
 
 Notes:
 
-- **Python 3.12 is the recommended target.** uc_core uses
-  `dataclass(kw_only=True)` (added in 3.10); 3.10 through 3.13 all
-  work. Apple's system Python 3.9 is too old — install 3.12 from
-  Homebrew on macOS.
+- **Python 3.12 is the recommended target; 3.11 is the floor.** 3.11
+  through 3.13 are tested in CI. The floor is set by a transitive
+  dependency rather than by uc386's own code: uc_core requires uplox,
+  and uplox declares `requires-python >=3.11`, so on 3.10
+  `pip install uc386` fails with `ResolutionImpossible` ("no matching
+  distributions available ... uplox"). Apple's system Python 3.9 is
+  far too old — install 3.12 from Homebrew on macOS.
 - **The sibling packages are all on PyPI** and resolve automatically:
   `uc_core` (frontend), `uplox` (its parser generator), and
   `upeep386` (peephole optimizer, asm DCE, libc splitter) are

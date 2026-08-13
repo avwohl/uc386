@@ -17,6 +17,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        # 3.11 is the real floor and matches `requires-python`. Do not
+        # add 3.10: uc_core depends on uplox, which declares
+        # requires-python >=3.11, so `pip install` under 3.10 fails at
+        # resolution ("no matching distributions available ... uplox")
+        # before a single test runs. uc386's own code is 3.10-clean;
+        # the constraint is the transitive dep. addons/harness/ also
+        # imports tomllib, which is stdlib only from 3.11.
         python-version: ['3.11', '3.12', '3.13']
     steps:
     - uses: actions/checkout@v6

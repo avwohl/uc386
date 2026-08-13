@@ -8,7 +8,13 @@ version = "0.1.5"
 description = "C23 compiler targeting x86-32 (i386) and MS-DOS"
 readme = "README.md"
 license = "GPL-3.0-or-later"
-requires-python = ">=3.10"
+# 3.11, not 3.10. uc386's own code and uc_core/upeep386 are all
+# 3.10-clean, but uc_core depends on uplox, and uplox declares
+# requires-python >=3.11 — so `pip install uc386` under 3.10 dies with
+# ResolutionImpossible ("no matching distributions ... uplox"). The
+# floor is set by the transitive dep, not by our syntax. If uplox ever
+# lowers its floor, this can follow it back down.
+requires-python = ">=3.11"
 dependencies = [
     # Upper bound is load-bearing, not defensive: uc_core 0.4.0 renamed
     # TranslationUnit.declarations -> .items, and codegen.py:621 uses
@@ -31,7 +37,6 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",

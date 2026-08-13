@@ -12,7 +12,8 @@ A second 2026-05-01 update added 3 more cross-cutting asks
 (mac→linux portability, ship-source-with-binary, dosiz as a
 test runner). Status:
 - **Mac→Linux install** ✓ — `docs/INSTALL.md` covers apt / brew /
-  dnf, `pyproject.toml` accepts Python ≥ 3.10, and `pytest tests/`
+  dnf, `pyproject.toml` accepts Python ≥ 3.11 (raised from a claimed
+  ≥ 3.10 that never installed — uplox's own floor is 3.11), and `pytest tests/`
   passes (460 passed, 1 skipped — the peephole / asm-DCE /
   libc-split tests moved to the sibling `upeep386` package, which
   is where the old ~1300 count went).

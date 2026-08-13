@@ -67,9 +67,15 @@ copy `peephole.py`/`asm_dce.py`/`libc_split.py` back in.)
 
 ## Toolchain
 
-- Python ≥ 3.10 (uc_core uses `dataclass(kw_only=True)`, added in 3.10).
-  Linux ships 3.10+ in current LTSes; on macOS install via
+- Python ≥ 3.11, and the floor comes from a **transitive dep**, not our
+  own syntax: `src/uc386`, `tests/`, uc_core and upeep386 are all
+  3.10-clean, but uc_core → uplox, and uplox declares `>=3.11`. On 3.10
+  `pip install uc386` fails at resolution with "no matching
+  distributions ... uplox", so 3.10 was never installable regardless of
+  whether the code would have run. On macOS install via
   `brew install python@3.12` (Apple's system 3.9 is too old).
+  Note `addons/harness/` additionally needs 3.11 outright — it imports
+  `tomllib`, which is stdlib only from 3.11.
 - Working venv at `.venv/`.
   - **Just working on uc386?** No clones needed — pip resolves the
     frontend and optimizer from PyPI. `upyle` is the one extra:
@@ -147,10 +153,11 @@ API actually used — see the comment there. CI installs the siblings
 from `@main` rather than PyPI, so a bad bound passes CI and only
 breaks for `pip install uc386` users.
 
-⚠️ `pyproject.toml` declares `requires-python = ">=3.10"` and a 3.10
-classifier, but `.github/workflows/pytest.yml` only tests 3.11–3.13.
-Either add 3.10 to that matrix or raise the floor to 3.11; right now
-3.10 is claimed and untested.
+The `pytest.yml` matrix (3.11–3.13) matches `requires-python` now.
+It previously claimed `>=3.10` while testing only 3.11+; the claim was
+the wrong half — 3.10 is uninstallable because of uplox's own floor
+(see **Toolchain** above), so the floor moved up rather than the matrix
+moving down. Keep the two in step if uplox's floor ever changes.
 
 ## Codegen contract (current)
 
