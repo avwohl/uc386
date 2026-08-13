@@ -79,11 +79,17 @@ no-op stubs until recently — a stub that returns a plausible wrong
 answer is worse than one that fails — and `tests/test_stdio_position.py`
 now pins the behaviour.
 
-Still thin in `<stdio.h>`: `strerror` returns one fixed string rather
-than mapping `errno`, `setbuf`/`setvbuf` are no-ops (output is
-write-through, so there is nothing to buffer), and `popen`/`pclose`
-always fail — DOS has no pipe API without a shell layer. The remaining
-gaps are listed in [`addons/gnu/UPSTREAM.md`](addons/gnu/UPSTREAM.md).
+`errno` is populated too: DOS reports failure as a code in AX, which
+the libc now translates (invalid handle → `EBADF`, access denied →
+`EACCES`, not found → `ENOENT`, …), so `strerror` returns a real
+message and `perror` prints `path: No such file or directory` rather
+than a fixed `": error"`.
+
+Still missing in `<stdio.h>`: there is no buffering layer, so
+`putchar` costs one INT 21h per character and `setvbuf` refuses
+`_IOFBF`/`_IOLBF` rather than pretending to honor them; `popen` and
+`pclose` always fail, DOS having no pipe API without a shell layer.
+Details in [`addons/gnu/UPSTREAM.md`](addons/gnu/UPSTREAM.md).
 
 ## Size — measured, not asserted
 

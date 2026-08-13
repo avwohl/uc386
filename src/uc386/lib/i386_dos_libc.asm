@@ -119,6 +119,9 @@ _write:
         pop     ebp
         ret
 .wr_err:
+        push    eax                         ; AX = DOS error code
+        call    __set_errno_dos
+        add     esp, 4
         mov     eax, -1                     ; POSIX: -1 on error
         pop     ebx
         mov     esp, ebp
@@ -187,6 +190,9 @@ _fread:
         div     ecx
         jmp     .done
 .rd_err:
+        push    eax                  ; AX = DOS error code
+        call    __set_errno_dos
+        add     esp, 4
         push    ebx
         call    __stdio_flag_ptr
         add     esp, 4
@@ -229,7 +235,21 @@ _fopen:
         ; If fd is -1 (dos_emu sentinel), return NULL (0). Else return fd.
         cmp     eax, -1
         jne     .ok
+        ; dos_emu's -1 carries no DOS code; treat it as not-found, which
+        ; is what it means in practice for an open that failed.
+        mov     dword [_errno], 2           ; ENOENT
+        xor     eax, eax
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
 .null:
+        ; Real DOS: CF=1 with the code in AX. fopen() returning NULL
+        ; without setting errno made the universal
+        ; `if (!f) perror(path);` idiom print "No error".
+        push    eax
+        call    __set_errno_dos
+        add     esp, 4
         xor     eax, eax
 .ok:
         pop     ebx
@@ -346,10 +366,35 @@ _perror:
         mov     ah, 0x40
         int     21h
 .skip_msg:
-        ; print ": error\n"
-        mov     edx, _perror_suffix
+        ; ": " then strerror(errno) then newline. This used to print a
+        ; hardcoded ": error\n" regardless of what went wrong, so
+        ; perror() carried no information at all beyond "something
+        ; failed" — now that errno is actually populated, report it.
+        mov     edx, _perror_sep
         mov     ebx, 2
-        mov     ecx, 8
+        mov     ecx, 2
+        mov     ah, 0x40
+        int     21h
+        ; strerror(errno) -> EDX, then measure it.
+        push    dword [_errno]
+        call    _strerror
+        add     esp, 4
+        mov     edx, eax
+        mov     ecx, eax
+.pe_strlen:
+        cmp     byte [ecx], 0
+        je      .pe_strlen_done
+        inc     ecx
+        jmp     .pe_strlen
+.pe_strlen_done:
+        sub     ecx, edx
+        mov     ebx, 2
+        mov     ah, 0x40
+        int     21h
+        ; trailing newline
+        mov     edx, _perror_nl
+        mov     ebx, 2
+        mov     ecx, 1
         mov     ah, 0x40
         int     21h
         mov     esp, ebp
@@ -389,6 +434,9 @@ _fgetc:
         ; A read error is not end-of-file: set the error bit instead, so
         ; ferror() distinguishes the two. Previously CF was ignored and
         ; the DOS error code was returned as if it were a byte count.
+        push    eax                  ; AX = DOS error code
+        call    __set_errno_dos
+        add     esp, 4
         push    ebx
         call    __stdio_flag_ptr
         add     esp, 4
@@ -493,6 +541,9 @@ _fgets:
 .fg_err:
         ; Read error: flag it and return NULL regardless of how much of
         ; the line we had, per C11 7.21.7.2p3.
+        push    eax                  ; AX = DOS error code
+        call    __set_errno_dos
+        add     esp, 4
         push    ebx
         call    __stdio_flag_ptr
         add     esp, 4
@@ -628,6 +679,9 @@ _read:
         pop     ebp
         ret
 .rd_err:
+        push    eax                         ; AX = DOS error code
+        call    __set_errno_dos
+        add     esp, 4
         mov     eax, -1                     ; POSIX: -1 on error
         pop     ebx
         mov     esp, ebp
@@ -657,6 +711,9 @@ _getchar:
 .gc_err:
         ; A read error on stdin is not EOF — record it as an error so
         ; ferror(stdin) reports it, and still return EOF to the caller.
+        push    eax                  ; AX = DOS error code
+        call    __set_errno_dos
+        add     esp, 4
         push    dword 0
         call    __stdio_flag_ptr
         add     esp, 4
@@ -3384,7 +3441,9 @@ __heap_ptr:     dd __heap
 _stdin:         dd 0xF0
 _stdout:        dd 0xF1
 _stderr:        dd 0xF2
-_perror_suffix: db ': error', 10
+_perror_suffix: db ': error', 10        ; legacy; kept for compatibility
+_perror_sep:    db ': '
+_perror_nl:     db 10
 section .text
 
 _malloc:
@@ -3694,7 +3753,20 @@ _open:
         ; config writer relies on errno==ENOENT to tell "create it"
         ; from a real error. Set only on the failure path so a
         ; successful open leaves errno untouched (also POSIX).
+        ;
+        ; Where DOS gave us a real code, translate it — "access denied"
+        ; deserves EACCES, not a blanket ENOENT. dos_emu instead signals
+        ; failure as AX=0xFFFF with no code; that is overwhelmingly
+        ; file-not-found, and the ENOENT contract above rests on it.
+        cmp     ax, 0xFFFF
+        je      .err_enoent
+        push    eax
+        call    __set_errno_dos
+        add     esp, 4
+        jmp     .err_ret
+.err_enoent:
         mov     dword [_errno], 2           ; ENOENT
+.err_ret:
         mov     eax, -1
         pop     esi
         pop     ebx
@@ -3724,7 +3796,17 @@ _creat:
         pop     ebp
         ret
 .err:
+        ; Same shape as _open's failure path: use the DOS code when we
+        ; have one, fall back to ENOENT for dos_emu's 0xFFFF sentinel.
+        cmp     ax, 0xFFFF
+        je      .cr_enoent
+        push    eax
+        call    __set_errno_dos
+        add     esp, 4
+        jmp     .cr_ret
+.cr_enoent:
         mov     dword [_errno], 2           ; ENOENT
+.cr_ret:
         mov     eax, -1
         mov     esp, ebp
         pop     ebp
@@ -4020,7 +4102,94 @@ ___uc386_umod128:
 _errno:         dd 0
 _strerror_msg:  db "error", 0
 
+; ---- DOS error code -> errno ------------------------------------------------
+; INT 21h reports failure as CF=1 with a code in AX. Those codes were
+; being discarded at every call site, so errno stayed 0 and strerror()
+; had nothing to report. __dos_to_errno maps the codes this libc can
+; actually provoke; anything unrecognised becomes EIO.
+;
+; Table is indexed by DOS code 0..0x22; entry 0 is unused (CF=0 means
+; success, so we never look it up).
+__dos_errno_map:
+        db 0                                ; 0x00 (unused)
+        db 22, 2, 2, 24, 13, 9, 12, 8       ; 01 EINVAL  02/03 ENOENT
+                                            ; 04 EMFILE  05 EACCES
+                                            ; 06 EBADF   07 ENOMEM
+                                            ; 08 ENOMEM
+        db 12, 22, 8, 22, 22, 13, 19, 13    ; 09-10 ENOMEM/EINVAL
+                                            ; 0B ENOEXEC 0C-0D EINVAL
+                                            ; 0E EACCES  0F ENODEV
+                                            ; 10 EACCES
+        db 18, 17, 18, 30, 5, 22, 22, 22    ; 11 EXDEV  12 EEXIST
+                                            ; 13 EXDEV  14 EROFS
+                                            ; 15 EIO    16-18 EINVAL
+        db 22, 22, 22, 22, 22, 22, 22, 22   ; 19-20 EINVAL
+        db 13, 17, 28                       ; 21 EACCES 22 EEXIST
+                                            ; 23 ENOSPC
+__DOS_ERRNO_MAX  equ 0x23
+
+; strerror() message table, indexed by errno. Only the values this libc
+; can actually set carry a distinct string; the rest fall through to
+; "Unknown error" rather than pretending to know.
+_se_ok:         db "No error", 0
+_se_unknown:    db "Unknown error", 0
+_se_eperm:      db "Operation not permitted", 0
+_se_enoent:     db "No such file or directory", 0
+_se_eio:        db "Input/output error", 0
+_se_enxio:      db "No such device or address", 0
+_se_enoexec:    db "Exec format error", 0
+_se_ebadf:      db "Bad file descriptor", 0
+_se_enomem:     db "Cannot allocate memory", 0
+_se_eacces:     db "Permission denied", 0
+_se_eexist:     db "File exists", 0
+_se_exdev:      db "Invalid cross-device link", 0
+_se_enodev:     db "No such device", 0
+_se_einval:     db "Invalid argument", 0
+_se_emfile:     db "Too many open files", 0
+_se_enospc:     db "No space left on device", 0
+_se_espipe:     db "Illegal seek", 0
+_se_erofs:      db "Read-only file system", 0
+_se_erange:     db "Numerical result out of range", 0
+
+_strerror_table:
+        dd _se_ok,      _se_eperm,   _se_enoent,  _se_unknown   ;  0- 3
+        dd _se_unknown, _se_eio,     _se_enxio,   _se_unknown   ;  4- 7
+        dd _se_enoexec, _se_ebadf,   _se_unknown, _se_unknown   ;  8-11
+        dd _se_enomem,  _se_eacces,  _se_unknown, _se_unknown   ; 12-15
+        dd _se_unknown, _se_eexist,  _se_exdev,   _se_enodev    ; 16-19
+        dd _se_unknown, _se_unknown, _se_einval,  _se_unknown   ; 20-23
+        dd _se_emfile,  _se_unknown, _se_unknown, _se_unknown   ; 24-27
+        dd _se_enospc,  _se_espipe,  _se_erofs,   _se_unknown   ; 28-31
+        dd _se_unknown, _se_unknown, _se_erange                 ; 32-34
+_STRERROR_MAX    equ 35
+
         section .text
+
+; __set_errno_dos(dos_code) -> void. Translate an INT 21h error code
+; into errno. Takes its argument on the stack, not in a register: the
+; peephole deletes `mov eax, [ebp+8]` before a `call` and runs over the
+; bundled libc (see CLAUDE.md).
+__set_errno_dos:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        and     eax, 0xFFFF                 ; AX only — AH is the fn number
+        test    eax, eax
+        jz      .sed_io                     ; 0 is not a real DOS error
+        cmp     eax, __DOS_ERRNO_MAX
+        jae     .sed_io
+        movzx   eax, byte [__dos_errno_map + eax]
+        test    eax, eax
+        jz      .sed_io                     ; unmapped slot
+        mov     [_errno], eax
+        mov     esp, ebp
+        pop     ebp
+        ret
+.sed_io:
+        mov     dword [_errno], 5           ; EIO
+        mov     esp, ebp
+        pop     ebp
+        ret
 
 ; ---- getenv(name) ----------------------------------------------------------
 ; dos_emu doesn't keep a real environment table — but a handful of
@@ -4095,8 +4264,24 @@ ___errno_location:
 ; ---- strerror(errnum) ------------------------------------------------------
 ; Return a static "error" string. Differentiating per-errno is a future
 ; refinement — most callers just print the message and exit.
+; strerror(int errnum) -> message for that errno.
+; Was a single fixed string ("error") for every value, which made
+; perror() and any strerror()-based diagnostic useless. Out-of-range or
+; unmapped values give "Unknown error" rather than a wrong message.
 _strerror:
-        mov     eax, _strerror_msg
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        cmp     eax, _STRERROR_MAX
+        jae     .str_unknown                ; unsigned: also catches < 0
+        mov     eax, [_strerror_table + eax * 4]
+        mov     esp, ebp
+        pop     ebp
+        ret
+.str_unknown:
+        mov     eax, _se_unknown
+        mov     esp, ebp
+        pop     ebp
         ret
 
 ; ---- fflush(stream) --------------------------------------------------------
@@ -4452,11 +4637,37 @@ _ferror:
         pop     ebp
         ret
 _setbuf:
-        ; setbuf(FILE*, char*) — buffering is a no-op (we write through).
+        ; setbuf(FILE *stream, char *buf) — returns void, so there is
+        ; nothing to misreport. `setbuf(f, NULL)` requests an unbuffered
+        ; stream, which is exactly what this libc provides (every
+        ; putchar/fputc issues its own INT 21h), so that call is honored
+        ; precisely. `setbuf(f, buf)` requests full buffering and is
+        ; silently ignored — C11 7.21.5.5p2 defines setbuf in terms of
+        ; setvbuf and gives it no way to report failure.
         ret
 _setvbuf:
-        ; setvbuf(FILE*, char*, int, size_t) — same as above; return 0.
+        ; setvbuf(FILE *stream, char *buf, int mode, size_t size)
+        ;   -> 0 if the request is honored, nonzero otherwise.
+        ;
+        ; There is no buffering layer, so only _IONBF (2) can be
+        ; honored. This used to return 0 unconditionally — claiming to
+        ; have installed a buffer it never installed, so a program that
+        ; checked the return value was told its request succeeded and
+        ; then saw byte-at-a-time output anyway. Refusing is the honest
+        ; answer until a real buffering layer exists.
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 16]             ; mode
+        cmp     eax, 2                      ; _IONBF — already the case
+        je      .svb_ok
+        mov     eax, -1                     ; _IOFBF / _IOLBF: refused
+        mov     esp, ebp
+        pop     ebp
+        ret
+.svb_ok:
         xor     eax, eax
+        mov     esp, ebp
+        pop     ebp
         ret
 
 ; ---- strdup(s) -------------------------------------------------------------

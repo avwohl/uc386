@@ -41,7 +41,7 @@ int main(void) {
     printf("dup=%s\n", dup);
     free(dup);
 
-    /* strerror — static "error" */
+    /* strerror — maps errno to a real message (2 == ENOENT) */
     printf("err=%s\n", strerror(2));
 
     /* fflush — should return 0 */

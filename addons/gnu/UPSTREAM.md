@@ -24,19 +24,34 @@ code commonly assumes that uc386's libc **still does not provide**:
 - `regex.h` (BRE/ERE) — needed by `sed`, `grep`, gawk, `ed`.
   Still the single biggest item.
 
-⚠️ **Still stubs — these link and then lie.** Nothing diagnoses
-their use; the program just misbehaves:
+⚠️ **Still missing.** These are honest about it rather than
+misreporting:
 
 | Symbol | Actual behaviour |
 |---|---|
-| `setbuf` / `setvbuf` | no-op |
-| `strerror` | one fixed string, ignores `errno` |
-| `popen` / `pclose` | always fail |
+| `popen` / `pclose` | always fail — DOS has no pipe API without a shell layer |
+| `setbuf` | `setbuf(f, NULL)` (unbuffered) is honored exactly, since that is what this libc does; `setbuf(f, buf)` is ignored, and C11 gives it no way to report that |
+| `setvbuf` | returns nonzero for `_IOFBF`/`_IOLBF` — refused, not silently dropped |
+| `fflush` | returns 0, which is accurate: output is write-through, so there is nothing to flush |
 
-`setbuf` and `fflush` being no-ops is honest — output is
-write-through, so there is nothing to buffer or flush. `strerror`
-is the one that can genuinely mislead: every failure reports the
-same message regardless of `errno`.
+**No buffering layer exists at all.** `putchar` issues one INT 21h
+per character, so printing 2,000 bytes costs 2,000 DOS calls against
+one for a bulk `fwrite`. Implementing `setvbuf` properly means
+building that layer first — per-stream buffer, flush on
+full/newline/`fclose`/`exit` — which is a performance feature with a
+correctness tail (an unflushed buffer at abnormal exit loses output).
+
+✅ **Fixed — `errno` is now populated and `strerror` maps it.**
+`errno` used to be written in exactly two places in the whole libc
+(`_open` and `_creat`, both hardcoding ENOENT), so `strerror`
+returned the fixed string `"error"` for every input and `perror`
+printed a hardcoded `": error"`. The INT 21h codes were always
+available — DOS reports failure as CF=1 with a code in AX — they
+were just discarded at each call site. Failure paths now translate
+them through `__set_errno_dos` (DOS 6 → `EBADF`, 5 → `EACCES`,
+2/3 → `ENOENT`, 4 → `EMFILE`, …), `strerror` indexes a real message
+table, and `perror` prints `path: message`. Pinned by
+`tests/test_errno_strerror.py`.
 
 ✅ **Fixed — the file-position and stream-state group is now real.**
 `fseek` / `ftell` / `rewind` / `clearerr` / `feof` / `ferror` were

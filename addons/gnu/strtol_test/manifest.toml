@@ -7,9 +7,13 @@ neg=-1234 rem=
 dec99=99
 env=(null)
 dup=hello
-err=error
+err=No such file or directory
 fflush=0
 """
+# `err=` is strerror(2) == strerror(ENOENT). This used to expect the
+# literal "error", because strerror returned one fixed string for every
+# input. It now maps errno properly, so the expectation is the real
+# message.
 # Note: minimal strtol sets *endptr to end-of-string (not "after the
 # parsed digits" as C99 specifies). So `rem=` is empty string. A
 # richer strtol that walks past digits → endptr is a future slice.
