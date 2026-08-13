@@ -193,6 +193,90 @@ def _is_dos83_path(path: bytes, *, allow_wild: bool = False) -> bool:
     )
 
 
+# The INT-wrapping helpers in a uc386 binary share this prologue:
+# push ebp / mov ebp,esp / push esi / push edi / push ebx / **push es**.
+# That trailing `push es` (opcode 0x06) at function entry only happens in
+# this family, so the 7-byte pattern finds them in a flat binary with no
+# symbol table. The bodies then tell them apart:
+#   - `pktdrv_int_invoke(int_num, regs)` patches its own INT immediate,
+#     so its body contains `cd 00`.
+#   - the DPMI real-mode-call bridge (freedos_micro_python's
+#     port/dosint21_uc386dos.c) hardcodes `mov eax, 0x0301`.
+_SEG_WRAPPER_SIG = b"\x55\x89\xe5\x56\x57\x53\x06"
+_PKTDRV_BODY_SIG = b"\xcd\x00"                  # self-patched INT imm
+_DPMI_RMI_BODY_SIG = b"\xb8\x01\x03\x00\x00"    # mov eax, 0x0301
+_SEG_WRAPPER_BODY = 0x40                        # bytes to classify over
+
+
+def locate_seg_wrappers(binary: bytes) -> tuple:
+    """Find every INT-wrapping helper and classify it by body.
+
+    Returns ``(pktdrv_int_invoke_addr, dpmi_simulate_int_addr)``, each
+    -1 when absent.
+
+    This used to be a bare ``binary.find()`` that took the first match
+    and a comment asserting the prologue "appears at exactly one address
+    in the MicroPython port build". It appears twice, and has for a long
+    time. Taking only the first left the DPMI bridge to execute
+    natively — straight into the unicorn 2.x bug the interception exists
+    to dodge, which killed every dos_emu run of the MicroPython port at
+    the same instruction.
+
+    The bug, precisely: **executing `pop es` (0x07) or `pop ds` (0x1F)
+    silently switches unicorn's stack accesses to 16-bit.** From then on
+    every SS-relative access — push, pop, call, ret, leave — truncates
+    its address to 16 bits. It is sticky, survives across `emu_start`
+    calls, and cannot be undone. Reduced repro, no dos_emu involved::
+
+        uc = Uc(UC_ARCH_X86, UC_MODE_32); uc.mem_map(0, 0x1100000)
+        uc.mem_write(0x1000, b"\\x07\\x58\\xf4")     # pop es / pop eax / hlt
+        uc.mem_write(0x10FFF70, struct.pack("<II", 0, 0xCCCCCCCC))
+        uc.mem_write(0x000FF70, struct.pack("<II", 0, 0xDDDDDDDD))
+        uc.reg_write(UC_X86_REG_ESP, 0x10FFF70)
+        uc.emu_start(0x1000, 0, count=2)          # EAX = 0xDDDDDDDD (!)
+
+    In the port that showed up as a `pop ebp` yielding 0x01895959 where
+    memory plainly held 0x010fff80 — because the pop actually read
+    linear 0xff70, i.e. 0x010fff70 truncated. Data accesses through DS
+    and the `mem_read`/`mem_write` API are unaffected, which is why
+    287k instructions ran fine first and why every probe read looked
+    correct.
+
+    Note `uc.reg_write(UC_X86_REG_<seg>, 0)` from Python triggers it
+    too — so "helpfully" restoring a segment register is not a
+    workaround, it is another way to fall in. Bypassing the whole
+    function is the only remedy, which is why these helpers are
+    intercepted at their entry point rather than emulated instruction
+    by instruction.
+
+    The two helpers take different arguments and so cannot share one
+    intercept — hence classify rather than merely count.
+    """
+    starts = []
+    pos = binary.find(_SEG_WRAPPER_SIG)
+    while pos != -1:
+        starts.append(pos)
+        pos = binary.find(_SEG_WRAPPER_SIG, pos + 1)
+
+    pktdrv_addr = -1
+    dpmi_addr = -1
+    for i, start in enumerate(starts):
+        # Classify over this helper only. Clamping at the next match
+        # matters: these helpers are short, and an unclamped window
+        # runs past the `ret` into whatever follows — which, when the
+        # next thing is the other helper, reads its discriminator and
+        # mislabels both.
+        end = start + _SEG_WRAPPER_BODY
+        if i + 1 < len(starts):
+            end = min(end, starts[i + 1])
+        body = binary[start:end]
+        if _DPMI_RMI_BODY_SIG in body:
+            dpmi_addr = start
+        elif _PKTDRV_BODY_SIG in body:
+            pktdrv_addr = start
+    return pktdrv_addr, dpmi_addr
+
+
 def run(
     binary: bytes | Path,
     *,
@@ -254,19 +338,12 @@ def run(
     # Load the program at address 0 (matches NASM `-f bin` default org 0).
     mu.mem_write(CODE_BASE, binary)
 
-    # Locate `pktdrv_int_invoke` in the loaded binary, if present, so
-    # we can intercept its calls — see the long comment further down
-    # where the UC_HOOK_CODE that does the intercept is installed.
-    # The function is uc386 libc's wrapper that takes a cdecl
-    # (int_num, regs[8]) and dispatches the INT. Its prologue is
-    # distinctive: push ebp / mov ebp,esp / push esi / push edi /
-    # push ebx / **push es** — that final `push es` (opcode 0x06) at
-    # function entry only happens in this helper, so a 7-byte byte
-    # pattern search finds the function reliably without symbol
-    # tables (the binary is flat). Verified empirically: the prefix
-    # appears at exactly one address in the MicroPython port build.
-    _PKTDRV_INT_INVOKE_SIG = b"\x55\x89\xe5\x56\x57\x53\x06"
-    pktdrv_int_invoke_addr = binary.find(_PKTDRV_INT_INVOKE_SIG)
+    # Locate the INT-wrapping helpers so we can intercept their calls —
+    # see locate_seg_wrappers, and the long comment further down where
+    # the UC_HOOK_CODE that does the intercept is installed.
+    pktdrv_int_invoke_addr, dpmi_simulate_int_addr = \
+        locate_seg_wrappers(binary)
+
     pktdrv_invoke_seg_arena = [0x4000]   # bump allocator state
 
     # When a NetworkSimulator is wired with Crynwr enabled, plant a
@@ -601,14 +678,45 @@ def run(
             if mask.endswith("\\*.*") or mask.endswith("/*.*"):
                 return True
             return name.lower() == mask.lower()
+        def _has_basename(key: bytes) -> bool:
+            # A drive root (`C:\`) canonicalises to a key with nothing
+            # after the separator. It is a directory, but it is not an
+            # entry *inside* itself, and real DOS never reports it from
+            # a find-first — so keep it out of both enumerations.
+            return bool(key.replace(b"/", b"\\").rsplit(b"\\", 1)[-1])
+
         out = []
         for fname in vfiles:
             if _m(fname.decode("ascii", errors="replace")):
                 out.append((fname, False))
         for dname in vdirs:
-            if _m(dname.decode("ascii", errors="replace")):
+            if _has_basename(dname) and _m(
+                    dname.decode("ascii", errors="replace")):
                 out.append((dname, True))
         return out
+
+    def _dta_write_entry(uc, key: bytes, is_dir: bool) -> None:
+        """Fill the legacy DTA for find-first/find-next (AH=0x4E/0x4F).
+
+        Layout: attr at +21, 8.3 filename + NUL at +30.
+
+        The name field is a *bare* 8.3 filename — 13 bytes, room for
+        12 characters and a terminator — never a path. That matters
+        because the vfs keys are absolute (`C:\\CONFIG.INI`) since
+        keys were canonicalised; writing the key verbatim both leaked
+        the `C:\\` prefix into the guest's readdir results and silently
+        truncated: `C:\\CONFIG.INI` is exactly 13 characters, so the
+        NUL displaced the final `I` and the guest saw `C:\\CONFIG.IN`.
+
+        Unlike this one, the DOSLFN find (AX=714E/714F) deliberately
+        emits the verbatim key into its 260-byte long-name field — see
+        `_lfn_write_find_data`. Only the legacy API is path-free.
+        """
+        if not vdta_addr[0]:
+            return
+        base = key.replace(b"/", b"\\").rsplit(b"\\", 1)[-1]
+        uc.mem_write(vdta_addr[0] + 21, bytes([0x10 if is_dir else 0x00]))
+        uc.mem_write(vdta_addr[0] + 30, base[:12] + b"\x00")
 
     def _lfn_write_find_data(addr: int, ent: tuple) -> None:
         """Fill a WIN32_FIND_DATA at `addr` for DOSLFN AX=714E/714F.
@@ -1027,6 +1135,26 @@ def run(
                 edx_new = (uc.reg_read(UC_X86_REG_EDX) & 0xFFFF0000) | fake_off
                 uc.reg_write(UC_X86_REG_ECX, ecx_new)
                 uc.reg_write(UC_X86_REG_EDX, edx_new)
+                uc.reg_write(UC_X86_REG_EFLAGS, flags & ~0x1)
+                return
+            if ax == 0x0301:
+                # DPMI fn 0x0301 — Simulate Real Mode Procedure With
+                # Far Return. ES:EDI points at the real-mode call
+                # structure; dispatch the INT it describes and write
+                # the results back.
+                #
+                # This is the same service `_pktdrv_int_invoke_intercept`
+                # provides, and it must be here too: the port reaches
+                # 0x0301 by two different routes. `pktdrv_int_invoke`
+                # goes through the intercept, but the port's DPMI
+                # bridge (dosint21_uc386dos.c) issues a bare `int 31h`
+                # that lands here instead. Without this branch that
+                # route fell through to the CF=1 "unsupported" path
+                # below, and the port -- correctly assuming a DPMI host
+                # that implements 0x0301 -- walked off into unmapped
+                # memory a few instructions later.
+                _pktdrv_int_invoke_dispatch_rmcs(
+                    uc, uc.reg_read(UC_X86_REG_EDI))
                 uc.reg_write(UC_X86_REG_EFLAGS, flags & ~0x1)
                 return
             # Unimplemented fn or unmatched int_num → CF=1, AX=0.
@@ -1562,12 +1690,7 @@ def run(
             # Pop the first; queue the rest for find-next.
             first, is_dir = entries[0]
             vfind_state[:] = entries[1:]
-            # Write into DTA: attr at +21, name at +30 (max 13 bytes).
-            if vdta_addr[0]:
-                uc.mem_write(vdta_addr[0] + 21,
-                             bytes([0x10 if is_dir else 0x00]))
-                truncated = first[:12] + b"\x00"
-                uc.mem_write(vdta_addr[0] + 30, truncated)
+            _dta_write_entry(uc, first, is_dir)
             uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
             return
         if ah == 0x4F:
@@ -1577,11 +1700,7 @@ def run(
                 uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
                 return
             next_name, is_dir = vfind_state.pop(0)
-            if vdta_addr[0]:
-                uc.mem_write(vdta_addr[0] + 21,
-                             bytes([0x10 if is_dir else 0x00]))
-                truncated = next_name[:12] + b"\x00"
-                uc.mem_write(vdta_addr[0] + 30, truncated)
+            _dta_write_entry(uc, next_name, is_dir)
             uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
             return
         if ah == 0x39:
@@ -1939,6 +2058,8 @@ def run(
             uc.emu_stop()
         if pktdrv_int_invoke_addr != -1 and address == pktdrv_int_invoke_addr:
             _pktdrv_int_invoke_intercept(uc)
+        elif dpmi_simulate_int_addr != -1 and address == dpmi_simulate_int_addr:
+            _dpmi_simulate_int_intercept(uc)
 
     def _pktdrv_int_invoke_intercept(uc):
         # Stand-in for the libc helper `pktdrv_int_invoke(int_num, regs)`
@@ -2129,6 +2250,32 @@ def run(
         uc.reg_write(UC_X86_REG_EIP, ret_addr)
         uc.reg_write(UC_X86_REG_ESP, esp + 4)
 
+    def _dpmi_simulate_int_intercept(uc):
+        # Stand-in for the port's DPMI real-mode-call bridge
+        # (freedos_micro_python port/dosint21_uc386dos.c). The real
+        # function switches to a real-mode stack, issues
+        # `int 31h` with AX=0x0301 (Simulate Real Mode Procedure With
+        # Far Return) against an rmcs the caller built, then restores
+        # the stack and segment registers.
+        #
+        # We bypass it for the same reason we bypass
+        # `pktdrv_int_invoke`: its `push ds / pop es` poisons unicorn's
+        # stack width for the rest of the run — see locate_seg_wrappers
+        # for the mechanism and a reduced repro. Every push/pop/ret
+        # after it addresses 16-bit-truncated memory, so the function
+        # returns into garbage. Nothing in the body can be salvaged
+        # instruction-by-instruction; it has to not run.
+        #
+        # cdecl: [esp+0] = return address, [esp+4] = rmcs pointer.
+        esp = uc.reg_read(UC_X86_REG_ESP)
+        ret_addr, rmcs_ptr = struct.unpack("<II", uc.mem_read(esp, 8))
+        _pktdrv_int_invoke_dispatch_rmcs(uc, rmcs_ptr)
+        # The real function returns CF from the DPMI call, computed as
+        # `pushfd / pop eax / and eax,1`. We serviced the call, so CF=0.
+        uc.reg_write(UC_X86_REG_EAX, 0)
+        uc.reg_write(UC_X86_REG_EIP, ret_addr)
+        uc.reg_write(UC_X86_REG_ESP, esp + 4)
+
     def _pktdrv_int_invoke_dispatch_rmcs(uc, rmcs_linear):
         # rmcs layout from port/dosint21_uc386dos.c:
         #   uint32 edi, esi, ebp, reserved, ebx, edx, ecx, eax;
@@ -2218,7 +2365,37 @@ def run(
                 "<HHH", new_flags & 0xFFFF, es, ds))
             return
 
-        if ah == 0x3D:
+        if ah == 0x3C:
+            # creat(name, attr): create, or truncate an existing file,
+            # and return a read/write handle. DS:DX = name.
+            #
+            # This has to be here as well as on the direct-INT path.
+            # The port reaches DOS two ways, and its `open(path, "w")`
+            # goes through this bridge (file_uc386dos.c calls
+            # dos_int21_creat), so a dispatcher that knows 0x3D but not
+            # 0x3C fails every write-mode open with CF=1 — which the
+            # port faithfully reports as ENOENT for a file it was being
+            # asked to create.
+            name_linear = ds_linear + (edx & 0xFFFF)
+            name, _ok = _dos_path(name_linear)
+            fd = _vfile_open(name, "w") if _ok else -1
+            if fd < 0:
+                new_eax = (eax & ~0xFFFF) | 0x03   # path not found
+                new_flags |= 1
+            else:
+                new_eax = (eax & ~0xFFFF) | (fd & 0xFFFF)
+        elif ah == 0x47:
+            # getcwd(drive, buf): DL = drive (0=current), DS:SI = buf.
+            # DOS writes the path *without* the leading "X:\".
+            buf_linear = ds_linear + (esi & 0xFFFF)
+            cwd = vcwd[0]
+            if len(cwd) >= 3 and cwd[1:2] == b":" and cwd[2:3] == b"\\":
+                rest = cwd[3:]
+            else:
+                rest = cwd
+            uc.mem_write(buf_linear, rest + b"\x00")
+            new_flags &= ~1
+        elif ah == 0x3D:
             # open(name, mode). Path is DS:DX in real-mode; the bounce
             # buffer that holds the path lives at linear ds_linear.
             name_linear = ds_linear + (edx & 0xFFFF)

@@ -95,7 +95,7 @@ copy `peephole.py`/`asm_dce.py`/`libc_split.py` back in.)
     `tests/` touches the `.exe` path. It fails only when you run
     `addons.harness.exe`. Check with
     `.venv/bin/python -c "import upyle"` before trusting an `.exe` build.
-- Run tests: `.venv/bin/pytest tests/` (expect 490 passed, 1 skipped).
+- Run tests: `.venv/bin/pytest tests/` (expect 498 passed, 1 skipped).
   The peephole/dce/libc_split tests now live in upeep386 — run those
   with `.venv/bin/pytest ../upeep386/tests` (expect 897 passed).
 - Run driver: `.venv/bin/python -m uc386.main examples/hello.c -o /tmp/hello.asm`

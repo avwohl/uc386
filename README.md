@@ -222,7 +222,7 @@ sudo apt-get install -y python3 python3-venv nasm    # Debian/Ubuntu
 git clone https://github.com/avwohl/uc386 && cd uc386
 python3 -m venv .venv && . .venv/bin/activate
 pip install pytest unicorn upyle -e .
-pytest tests/          # 490 passed, 1 skipped
+pytest tests/          # 498 passed, 1 skipped
 ```
 
 To co-develop the frontend or the optimizer, clone them as siblings
