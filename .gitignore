@@ -10,3 +10,9 @@ dist/
 
 # Addons: upstream sources are fetched by fetch.sh, never checked in.
 addons/**/upstream/
+
+# Local scratch. `work/uc386-dos` was once committed by accident (a
+# symlink to a machine-specific absolute path, swept into 93338fb
+# alongside a codegen change), so every clone got a dangling link
+# into someone else's home directory. Keep the directory local.
+work/
