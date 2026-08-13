@@ -1,10 +1,17 @@
 name: exe-smoke
 
 # Validates `addons/harness/exe.py` end-to-end:
-#   uc386 → .asm → nasm -f obj → wlink system causeway → .exe
+#   uc386 → .asm → nasm -f obj → upyle → MZ+LE .exe (DOS/32A bound)
 #
-# Runs only on Linux (Watcom has no native macOS build) and only
-# on changes that actually affect the pipeline (the harness, the
+# Open Watcom is deliberately NOT installed here. The default
+# extender is DOS/32A (58c1f79) and `build_exe` always routes that
+# through upyle — wlink has no `system dos32a` — so a Watcom install
+# would be a ~100 MB download that nothing in this job consults.
+# wlink is only needed for the causeway / dos4g extenders, which
+# this workflow doesn't exercise.
+#
+# Runs only on Linux (that's where the DOSBox runtime legs work) and
+# only on changes that actually affect the pipeline (the harness, the
 # codegen, lib/, or this workflow itself) — keeps churn off PRs
 # that only touch docs.
 
@@ -38,18 +45,6 @@ jobs:
           python-version: '3.12'
       - name: Install nasm
         run: sudo apt-get update -y && sudo apt-get install -y nasm
-      - name: Install Open Watcom V2
-        # Same install pattern as release.yml: the Linux x64 "installer"
-        # is an ELF wrapper around a regular ZIP archive. Unzip it
-        # directly (the installer FPEs under unattended runs).
-        run: |
-          mkdir -p ~/.local/opt/watcom
-          curl -sL -o /tmp/watcom.bin \
-            https://github.com/open-watcom/open-watcom-v2/releases/download/Current-build/open-watcom-2_0-c-linux-x64
-          unzip -q /tmp/watcom.bin -d ~/.local/opt/watcom
-          chmod +x ~/.local/opt/watcom/binl64/wlink || true
-          echo "WATCOM=$HOME/.local/opt/watcom" >> $GITHUB_ENV
-          echo "$HOME/.local/opt/watcom/binl64" >> $GITHUB_PATH
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
@@ -57,32 +52,53 @@ jobs:
           pip install "upeep386 @ git+https://github.com/avwohl/upeep386@main"
           pip install "upyle @ git+https://github.com/avwohl/pyle@main"
           pip install -e .
-      - name: Build true.exe
+      - name: Build true.exe (default extender = DOS/32A)
         # Smallest possible C surface: `int main(void) { return 0; }`.
-        # Any wlink failure is a Phase 1 wrapper bug or an OMF
-        # compatibility issue, not "this addon happens to use a libc
-        # symbol the bridge doesn't provide."
-        # exe.py auto-binds pmodew.exe (the default extender) so the
-        # output should be ~11 KB self-contained (PMODE/W + LE
-        # payload), not 371 bytes (unbound LE that prints "This is
-        # a PMODE/W executable" and exits).
+        # Any failure here is a wrapper/OMF bug, not "this addon
+        # happens to use a libc symbol the bridge doesn't provide."
+        # upyle binds its pre-bound DOS/32A stub, so the output should
+        # be ~32.8 KB self-contained (stub + LE payload), not a few
+        # hundred bytes of unbound LE.
         run: |
           python -m addons.harness.exe addons/gnu/true/main.c \
             -o /tmp/true.exe
           ls -la /tmp/true.exe
           file /tmp/true.exe
-          # Self-contained .exe should be > 1 KB (PMODE/W is ~11 KB).
-          # Catches the regression where the stub binary doesn't get
-          # bound in.
+          # The DOS/32A stub alone is ~27.5 KB, so a correctly bound
+          # .exe clears 16 KB comfortably. Catches the regression
+          # where the stub doesn't get bound in at all.
           SIZE=$(stat -c '%s' /tmp/true.exe)
-          if [ "$SIZE" -lt 1024 ]; then
+          if [ "$SIZE" -lt 16384 ]; then
             echo "FAIL: true.exe is only $SIZE bytes — extender wasn't bound"
             exit 1
           fi
-          # `file` should mention PMODE/W explicitly.
-          file /tmp/true.exe | grep -qi "PMODE/W" \
+          # `file` should name DOS/32A explicitly. It reports:
+          #   "MS-DOS executable, LE executable for MS-DOS,
+          #    DOS/32A DOS extender (embedded)"
+          file /tmp/true.exe | grep -qi "DOS/32A" \
+            || (echo "FAIL: file output doesn't mention DOS/32A" && exit 1)
+          echo "PASS: true.exe is $SIZE bytes, DOS/32A bound"
+
+      - name: Build true.exe with --extender=pmodew
+        # PMODE/W is still a supported option and halves the size, so
+        # keep it from bit-rotting — but it is NOT the default: its
+        # real-mode call path hangs on any DOS call touching a
+        # physical sector, so a PMODE/W build can't do disk I/O on
+        # real DOS. Bind-only check; the runtime legs below all use
+        # the DOS/32A default.
+        run: |
+          python -m addons.harness.exe addons/gnu/true/main.c \
+            --extender=pmodew -o /tmp/true_pmodew.exe
+          ls -la /tmp/true_pmodew.exe
+          file /tmp/true_pmodew.exe
+          SIZE=$(stat -c '%s' /tmp/true_pmodew.exe)
+          if [ "$SIZE" -lt 8192 ]; then
+            echo "FAIL: pmodew true.exe is only $SIZE bytes — stub unbound"
+            exit 1
+          fi
+          file /tmp/true_pmodew.exe | grep -qi "PMODE/W" \
             || (echo "FAIL: file output doesn't mention PMODE/W" && exit 1)
-          echo "PASS: true.exe is $SIZE bytes, PMODE/W bound"
+          echo "PASS: pmodew true.exe is $SIZE bytes, PMODE/W bound"
       - name: Build cat.exe
         # cat exercises libc (putchar via INT 21h, file open/read/close).
         # Most likely failure mode if Phase 1 needs the calling-convention
@@ -106,9 +122,11 @@ jobs:
           fail=0
           for d in addons/gnu/*/; do
             name=$(basename "$d")
-            # Skip non-buildable: special dirs + upstream-fetched ports.
+            # Skip non-buildable: shared shims (_*), upstream-fetched
+            # ports (awk-bwk), and the doc-only gawk stub. MicroPython
+            # moved out to the freedos_micro_python repo.
             case "$name" in
-              _*|awk-bwk|gawk|micropython) continue ;;
+              _*|awk-bwk|gawk) continue ;;
             esac
             [ -f "$d/main.c" ] || continue
             if python -m addons.harness.exe "$d/main.c" \
@@ -126,17 +144,19 @@ jobs:
 
       - name: Inspect true.exe structure
         # Quick post-build sanity: the file should have the MZ header,
-        # an LE signature at the new-exe offset, and the PMODE/W
+        # an LE signature at the new-exe offset, and the DOS/32A
         # version banner somewhere in the bound stub.
         run: |
           xxd /tmp/true.exe | head -8
-          # `strings` should show "PMODE/W" since the extender is
-          # bundled as the MZ portion.
-          strings /tmp/true.exe | grep -i "PMODE/W" | head -3
+          # `strings` should show "DOS/32A" since the extender is
+          # bundled as the MZ portion (banner reads
+          # "SUNSYS DOS/32A" / "DOS/32A -- DOS Extender version ...").
+          strings /tmp/true.exe | grep -i "DOS/32A" | head -3 \
+            || (echo "FAIL: no DOS/32A banner in the bound stub" && exit 1)
 
       - name: Install DOSBox
         # Phase 3: actually run the .exe under DOSBox to verify the
-        # PMODE/W extender boots, switches to PM, runs our 32-bit
+        # DOS/32A extender boots, switches to PM, runs our 32-bit
         # code, and exits cleanly. headless via SDL_VIDEODRIVER=dummy.
         run: |
           sudo apt-get install -y dosbox
