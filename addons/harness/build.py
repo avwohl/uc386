@@ -217,8 +217,10 @@ def smoke() -> int:
     """Compile + run examples/hello.c through the harness path.
 
     Sanity check that the toolchain is installed and the harness can
-    drive it end-to-end. Hello.c returns 0 with no stdout, so the
-    expected result is exit_code=0 and empty stdout.
+    drive it end-to-end. hello.c prints one line via libc printf and
+    returns 0, so a healthy toolchain gives exit_code=0 and
+    "Hello, DOS!\\n" on stdout — which also proves the libc actually
+    reached INT 21h rather than just linking.
     """
     print("== smoke: compile + run examples/hello.c ==")
     build_dir = REPO_ROOT / "build" / "addons-smoke"
@@ -227,7 +229,7 @@ def smoke() -> int:
             name="hello",
             description="examples/hello.c smoke test",
             sources=[EXAMPLES_DIR / "hello.c"],
-            expect_stdout="",
+            expect_stdout="Hello, DOS!\n",
             expect_exit=0,
         ),
         build_dir=build_dir,
