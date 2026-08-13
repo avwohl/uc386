@@ -1464,7 +1464,13 @@ def run(
                     actual = 0
             else:
                 actual = 0
-            # Return bytes-written in AX; CF clear on success.
+            # Return bytes-written in AX, and actually clear CF —
+            # real DOS clears it on success, and callers are entitled
+            # to `jc` straight after the INT. This used to only claim
+            # to clear it, leaving whatever CF the guest happened to
+            # carry in, so a stale CF read as a write error.
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
             new_eax = (eax & ~0xFFFF) | (actual & 0xFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
             return
@@ -1493,6 +1499,13 @@ def run(
                     actual = 0
             else:
                 actual = 0
+            # Clear CF: on real DOS a successful read clears carry, and
+            # AX=0 (not CF) is how end-of-file is signalled. Without this
+            # a stale CF makes libc's `jc` treat a good read as an I/O
+            # error — which is exactly what feof()/ferror() must not
+            # confuse. See the matching clear in the AH=0x40 handler.
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
             new_eax = (eax & ~0xFFFF) | (actual & 0xFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
             return

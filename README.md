@@ -70,15 +70,20 @@ third-party C programs into runnable DOS executables:
 See `addons/STATUS.md` for the full per-addon report and
 `docs/path-a-mz-le.md` for the `.exe` build path.
 
-**Known sharp edge — stdio stubs.** Part of the shipped `<stdio.h>`
-surface links cleanly and then returns wrong answers rather than
-failing: `feof` always reports "not at EOF" (so `while (!feof(f))`
-never terminates), `fseek` returns success without seeking, `ftell`
-always returns 0, and `strerror` ignores `errno`. There is no
-diagnostic. When file position matters, use the POSIX layer
-(`open`/`read`/`write`/`lseek`), which is really implemented on
-INT 21h. Full table in
-[`addons/gnu/UPSTREAM.md`](addons/gnu/UPSTREAM.md).
+**File positioning and stream state work.** `fseek`, `ftell`, `rewind`,
+`clearerr`, `feof` and `ferror` are real: seeking goes through INT 21h
+AH=0x42, and per-stream EOF/error state lives in a handle-indexed table,
+so `while (!feof(f))` terminates, `ftell` reports the true position, and
+`ferror` distinguishes a read error from end-of-file. These were
+no-op stubs until recently — a stub that returns a plausible wrong
+answer is worse than one that fails — and `tests/test_stdio_position.py`
+now pins the behaviour.
+
+Still thin in `<stdio.h>`: `strerror` returns one fixed string rather
+than mapping `errno`, `setbuf`/`setvbuf` are no-ops (output is
+write-through, so there is nothing to buffer), and `popen`/`pclose`
+always fail — DOS has no pipe API without a shell layer. The remaining
+gaps are listed in [`addons/gnu/UPSTREAM.md`](addons/gnu/UPSTREAM.md).
 
 ## Size — measured, not asserted
 

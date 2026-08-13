@@ -24,25 +24,32 @@ code commonly assumes that uc386's libc **still does not provide**:
 - `regex.h` (BRE/ERE) — needed by `sed`, `grep`, gawk, `ed`.
   Still the single biggest item.
 
-⚠️ **Present but non-functional — these link and then lie.** They
-are deliberate no-op stubs (`i386_dos_libc.asm:4142`, "no-op
-stubs"). Nothing diagnoses their use; the program just misbehaves:
+⚠️ **Still stubs — these link and then lie.** Nothing diagnoses
+their use; the program just misbehaves:
 
 | Symbol | Actual behaviour |
 |---|---|
-| `fseek` | returns 0 ("success"), **does not seek** |
-| `ftell` | always returns 0 |
-| `rewind` / `clearerr` | no-op |
-| `feof` | **always 0 — never reports EOF** |
-| `ferror` | always 0 |
-| `setbuf` / `setvbuf` | no-op (output is unbuffered) |
+| `setbuf` / `setvbuf` | no-op |
 | `strerror` | one fixed string, ignores `errno` |
+| `popen` / `pclose` | always fail |
 
-`while (!feof(f))` therefore never terminates, and any
-seek-and-report-position logic is silently wrong. Use the POSIX
-layer (`lseek`, `read`, `write`) when position actually matters —
-those are real. `fflush` returning 0 is honest: output is
-write-through, so there is nothing to flush.
+`setbuf` and `fflush` being no-ops is honest — output is
+write-through, so there is nothing to buffer or flush. `strerror`
+is the one that can genuinely mislead: every failure reports the
+same message regardless of `errno`.
+
+✅ **Fixed — the file-position and stream-state group is now real.**
+`fseek` / `ftell` / `rewind` / `clearerr` / `feof` / `ferror` were
+no-op stubs: `feof` was hardwired to 0 (so `while (!feof(f))` never
+terminated), `fseek` returned success without seeking, and `ftell`
+always returned 0. Seeking now goes through INT 21h AH=0x42 via the
+real `_lseek`, and per-stream EOF/error state lives in
+`_stdio_flags` — one byte per DOS handle, bit 0 EOF, bit 1 error —
+because `FILE*` is the raw handle and there is no FILE struct to
+hold it. `fgetc` / `fread` set those bits, and both now check the
+carry flag so a DOS error is reported through `ferror` instead of
+being returned as if it were a byte count. Pinned by
+`tests/test_stdio_position.py`.
 
 **Genuinely filled since this document was first written** (real
 INT 21h implementations, not stubs): `getenv`, `strtol` /

@@ -161,20 +161,22 @@ moving down. Keep the two in step if uplox's floor ever changes.
 
 ## Codegen contract (current)
 
-⚠️ **`--int` / `--long` / `--long-long` / `--ptr` are not safe to use.**
-They change what `sizeof` reports without changing storage or arithmetic
-width. Measured:
+**`--int` / `--long` / `--long-long` / `--ptr` only accept the flat-32
+values.** These flags feed the *frontend* — they reach `ASTOptimizer`,
+which const-folds `sizeof` — while codegen sizes types from its own
+`CodeGenerator._BASIC_SIZES` and never receives them. A non-default
+width therefore used to produce a compiler whose `sizeof` contradicted
+its own storage layout (`--long 64` → `sizeof(long)==8` with `long`
+locals 4 bytes apart), silently overrunning any `sizeof`-driven
+`memcpy`/stride.
 
-```
-$ uc386 t.c --long 32   →  sizeof(long)=4   adjacent long locals 4 bytes apart
-$ uc386 t.c --long 64   →  sizeof(long)=8   adjacent long locals 4 bytes apart
-```
-
-So under `--long 64` any `sizeof`-driven `memcpy`/`malloc`/array stride
-overruns by 2×, with no diagnostic. Only the defaults (`--int 32
---long 32 --long-long 64 --ptr 32`, i.e. the Watcom flat-32 model) are
-sound. Either finish the widths or make the non-default values an error;
-until then treat these flags as unimplemented.
+`main.py` now compares the requested `TypeConfig` against
+`_BASIC_SIZES` and exits 1 with a diagnostic rather than miscompiling.
+Making a width genuinely work is the larger job: the 64-bit paths key
+off the type *name* (`_is_long_long`, codegen.py) rather than the size,
+so `long` at 8 bytes would get 8-byte storage and 32-bit arithmetic.
+Size-key those predicates first; the guard lifts automatically once
+`_BASIC_SIZES` agrees.
 
 - Output is a single `.asm` text file in NASM syntax.
 - Entry point `_start` calls `_main`, then exits via `INT 21h` AH=4Ch with AL = main's return.

@@ -154,14 +154,27 @@ _fread:
         mov     ecx, eax
         mov     ah, 0x3F
         int     21h
-        ; AX = bytes-read. Divide by size to get nmemb actually read.
+        jc      .rd_err              ; CF=1: DOS error, AX = code
+        ; AX = bytes-read. A short read means we reached end-of-file;
+        ; record it so feof() reports EOF after the partial read.
         movzx   eax, ax
+        cmp     eax, ecx
+        jae     .no_eof
+        cmp     ebx, 255
+        ja      .no_eof
+        or      byte [_stdio_flags + ebx], 1
+.no_eof:
+        ; Divide by size to get nmemb actually read.
         xor     edx, edx
         mov     ecx, [ebp + 12]
         test    ecx, ecx
         jz      .zero
         div     ecx
         jmp     .done
+.rd_err:
+        cmp     ebx, 255
+        ja      .zero
+        or      byte [_stdio_flags + ebx], 2
 .zero:
         xor     eax, eax
 .done:
@@ -336,12 +349,29 @@ _fgetc:
         mov     ecx, 1
         mov     ah, 0x3F
         int     21h
+        jc      .ioerr               ; CF=1: DOS error, AX = code
         movzx   eax, ax
         test    eax, eax
-        jz      .eof
+        jz      .eof                 ; 0 bytes read = end of file
         movzx   eax, byte [ebp - 4]
         jmp     .done
 .eof:
+        ; Record EOF for this stream so feof() can report it. Without
+        ; this, `while (!feof(f))` never terminates.
+        cmp     ebx, 255
+        ja      .eof_ret
+        or      byte [_stdio_flags + ebx], 1
+.eof_ret:
+        mov     eax, -1
+        jmp     .done
+.ioerr:
+        ; A read error is not end-of-file: set the error bit instead, so
+        ; ferror() distinguishes the two. Previously CF was ignored and
+        ; the DOS error code was returned as if it were a byte count.
+        cmp     ebx, 255
+        ja      .ioerr_ret
+        or      byte [_stdio_flags + ebx], 2
+.ioerr_ret:
         mov     eax, -1
 .done:
         pop     ebx
@@ -4075,6 +4105,10 @@ _close:
 _lseek:
         push    ebp
         mov     ebp, esp
+        push    ebx                         ; EBX is callee-saved; this
+                                            ; used to be clobbered, which
+                                            ; corrupted any caller holding
+                                            ; a value in it across lseek().
         mov     ebx, [ebp + 8]              ; fd
         mov     edx, [ebp + 12]             ; offset (low half)
         mov     ecx, [ebp + 12]
@@ -4091,6 +4125,7 @@ _lseek:
 ._err:
         mov     eax, -1
 ._done:
+        pop     ebx
         mov     esp, ebp
         pop     ebp
         ret
@@ -4139,33 +4174,144 @@ _strcasecmp:
         pop     ebp
         ret
 
-; ---- fseek / ftell / rewind / clearerr / feof / ferror (no-op stubs) -------
-; Our FILE* backing isn't seekable — stdin is byte-stream-only and
-; vfiles maintain their own position via fopen mode. Real seekable
-; semantics is a future slice; for now these stubs let programs
-; including <stdio.h> link cleanly.
+; ---- fseek / ftell / rewind / clearerr / feof / ferror ----------------------
+; These were no-op stubs. They now do the real thing, because a stub
+; that returns a plausible-but-wrong answer is worse than one that
+; fails: `while (!feof(f))` against a feof() hardwired to 0 spins
+; forever, and an ftell() hardwired to 0 silently corrupts any
+; save-position/restore-position logic.
+;
+; FILE* is the raw DOS handle (see _fopen), so seeking is just
+; INT 21h AH=0x42 via _lseek — which is real. What was genuinely
+; missing was per-stream EOF/error state, since there is no FILE
+; struct to hold it. `_stdio_flags` supplies it: one byte per handle,
+; bit 0 = EOF, bit 1 = error.
+;
+; 256 entries covers every handle we can see — real DOS caps a
+; process at far fewer, and the dos_emu stdin/stdout/stderr sentinels
+; are 0xF0/0xF1/0xF2 (240-242), which fit. Anything outside the table
+; is treated as "no flags" rather than being allowed to scribble past
+; the end of it.
+        section .bss
+_stdio_flags:   resb 256                    ; per-handle: bit0 EOF, bit1 error
+        section .text
+
+; fseek(FILE *stream, long offset, int whence) -> 0 on success, -1 on error.
+; Clears EOF for the stream (C11 7.21.9.2p5) but preserves the error flag.
 _fseek:
-        ; Returns 0 for "success" — many programs use it for non-essential
-        ; seeks (e.g., rewinding before re-reading a config file). The
-        ; actual data-position is unaffected.
-        xor     eax, eax
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        mov     eax, [ebp + 8]              ; stream -> fd
+        cmp     eax, 255
+        ja      .fsk_call                   ; out of table range: skip flags
+        and     byte [_stdio_flags + eax], 0xFE   ; clear EOF, keep error
+.fsk_call:
+        push    dword [ebp + 16]            ; whence
+        push    dword [ebp + 12]            ; offset
+        push    dword [ebp + 8]             ; fd
+        call    _lseek
+        add     esp, 12
+        cmp     eax, -1
+        je      .fsk_err
+        xor     eax, eax                    ; success -> 0
+        jmp     .fsk_done
+.fsk_err:
+        mov     eax, [ebp + 8]
+        cmp     eax, 255
+        ja      .fsk_err_ret
+        or      byte [_stdio_flags + eax], 2     ; set error
+.fsk_err_ret:
+        mov     eax, -1
+.fsk_done:
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
         ret
+
+; ftell(FILE *stream) -> current position, or -1 on error.
+; lseek(fd, 0, SEEK_CUR) reports the position without moving it.
 _ftell:
-        ; Always 0 — programs that depend on this return value are
-        ; broken under our model and would need real seek.
-        xor     eax, eax
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    dword 1                     ; SEEK_CUR
+        push    dword 0                     ; offset 0
+        push    dword [ebp + 8]             ; fd
+        call    _lseek
+        add     esp, 12
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
         ret
+
+; rewind(FILE *stream) -> void. Seek to 0 AND clear both flags
+; (C11 7.21.9.5p2 — rewind clears the error indicator, fseek doesn't).
 _rewind:
+        push    ebp
+        mov     ebp, esp
+        push    dword 0                     ; SEEK_SET
+        push    dword 0                     ; offset 0
+        push    dword [ebp + 8]
+        call    _fseek
+        add     esp, 12
+        mov     eax, [ebp + 8]
+        cmp     eax, 255
+        ja      .rw_done
+        mov     byte [_stdio_flags + eax], 0     ; clear EOF and error
+.rw_done:
+        mov     esp, ebp
+        pop     ebp
         ret
+
+; clearerr(FILE *stream) -> void
 _clearerr:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        cmp     eax, 255
+        ja      .ce_done
+        mov     byte [_stdio_flags + eax], 0
+.ce_done:
+        mov     esp, ebp
+        pop     ebp
         ret
+
+; feof(FILE *stream) -> nonzero once a read has hit end-of-file.
+; Set by the read paths (_fgetc / _fread), not by lseek position.
 _feof:
-        ; Always 0 (not at EOF) — programs check feof after read; better
-        ; signal is read returning 0 / EOF directly.
-        xor     eax, eax
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        cmp     eax, 255
+        ja      .fe_none
+        movzx   eax, byte [_stdio_flags + eax]
+        and     eax, 1
+        mov     esp, ebp
+        pop     ebp
         ret
-_ferror:
+.fe_none:
         xor     eax, eax
+        mov     esp, ebp
+        pop     ebp
+        ret
+
+; ferror(FILE *stream) -> nonzero if a read/seek reported a DOS error.
+_ferror:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        cmp     eax, 255
+        ja      .ferr_none
+        movzx   eax, byte [_stdio_flags + eax]
+        and     eax, 2
+        mov     esp, ebp
+        pop     ebp
+        ret
+.ferr_none:
+        xor     eax, eax
+        mov     esp, ebp
+        pop     ebp
         ret
 _setbuf:
         ; setbuf(FILE*, char*) — buffering is a no-op (we write through).

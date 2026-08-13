@@ -372,6 +372,51 @@ def main() -> int:
         long_double_size=WATCOM_FLAT32.long_double_size,
     )
 
+    # The width flags feed the *frontend* (they reach ASTOptimizer, which
+    # const-folds sizeof), but codegen sizes types from its own
+    # CodeGenerator._BASIC_SIZES and never sees this config. When the two
+    # disagree the compiler does not fail — it silently emits code whose
+    # sizeof() contradicts its own storage layout. Measured with
+    # `--long 64`: sizeof(long) reported 8 while adjacent long locals sat
+    # 4 bytes apart, so any sizeof-driven memcpy or array stride
+    # overran by 2x, with no diagnostic.
+    #
+    # Refuse that combination instead of miscompiling. The check compares
+    # against codegen's real table rather than hardcoding a blocklist, so
+    # it stops complaining by itself the day codegen learns a width.
+    _cg_sizes = CodeGenerator._BASIC_SIZES
+    _width_mismatches = [
+        (flag, name, want, _cg_sizes[name])
+        for flag, name, want in (
+            ("--int", "int", type_config.int_size),
+            ("--long", "long", type_config.long_size),
+            ("--long-long", "long long", type_config.long_long_size),
+        )
+        if _cg_sizes[name] != want
+    ]
+    if type_config.ptr_size != 4:
+        _width_mismatches.append(("--ptr", "pointer", type_config.ptr_size, 4))
+    if _width_mismatches:
+        print(
+            "uc386: error: requested type widths are not supported by the "
+            "x86-32 code generator.",
+            file=sys.stderr,
+        )
+        for flag, name, want, have in _width_mismatches:
+            print(
+                f"  {flag}: sizeof({name}) would be {want}, but codegen "
+                f"lays out {name} as {have} bytes",
+                file=sys.stderr,
+            )
+        print(
+            "  sizeof() and storage would disagree, silently corrupting "
+            "sizeof-driven memcpy/stride.\n"
+            "  uc386 targets the Watcom flat-32 model: int 32, long 32, "
+            "long long 64, pointer 32.",
+            file=sys.stderr,
+        )
+        return 1
+
     input_paths = [Path(f) for f in args.input]
     for p in input_paths:
         if not p.exists():
