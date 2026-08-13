@@ -179,11 +179,19 @@ def build_uc386(addon: Path) -> int | None:
 
 
 def build_uc386_exe(addon: Path) -> int | None:
-    """Build via the .exe pipeline: uc386 → nasm OMF → wlink → MZ+LE PMODE/W .exe.
+    """Build via the .exe pipeline: uc386 → nasm OMF → upyle → MZ+LE .exe.
+
+    Passes extender="dos32a" EXPLICITLY. Do not drop that argument:
+    `build_exe`'s signature default is still "pmodew" (58c1f79 flipped
+    only the argparse default), so an unqualified call would measure
+    PMODE/W — a ~16.8 KB floor — while CI and every user of
+    `python -m addons.harness.exe` ship a ~32.8 KB DOS/32A binary. The
+    table would then understate the artifact people actually get.
 
     Returns the bound .exe size, or None if the toolchain isn't
-    available (no Watcom on macOS) or the build fails. Sizes are
-    larger than .bin because the PMODE/W stub (~11 KB) is bundled.
+    available (needs nasm + upyle; Open Watcom is NOT required) or the
+    build fails. Sizes are much larger than .bin because the DOS/32A
+    stub dominates every row — that stub, not our codegen.
     The honest comparator vs Watcom/DJGPP for FreeDOS deployment."""
     from addons.harness.exe import build_exe  # local import: optional dep
     out = REPO_ROOT / "build" / "compare" / addon.name
@@ -197,7 +205,7 @@ def build_uc386_exe(addon: Path) -> int | None:
     if proc.returncode != 0:
         return None
     exe_path = out / "uc386.exe"
-    ok, _msg = build_exe(asm_path, exe_path)
+    ok, _msg = build_exe(asm_path, exe_path, extender="dos32a")
     if not ok or not exe_path.exists():
         return None
     return exe_path.stat().st_size
@@ -340,10 +348,13 @@ def main() -> int:
           "- **uc386 (.exe)**: the real DOS-deployable artifact — ",
           "  same codegen, then `nasm -f obj` + the bundled ",
           "  pure-Python `upyle` linker emit an MZ+LE .exe with the ",
-          "  PMODE/W extender bound (~16 KB stub floor). Runs ",
+          "  **DOS/32A** extender bound (~32.8 KB stub floor — that ",
+          "  stub, not our codegen, dominates every row). Runs ",
           "  unmodified on FreeDOS / DOSBox / real DOS. Builds on ",
           "  **macOS too** (upyle needs no Open Watcom). **This is ",
-          "  the honest row to compare against Watcom and DJGPP.**",
+          "  the honest row to compare against Watcom and DJGPP.** ",
+          "  `--extender=pmodew` halves the floor (~16.8 KB) but ",
+          "  cannot do disk I/O on real DOS, so DOS/32A is default.",
           "- **gcc**: native host ELF (Linux/macOS) — *not a DOS ",
           "  target*. A sanity baseline only; ignore for DOS size.",
           "- **Watcom (`wcc386`)**: real Open Watcom V2, 32-bit ",
@@ -354,11 +365,14 @@ def main() -> int:
           "- **DJGPP**: COFF DOS executable for the go32 DPMI ",
           "  extender (gcc 12.2.0 cross, `-O2`). The full djgpp C ",
           "  runtime is baked in — explains the ~148 KB `true`.", "",
-          "Apples-to-apples (real DOS .exe): **uc386 .exe ≈ 17 KB**, ",
-          "**Watcom ≈ 5–8 KB**, **DJGPP ≈ 148–180 KB**. Watcom wins ",
-          "the floor (mature linker + tight DOS/4GW clib); uc386 ",
-          "beats DJGPP by ~9× and gcc-on-host by ~2×, and its .bin ",
-          "codegen floor (no extender) is far smaller still.", "",
+          "Apples-to-apples (real DOS .exe): **uc386 .exe ≈ 33 KB**, ",
+          "**Watcom ≈ 5–22 KB**, **DJGPP ≈ 148–182 KB**. Watcom wins ",
+          "the floor (mature linker + tight DOS/4GW clib) — ~6× on ",
+          "`true`, narrowing to ~1.6× on `wc`/`factor` as real code ",
+          "grows. uc386 beats DJGPP by ~4.5–5.5×; against host gcc ",
+          "the two are now comparable, and that column is a non-DOS ",
+          "baseline anyway. uc386's .bin codegen floor (no extender) ",
+          "is far smaller still.", "",
           "| Tool | uc386 (.bin) | uc386 (.exe) | gcc (host ELF) | Watcom wcc386 | DJGPP |",
           "|------|--------------|--------------|----------------|---------------|-------|"]
     for name, uc_sz, uc_exe_sz, gcc_sz, wcc_sz, djgpp_sz in rows:
