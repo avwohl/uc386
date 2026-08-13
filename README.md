@@ -4,19 +4,14 @@
 >
 > **The code in this repository is written by AI. No primate wrote it.**
 >
-> FreeDOS — the platform this compiler targets — has a
-> [No AI policy](https://www.freedos.org/about/devel/): *"We do not allow
-> AI for writing code… the code must be 100% written by a human."*
-> uc386 is the exact inverse of that policy, and says so at the top
-> rather than leaving anyone to find out later.
->
 > Code: AI. Documentation: AI. Deciding what to build, what is correct,
 > and what ships: primate.
 >
-> This is a disclosure, not a boast. Nothing below asks to be taken on
-> trust — every number is measured, the suites are public, and the whole
-> thing rebuilds from source. Run it yourself and judge the output, not
-> the byline.
+> Stated up front so nobody has to work it out later. This is a
+> disclosure, not a boast — and nothing below asks to be taken on trust.
+> Every number is measured, the suites are public, and the whole thing
+> rebuilds from source. Run it yourself and judge the output, not the
+> byline.
 
 C23 compiler targeting the Intel 386 (i386 / x86-32) processor under a
 DOS extender — specifically the **flat 32-bit Watcom / DOS/4GW-era** C
