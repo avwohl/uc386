@@ -1,10 +1,28 @@
 # uc386
 
+> ### 🤖 No Primate policy
+>
+> **The code in this repository is written by AI. No primate wrote it.**
+>
+> FreeDOS — the platform this compiler targets — has a
+> [No AI policy](https://www.freedos.org/about/devel/): *"We do not allow
+> AI for writing code… the code must be 100% written by a human."*
+> uc386 is the exact inverse of that policy, and says so at the top
+> rather than leaving anyone to find out later.
+>
+> Code: AI. Documentation: AI. Deciding what to build, what is correct,
+> and what ships: primate.
+>
+> This is a disclosure, not a boast. Nothing below asks to be taken on
+> trust — every number is measured, the suites are public, and the whole
+> thing rebuilds from source. Run it yourself and judge the output, not
+> the byline.
+
 C23 compiler targeting the Intel 386 (i386 / x86-32) processor under a
 DOS extender — specifically the **flat 32-bit Watcom / DOS/4GW-era** C
 that early-to-mid-1990s PC games were written in.
 
-**Status: working and released — `pip install uc386` (0.2.0 on
+**Status: working and released — `pip install uc386` (0.2.1 on
 [PyPI](https://pypi.org/project/uc386/)).** Measured
 against two reference suites under our DOS emulator (compile →
 assemble → run → diff): **215 / 220**
