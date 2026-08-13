@@ -374,8 +374,9 @@ Layered evidence:
   links cleanly under `nasm -f bin` to a ~169 KB `.bin`. Only
   externs remaining are dead libm names left in a string table
   (DCE doesn't strip those today).
-- **REPL smoke tests** (43 cases):
-  `addons/gnu/micropython/test_micropython_smoke.py` runs the bin
+- **REPL smoke tests** (43 cases): `test_micropython_smoke.py`
+  (paths in this section are pre-split and now live in the
+  freedos_micro_python repo, not `addons/gnu/micropython/`) runs the bin
   under dos_emu and pins: banner, clean Ctrl-D exit, arithmetic
   (`2+3` → `5`), assignment (`x = 5`), `pass`, named builtins
   (`__name__`), `print()` with real newlines, function def + call,
@@ -453,7 +454,7 @@ Triage progression as the slice unfolded:
   initializer — which is the same shape a real port-without-
   modules emits.
 
-See `addons/gnu/micropython/NOTES.md` for the path to a runnable
+See `NOTES.md` in the freedos_micro_python repo for the path to a runnable
 `micropython.bin` (`tools/makeqstrdefs.py` → real qstrdefs,
 write `ports/uc386-dos/` with INT-21h-backed `mp_hal_stdout_tx_strn`).
 

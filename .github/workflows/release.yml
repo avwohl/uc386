@@ -94,7 +94,7 @@ jobs:
           mkdir -p build/exe
           for d in addons/gnu/*/; do
             name=$(basename "$d")
-            case "$name" in _*|awk-bwk|gawk|micropython) continue ;; esac
+            case "$name" in _*|awk-bwk|gawk) continue ;; esac
             [ -f "$d/main.c" ] || continue
             python -m addons.harness.exe "$d/main.c" \
               -o "build/exe/$name.exe" 2>&1 | tail -2
@@ -104,22 +104,25 @@ jobs:
       - name: Build addon binaries (FOSS tarball)
         run: python -m addons.harness.package --version "${{ steps.ver.outputs.version }}" --foss-only
 
-      - name: Path A smoke — build a .exe via nasm + wlink
+      - name: Path A smoke — build a .exe via nasm + upyle
         # Validates `addons/harness/exe.py` end-to-end: uc386 → .asm,
-        # nasm → .obj (OMF), wlink → .exe (MZ+LE bound to CauseWay).
-        # If the pipeline breaks (NASM OMF surprise, wlink linkerd
+        # nasm → .obj (OMF), upyle → .exe (MZ+LE bound to DOS/32A,
+        # the default extender since 58c1f79 — no wlink involved).
+        # If the pipeline breaks (NASM OMF surprise, stub-binding
         # error, etc.) we want to know at release time, not at user-
         # report time. Target `true` (smallest in-tree addon) — its
         # main is `int main(void) { return 0; }`, no libc surface.
-        # `continue-on-error` because Phase 1 is best-effort: if
-        # wlink chokes on uc386's .obj, the tarball still ships.
-        continue-on-error: true
         run: |
           mkdir -p /tmp/exe-smoke
           python -m addons.harness.exe addons/gnu/true/main.c \
             -o /tmp/exe-smoke/true.exe
           ls -la /tmp/exe-smoke/true.exe
           file /tmp/exe-smoke/true.exe
+          # The .exe now ships in the FOSS tarball under exe/, so a
+          # silent failure here means shipping a tarball missing the
+          # artifact users are told to run on real DOS. Assert it.
+          file /tmp/exe-smoke/true.exe | grep -qi "DOS/32A" \
+            || (echo "FAIL: true.exe isn't DOS/32A-bound" && exit 1)
 
       - name: Build BWK awk
         # Bison 3.x's awkgram.tab.c output uses typedef chains that
@@ -138,22 +141,13 @@ jobs:
         if: success()
         run: python -m addons.harness.package --version "${{ steps.ver.outputs.version }}" --foss-only
 
-      - name: Build MicroPython binary (full Python REPL under dos_emu)
-        # Best-effort: the build is multi-TU + ~14 min wall-clock, so a
-        # uc386 regression here shouldn't block the rest of the
-        # release. The FOSS tarball ships scripts either way. The
-        # repackage step below picks up the binary if it built.
-        continue-on-error: true
-        run: |
-          cd addons/gnu/micropython
-          ./fetch.sh
-          ./build.sh > /dev/null  # produces genhdr/ stubs
-          ./build_port.sh
-          ls -la build/micropython.bin
-
-      - name: Repackage with micropython
-        if: success()
-        run: python -m addons.harness.package --version "${{ steps.ver.outputs.version }}" --foss-only
+      # The MicroPython port moved out to its own repo
+      # (github.com/avwohl/freedos_micro_python), so the build +
+      # repackage steps that lived here are gone: `addons/gnu/
+      # micropython/` no longer exists and the `cd` into it failed on
+      # every release, surviving only because it was
+      # continue-on-error. The follow-on repackage then re-ran
+      # package.py for nothing. CI for that port belongs in its repo.
 
       - name: Build games-scripts tarball
         run: python -m addons.harness.package --version "${{ steps.ver.outputs.version }}" --games-only
@@ -169,12 +163,12 @@ jobs:
           ./build.sh
           ls -la build/doom.bin
 
-      - name: Try doom.exe (PMODE/W bind)
+      - name: Try doom.exe (DOS/32A bind)
         # Speculative — feed doom.asm through the .exe pipeline and
-        # see if wlink links it cleanly. doom.bin works under
+        # see if upyle links it cleanly. doom.bin works under
         # dos_emu via libc INT 21h; the .exe path needs the bridge
         # stub's stream-fd fix + argv parsing (Path A Phases 6 + 7).
-        # If wlink chokes on missing externs or relocation issues,
+        # If linking chokes on missing externs or relocation issues,
         # the games tarball still ships the .bin.
         continue-on-error: true
         run: |
@@ -198,9 +192,9 @@ jobs:
         # see — paths inside the tarball, missing license files, the
         # tarball-mode bin lookup in the smoke tests. Extracts the
         # tarball, runs `python test_addons.py`, asserts every
-        # binary passes (16 manifest-driven + awk + micropython if
-        # they shipped). The tarball runner already returns rc=1 on
-        # any failure, so we just propagate that.
+        # binary passes (17 manifest-driven + awk if it shipped).
+        # The tarball runner already returns rc=1 on any failure, so
+        # we just propagate that.
         run: |
           mkdir -p /tmp/foss-smoke
           tar xzf dist/uc386-foss-addons-*.tar.gz -C /tmp/foss-smoke
@@ -240,17 +234,22 @@ jobs:
             Two release artifacts:
 
             - **`uc386-foss-addons-*.tar.gz`** — built FOSS binaries
-              + sources + a test runner. 16 utilities + BWK awk
-              (~107 KB) + MicroPython REPL (~169 KB) plus a per-addon
-              `src/` tree (manifest.toml + .c sources or fetch.sh /
-              build.sh) and `test_addons.py` that walks the manifests
-              and runs every binary under `uc386.dos_emu`. When a
-              built upstream-port binary ships (awk.bin,
-              micropython.bin), the matching upstream tree ships
-              under `src/<name>/upstream/` so every shipped binary
-              travels with its source. Source provenance: this repo
-              (GPL-3.0) + sbase upstream (MIT) + one-true-awk
-              (Lucent free license) + MicroPython (MIT).
+              + sources + a test runner. 17 utilities + BWK awk
+              (~107 KB), plus a per-addon `src/` tree (manifest.toml
+              + .c sources or fetch.sh / build.sh) and
+              `test_addons.py` that walks the manifests and runs
+              every binary under `uc386.dos_emu`. The top-level
+              `*.bin` files are flat-32 images for `dos_emu`; the
+              `exe/<name>.exe` variants are self-contained MZ+LE
+              executables with the DOS/32A extender bound in, and run
+              unmodified on FreeDOS / DOSBox / real DOS. When a built
+              upstream-port binary ships (awk.bin), the matching
+              upstream tree ships under `src/<name>/upstream/` so
+              every shipped binary travels with its source. Source
+              provenance: this repo (GPL-3.0) + sbase upstream (MIT)
+              + one-true-awk (Lucent free license).
+              (The MicroPython REPL now releases separately from
+              github.com/avwohl/freedos_micro_python.)
 
             - **`uc386-games-build-scripts-*.tar.gz`** — fetch +
               build scripts for Doom, Duke3D, Heretic, Hexen, ROTT,
