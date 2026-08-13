@@ -41,7 +41,7 @@ you `.c` → `.asm`. Add `pip install unicorn` to run the output under
 	pip install pytest unicorn upyle -e .
 	pytest tests/
 
-A clean run prints `460 passed, 1 skipped`.
+A clean run prints `490 passed, 1 skipped`.
 
 ## Required tools
 
@@ -185,13 +185,13 @@ bridge the Linux ABI.)
 ## Verifying the install
 
 	. .venv/bin/activate
-	pytest tests/ -q              # 460 passed, 1 skipped
+	pytest tests/ -q              # 490 passed, 1 skipped
 	python -m uc386.main examples/hello.c -o /tmp/hello.asm
 	nasm -f bin /tmp/hello.asm -o /tmp/hello.bin
 	python -c "from pathlib import Path; from uc386.dos_emu import run; print(run(Path('/tmp/hello.bin')).stdout)"
 
 That last line prints `Hello, DOS!`. If `pytest` reports
-`460 passed, 1 skipped`, the core install is healthy. The optional
+`490 passed, 1 skipped`, the core install is healthy. The optional
 tools only matter if you plan to build addons or run the comparison
 report.
 

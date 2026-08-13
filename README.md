@@ -4,7 +4,7 @@ C23 compiler targeting the Intel 386 (i386 / x86-32) processor under a
 DOS extender — specifically the **flat 32-bit Watcom / DOS/4GW-era** C
 that early-to-mid-1990s PC games were written in.
 
-**Status: working and released — `pip install uc386` (0.1.5 on
+**Status: working and released — `pip install uc386` (0.2.0 on
 [PyPI](https://pypi.org/project/uc386/)).** Measured
 against two reference suites under our DOS emulator (compile →
 assemble → run → diff): **215 / 220**
@@ -222,7 +222,7 @@ sudo apt-get install -y python3 python3-venv nasm    # Debian/Ubuntu
 git clone https://github.com/avwohl/uc386 && cd uc386
 python3 -m venv .venv && . .venv/bin/activate
 pip install pytest unicorn upyle -e .
-pytest tests/          # 460 passed, 1 skipped
+pytest tests/          # 490 passed, 1 skipped
 ```
 
 To co-develop the frontend or the optimizer, clone them as siblings

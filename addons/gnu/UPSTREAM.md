@@ -143,7 +143,7 @@ Two parallel tracks:
 
 1. **Add missing libc** — incrementally extend `lib/i386_dos_libc.asm`
    with shims for the most-needed functions, keeping the uc386 suite
-   (460 passed, 1 skipped) green, and no regression against the
+   (490 passed, 1 skipped) green, and no regression against the
    c-testsuite / gcc-c-torture corpora (see `../../README.md` for the
    current rates and `../../CLAUDE.md` for how to run them)
    green at every step. Items 1-6 of the original priority list are

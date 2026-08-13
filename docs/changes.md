@@ -21,7 +21,7 @@
 > - **Test counts don't transfer.** Entries cite "1329 uc386 unit
 >   tests". The peephole / asm-DCE / libc-split suites moved to the
 >   sibling `upeep386` package, so `pytest tests/` is now
->   *460 passed, 1 skipped*, and `pytest ../upeep386/tests` is *897*.
+>   *490 passed, 1 skipped*, and `pytest ../upeep386/tests` is *897*.
 > - **Two components left the tree.** The peephole optimizer and asm
 >   DCE now live in [upeep386](https://github.com/avwohl/upeep386);
 >   the MicroPython port moved to

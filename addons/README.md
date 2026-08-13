@@ -6,7 +6,7 @@ DPMI-era games, and DOS installers. The compiler itself lives in
 shelf.
 
 **Releases**: <https://github.com/avwohl/uc386/releases> (latest tag
-v0.1.5). `addons/harness/package.py` builds the tarballs:
+v0.2.0). `addons/harness/package.py` builds the tarballs:
 
 - the FOSS addon tarball — the in-tree GNU userland binaries
   (`.bin`, plus `.exe` variants under `exe/`) + BWK awk.
