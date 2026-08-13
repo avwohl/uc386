@@ -63,11 +63,17 @@ that bypasses LE-record parsing.
   fits. Real DOS users still couldn't run the binary directly
   (they'd need DOS/4GW + an LE wrapper, which is path A).
 
-**Path B first** is the right order: it gets dosiz running as a
-second uc386 runner this week, and feeds bug reports back into
-the codegen pipeline. Path A is the harder, longer payoff —
-real DOS compatibility — and benefits from whatever Path B
-shakes out first.
+**Resolved: Path A shipped, Path B was never needed.** The original
+plan was Path B first (quick win), but the `.exe` pipeline landed
+instead and turned out to subsume it — see
+[`path-a-mz-le.md`](path-a-mz-le.md). uc386 now emits real MZ+LE
+executables via `nasm -f obj` + the pure-Python `upyle` linker, and
+dosiz already loads those with its existing `load_exe_at` /
+`load_le_at` chain. No flat-binary loader was added to dosiz, and
+none is planned: Path A's output runs on real DOS too, which was
+always the larger payoff.
+
+The sections below are kept for the design record.
 
 ## Calling convention dosiz needs to honour
 
@@ -101,23 +107,33 @@ libc emits today):
 dosiz already implements all of the above (and more) — see
 `bridge.cc`'s INT 21h dispatch table.
 
-## Test integration sketch (once Path B lands)
+## How it actually works now
 
-	# addons/harness/run_under_dosiz.py
-	import subprocess, sys
-	from pathlib import Path
+`src/uc386/dosiz_run.py` is the dosiz-backed runner, with the same
+call shape as `dos_emu.run`. Select it per-process:
 
-	def run(bin_path: Path, argv: list[str], *, timeout: float = 10.0):
-	    cmd = ["dosiz", "--flat-bin", str(bin_path), *argv]
-	    p = subprocess.run(cmd, capture_output=True, timeout=timeout)
-	    return p.stdout, p.returncode
+	UC386_HARNESS=dosiz .venv/bin/pytest tests/
 
-Then `test_addons.py` grows a `--runner=dosiz` flag and the
-addons harness can compare the two runners' stdout / exit codes
-on every addon. Mismatches go straight into a bug report.
+Tests should `from uc386.harness import run` — `harness.py` reads
+`UC386_HARNESS` and dispatches to `dosiz_run.run` or `dos_emu.run`,
+so the toggle needs no per-test edits.
+
+It takes a ready-built `.exe`, or a flat `.bin` with a companion
+`.exe` at the same stem (`micropython.bin` → `micropython.exe`).
+Building that companion is the caller's job: the extender and stub
+choice is configuration the port owns, not the harness.
+
+`stdin_bytes`, `timeout_seconds`, `argv`, `env`, and `vfiles_init`
+carry over unchanged. `instruction_limit` (dosiz doesn't bound
+instruction count), `net` (no NetworkSimulator counterpart yet — the
+packet-driver / lwIP tests still need dos_emu), and `program_path`
+are ignored.
 
 ## Status
 
-- 2026-05-01: ask filed in `docs/addons.txt`. This document
-  captures the gap. Path B (flat-bin loader in dosiz) is the
-  next concrete piece of work.
+- 2026-05-01: ask filed in `docs/addons.txt`; this document captured
+  the gap and proposed Path B first.
+- **Superseded**: Path A (MZ+LE `.exe` output) landed instead, and
+  dosiz runs those directly. `dosiz_run.py` + `harness.py` provide
+  the second runner. The remaining gap is network simulation, which
+  has no dosiz equivalent.

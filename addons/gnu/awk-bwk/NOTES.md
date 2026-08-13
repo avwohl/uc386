@@ -51,12 +51,19 @@ stdin off NULL — see `docs/changes.md`).
 ## What doesn't work yet
 
 - `popen` / `pclose` are stubs that always fail; awk's `getline` from
-  a piped command always errors.
-- `system(cmd)` returns -1; `awk 'BEGIN { system("ls") }'` errors out.
+  a piped command always errors. (No pipe API on DOS without a shell
+  layer — see `i386_dos_libc.asm:4219`.)
 - Hex floats in input data (strtod doesn't parse `0x1p2`).
-- The exponent in `strtod` is lexed but not numerically applied —
-  `1e3` parses as `1` (decimal accumulator only). Affects awk-script
-  numeric literals AND input-data field-as-number coercion.
+
+Fixed since this was written:
+
+- ~~`system(cmd)` returns -1~~ — `system` is now a real
+  implementation: resolves `COMSPEC` (falling back to a default
+  path), builds a ` /C <cmd>` tail, and EXECs via INT 21h AH=0x4B,
+  reading the child's code back with AH=0x4D.
+- ~~exponent in `strtod` lexed but not applied~~ — verified applied:
+  `strtod("1e3")` is 1000.0, `strtod("2.5e2")` is 250.0, and
+  `strtod("1e-2")` is 0.01.
 
 ## Reproducing the build from scratch
 

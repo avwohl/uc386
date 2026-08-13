@@ -3,52 +3,91 @@
 uc386 runs on **Linux** and **macOS** with the same toolchain. The
 core driver is pure Python and produces NASM-syntax `.asm` text.
 NASM assembles it into a flat 32-bit binary that runs under
-`uc386.dos_emu` (Unicorn-backed) for testing.
+`uc386.dos_emu` (Unicorn-backed) for testing, or into a DOS `.exe`
+via the `addons/harness/` pipeline.
 
-## TL;DR
+## Just want the compiler?
+
+	pip install uc386
+	# plus nasm from your system package manager
+
+That pulls the frontend (`uc_core`, `uplox`) and the asm-level
+optimizer (`upeep386`) from PyPI automatically, and ships the DOS
+libc (`i386_dos_libc.asm`) and the `lib/include/` headers. It gives
+you `.c` → `.asm`. Add `pip install unicorn` to run the output under
+`dos_emu`, and `pip install upyle` plus a source checkout to build
+`.exe` files (see **Building `.exe` files** below).
+
+## TL;DR — source checkout
 
 	# Linux (Debian / Ubuntu)
-	sudo apt-get install -y python3 python3-venv nasm
+	sudo apt-get install -y python3 python3-venv nasm git
+	git clone https://github.com/avwohl/uc386 && cd uc386
 	python3 -m venv .venv && . .venv/bin/activate
-	pip install pytest unicorn "uc_core @ git+https://github.com/avwohl/uc_core@main" -e .
+	pip install pytest unicorn upyle -e .
 	pytest tests/
 
 	# macOS (Homebrew)
-	brew install python@3.12 nasm
+	brew install python@3.12 nasm git
+	git clone https://github.com/avwohl/uc386 && cd uc386
 	python3.12 -m venv .venv && . .venv/bin/activate
-	pip install pytest unicorn "uc_core @ git+https://github.com/avwohl/uc_core@main" -e .
+	pip install pytest unicorn upyle -e .
 	pytest tests/
 
 	# Fedora / RHEL (dnf)
-	sudo dnf install -y python3 python3-virtualenv nasm
+	sudo dnf install -y python3 python3-virtualenv nasm git
+	git clone https://github.com/avwohl/uc386 && cd uc386
 	python3 -m venv .venv && . .venv/bin/activate
-	pip install pytest unicorn "uc_core @ git+https://github.com/avwohl/uc_core@main" -e .
+	pip install pytest unicorn upyle -e .
 	pytest tests/
 
-A clean run prints `1329 passed`.
+A clean run prints `460 passed, 1 skipped`.
 
 ## Required tools
 
 	tool	purpose	apt	brew	dnf
-	python ≥ 3.11	driver + uc_core frontend	python3 python3-venv	python@3.12	python3 python3-virtualenv
+	python ≥ 3.10	driver + uc_core frontend	python3 python3-venv	python@3.12	python3 python3-virtualenv
 	nasm	assembler for emitted .asm	nasm	nasm	nasm
-	git	cloning uc_core	git	git	git
+	git	source checkout	git	git	git
 
 Notes:
 
 - **Python 3.12 is the recommended target.** uc_core uses
-  `dataclass(kw_only=True)` (added in 3.10); 3.11/3.12/3.13 all
+  `dataclass(kw_only=True)` (added in 3.10); 3.10 through 3.13 all
   work. Apple's system Python 3.9 is too old — install 3.12 from
   Homebrew on macOS.
-- **`uc_core` is a sibling project**, not yet on PyPI. Either
-  pip-install it from GitHub (as above), or — if you have a local
-  checkout at `../uc_core` — use `pip install -e ../uc_core`
-  instead.
+- **The sibling packages are all on PyPI** and resolve automatically:
+  `uc_core` (frontend), `uplox` (its parser generator), and
+  `upeep386` (peephole optimizer, asm DCE, libc splitter) are
+  declared dependencies of uc386.
+- **`upyle` is the exception.** It is the pure-Python OMF→MZ+LE
+  linker used by the `.exe` pipeline, which lives in `addons/` and
+  isn't packaged — so uc386 does not declare it. Install it
+  explicitly when you want `.exe` output.
+- ⚠️ **The repo is `pyle`; the package is `upyle`.** `pip install
+  upyle`, never `pip install pyle` — the bare name on PyPI belongs
+  to an unrelated project.
+- To **co-develop** a sibling, clone it next to uc386 and install
+  that one editable (`pip install -e ../uc_core`); the rest can stay
+  on PyPI. See `CLAUDE.md` for that layout.
+
+## Building `.exe` files
+
+The DOS-extender pipeline needs the source checkout (it lives in
+`addons/harness/`, not in the wheel), `nasm`, and `upyle`:
+
+	pip install upyle
+	python -m addons.harness.exe addons/gnu/true/main.c -o true.exe
+
+It defaults to the **DOS/32A** extender and needs no Open Watcom —
+`upyle` does the linking and ships a pre-bound stub. Open Watcom's
+`wlink` is required only for the `causeway` and `dos4g` extenders.
+See [`path-a-mz-le.md`](path-a-mz-le.md).
 
 ## Optional: building the addons
 
-The `addons/` tree (GNU utilities, BWK awk, MicroPython skeleton,
-period DOS games) needs additional tools.
+The `addons/` tree (GNU utilities, BWK awk, period DOS games) needs
+additional tools.
 
 	tool	for	apt	brew	dnf
 	bison	awk-bwk parser generator	bison	bison	bison
@@ -73,7 +112,7 @@ chain pattern that uc386 currently misparses when bison 3.x emits
 the parser table; bison 2.3 (Homebrew on the dev workstation,
 historical macOS default) avoids it. The release CI ships the
 FOSS tarball without awk-bwk if the build trips this. Use bison
-2.x if you want a guaranteed awk build; otherwise the 16 in-tree
+2.x if you want a guaranteed awk build; otherwise the in-tree
 GNU utilities still build fine.
 
 ## Optional: size-comparison column (`addons/results.md`)
@@ -109,7 +148,7 @@ macOS:
 
 ### OpenWatcom V2 (the period reference compiler)
 
-Linux:
+Linux — native build:
 
 	mkdir -p ~/.local/opt/watcom
 	curl -sL -o /tmp/watcom.bin \
@@ -119,27 +158,40 @@ Linux:
 	export INCLUDE=$WATCOM/h
 	export PATH="$WATCOM/binl64:$PATH"
 
-macOS: **no native build.** The Open Watcom V2 Current-build
-release ships dos/linux-x86/linux-x64/win/win16/os2 — but no
-macOS binary, and the linux-x64 build won't run on Darwin even
-under Rosetta (Rosetta translates x86_64 → arm64 user-space; it
-doesn't bridge the linux ABI). Either skip Watcom on the dev
-host (`compare.py` will leave the column empty) or run the
-size comparison through CI on a Linux runner. See
-`addons/harness/compare.py` for the candidate paths it walks.
-
 The Linux installer is an ELF wrapper around a regular ZIP; running it
 under `-i=u` floating-point-faults on some hosts. Unzipping the
 embedded archive directly (as above) avoids the installer entirely.
 
+macOS — **no native build**, so run the *DOS-hosted* toolchain under
+DOSBox-X. `addons/harness/watcom_dosbox.py` drives this automatically,
+and `compare.py` falls back to it, so the Watcom column stays
+*checked, not asserted* on a Mac. Roughly 99 MB extracted:
+
+	brew install dosbox-x
+	curl -sL -o /tmp/ow.exe \
+	  https://github.com/open-watcom/open-watcom-v2/releases/download/Current-build/open-watcom-2_0-c-dos.exe
+	mkdir -p ~/.local/opt/watcom-dos
+	unzip -q /tmp/ow.exe 'binw/*' 'h/*' 'lib386/dos/*' 'lib386/*.lib' \
+	  -d ~/.local/opt/watcom-dos
+
+It searches `$WATCOM_DOS_DIR`, then `~/.local/opt/watcom-dos`, then
+`/tmp/watcom`. (The Linux x64 build won't run on Darwin even under
+Rosetta — Rosetta translates x86_64 → arm64 user space, it doesn't
+bridge the Linux ABI.)
+
 ## Verifying the install
 
 	. .venv/bin/activate
-	pytest tests/ -q              # 1329 unit tests
+	pytest tests/ -q              # 460 passed, 1 skipped
 	python -m uc386.main examples/hello.c -o /tmp/hello.asm
 	nasm -f bin /tmp/hello.asm -o /tmp/hello.bin
-	python -c "from pathlib import Path; from uc386.dos_emu import run; print(run(Path('/tmp/hello.bin')))"
+	python -c "from pathlib import Path; from uc386.dos_emu import run; print(run(Path('/tmp/hello.bin')).stdout)"
 
-If `pytest` reports `1329 passed`, the core install is healthy.
-The optional tools only matter if you plan to build addons or
-run the comparison report.
+That last line prints `Hello, DOS!`. If `pytest` reports
+`460 passed, 1 skipped`, the core install is healthy. The optional
+tools only matter if you plan to build addons or run the comparison
+report.
+
+The peephole / asm-DCE / libc-split tests now live in the sibling
+package: `pytest ../upeep386/tests` prints `897 passed` against a
+checkout of [upeep386](https://github.com/avwohl/upeep386).

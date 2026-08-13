@@ -1,4 +1,4 @@
-# addons.txt — completion status (2026-05-01)
+# addons.txt — completion status (updated 2026-08-13)
 
 Status of each item in `docs/addons.txt`. The original 8 items
 from 2026-04-30 are still done; **3 new line-items** added by the
@@ -12,59 +12,77 @@ A second 2026-05-01 update added 3 more cross-cutting asks
 (mac→linux portability, ship-source-with-binary, dosiz as a
 test runner). Status:
 - **Mac→Linux install** ✓ — `docs/INSTALL.md` covers apt / brew /
-  dnf, `pyproject.toml` accepts Python ≥ 3.11, 1320 tests pass on
-  this Linux box.
+  dnf, `pyproject.toml` accepts Python ≥ 3.10, and `pytest tests/`
+  passes (460 passed, 1 skipped — the peephole / asm-DCE /
+  libc-split tests moved to the sibling `upeep386` package, which
+  is where the old ~1300 count went).
 - **Ship source with binary** ✓ — `addons/harness/package.py`
   no longer excludes `upstream/` from either tarball, so when the
   CI fetches + builds awk-bwk or doom, the matching upstream
   source tree ships alongside the binary.
 - **MZ+LE .exe output (Path A)** ✓ — uc386 produces self-contained
   `.exe` files via `addons/harness/exe.py`
-  (uc386 → nasm OMF → wlink → MZ+LE bound to PMODE/W). All seven
-  Path A phases verified end-to-end in CI: `true.exe` boots PMODE/W
+  (uc386 → nasm OMF → **upyle** → MZ+LE bound to **DOS/32A**; no
+  Open Watcom needed, so this works on macOS). All seven
+  Path A phases verified end-to-end in CI: `true.exe` boots
   + exits 0; `false.exe` exits 1; `myecho.exe hello dos` writes
   literal `hello dos\n` via libc fputs through real DOS handles;
   `argv_pr.exe alpha beta` prints `argc=3 / argv[1]='alpha' /
   argv[2]='beta'`; `factor.exe 2 12 60 97` emits multi-arg printf
   output (`2: 2 / 12: 2 2 3 / 60: 2 2 3 5 / 97: 97`) via the
   legacy in-asm format engine. The bridge stub handles three
-  PMODE/W ↔ uc386 mismatches: (1) stream sentinels (libc's
+  extender ↔ uc386 mismatches: (1) stream sentinels (libc's
   `_stdout=0xF1` was dos_emu-only; real DOS needs raw fd 1),
-  (2) argv parsing (PMODE/W puts the PSP selector in ES at entry
-  per the OpenWatcom CRT convention; the bridge reads `[es:0x80]`
-  for cmdline length and `[es:0x81..]` for the tail), and (3)
-  `_printf` now tail-jumps to `_printf_legacy` (real-DOS-safe
-  via INT 21h AH=02h per char). 14 in-tree manifest addons all
-  build .exe successfully. Full progression in
+  (2) argv parsing (the extender puts the PSP selector in ES at
+  entry per the OpenWatcom CRT convention; the bridge reads
+  `[es:0x80]` for cmdline length and `[es:0x81..]` for the tail),
+  and (3) `_printf` now tail-jumps to `_printf_legacy`
+  (real-DOS-safe via INT 21h AH=02h per char). All 17 in-tree
+  manifest addons build `.exe` successfully. Full progression in
   `docs/path-a-mz-le.md`.
-- **dosiz integration** ◐ — Path A makes the dosiz-side
-  flat-bin-loader gap moot for the FreeDOS case (.exe runs on
-  any DOS). dosiz can still be useful as a third runner for
-  differential testing — gap analysis stays in
-  `docs/dosiz-integration.md`.
+
+  PMODE/W was the original default and is still selectable with
+  `--extender=pmodew` (~16 KB smaller), but it **cannot do disk I/O
+  on real DOS** — its real-mode call path hangs on any DOS call
+  touching a physical sector. DOS/32A became the default in
+  `58c1f79` for that reason.
+- **dosiz integration** ✓ — Path A made the flat-bin-loader gap
+  moot: dosiz loads the `.exe` directly with its existing
+  MZ/LE chain. `src/uc386/dosiz_run.py` is the second runner and
+  `src/uc386/harness.py` selects it via `UC386_HARNESS=dosiz`.
+  The one remaining gap is network simulation, which has no dosiz
+  counterpart. See `docs/dosiz-integration.md`.
 
 ## ✓ Port GNU utilities to this compiler
 
-**Done.** 16 addons under `addons/gnu/` ship working binaries:
+**Done.** 17 addons under `addons/gnu/` ship working binaries, and
+`python -m addons.harness.build gnu all` reports **17/17 passed**
+against their manifests. Flat `.bin` bytes, re-measured 2026-08-13:
 
 | Addon | Source | Size (uc386 .bin) |
 |-------|--------|-------------------|
-| true | in-tree | 14 |
-| false | in-tree | 17 |
+| true | in-tree | 18 |
+| false | in-tree | 21 |
 | yes | in-tree | 74 |
 | echo | in-tree | 148 |
-| wc | in-tree | 233 |
-| dirname | in-tree | 420 |
 | head | in-tree | 419 |
+| dirname | in-tree | 420 |
 | basename | in-tree | 479 |
-| cat | in-tree | 512 |
-| factor | in-tree | 566 |
-| open_test | in-tree (smoke) | 580 |
-| strtol_test | in-tree (smoke) | 703 |
+| argv_probe | in-tree (smoke) | 501 |
+| cat | in-tree | 516 |
+| open_test | in-tree (smoke) | 668 |
 | tail | in-tree | 959 |
-| sbase-cat | sbase upstream | 1,167 |
-| sbase-tee | sbase upstream | 1,355 |
-| sbase-head | sbase upstream | 1,765 |
+| wc | in-tree | 1,557 |
+| factor | in-tree | 1,886 |
+| strtol_test | in-tree (smoke) | 2,131 |
+| sbase-cat | sbase upstream | 2,619 |
+| sbase-tee | sbase upstream | 2,803 |
+| sbase-head | sbase upstream | 3,113 |
+
+(The earlier revision of this table listed much smaller figures for
+`wc`, `factor`, and `strtol_test`; those predated later libc and
+codegen work and no longer reproduce. The numbers above match what
+`addons/harness/compare.py` writes into `results.md`.)
 
 **Plus BWK awk (one-true-awk):** 107 KB binary, 6K LoC of upstream
 C compiled verbatim through the entire uc386 pipeline. Runs
@@ -233,16 +251,20 @@ of artifact on both sides:
 - **Codegen floor (`.bin`, not shippable):** uc386 is in a class
   of its own — tens of bytes vs Watcom's multi-KB. Real, but it
   measures the code generator, not a deployable program.
-- **Real DOS executable (`.exe`):** uc386's PMODE/W-bound `.exe`
-  has a ~17 KB extender floor. **Open Watcom is ~2–3× smaller**
-  on tiny programs (`true` 5,420 vs 16,907; `echo` 11,286 vs
-  16,915) and roughly converges as code grows (`factor` 20,538
-  vs 16,989, `wc` 20,158 vs 16,928 — uc386 ahead). uc386's
-  *codegen* is tighter but its *DOS packaging* loses to Watcom's
-  mature DOS/4GW clib+linker on small binaries.
-- **vs DJGPP / gcc:** uc386 `.exe` beats DJGPP **~9×** (148–182 KB
-  go32+djgpp runtime) and host gcc **~2×** (gcc isn't a DOS
-  target anyway — sanity baseline only).
+- **Real DOS executable (`.exe`):** uc386's DOS/32A-bound `.exe`
+  has a **~32.8 KB extender floor** — every small program lands
+  within a few hundred bytes of it. **Open Watcom is smaller**:
+  ~6× on tiny programs (`true` 5,420 vs 32,847; `echo` 11,286 vs
+  32,855), narrowing to ~1.6× as code grows (`factor` 20,538 vs
+  32,925, `wc` 20,158 vs 32,868). uc386's *codegen* is tighter but
+  its *DOS packaging* loses to Watcom's mature DOS/4GW
+  clib+linker. Re-measured 2026-08-13 after DOS/32A became the
+  default; the older ~17 KB figures were PMODE/W builds, which
+  cannot do disk I/O on real DOS.
+- **vs DJGPP / gcc:** uc386 `.exe` beats DJGPP **~4.5–5.5×**
+  (148–182 KB go32+djgpp runtime). Against host gcc the two are
+  now comparable (gcc isn't a DOS target anyway — sanity baseline
+  only).
 
 Toolchain provenance (all on the dev macOS/arm64 host):
 
@@ -504,9 +526,15 @@ revealed 2 build.sh hard-coded `.venv/bin/python` paths (fixed)
 and an awk-bwk bison-3.x parser issue (made non-fatal in CI;
 real fix is uc_core typedef-chain at block scope).
 
-Total code shipped: 1320 unit tests passing, 220/220 c-testsuite
-(full mode), 1514/1514 gcc-c-torture, 16/16 addons, BWK awk
-fully functional. ~30 new libc symbols, ~5 new headers, 3 codegen
+Total code shipped (as of that 2026-05 release): 1320 unit tests
+passing, 220/220 c-testsuite (full mode), 1514/1514 gcc-c-torture,
+16/16 addons, BWK awk fully functional. **Those counts are a
+snapshot of their time** — the unit-test total is now 460 (+897 in
+the sibling `upeep386`) after the extraction, the addon count is
+17/17, and the current suite figures are 215/220 c-testsuite and
+1397/1514 gcc-c-torture as measured in `README.md`. The
+1514/1514 above was compile-only coverage of the corpus, not the
+execute-and-diff pass rate. ~30 new libc symbols, ~5 new headers, 3 codegen
 fixes (preprocessor multi-line comments, extern enum-in-VarDecl,
 asm DCE filters unused externs), 2 fixes downstream (`_start_stub`
 arg-push ordering, `assemble_and_run` cleanup-when-bundling-skipped).

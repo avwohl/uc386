@@ -10618,8 +10618,11 @@ class CodeGenerator:
           zeroed.
         - `char arr[N] = "..."` lays the string bytes out, appends a null
           terminator, and zero-fills any padding.
-        - Anything else is rejected — designated initializers and nested
-          {} for multidim arrays are still TODOs.
+        - Designated initializers (`{[2]=9, [0]=1}`) are handled here too:
+          `_infer_array_length_from_init` sizes the array as
+          max(designated index) + 1, and mixed forms walk a cursor that
+          jumps on each designator. Nested `{}` for multidim arrays works
+          via the brace-elider.
         """
         elem_type = arr_type.base_type
         elem_size = self._size_of(elem_type)

@@ -108,7 +108,9 @@ def package_foss(version: str) -> Path:
           README.md, LICENSE, SBASE-LICENSE, AWK-LICENSE
           test_addons.py           — runs <name>.bin under dos_emu
                                      against src/<name>/manifest.toml
-          <name>.bin                — built binaries (16 + awk)
+          <name>.bin                — built binaries (17 + awk)
+          exe/<name>.exe            — DOS/32A-bound .exe, when the
+                                      release pipeline built them
           src/<name>/manifest.toml  — argv / stdin / expected stdout
           src/<name>/*.c            — addon source
           src/_sbase_shim/util.{c,h}, LICENSE — shared sbase helpers

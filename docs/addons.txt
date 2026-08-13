@@ -1,3 +1,11 @@
+=== ORIGINAL REQUIREMENTS BRIEF — preserved verbatim, not a status doc ===
+This is the raw ask the addons work was scoped from. It is kept as the
+record of what was requested; it does NOT describe current state and
+some of its operational notes (the /loop cadence, the mac->linux move)
+are long since spent. For what actually got built and how far each item
+got, see addons/STATUS.md and addons/README.md.
+=========================================================================
+
 For /loop work as long you can on one session, hours are fine.
 For scheduling the next /loop start time use 1min (to start) but still think for as long as possible (hours)
  till next stop. Previously you tried two commbine these two different numbers (think time, wait time) into

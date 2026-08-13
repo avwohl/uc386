@@ -9,11 +9,14 @@ The suite has ~30K single-source tests grouped under `C/`. Each test
 has a `.reference_output` file with the expected stdout. Tests use
 `#ifdef` to handle 32 / 64-bit long differences.
 
-Like `run_ctests.py`, this defaults to `--compile-only` because the
-i386 assemble → link → run pipeline isn't wired yet. The full mode
-will compile, NASM-assemble, link with a (yet-to-be-built) DOS
-extender, run under dosemu/dosbox, and diff stdout against the
-reference output.
+Like `run_ctests.py`, this defaults to `--compile-only` — the suite is
+~30K tests and compiling alone is the fast signal. Pass `--full` to
+also NASM-assemble each test and run it under the unicorn-based
+`uc386.dos_emu` harness, diffing stdout against the reference output.
+
+(`--full` runs flat `.bin` images under dos_emu; it does not go
+through the DOS-extender `.exe` path, which lives in
+`addons/harness/exe.py` — see `docs/path-a-mz-le.md`.)
 """
 
 import argparse

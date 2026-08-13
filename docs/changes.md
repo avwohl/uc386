@@ -1,12 +1,40 @@
 # uc386 changes
 
-Slice-by-slice notes on the codegen, peephole, and pipeline work
-as it landed. Newest entries are at the bottom. The early entries
-cover Phase 4 (ints, pointers, control flow, types, struct/union/
-enum, va_list); Phase 5 (floats, _Complex, __int128); the c-testsuite
-and gcc-c-torture passes; and Phase A peephole.
+> ## ⚠️ Historical log — closed 2026-05-04. Not a feature reference.
+>
+> This is a slice-by-slice narrative of how the codegen, peephole, and
+> pipeline work landed between **2026-04-25 and 2026-05-04** (356
+> entries). **It stopped there.** Roughly 236 commits have touched
+> `src/` and `addons/` since — 95 of them `codegen.py` alone — and none
+> are recorded here. `git log` is the authority for anything after
+> 2026-05-04.
+>
+> **Do not read this file to find out what uc386 supports today.** Many
+> entries describe limitations that were later fixed (designated
+> initializers, VLAs, `offsetof` designators, wide literals, 64-bit
+> shifts). For current state use:
+> - `../CLAUDE.md` — the codegen contract
+> - `../STANDARD_C_BACKLOG.md` — what genuinely remains
+> - `../README.md` — measured suite results
+>
+> Two other caveats when reading old entries:
+> - **Test counts don't transfer.** Entries cite "1329 uc386 unit
+>   tests". The peephole / asm-DCE / libc-split suites moved to the
+>   sibling `upeep386` package, so `pytest tests/` is now
+>   *460 passed, 1 skipped*, and `pytest ../upeep386/tests` is *897*.
+> - **Two components left the tree.** The peephole optimizer and asm
+>   DCE now live in [upeep386](https://github.com/avwohl/upeep386);
+>   the MicroPython port moved to
+>   [freedos_micro_python](https://github.com/avwohl/freedos_micro_python).
+>   Entries here still refer to them as in-tree.
+>
+> Ordering is *mostly* oldest-first, but the final block (from the
+> 2026-05-04 entry onward) is reverse-chronological, so the newest
+> entry is **not** the last line.
 
-For the codebase contract and operating notes, see ../CLAUDE.md.
+The early entries cover Phase 4 (ints, pointers, control flow, types,
+struct/union/enum, va_list); Phase 5 (floats, _Complex, __int128); the
+c-testsuite and gcc-c-torture passes; and Phase A peephole.
 
 ----
 

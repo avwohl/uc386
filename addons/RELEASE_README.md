@@ -12,7 +12,8 @@ emulator that initialises EAX=argc / EBX=&argv[0]).
 
 ```
 uc386-foss/
-  *.bin             ← 16 utility binaries + awk.bin
+  *.bin             ← 17 utility binaries + awk.bin (flat-32 images)
+  exe/<name>.exe    ← the same programs as real DOS executables
   src/<name>/       ← per-addon: manifest.toml + sources
   src/_sbase_shim/  ← shared sbase headers (used by sbase-cat etc.)
   src/awk-bwk/      ← BWK awk fetch.sh / build.sh / NOTES
@@ -48,10 +49,18 @@ run them:
    `src/<name>/manifest.toml`. The runner compares stdout + exit
    code to those fields.
 
-3. **DOS / DOSBox** — the binaries are flat-32 with a uc386
-   `_start_stub` entry, not COM/EXE format. They run under
-   `dos_emu` natively; for real DOS you'd need a flat-32 loader
-   shim (out of scope for this tarball).
+3. **DOS / DOSBox / real hardware** — use `exe/<name>.exe`. Those
+   are self-contained MZ+LE executables with the DOS/32A extender
+   bound in, and run unmodified on FreeDOS, DOSBox, dosiz, and real
+   DOS:
+
+   ```sh
+   dosbox exe/echo.exe
+   ```
+
+   The top-level `*.bin` files are flat-32 images with a uc386
+   `_start_stub` entry, **not** COM/EXE format — those only run
+   under `dos_emu` or a custom loader.
 
 ## Rebuild from source
 
@@ -64,12 +73,16 @@ compile it through uc386.
 
 ```sh
 git clone https://github.com/avwohl/uc386
-cd uc386 && python3.12 -m venv .venv && .venv/bin/pip install -e .
+cd uc386 && python3.12 -m venv .venv
+.venv/bin/pip install pytest unicorn upyle -e .
 
 # Then for any in-tree addon: drop its sources + manifest into
 # addons/gnu/<name>/ in the uc386 checkout (or replace this
 # tarball's sources back into a checkout) and run:
-.venv/bin/python -m addons.harness.build gnu --all
+.venv/bin/python -m addons.harness.build gnu all
+
+# ...and to rebuild the .exe variants:
+.venv/bin/python -m addons.harness.exe addons/gnu/echo/main.c -o echo.exe
 ```
 
 For the upstream awk port:
@@ -95,6 +108,7 @@ cd src/awk-bwk
 | basename    | in-tree        | strip dir + suffix                            |
 | dirname     | in-tree        | strip last path component                     |
 | factor      | in-tree        | trial-division prime factorisation            |
+| argv_probe  | in-tree        | smoke for argc/argv delivery                  |
 | open_test   | in-tree        | smoke for fopen/fread                         |
 | strtol_test | in-tree        | smoke for strtol parsing                      |
 | sbase-cat   | sbase upstream | via `_sbase_shim/util.c`                      |
@@ -104,8 +118,8 @@ cd src/awk-bwk
 
 ## Licenses
 
-- **In-tree addons** (basename, cat, dirname, echo, factor, false,
-  head, open_test, strtol_test, tail, true, wc, yes): GPL-3.0
+- **In-tree addons** (argv_probe, basename, cat, dirname, echo,
+  factor, false, head, open_test, strtol_test, tail, true, wc, yes): GPL-3.0
   (matches the parent uc386 repo). See `LICENSE`.
 - **sbase-cat / sbase-head / sbase-tee**: ISC (sbase upstream
   license). See `SBASE-LICENSE` and `src/_sbase_shim/LICENSE`.

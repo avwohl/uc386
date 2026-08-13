@@ -25,7 +25,9 @@ load + consumers). They're best tackled as scoped feature tasks, not
 in-session one-liners. Precise per-item findings recorded below so
 each is resumable without re-triage.
 
-## Remaining genuine standard-C items (~30)
+## Remaining items (~8 tests, all features or GNU extensions)
+
+No standard-C codegen singletons remain — see the two sections below.
 
 ### Fixed this campaign
 
@@ -37,7 +39,7 @@ each is resumable without re-triage.
 | ~~20020508-3.c~~, ~~pr40386.c~~ | `9b0f255` (uc386) | `_ll_shift_const` signed `>>` `s≥32` w/ `big_half_in_eax`: EDX caller-unspecified, `sar edx,31` sign-replicated garbage. Seed `mov edx,eax` first. |
 | ~~20020904-1.c~~ (PR c/7102) | `34d45ab` (uc386) | `(u8)255` (u8=typedef unsigned char) emitted `movsx`; `_cast` target stayed `BasicType(name='u8',is_signed=None)`. Resolve typedef via `_resolve_typedef_name` before movzx/movsx. |
 | ~~bitfld-4.c~~ | `2ee96e4` (uc_core) | `_optimize_unary` folded `-123U`→bare `4294967173`→long long → 64-bit compare mismatch. `make_int_lit(result, unsigned=int_flags(operand)[2])` for `-`/`+`/`~`. |
-| ~~20060412-1.c~~ | (uc_core, pending) | DSE: auto-AST splits `Member`(`.`)/`ArrowMember`(`->`); `_expr_references_var`/`_expr_has_pointer_or_call` only matched `ast.Member`(+stale `.is_arrow`), so `p=&t; p=&((T*)p)->m[0];` dropped `p=&t`. Added `_MEMBER`; `ArrowMember`=deref. |
+| ~~20060412-1.c~~ | `1851278` (uc_core) | DSE: auto-AST splits `Member`(`.`)/`ArrowMember`(`->`); `_expr_references_var`/`_expr_has_pointer_or_call` only matched `ast.Member`(+stale `.is_arrow`), so `p=&t; p=&((T*)p)->m[0];` dropped `p=&t`. Added `_MEMBER`; `ArrowMember`=deref. |
 | ~~pr49039.c~~, ~~conversion.c~~ | (cascaded) | recovered by the fold-unsignedness / LL-shift fixes; verified PASS. |
 
 ### Remaining genuine standard-C codegen singletons
@@ -59,11 +61,13 @@ by per-test triage; not claimed as passing.
 | ~~970217-1~~ | **FIXED** (uc_core) | C99 6.7.6.3p7/6.9.1p10 VMT-parameter side effect: `sub(int i, int array[i++])` must evaluate `i++` on entry (i→11). The size expr survives as `pt.size_expr` on the array `ResolvedType`; only `_decay_for_param` dropped it when collapsing to a pointer. `_fd_params` now collects the non-`IntLiteral` dimension exprs down the array chain into `_ParamView.size_side_effects` (purely additive — that field was vestigial; uc386 codegen read-sites 3645/3846/4004 already consume it; uc80/uplm80 ignore it). `_sub` now emits `inc [esp+4]` then returns 11. |
 | ~~20040411-1~~ | **FIXED** (uc386) | C99 VLA-typedef `sizeof`. `sizeof(<typedef-name>)` passed an unresolved `TypeName(TypedefNameSpec('c'))` to `_emit_runtime_size_of` → `_type_has_vla` False → static `mov eax,4`. Now resolve the typedef (TypeName→legacy; typedef-name→`_resolve_typedef_name`→`resolved_to_legacy`) at the top of `_emit_runtime_size_of`, so a VLA typedef routes through the runtime path (cf. `_cast` fix `34d45ab`). Gated by `_is_genuine_vla_array` (`aa9dc2c`) so only a genuine — non-const-foldable — VLA array typedef is adopted; constant/struct typedefs keep the byte-identical pre-fix static path (the unguarded `f9d8fe4` mis-routed those into the runtime path → compile regression, caught by the sweep). *Known limitation:* re-evaluates the size expr at the `sizeof` site, not C99 6.7.7p2 evaluate-once-at-typedef-decl — correct whenever the size operands are unmodified between typedef and `sizeof` (the normal case + what the test exercises). |
 | ~~20041218-2~~ | **FIXED** (uc386) | C99 VMT-in-struct `sizeof` evaluate-once (6.7.7p2): `struct s{char b[n];}; n++; sizeof(struct s)` must be 123 not 124. The `_capture_struct_vla_member_sizes` machinery only fired for `ast.StructDecl`; an in-function `struct s{…};` is `ast.Declaration`+`StructDef`. Wired capture into the `_collect_locals` Declaration/StructDef branch (run on a `SimpleNamespace` shim of `st`, *before* `_resolve_struct_name` so the registered member ArrayType carries `Identifier(slot)`; stash on the Declaration node) and the eval+store into `_lower_declaration` (at the decl point, before later mutation). Also generalised `_is_genuine_vla_array` to recurse `StructType` members so a struct-VMT typedef is adopted for the runtime-sizeof path while const-foldable struct typedefs stay static (keeps the `aa9dc2c` regression fix). The `_collect_locals` wiring is gated on a genuine-VLA member check (`_const_eval`, not the weak `_try_simple_int_fold`) so a constant member (`int a[ENUM]`, `char b[sizeof T]`) is *not* slot-captured — caught by the sweep as a +4 compile regression first, then gated. |
-| pr23467, 20010904-1, 20010904-2 | GNU ext | `__attribute__((aligned(N)))` type-alignment in struct layout/sizeof/stride — multi-site, non-standard. |
+| pr23467, 20010904-1, 20010904-2 | GNU ext | `__attribute__((aligned(N)))` type-alignment in struct layout/sizeof/stride — multi-site, non-standard. **Parsed but silently ignored**: `struct __attribute__((aligned(16))) A { int x; }` compiles and reports `sizeof == 4`, not 16. Wrong answer rather than a diagnostic — the risk if period headers rely on it. |
 | 20020227-1 | C99 `_Complex` | `__complex__ float` member codegen — full complex feature. |
 | 960830-1, pr49279 | GNU ext | extended inline `__asm__` with operand constraints. |
 | eeprof-1 | GNU ext | `-finstrument-functions` / `__cyg_profile_func_*`. |
 | pr28982b | edge | 0x80100-byte by-value struct / stack frame — large-frame, not codegen. |
+| (not a torture test) | **silently wrong** | `--int` / `--long` / `--long-long` / `--ptr` change `sizeof` but not storage or arithmetic width. `--long 64` reports `sizeof(long)==8` while adjacent `long` locals stay 4 bytes apart, so any `sizeof`-driven `memcpy`/stride overruns 2× with no diagnostic. Only the defaults are sound. Fix the widths or reject non-default values. |
+| (not a torture test) | **silently wrong** | stdio `FILE*` layer is no-op stubs (`i386_dos_libc.asm:4142`): `feof` never reports EOF, `fseek` doesn't seek, `ftell` returns 0, `strerror` ignores `errno`. `while (!feof(f))` hangs. POSIX `open`/`read`/`lseek` are real. |
 
 ## Out of scope / excluded (do not count as standard-C bugs)
 - Nested functions / `__label__` (GCC ext, needs closure conversion +

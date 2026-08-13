@@ -1,30 +1,34 @@
 #!/usr/bin/env python3
 """Pipeline: uc386 .asm → MZ+LE .exe that runs on FreeDOS / DOSBox / dosiz.
 
-Today this orchestrates external tools rather than emitting the LE
-format directly:
-
     1. NASM (`-f obj`) turns uc386's NASM-syntax .asm into a 32-bit
        OMF (Object Module Format) .obj file. NASM's OMF backend
        produces Watcom-compatible objects with USE32 segments.
 
-    2. Open Watcom's `wlink` consumes the .obj and produces an MZ+LE
-       executable. The `system causeway` directive bundles the
-       CauseWay DOS extender (~10 KB free stub) into the .exe so the
-       result runs unmodified on FreeDOS / DOSBox / dosiz / real DOS,
-       no separate `dos4gw.exe` redistribution required.
+    2. `upyle` — our pure-Python OMF→MZ+LE linker — consumes that
+       .obj plus the bridge .obj and binds a DOS extender stub as the
+       MZ portion with the LE payload appended. The result runs
+       unmodified on FreeDOS / DOSBox / dosiz / real DOS, with no
+       separate `dos4gw.exe` redistribution.
+
+The default extender is **DOS/32A**, and upyle ships a pre-bound
+stub, so no flag is needed. `--extender=pmodew` produces a ~16 KB
+smaller .exe but PMODE/W's real-mode call path hangs on any DOS call
+that touches a physical sector — it cannot do disk I/O on real DOS.
+Both of those go through upyle.
+
+Open Watcom's `wlink` is OPTIONAL and used only for the `causeway`
+and `dos4g` extenders. Because the default path needs no Watcom, the
+.exe pipeline works on macOS, where no native Open Watcom build
+exists.
 
 The pipeline isn't free of caveats — uc386's libc was written
 assuming flat-bin layout under dos_emu (INT 21h calls reach our
-Python harness directly). Under DOS/4GW or CauseWay those same
-INT 21h calls get reflected back to real-mode DOS by the extender,
-which means the *extender* loads our binary — so its protected-mode
-stack, segment selectors, and PSP are owned by the extender.
-
-Watcom availability: Linux + Windows have native builds. macOS does
-not (per the comment in `compare.py`). On macOS the function returns
-None and the harness must skip — `compare.py` does this for the same
-reason.
+Python harness directly). Under a real extender those same INT 21h
+calls get reflected back to real-mode DOS, which means the *extender*
+loads our binary — so its protected-mode stack, segment selectors,
+and PSP are owned by the extender. The bridge stub below reconciles
+that (real stdio handles, argv from the PSP via ES).
 
 Usage:
     python -m addons.harness.exe addons/gnu/echo/main.c -o echo.exe
@@ -32,8 +36,8 @@ Usage:
 After build, the .exe runs under DOSBox:
     dosbox echo.exe
 
-Or under dosiz (`../dosiz/dosiz echo.exe` once the LE-loader is
-wired up — see `docs/dosiz-integration.md`).
+See `docs/path-a-mz-le.md` for the full design and the debugging
+notes behind the bridge.
 """
 from __future__ import annotations
 
@@ -49,25 +53,27 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 LIB_INCLUDE = REPO_ROOT / "src" / "uc386" / "lib" / "include"
 
 
-# The PMODE/W bridge stub. Linked into every .exe build; provides:
+# The bridge stub (the `_pmodew_` symbol prefix is historical — it runs
+# under DOS/32A too). Linked into every .exe build; provides:
 #   - Real DOS handles (0/1/2) for stdin/stdout/stderr (libc's
 #     0xF0/F1/F2 dos_emu sentinels are stripped by the asm rewriter).
 #     Without this, fputs/fwrite/printf via INT 21h AH=0x40 silently
 #     drop output (BX=0xF1 is an invalid DOS handle).
-#   - argv setup: argc=1 + argv[0]="program" placeholder. PMODE/W
-#     doesn't pass argc/argv in any register and its protected-mode
-#     PSP doesn't carry the cmdline tail at PSP+0x80. Reading the
-#     real cmdline requires Watcom CRT internals — see Phase 7
-#     section of docs/path-a-mz-le.md for the full failure log.
+#   - Real argv. The extender leaves the PSP selector in ES at entry,
+#     so the bridge reads the cmdline length at [es:0x80] and the tail
+#     at [es:0x81..], copies it to a flat-DS buffer, and tokenizes on
+#     space/tab/CR. argv[0] comes from the environment block when
+#     available, else a "program" placeholder. Exercised by the
+#     argv_probe addon. See the Phase 7 / engineering notes in
+#     docs/path-a-mz-le.md for the six approaches that failed first —
+#     the rule is to USE the ES the extender gives you, never to load
+#     a different selector into it.
 #
-# Programs that don't read argv work cleanly. Programs that do see
-# argc=1 + a placeholder argv[0].
 # The bridge prints a diagnostic marker at each startup step
 # ([bridge-entered], [mp-...], [esp]=...). They were indispensable while
-# getting PMODE/W entry working and docs/WIP.md still refers to them by
-# name, but in a shipped binary they land on the program's own stdout —
-# roughly twenty lines before a script produces its first byte of
-# output.
+# getting extender entry working, but in a shipped binary they land on
+# the program's own stdout — roughly twenty lines before a script
+# produces its first byte of output.
 #
 # Off by default; set UC386_BRIDGE_MARKERS=1 (or pass
 # --bridge-markers) to get them back. Marker DATA is always emitted so

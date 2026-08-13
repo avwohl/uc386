@@ -3,62 +3,92 @@
 The trivial in-tree utilities (`true`, `false`, `cat`, `echo`, `head`,
 `tail`, `wc`, `yes`, `basename`, `dirname`) demonstrate that uc386 +
 the dos_emu runtime can build POSIX-flavored userland from scratch.
-Porting real GNU coreutils / gawk source unmodified is the next step
+Porting real upstream source unmodified is now partly done —
+`sbase-cat` / `sbase-head` / `sbase-tee` and BWK awk build from
+upstream trees — and a broader coreutils / gawk sweep remains
 (addons.txt items 1-5).
 
 ## Libc gaps for upstream code
 
-Functions GNU code commonly assumes that uc386's libc does **not**
-yet provide:
+Most of the original gap list has since been filled. Verified
+against `lib/i386_dos_libc.asm` on 2026-08-13, the functions GNU
+code commonly assumes that uc386's libc **still does not provide**:
 
-- `getenv` / `setenv` / `putenv` — no environment under dos_emu
-- `strtol` / `strtoul` / `strtoll` (only `atoi` exists)
-- `strerror` + the `errno` global (libc has no errno mechanism yet)
-- `fflush`, `setbuf`, `ungetc`, `feof`, `ferror`
-- `fseek` / `ftell` / `rewind` / `clearerr`
-- `system` (no shell under dos_emu)
+- `setenv` / `putenv` — `getenv` exists (reads the real PSP env
+  block); writing it does not
 - `getopt` / `getopt_long` (gnulib brings its own; needs porting)
-- `unlink` / `rename` / `mkdir` / `rmdir` / `stat` / `access`
-- `time` / `gettimeofday` / `clock`
-- `realloc` (we have `malloc` / `free` / `calloc`)
-- `strdup` / `strndup` / `strcasecmp` / `strncasecmp` / `strpbrk`
-- `qsort_r`, `bsearch`
-- `regex.h` (BRE/ERE) — needed by `sed`, `grep`, `awk`, `ed`
+- `time` / `gettimeofday` — `clock` exists
+- `strtok`, `strspn`, `strcspn`, `strpbrk`, `strndup`
+- `vsnprintf` — `snprintf` exists, the `va_list` form does not
+- `qsort_r` — plain `qsort` and `bsearch` exist
+- `regex.h` (BRE/ERE) — needed by `sed`, `grep`, gawk, `ed`.
+  Still the single biggest item.
 
-Functions we **do** have (per `lib/i386_dos_libc.asm`): `puts`,
-`putchar`, `printf`, `snprintf`, `fprintf`, `sprintf`, `fputs`,
-`fputc`, `fgetc`, `fgets`, `fread`, `fwrite`, `fopen`, `fclose`,
-`getchar`, `getc`, `read`, `write`, `open`, `creat`, `link`,
-`malloc`, `calloc`, `free`, `memcpy`, `memmove`, `memset`, `memcmp`,
-`memchr`, `mempcpy`, `strlen`, `strcpy`, `strncpy`, `strcat`,
-`strncat`, `strcmp`, `strncmp`, `strchr`, `strrchr`, `strstr`,
-`isalpha`, `isdigit`, `isspace`, `tolower`, `toupper`, `atoi`,
-`abs`, `labs`, `llabs`, `signal`, `raise`, `setjmp`, `longjmp`,
-`qsort`, `exit`, `abort`, `perror`, `tmpnam`, `remove`, math
-(`sin`, `cos`, `sqrt`, `pow`, `floor`, `ceil`, `fabs`).
+⚠️ **Present but non-functional — these link and then lie.** They
+are deliberate no-op stubs (`i386_dos_libc.asm:4142`, "no-op
+stubs"). Nothing diagnoses their use; the program just misbehaves:
+
+| Symbol | Actual behaviour |
+|---|---|
+| `fseek` | returns 0 ("success"), **does not seek** |
+| `ftell` | always returns 0 |
+| `rewind` / `clearerr` | no-op |
+| `feof` | **always 0 — never reports EOF** |
+| `ferror` | always 0 |
+| `setbuf` / `setvbuf` | no-op (output is unbuffered) |
+| `strerror` | one fixed string, ignores `errno` |
+
+`while (!feof(f))` therefore never terminates, and any
+seek-and-report-position logic is silently wrong. Use the POSIX
+layer (`lseek`, `read`, `write`) when position actually matters —
+those are real. `fflush` returning 0 is honest: output is
+write-through, so there is nothing to flush.
+
+**Genuinely filled since this document was first written** (real
+INT 21h implementations, not stubs): `getenv`, `strtol` /
+`strtoul` / `strtoll`, `errno`, `ungetc`, `system` (AH=0x4B via
+COMSPEC), `unlink`, `rename`, `mkdir`, `rmdir`, `stat`, `access`,
+`clock`, `realloc`, `strdup`, `strcasecmp`, `strncasecmp`,
+`bsearch`, `lseek`, `close`.
+
+Also present: `puts`, `putchar`, `printf`, `snprintf`, `fprintf`,
+`sprintf`, `fputs`, `fputc`, `fgetc`, `fgets`, `fread`, `fwrite`,
+`fopen`, `fclose`, `getchar`, `getc`, `read`, `write`, `open`,
+`creat`, `link`, `malloc`, `calloc`, `free`, `memcpy`, `memmove`,
+`memset`, `memcmp`, `memchr`, `mempcpy`, `strlen`, `strcpy`,
+`strncpy`, `strcat`, `strncat`, `strcmp`, `strncmp`, `strchr`,
+`strrchr`, `strstr`, `isalpha`, `isdigit`, `isspace`, `tolower`,
+`toupper`, `atoi`, `atol`, `atof`, `abs`, `labs`, `llabs`,
+`signal`, `raise`, `setjmp`, `longjmp`, `qsort`, `exit`, `abort`,
+`perror`, `tmpnam`, `remove`, math (`sin`, `cos`, `sqrt`, `pow`,
+`floor`, `ceil`, `fabs`).
 
 ## Strategy
 
 Two parallel tracks:
 
 1. **Add missing libc** — incrementally extend `lib/i386_dos_libc.asm`
-   with shims for the most-needed functions, keeping all 1320 unit
-   tests + 220 c-testsuite + 1514 gcc-c-torture green at every step.
-   Priority:
-   1. `getenv` (returns NULL — empty environment) — unlocks any code
-      that reads env vars optionally
-   2. `errno` global + `strerror` (returns static "Unknown error")
-   3. `strtol` / `strtoul` (full C99 with base, endptr, optional sign)
-   4. `fflush` (no-op — we write immediately)
-   5. `strdup` (calls `malloc` + `strcpy`)
-   6. `unlink` / `rename` (route to dos_emu vfile system)
-   7. `getopt` (rolled in C, ~50 lines)
-   8. `regex.h` — biggest item. Either port `regcomp`/`regexec`
+   with shims for the most-needed functions, keeping the uc386 suite
+   (460 passed, 1 skipped) green, and no regression against the
+   c-testsuite / gcc-c-torture corpora (see `../../README.md` for the
+   current rates and `../../CLAUDE.md` for how to run them)
+   green at every step. Items 1-6 of the original priority list are
+   done; what's left, in order:
+   1. `strtok` / `strspn` / `strcspn` / `strpbrk` — small, and a
+      surprising amount of upstream string code wants them
+   2. `getopt` (rolled in C, ~50 lines)
+   3. `vsnprintf` (refactor `snprintf`'s core to take a `va_list`)
+   4. `time` / `gettimeofday` (INT 21h AH=2Ah/2Ch)
+   5. `setenv` / `putenv` — needs a writable copy of the env block
+   6. `regex.h` — biggest item. Either port `regcomp`/`regexec`
       from glibc (~3000 lines) or use `re_search` / Spencer's regex.
 
-2. **Pick small upstream targets** — start with single-file utilities
-   that have minimal gnulib dependencies:
-   - `tee` (~150 lines, only stdio)
+2. **Pick small upstream targets** — single-file utilities with
+   minimal gnulib dependencies. **Three have landed**: `sbase-cat`,
+   `sbase-head`, and `sbase-tee` build verbatim from
+   [sbase](https://git.suckless.org/sbase) upstream via the shared
+   `_sbase_shim/util.c`, and BWK awk compiles ~6 KLoC of upstream C
+   unmodified. The shim pattern is the template for the rest:
    - `nl` (~300 lines, line numbering)
    - `sum` / `cksum` (~200 lines each)
    - `tac` (reverse cat — uses `mmap` under coreutils, simpler

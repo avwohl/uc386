@@ -4,7 +4,8 @@ C23 compiler targeting the Intel 386 (i386 / x86-32) processor under a
 DOS extender — specifically the **flat 32-bit Watcom / DOS/4GW-era** C
 that early-to-mid-1990s PC games were written in.
 
-**Status: working — in testing ahead of a general release.** Measured
+**Status: working and released — `pip install uc386` (0.1.5 on
+[PyPI](https://pypi.org/project/uc386/)).** Measured
 against two reference suites under our DOS emulator (compile →
 assemble → run → diff): **215 / 220**
 [c-testsuite](https://github.com/c-testsuite/c-testsuite) and, with
@@ -12,12 +13,15 @@ the `--kr` pre-pass (see below), **1397 / 1514**
 [gcc-c-torture](https://github.com/llvm/llvm-test-suite) executable
 tests passing. The frontend defaults to **strict C23**; the
 gcc-c-torture corpus is pre-ANSI and GNU-heavy, so it is run with
-`--kr` enabled. The remaining ~117 are GCC extensions that need a
-static-chain ABI / closure conversion (nested functions, `__label__`),
-a fragmented backlog of unimplemented codegen features (C99 VLA /
-variably-modified types, vectors, designated initializers, `_Complex`,
-offsetof designators, …), and a few large-frame / file-I/O edges —
-tracked, not claimed as passing. The standard-C codegen-corner
+`--kr` enabled. The remaining ~117 are GCC extensions and scoped
+features rather than standard-C miscompiles: nested functions and
+`__label__` (which need a static-chain ABI / closure conversion),
+`__attribute__((aligned(N)))` in struct layout, extended inline
+`__asm__` with operand constraints, `_Complex` struct members,
+`-finstrument-functions`, and a few large-frame / file-I/O edges —
+tracked, not claimed as passing. C99 VLAs and variably-modified
+types, designated initializers, and `offsetof` designators all
+landed during the campaign, and the standard-C codegen-corner
 miscompiles have been driven out (see `STANDARD_C_BACKLOG.md`).
 
 **K&R / implicit-int compatibility (`--kr`).** Pre-ANSI sources —
@@ -41,10 +45,13 @@ driver, the x86-32 NASM emitter, and the DOS runtime bindings.
 **Highlights** — beyond the reference suites, uc386 compiles real
 third-party C programs into runnable DOS executables:
 
-- **Real `.exe` output.** Produces self-contained, PMODE/W-bound DOS
+- **Real `.exe` output.** Produces self-contained, DOS/32A-bound DOS
   `.exe` files (not just flat binaries), boot-tested under DOSBox in
   CI: correct errorlevels, command-line argument parsing, and
-  `printf`/file I/O through genuine DOS handles.
+  `printf`/file I/O through genuine DOS handles. The `.exe` pipeline
+  lives in `addons/harness/` and needs a source checkout plus
+  [`upyle`](https://github.com/avwohl/pyle); the PyPI package ships
+  the compiler and its libc, which stop at `.asm`.
 - **DOOM** (id Software's 1993 shooter) compiles and boots
   end-to-end, running through engine startup until it exits cleanly
   on the expected "WAD file not found".
@@ -56,11 +63,22 @@ third-party C programs into runnable DOS executables:
   It is our toughest end-to-end test of the compiler.
 - **awk** — Kernighan's "one true awk" runs arithmetic, regexes,
   aggregation, and string functions.
-- **GNU utilities** — 16 in-tree coreutils-style programs (`cat`,
-  `wc`, `true`, …) build and pass parametrized regression tests.
+- **GNU utilities** — 17 in-tree programs (`cat`, `wc`, `true`,
+  `head`, `tail`, three `sbase` ports, …) build and pass
+  parametrized regression tests against per-addon manifests.
 
 See `addons/STATUS.md` for the full per-addon report and
 `docs/path-a-mz-le.md` for the `.exe` build path.
+
+**Known sharp edge — stdio stubs.** Part of the shipped `<stdio.h>`
+surface links cleanly and then returns wrong answers rather than
+failing: `feof` always reports "not at EOF" (so `while (!feof(f))`
+never terminates), `fseek` returns success without seeking, `ftell`
+always returns 0, and `strerror` ignores `errno`. There is no
+diagnostic. When file position matters, use the POSIX layer
+(`open`/`read`/`write`/`lseek`), which is really implemented on
+INT 21h. Full table in
+[`addons/gnu/UPSTREAM.md`](addons/gnu/UPSTREAM.md).
 
 ## Size — measured, not asserted
 
@@ -75,10 +93,10 @@ Bytes of the on-disk executable; full table in
 
 | program | uc386 .bin | uc386 .exe | Watcom | DJGPP |
 |---------|-----------:|-----------:|-------:|------:|
-| true    |         18 |     16,907 |  5,420 | 147,914 |
-| echo    |        148 |     16,915 | 11,286 | 150,212 |
-| factor  |      1,858 |     16,989 | 20,538 | 179,614 |
-| wc      |      1,529 |     16,928 | 20,158 | 179,092 |
+| true    |         18 |     32,847 |  5,420 | 147,914 |
+| echo    |        148 |     32,855 | 11,286 | 150,212 |
+| factor  |      1,886 |     32,925 | 20,538 | 179,614 |
+| wc      |      1,557 |     32,868 | 20,158 | 179,092 |
 
 Reading this honestly:
 
@@ -86,15 +104,22 @@ Reading this honestly:
   only under `uc386.dos_emu`/a custom loader. It is the right
   metric for *codegen+DCE tightness* (and there uc386 is in a
   class of its own — tens of bytes), but it is not what you ship.
-- **`.exe` is what you ship**, and it carries a ~17 KB PMODE/W
-  extender floor. Against that real-DOS artifact, **Open Watcom
-  is ~2–3× smaller on tiny programs** (its DOS/4GW clib + mature
-  linker beat our extender floor); the two converge as real code
-  grows. uc386 beats **DJGPP ~9×** and host **gcc ~2×**.
+- **`.exe` is what you ship**, and it carries a **~32.8 KB DOS/32A
+  extender floor** — every `.exe` in the table is that floor plus a
+  few hundred bytes of program. Against that real-DOS artifact,
+  **Open Watcom is smaller: ~6× on `true`, ~1.6× on `wc`/`factor`**
+  (its DOS/4GW clib + mature linker beat our extender floor); the
+  two converge as real code grows. uc386 beats **DJGPP ~4.5–5.5×**.
+- **The floor is a deliberate correctness trade.** `--extender=pmodew`
+  halves it (~16.8 KB), but PMODE/W's real-mode call path hangs on
+  any DOS call that touches a physical sector, so a PMODE/W build
+  cannot do disk I/O on real DOS. DOS/32A is the default because a
+  working `.exe` beats a smaller broken one; PMODE/W stays available
+  for programs that only touch stdout.
 - So: uc386's *code generation* is extremely compact; its current
-  *DOS packaging* (PMODE/W) is not yet competitive with Watcom's
-  on small binaries. Both statements are true and the table shows
-  which is which — no single "390× smaller" headline.
+  *DOS packaging* is not yet competitive with Watcom's. Both
+  statements are true and the table shows which is which — no
+  single "390× smaller" headline.
 
 ## Goal
 
@@ -121,20 +146,27 @@ This project contributes only:
 
 - `main.py` — driver (CLI, I/O, embedding, post-processing)
 - `codegen.py` — x86-32 NASM code generator
-- `peephole.py` — NASM-text peephole optimizer
-- `asm_dce.py` — assembly-level dead-code elimination from `_start` / `_main`
-- `libc_split.py` — selective inclusion of `lib/i386_dos_libc.asm` symbols
-- `runtime.py` — MS-DOS runtime library bindings (INT 21h wrappers, stubs)
+- `lib/i386_dos_libc.asm` — the DOS libc, plus `lib/include/` headers
+- `runtime.py` — placeholder for Python-side runtime bindings (the
+  real libc is the `.asm` above)
 - `dos_emu.py` — i386 emulator harness for testing flat-binary output
 - `dos_emu_netsim.py` — simulated network for the INT 0x83 packet-driver shim
+- `dosiz_run.py` — alternate harness dispatching to `../dosiz`
+  (in-process dosbox-staging, full DPMI 0.9)
+- `harness.py` — selects between the two via `UC386_HARNESS`
+- `addons/harness/` — the `.asm` → `.obj` → MZ+LE `.exe` pipeline
+  (source checkout only; not shipped on PyPI)
+
+The NASM-text peephole optimizer, the assembly-level dead-code
+eliminator, and the libc symbol splitter used to live here; they were
+factored out into [upeep386](https://github.com/avwohl/upeep386) and
+are now a dependency rather than part of this repo.
 
 Every front-end improvement (new C23 feature, AST optimization, DOS-era
 syntax tolerance) lands in uc_core and benefits both targets
 automatically.
 
 ## Install
-
-> **Note:** not yet ready on PyPI — install from the GitHub repository for now.
 
 From PyPI:
 
@@ -143,18 +175,41 @@ pip install uc386
 ```
 
 That gets you the `uc386` driver, the bundled `i386_dos_libc.asm`,
-and the `lib/include/` headers. To assemble + run the output you
-also need `nasm` (system package) and, for the `dos_emu` test
-harness, `pip install unicorn`.
+and the `lib/include/` headers, and it pulls the frontend
+(`uc_core`, `uplox`) and the asm-level optimizer (`upeep386`)
+automatically. To assemble + run the output you also need `nasm`
+(system package) and, for the `dos_emu` test harness, `pip install
+unicorn`.
+
+**The driver has no default include path**, so `#include <stdio.h>`
+fails until you point `-I` at the installed headers:
+
+```sh
+UC386_INC=$(python -c "import uc386,os;print(os.path.join(os.path.dirname(uc386.__file__),'lib','include'))")
+uc386 hello.c -o hello.asm -I "$UC386_INC"
+```
+
+`examples/hello.c` declares its one prototype inline specifically so
+it compiles with no `-I` at all.
+
+That install compiles C to `.asm`. Building a bootable DOS `.exe`
+additionally needs `pip install upyle` and the `addons/harness/`
+tree, which ships only in the source checkout — see
+[`docs/path-a-mz-le.md`](docs/path-a-mz-le.md).
 
 Source checkout for development:
 
 ```
 sudo apt-get install -y python3 python3-venv nasm    # Debian/Ubuntu
+git clone https://github.com/avwohl/uc386 && cd uc386
 python3 -m venv .venv && . .venv/bin/activate
-pip install pytest unicorn "uc_core @ git+https://github.com/avwohl/uc_core@main" -e .
-pytest tests/
+pip install pytest unicorn upyle -e .
+pytest tests/          # 460 passed, 1 skipped
 ```
+
+To co-develop the frontend or the optimizer, clone them as siblings
+and install those editable too — see
+[`CLAUDE.md`](CLAUDE.md) for that layout.
 
 macOS (Homebrew) and Fedora/RHEL (dnf) instructions, plus the
 optional toolchains for addon builds (bison/flex) and the
@@ -165,12 +220,14 @@ DJGPP / OpenWatcom comparison columns, are documented in
 
 - [cpmdroid](https://github.com/avwohl/cpmdroid) - Z80/CP/M emulator for Android phones and tablets. It emulates the RomWBW HBIOS interface and a VT100 terminal.
 - [cpmemu](https://github.com/avwohl/cpmemu) - Z80/CP/M emulator for Linux and Windows, with Z80 and 8080 CPU cores. It translates the BDOS and BIOS calls of CP/M 2.2 programs to the host file system.
-- [dosemu](https://github.com/avwohl/dosiz) - MS-DOS emulator for Linux. It uses the dosbox-staging CPU core and translates system calls in the manner of cpmemu. It is the intended test host for uc386.
+- [dosiz](https://github.com/avwohl/dosiz) - MS-DOS emulator for Linux. It uses the dosbox-staging CPU core and translates system calls in the manner of cpmemu. It is the intended test host for uc386.
+- [pyle](https://github.com/avwohl/pyle) - OMF to MZ+LE linker written in pure Python. It builds the DOS `.exe` files of uc386 and needs no Open Watcom. The repository is `pyle` but the package is `upyle`.
 - [qxDOS](https://github.com/avwohl/qxDOS) - DOS emulator app for iOS and macOS with a SwiftUI interface. DOSBox Staging supplies the emulated i386 hardware.
 - [uc80](https://github.com/avwohl/uc80) - C compiler for the Z80 processor and CP/M. This sibling backend shares the C23 frontend of uc_core.
 - [uc_core](https://github.com/avwohl/uc_core) - Shared C23 frontend and AST optimizer for the uc80 and uc386 compilers.
 - [um80_and_friends](https://github.com/avwohl/um80_and_friends) - Linux toolchain that is compatible with Microsoft MACRO-80. It has an assembler, a linker, a librarian, and a disassembler. It is the Z80 equivalent of what uc386 needs for i386.
-- [upeepz80](https://github.com/avwohl/upeepz80) - Peephole optimizer for Z80 compilers. It is the template for a future upeep386.
+- [upeep386](https://github.com/avwohl/upeep386) - Peephole optimizer, assembly dead-code eliminator, and libc symbol splitter for i386. uc386 depends on it.
+- [upeepz80](https://github.com/avwohl/upeepz80) - Peephole optimizer for Z80 compilers. It was the template for upeep386.
 - [uplox](https://github.com/avwohl/uplox) - LR(1) and GLR parser generator. It writes the lexer and parser tables for the C23 frontend of uc_core from `examples/c23.uplox`.
 
 ## License

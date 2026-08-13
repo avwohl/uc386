@@ -40,7 +40,13 @@ inline asm, and assumptions about flat-32 `__watcall` calling
 conventions that uc386 still parses-and-flattens (Phase 1) but
 hasn't fully implemented (Phase 2).
 
-Status today (2026-05-01):
+Status as measured 2026-05-01. The per-file triage counts below are
+a **snapshot, not a live check** — no `upstream/` tree is committed
+(each game's `fetch.sh` pulls it), so reproducing the table means
+running `fetch.sh` then `build.sh` per game. Treat the numbers as
+last-known-good rather than as currently asserted; only the
+`SHIP_BIN = {"doom"}` gate in `addons/harness/package.py` is
+enforced in the release pipeline.
 
 | Game     | Source available    | Per-file triage | Boots? | Notes                                                                     |
 |----------|---------------------|-----------------|--------|---------------------------------------------------------------------------|
