@@ -794,6 +794,9 @@ class CodeGenerator:
         # would otherwise conflict with our self-defined entry symbol.
         externs.discard("_start")
         extern_list = sorted(externs)
+        # Remember which libc symbols this unit references, so the entry
+        # stub can decide whether an exit-time stdio flush is needed.
+        self._referenced_externs = set(externs)
         # Strings are collected lazily as expressions get lowered; reset
         # the table at the top of each generate() call so the codegen is
         # safe to reuse.
@@ -1047,6 +1050,14 @@ class CodeGenerator:
         # for VLA-backed locals). These get merged into extern_list
         # before header emission.
         self._auto_externs: set[str] = set()
+        # Populated in generate(); the entry stub consults it to decide
+        # whether to emit the exit-time stdio flush.
+        self._referenced_externs: set[str] = set()
+        # Every name reached by a direct `call` during lowering. This is
+        # the signal the entry stub uses: a declared-but-unused extern
+        # does not mean the program prints anything, and prototypes that
+        # never resolve to an extern (headers vary) would be missed.
+        self._called_names: set[str] = set()
 
         # `-finstrument-functions` semantics. If both
         # `__cyg_profile_func_enter` and `__cyg_profile_func_exit` are
@@ -1129,6 +1140,21 @@ class CodeGenerator:
         # may legitimately reference symbols in libc bundled later.
         extern_list = [n for n in extern_list if n not in self._globals]
         extern_list = sorted(set(extern_list))
+        # The entry stub is emitted before the bodies are lowered, so at
+        # that point we don't yet know whether the program prints
+        # anything. Resolve the placeholder now that every call site has
+        # been seen.
+        if self._FLUSH_HOOK in lines:
+            idx = lines.index(self._FLUSH_HOOK)
+            if self._uses_buffered_stdio():
+                lines[idx:idx + 1] = [
+                    "        push    eax",          # preserve main's exit code
+                    "        call    __stdio_flush_con",
+                    "        pop     eax",
+                ]
+            else:
+                del lines[idx]
+
         # Build header now and prepend to lines.
         header = self._header(extern_list)
         lines = header + lines
@@ -3534,12 +3560,42 @@ class CodeGenerator:
                 "        sub     ecx, edi",
                 "        rep     stosb",
             ])
+        out.append("        call    _main")
+        # Console output is line-buffered in the libc, so a final line
+        # with no trailing newline is still sitting in the buffer when
+        # main returns. Falling straight into INT 21h/4Ch would discard
+        # it. exit()/abort() flush themselves; this covers the
+        # return-from-main path, which codegen owns.
+        #
+        # Emitted only when the program actually references a libc
+        # output symbol: an unconditional call would drag the buffering
+        # code into programs that never print, and `true.bin` is 18
+        # bytes precisely because nothing unused is linked in.
+        # Placeholder: generate() replaces it once the bodies have been
+        # lowered and every call site is known.
+        out.append(self._FLUSH_HOOK)
         out.extend([
-            "        call    _main",
             "        mov     ah, 4Ch",
             "        int     21h",
         ])
         return out
+
+    # Sentinel line standing in for the exit-time stdio flush until
+    # generate() knows whether the program needs one.
+    _FLUSH_HOOK = "        ;;uc386:stdio-flush-hook;;"
+
+    # libc symbols whose output goes through the buffered console path.
+    # Referencing any of them means main may return with bytes pending.
+    _BUFFERED_STDIO_SYMS = frozenset({
+        "printf", "vprintf", "puts", "putchar", "putc", "fputc", "fputs",
+        "fwrite", "fprintf", "vfprintf", "perror", "write", "fflush",
+    })
+
+    def _uses_buffered_stdio(self) -> bool:
+        return bool(
+            (self._called_names | self._referenced_externs)
+            & self._BUFFERED_STDIO_SYMS
+        )
 
     def _needs_bss_init(self) -> bool:
         """True iff there's at least one non-noinit uninitialized global.
@@ -16937,6 +16993,7 @@ class CodeGenerator:
         if ecx_setup is not None:
             out += ecx_setup
         if direct is not None:
+            self._called_names.add(direct)
             out.append(f"        call    _{direct}")
         else:
             out += self._eval_expr_to_eax(indirect_callee, ctx)

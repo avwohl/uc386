@@ -85,11 +85,18 @@ the libc now translates (invalid handle → `EBADF`, access denied →
 message and `perror` prints `path: No such file or directory` rather
 than a fixed `": error"`.
 
-Still missing in `<stdio.h>`: there is no buffering layer, so
-`putchar` costs one INT 21h per character and `setvbuf` refuses
-`_IOFBF`/`_IOLBF` rather than pretending to honor them; `popen` and
-`pclose` always fail, DOS having no pipe API without a shell layer.
-Details in [`addons/gnu/UPSTREAM.md`](addons/gnu/UPSTREAM.md).
+Console output is line-buffered. Every character used to be its own
+INT 21h — measured, printing 2,000 bytes cost **2,000 DOS calls; it
+now costs 2**. Output is flushed on newline, when the 1024-byte buffer
+fills, by `fflush`/`fclose`, and at exit, so nothing is dropped;
+`setvbuf` honors all three modes for real. The trade is size: programs
+that print carry ~120–300 bytes more (`echo` 148 → 264), which is why
+the exit-time flush is emitted only for programs that actually print —
+`true` is still 18 bytes.
+
+`popen`/`pclose` remain the real gap: they always fail, DOS having no
+pipe API without a shell layer. Details in
+[`addons/gnu/UPSTREAM.md`](addons/gnu/UPSTREAM.md).
 
 ## Size — measured, not asserted
 
@@ -105,9 +112,9 @@ Bytes of the on-disk executable; full table in
 | program | uc386 .bin | uc386 .exe | Watcom | DJGPP |
 |---------|-----------:|-----------:|-------:|------:|
 | true    |         18 |     32,847 |  5,420 | 147,914 |
-| echo    |        148 |     32,855 | 11,286 | 150,212 |
-| factor  |      1,886 |     32,925 | 20,538 | 179,614 |
-| wc      |      1,557 |     32,868 | 20,158 | 179,092 |
+| echo    |        264 |     32,911 | 11,286 | 150,212 |
+| factor  |      2,022 |     32,981 | 20,538 | 179,614 |
+| wc      |      1,861 |     32,992 | 20,158 | 179,092 |
 
 Reading this honestly:
 

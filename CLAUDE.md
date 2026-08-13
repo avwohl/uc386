@@ -159,6 +159,25 @@ the wrong half — 3.10 is uninstallable because of uplox's own floor
 (see **Toolchain** above), so the floor moved up rather than the matrix
 moving down. Keep the two in step if uplox's floor ever changes.
 
+## Codegen owns the exit-time stdio flush
+
+Console output is line-buffered in the libc, but **return-from-main
+never passes through a libc function** — `_start_stub` calls `_main`
+and falls straight into INT 21h/4Ch. So codegen emits the flush:
+`_start_stub` drops a `_FLUSH_HOOK` sentinel, and `generate()` replaces
+it once every call site has been lowered (the stub is built *before*
+the bodies, so the decision can't be made in place).
+
+It is emitted only when `_uses_buffered_stdio()` is true — i.e. the
+program actually calls a buffered-output symbol. An unconditional call
+would link the buffering code into every binary, and `true.bin` is 18
+bytes precisely because nothing unused is linked in. The flush is
+wrapped in `push eax` / `pop eax` so it can't clobber main's exit code.
+
+If you add a libc function that writes to the console, add it to
+`_BUFFERED_STDIO_SYMS` or programs calling only that function will lose
+their last partial line.
+
 ## Trap: libc helpers must take arguments on the stack
 
 `main.py` re-runs the peephole over the **combined** user + libc asm

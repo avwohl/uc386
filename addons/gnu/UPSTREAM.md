@@ -24,22 +24,48 @@ code commonly assumes that uc386's libc **still does not provide**:
 - `regex.h` (BRE/ERE) — needed by `sed`, `grep`, gawk, `ed`.
   Still the single biggest item.
 
-⚠️ **Still missing.** These are honest about it rather than
-misreporting:
+⚠️ **Still missing.**
 
 | Symbol | Actual behaviour |
 |---|---|
 | `popen` / `pclose` | always fail — DOS has no pipe API without a shell layer |
-| `setbuf` | `setbuf(f, NULL)` (unbuffered) is honored exactly, since that is what this libc does; `setbuf(f, buf)` is ignored, and C11 gives it no way to report that |
-| `setvbuf` | returns nonzero for `_IOFBF`/`_IOLBF` — refused, not silently dropped |
-| `fflush` | returns 0, which is accurate: output is write-through, so there is nothing to flush |
+| `setbuf` | maps onto `setvbuf`; the caller's buffer pointer is ignored (we use our own), the mode is real |
 
-**No buffering layer exists at all.** `putchar` issues one INT 21h
-per character, so printing 2,000 bytes costs 2,000 DOS calls against
-one for a bulk `fwrite`. Implementing `setvbuf` properly means
-building that layer first — per-stream buffer, flush on
-full/newline/`fclose`/`exit` — which is a performance feature with a
-correctness tail (an unflushed buffer at abnormal exit loses output).
+✅ **Console output is buffered.** Every character used to be its own
+INT 21h AH=0x02: printing 2,000 bytes cost **2,000 DOS calls, now 2**
+(counted at the interrupt hook, not inferred). All console output in
+this libc funnels through that one AH=0x02 pattern — `putchar`,
+`puts`, the printf digit and float emitters — so a single buffered
+stand-in, `__stdio_putc_con`, covers all of it without touching the
+handle-based writers.
+
+Line-buffered by default, flushed on `'\n'`, when the 1024-byte buffer
+fills, by `fflush`, by `fclose`, and at exit. `setvbuf` now honors
+`_IOFBF`/`_IOLBF`/`_IONBF` for real.
+
+Things worth knowing before touching it:
+
+- **The exit flush is emitted by codegen**, not the libc, because
+  return-from-main goes straight to INT 21h/4Ch without passing
+  through any libc function. `_start_stub` emits it only when the
+  program references a buffered-output symbol — an unconditional call
+  would link the buffering code into every binary, and `true.bin` is
+  18 bytes precisely because nothing unused is linked. `exit()`
+  carries its own flush; `abort()` deliberately does not (see below).
+- **Handle-based writers flush first.** `fputs`/`fwrite`/`fputc`/
+  `write`/`perror` go straight to a DOS handle, so pending console
+  output would otherwise surface *after* them.
+- **`abort()` does not flush**, keeping it a dependency-free leaf
+  (pinned by `tests/test_libc_split_integration.py`). C11 7.22.4.1p2
+  makes this implementation-defined and glibc stopped flushing in
+  2.27; the loss is bounded to a partial line, and diagnostics
+  normally go to unbuffered stderr.
+- **Size cost**: programs that print grew ~120–300 bytes
+  (`echo` 148 → 264, `wc` 1,557 → 1,861). Programs that don't print
+  are unchanged.
+- The buffer size is a **literal, not an `equ`** — the libc splitter
+  tracks labels, not assembler constants, so an `equ` would vanish
+  from selective builds and NASM would fail with "symbol not defined".
 
 ✅ **Fixed — `errno` is now populated and `strerror` maps it.**
 `errno` used to be written in exactly two places in the whole libc

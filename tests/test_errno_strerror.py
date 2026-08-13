@@ -129,20 +129,23 @@ def test_dos_error_codes_map_to_distinct_errnos(run_prog):
     assert res.stdout == "-1 9\n-1 13\n"    # EBADF, EACCES
 
 
-def test_setvbuf_refuses_modes_it_cannot_honor(run_prog):
-    """setvbuf returned 0 ("request honored") while ignoring the request.
-    C11 7.21.5.6p3 requires nonzero when it cannot be honored; with no
-    buffering layer only _IONBF is honorable."""
+def test_setvbuf_honors_every_mode(run_prog):
+    """setvbuf originally returned 0 ("honored") while ignoring the
+    request entirely. It then briefly refused _IOFBF/_IOLBF honestly,
+    because no buffering layer existed. Console output is buffered now,
+    so all three modes are real and all three succeed. An invalid mode
+    still fails."""
     src = dedent(r"""
         #include <stdio.h>
         int main(void) {
-            printf("%d %d %d\n",
-                   setvbuf(stdout, 0, _IOFBF, 512) ? 1 : 0,
-                   setvbuf(stdout, 0, _IOLBF, 512) ? 1 : 0,
-                   setvbuf(stdout, 0, _IONBF, 0) ? 1 : 0);
+            int a = setvbuf(stdout, 0, _IOFBF, 512);
+            int b = setvbuf(stdout, 0, _IOLBF, 512);
+            int c = setvbuf(stdout, 0, _IONBF, 0);
+            int d = setvbuf(stdout, 0, 99, 0);
+            printf("%d %d %d %d\n", a, b, c, d ? 1 : 0);
             return 0;
         }
     """)
     res = run_prog(src)
     assert res.error is None
-    assert res.stdout == "1 1 0\n"
+    assert res.stdout == "0 0 0 1\n"

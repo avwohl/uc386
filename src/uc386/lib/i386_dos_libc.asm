@@ -14,6 +14,9 @@
 _exit:
         push    ebp
         mov     ebp, esp
+        ; Flush before the process dies, or a program whose last line has
+        ; no trailing newline loses it entirely.
+        call    __stdio_flush_con
         mov     eax, [ebp + 8]
         and     eax, 0xFF
         or      eax, 0x4C00          ; AH = 4Ch (DOS exit), AL = code
@@ -23,6 +26,13 @@ _exit:
         pop     ebp
         ret
 
+; abort() deliberately does NOT flush the console buffer, so it stays a
+; dependency-free leaf (pinned by tests/test_libc_split_integration.py).
+; C11 7.22.4.1p2 makes flushing implementation-defined here, and glibc
+; stopped doing it in 2.27 because flushing from a crashing process is
+; hazardous. The practical loss is bounded: output is line-buffered, so
+; only a partial final line can be dropped, and diagnostics normally go
+; to stderr, which is unbuffered.
 _abort:
         mov     ax, 0x4C01           ; exit code 1 — INT 21h doesn't really
         int     21h                  ; care, but the harness sees code 1
@@ -38,8 +48,7 @@ _putchar:
         push    ebp
         mov     ebp, esp
         mov     edx, [ebp + 8]       ; ch in low byte of EDX (passed as int)
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         mov     eax, [ebp + 8]       ; return ch
         and     eax, 0xFF
         mov     esp, ebp
@@ -58,14 +67,12 @@ _puts:
         test    al, al
         jz      .done
         mov     edx, eax
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         inc     esi
         jmp     .loop
 .done:
         mov     edx, 0x0A            ; newline
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         xor     eax, eax
         pop     esi
         mov     esp, ebp
@@ -76,6 +83,10 @@ _puts:
 _fputs:
         push    ebp
         mov     ebp, esp
+        ; Flush buffered console output first: this writer goes
+        ; straight to a handle, so pending AH=0x02 output would
+        ; otherwise appear after it.
+        call    __stdio_flush_con
         push    ebx
         push    esi
         mov     esi, [ebp + 8]       ; s
@@ -106,6 +117,10 @@ _fputs:
 _write:
         push    ebp
         mov     ebp, esp
+        ; Flush buffered console output first: this writer goes
+        ; straight to a handle, so pending AH=0x02 output would
+        ; otherwise appear after it.
+        call    __stdio_flush_con
         push    ebx                         ; callee-saved
         mov     ebx, [ebp + 8]
         mov     edx, [ebp + 12]
@@ -132,6 +147,10 @@ _write:
 _fwrite:
         push    ebp
         mov     ebp, esp
+        ; Flush buffered console output first: this writer goes
+        ; straight to a handle, so pending AH=0x02 output would
+        ; otherwise appear after it.
+        call    __stdio_flush_con
         push    ebx
         push    esi
         mov     esi, [ebp + 8]       ; ptr
@@ -262,6 +281,7 @@ _fclose:
         push    ebp
         mov     ebp, esp
         push    ebx
+        call    __stdio_flush_con    ; C11 7.21.5.1p2: closing flushes
         mov     ebx, [ebp + 8]       ; stream → fd
         mov     ah, 0x3E
         int     21h
@@ -350,6 +370,10 @@ _remove:
 _perror:
         push    ebp
         mov     ebp, esp
+        ; Flush buffered console output first: this writer goes
+        ; straight to a handle, so pending AH=0x02 output would
+        ; otherwise appear after it.
+        call    __stdio_flush_con
         mov     edx, [ebp + 8]
         test    edx, edx
         jz      .skip_msg
@@ -459,6 +483,10 @@ _getc:
 _fputc:
         push    ebp
         mov     ebp, esp
+        ; Flush buffered console output first: this writer goes
+        ; straight to a handle, so pending AH=0x02 output would
+        ; otherwise appear after it.
+        call    __stdio_flush_con
         sub     esp, 4
         push    ebx
         mov     eax, [ebp + 8]
@@ -2600,8 +2628,7 @@ _printf_legacy:
         je      .pcent
         ; ordinary char → output
         mov     edx, eax
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         inc     esi
         inc     ebx
         jmp     .next
@@ -2717,18 +2744,15 @@ _printf_legacy:
         je      .pd_pcent
         ; Unknown — output the literal '%' + char and move on.
         mov     edx, '%'
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         inc     ebx
         movzx   edx, al
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         inc     ebx
         jmp     .next
 .pd_pcent:
         mov     edx, '%'
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         inc     ebx
         jmp     .next
 
@@ -2737,8 +2761,7 @@ _printf_legacy:
         mov     eax, [edi]
         add     edi, 4
         mov     edx, eax
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         inc     ebx
         jmp     .next
 
@@ -2765,8 +2788,7 @@ _printf_legacy:
         jz      .ss_done
         movzx   edx, al
         push    ecx
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         pop     ecx
         inc     edi
         inc     ebx
@@ -2871,12 +2893,10 @@ _printf_legacy:
         push    edx
         push    ecx
         mov     edx, '0'
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         inc     ebx
         mov     edx, 'x'
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         inc     ebx
         pop     ecx
         pop     edx
@@ -3163,16 +3183,14 @@ _emit_padded_digits:
         test    eax, eax
         jz      .nosign
         mov     edx, '-'
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
 .nosign:
 .l:
         mov     al, [esi]
         test    al, al
         jz      .d
         movzx   edx, al
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         inc     esi
         jmp     .l
 .d:
@@ -3221,8 +3239,7 @@ _emit_padded_digits_wp:
         je      .zpad
         push    eax
         mov     edx, '-'
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         pop     eax
 .zpad:
         mov     ecx, eax
@@ -3231,8 +3248,7 @@ _emit_padded_digits_wp:
         jz      .digits_only
         push    ecx
         mov     edx, '0'
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         pop     ecx
         dec     ecx
         jmp     .zl
@@ -3243,8 +3259,7 @@ _emit_padded_digits_wp:
         jz      .signsp
         push    ecx
         mov     edx, ' '
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         pop     ecx
         dec     ecx
         jmp     .spl
@@ -3252,16 +3267,14 @@ _emit_padded_digits_wp:
         cmp     dword [ebp + 8], 0
         je      .digits_only
         mov     edx, '-'
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         jmp     .digits_only
 .nopad:
         ; No padding: sign then digits.
         cmp     dword [ebp + 8], 0
         je      .digits_only
         mov     edx, '-'
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
 .digits_only:
         ; Emit digits.
         mov     esi, [ebp + 12]
@@ -3270,8 +3283,7 @@ _emit_padded_digits_wp:
         test    al, al
         jz      .done
         movzx   edx, al
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         inc     esi
         jmp     .dl
 .done:
@@ -3323,8 +3335,7 @@ _printf_emit_double:
         jae     .nonneg
         push    eax
         mov     edx, '-'
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         pop     eax
         fchs
 .nonneg:
@@ -3377,8 +3388,7 @@ _printf_emit_double:
         add     esp, 8
         ; Emit '.'.
         mov     edx, '.'
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         ; Render fractional digits into a buffer with leading zeros.
         ; Buffer at [ebp - 56 .. ebp - 33]; we lay out right-to-left.
         mov     ecx, [ebp + 8]      ; precision (buffer length)
@@ -3402,8 +3412,7 @@ _printf_emit_double:
         test    al, al
         jz      .end
         movzx   edx, al
-        mov     ah, 0x02
-        int     21h
+        call    __stdio_putc_con
         inc     esi
         jmp     .fp
 .end:
@@ -4287,7 +4296,11 @@ _strerror:
 ; ---- fflush(stream) --------------------------------------------------------
 ; dos_emu writes immediately on each putchar / fputc / write — no buffer
 ; to flush. Return 0 (success) for any argument.
+; fflush(FILE *stream) -> 0. Now genuinely flushes the console buffer;
+; it used to return 0 while there was nothing buffered to flush.
+; fflush(NULL) means "all streams", which for us is the same buffer.
 _fflush:
+        call    __stdio_flush_con
         xor     eax, eax
         ret
 
@@ -4508,6 +4521,93 @@ __stdio_flag_ptr:
         pop     ebp
         ret
 
+; ---- console output buffering ----------------------------------------------
+; There was no buffering anywhere: every character of console output was
+; its own INT 21h AH=0x02, so printing 2,000 bytes cost 2,000 DOS calls.
+; On real hardware each of those is a full interrupt dispatch plus a
+; Ctrl-C poll, which dominates the runtime of any output-heavy program.
+;
+; All console output in this libc funnels through that one AH=0x02
+; pattern — putchar, puts, the printf digit/float emitters — so a single
+; buffered replacement covers all of it without touching the
+; handle-based (AH=0x40) writers.
+;
+; Line-buffered by default: flushed on '\n', when the buffer fills, by
+; fflush(), by fclose(), and at exit. Line buffering keeps the failure
+; window to a partial line and preserves sane interleaving with stderr,
+; which stays unbuffered.
+;
+; The buffer lives in .bss, which costs nothing in a flat .bin — the
+; libc already reserves a 1 MB heap there and `true.bin` is still 18
+; bytes. The *code* is not free, so codegen only emits the exit-time
+; flush for programs that actually reference stdio (see _start_stub).
+        section .bss
+; Size is a literal rather than an `equ`, deliberately: the libc
+; splitter tracks labels, not assembler constants, so an `equ` used
+; here would be dropped from selective builds and NASM would fail with
+; "symbol not defined". Keep this in step with the compare in
+; __stdio_putc_con.
+_con_buf:       resb 1024
+_con_len:       resd 1
+; 0 = line buffered (the default, and what .bss zeroing gives us)
+; 1 = fully buffered   2 = unbuffered
+_con_mode:      resd 1
+        section .text
+
+; __stdio_flush_con() — write out whatever console output is pending.
+; Preserves every register so it can be called from anywhere.
+__stdio_flush_con:
+        pushad
+        mov     ecx, [_con_len]
+        test    ecx, ecx
+        jz      .fc_done
+        mov     ebx, 1                      ; stdout handle
+        mov     edx, _con_buf
+        mov     ah, 0x40
+        int     21h
+        mov     dword [_con_len], 0
+.fc_done:
+        popad
+        ret
+
+; __stdio_putc_con — buffered stand-in for `mov ah,0x02 / int 21h`.
+; Takes the character in DL exactly like the DOS call it replaces, and
+; preserves ALL registers (that pair clobbered AX), so it is a drop-in
+; at every console-output site.
+; Saves only EAX/ECX rather than using pushad: this runs once per
+; character of output, so the eight extra register moves each way are
+; the hot path. DL is never touched, and the pair this replaces already
+; clobbered AX, so restoring EAX makes it strictly more conservative
+; than the original.
+__stdio_putc_con:
+        push    eax
+        push    ecx
+        cmp     dword [_con_mode], 2
+        je      .direct                     ; unbuffered: straight through
+        mov     ecx, [_con_len]
+        movzx   eax, dl
+        mov     [_con_buf + ecx], al
+        inc     ecx
+        mov     [_con_len], ecx
+        cmp     ecx, 1024
+        jae     .flush                      ; full
+        cmp     dword [_con_mode], 1
+        je      .done                       ; fully buffered: wait for full
+        cmp     al, 10                      ; line buffered: flush on '\n'
+        jne     .done
+.flush:
+        call    __stdio_flush_con
+.done:
+        pop     ecx
+        pop     eax
+        ret
+.direct:
+        mov     ah, 0x02
+        int     21h
+        pop     ecx
+        pop     eax
+        ret
+
 ; fseek(FILE *stream, long offset, int whence) -> 0 on success, -1 on error.
 ; Clears EOF for the stream (C11 7.21.9.2p5). It does NOT set the error
 ; indicator on failure: C11 7.21.9.2p4 only specifies the return value,
@@ -4649,21 +4749,37 @@ _setvbuf:
         ; setvbuf(FILE *stream, char *buf, int mode, size_t size)
         ;   -> 0 if the request is honored, nonzero otherwise.
         ;
-        ; There is no buffering layer, so only _IONBF (2) can be
-        ; honored. This used to return 0 unconditionally — claiming to
-        ; have installed a buffer it never installed, so a program that
-        ; checked the return value was told its request succeeded and
-        ; then saw byte-at-a-time output anyway. Refusing is the honest
-        ; answer until a real buffering layer exists.
+        ; All three modes are honored now that console output is
+        ; buffered. The caller's buffer pointer and size are ignored —
+        ; we always use our own fixed buffer — but the *mode* is real,
+        ; which is what programs actually depend on. Switching mode
+        ; flushes first, so bytes already queued under the old policy
+        ; aren't stranded.
+        ;
+        ; Maps the C constants onto _con_mode: _IOLBF(1)->0 (our
+        ; default), _IOFBF(0)->1, _IONBF(2)->2.
         push    ebp
         mov     ebp, esp
+        call    __stdio_flush_con
         mov     eax, [ebp + 16]             ; mode
-        cmp     eax, 2                      ; _IONBF — already the case
-        je      .svb_ok
-        mov     eax, -1                     ; _IOFBF / _IOLBF: refused
+        cmp     eax, 0                      ; _IOFBF
+        je      .svb_full
+        cmp     eax, 1                      ; _IOLBF
+        je      .svb_line
+        cmp     eax, 2                      ; _IONBF
+        je      .svb_none
+        mov     eax, -1                     ; not a valid mode
         mov     esp, ebp
         pop     ebp
         ret
+.svb_full:
+        mov     dword [_con_mode], 1
+        jmp     .svb_ok
+.svb_line:
+        mov     dword [_con_mode], 0
+        jmp     .svb_ok
+.svb_none:
+        mov     dword [_con_mode], 2
 .svb_ok:
         xor     eax, eax
         mov     esp, ebp
