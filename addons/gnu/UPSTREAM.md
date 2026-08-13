@@ -46,10 +46,22 @@ always returned 0. Seeking now goes through INT 21h AH=0x42 via the
 real `_lseek`, and per-stream EOF/error state lives in
 `_stdio_flags` — one byte per DOS handle, bit 0 EOF, bit 1 error —
 because `FILE*` is the raw handle and there is no FILE struct to
-hold it. `fgetc` / `fread` set those bits, and both now check the
-carry flag so a DOS error is reported through `ferror` instead of
-being returned as if it were a byte count. Pinned by
-`tests/test_stdio_position.py`.
+hold it. All four read paths set it (`fgetc`, `fread`, `fgets`,
+`getchar`), and `fgetc`/`fread` check the carry flag so a DOS error
+is reported through `ferror` instead of being returned as if it were
+a byte count. Pinned by `tests/test_stdio_position.py`.
+
+Two subtleties worth knowing if you touch this code:
+
+- Handles are normalized through `__stdio_flag_ptr`, because the two
+  halves of the library name the standard streams differently:
+  `getchar` reads raw fd 0, while `feof(stdin)` is called with the
+  `0xF0` sentinel. Both must land on the same flag byte.
+- `fseek` deliberately does **not** set the error indicator when the
+  seek fails. C11 7.21.9.2p4 specifies only the return value, and
+  seeking a non-seekable stream is an ordinary failure — setting the
+  flag would leave `ferror(stdout)` true forever for any program that
+  probes stdout with `fseek`.
 
 **Genuinely filled since this document was first written** (real
 INT 21h implementations, not stubs): `getenv`, `strtol` /

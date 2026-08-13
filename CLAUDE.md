@@ -159,6 +159,26 @@ the wrong half — 3.10 is uninstallable because of uplox's own floor
 (see **Toolchain** above), so the floor moved up rather than the matrix
 moving down. Keep the two in step if uplox's floor ever changes.
 
+## Trap: libc helpers must take arguments on the stack
+
+`main.py` re-runs the peephole over the **combined** user + libc asm
+(the `optimize` call after bundling), and the peephole deletes a
+`mov eax, [ebp+8]` that sits immediately before a `call`:
+
+```
+_caller:                          _caller:
+        mov  eax, [ebp + 8]  =>           call __helper
+        call __helper                     leave
+```
+
+That is sound for cdecl — EAX is caller-saved and its value is dead
+once the callee's return value lands there — but it silently miscompiles
+any hand-written libc helper that expects an argument **in a register**.
+Nothing in the libc relies on that today, and new helpers must not start:
+pass arguments on the stack (`__stdio_flag_ptr` is the worked example).
+The peephole rewriting the caller's `add esp, 4` into `pop ecx` is fine
+and expected; it does not touch the pushed argument itself.
+
 ## Codegen contract (current)
 
 **`--int` / `--long` / `--long-long` / `--ptr` only accept the flat-32

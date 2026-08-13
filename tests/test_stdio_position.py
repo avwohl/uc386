@@ -173,6 +173,64 @@ def test_fseek_clears_eof_but_clearerr_is_what_clears_error(run_prog):
     assert res.stdout == "eof=1\nafter_seek_eof=0\nafter_clearerr=0 0\n"
 
 
+def test_fgets_to_eof_sets_feof(run_prog):
+    """fgets has its own read loop and never goes through fgetc, so it
+    used to leave the EOF flag clear no matter how far it read — making
+    `while (!feof(f)) fgets(...)` (the usual line-reading idiom) spin."""
+    src = dedent(r"""
+        #include <stdio.h>
+        int main(void) {
+            FILE *f = fopen("d.txt", "r");
+            char buf[64];
+            int lines = 0;
+            while (fgets(buf, sizeof buf, f) != NULL) lines++;
+            printf("%d %d\n", lines, feof(f) ? 1 : 0);
+            fclose(f);
+            return 0;
+        }
+    """)
+    res = run_prog(src, vfiles_init={b"d.txt": b"l1\nl2\nl3\n"})
+    assert res.error is None
+    assert res.timed_out is False
+    assert res.stdout == "3 1\n"
+
+
+def test_getchar_eof_is_visible_to_feof_stdin(run_prog):
+    """getchar() reads raw fd 0 while feof(stdin) passes the 0xF0
+    sentinel. Without the normalization in __stdio_flag_ptr those index
+    different bytes and stdin never appears to reach EOF."""
+    src = dedent(r"""
+        #include <stdio.h>
+        int main(void) {
+            int n = 0;
+            while (getchar() != EOF) n++;
+            printf("%d %d\n", n, feof(stdin) ? 1 : 0);
+            return 0;
+        }
+    """)
+    res = run_prog(src, stdin_bytes=b"hey")
+    assert res.error is None
+    assert res.stdout == "3 1\n"
+
+
+def test_fseek_failure_does_not_poison_ferror(run_prog):
+    """Seeking a non-seekable stream is an expected failure. C11
+    7.21.9.2p4 specifies only the return value, so fseek must not set
+    the error indicator — otherwise a program that probes stdout with
+    fseek sees ferror(stdout) true forever after."""
+    src = dedent(r"""
+        #include <stdio.h>
+        int main(void) {
+            fseek(stdout, 0, SEEK_SET);
+            printf("%d\n", ferror(stdout) ? 1 : 0);
+            return 0;
+        }
+    """)
+    res = run_prog(src)
+    assert res.error is None
+    assert res.stdout == "0\n"
+
+
 def test_eof_is_per_stream_not_global(run_prog):
     """`_stdio_flags` is indexed by handle, so hitting EOF on one open
     file must not make a second, independent stream report EOF."""

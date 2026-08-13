@@ -160,9 +160,15 @@ _fread:
         movzx   eax, ax
         cmp     eax, ecx
         jae     .no_eof
-        cmp     ebx, 255
-        ja      .no_eof
-        or      byte [_stdio_flags + ebx], 1
+        push    eax                  ; preserve bytes-read across the call
+        push    ebx
+        call    __stdio_flag_ptr
+        add     esp, 4
+        test    eax, eax
+        jz      .eof_restore
+        or      byte [eax], 1
+.eof_restore:
+        pop     eax                  ; restore bytes-read for the divide
 .no_eof:
         ; Divide by size to get nmemb actually read.
         xor     edx, edx
@@ -172,9 +178,12 @@ _fread:
         div     ecx
         jmp     .done
 .rd_err:
-        cmp     ebx, 255
-        ja      .zero
-        or      byte [_stdio_flags + ebx], 2
+        push    ebx
+        call    __stdio_flag_ptr
+        add     esp, 4
+        test    eax, eax
+        jz      .zero
+        or      byte [eax], 2
 .zero:
         xor     eax, eax
 .done:
@@ -358,9 +367,12 @@ _fgetc:
 .eof:
         ; Record EOF for this stream so feof() can report it. Without
         ; this, `while (!feof(f))` never terminates.
-        cmp     ebx, 255
-        ja      .eof_ret
-        or      byte [_stdio_flags + ebx], 1
+        push    ebx
+        call    __stdio_flag_ptr
+        add     esp, 4
+        test    eax, eax
+        jz      .eof_ret
+        or      byte [eax], 1
 .eof_ret:
         mov     eax, -1
         jmp     .done
@@ -368,9 +380,12 @@ _fgetc:
         ; A read error is not end-of-file: set the error bit instead, so
         ; ferror() distinguishes the two. Previously CF was ignored and
         ; the DOS error code was returned as if it were a byte count.
-        cmp     ebx, 255
-        ja      .ioerr_ret
-        or      byte [_stdio_flags + ebx], 2
+        push    ebx
+        call    __stdio_flag_ptr
+        add     esp, 4
+        test    eax, eax
+        jz      .ioerr_ret
+        or      byte [eax], 2
 .ioerr_ret:
         mov     eax, -1
 .done:
@@ -443,6 +458,18 @@ _fgets:
         je      .end
         jmp     .loop
 .checkdone:
+        ; A 0-byte read is end-of-input. Record EOF whether we end up
+        ; returning NULL or a final partial line, so the common
+        ; `while (!feof(f)) fgets(...)` loop terminates — fgets has its
+        ; own read loop and never went through _fgetc, so it used to
+        ; leave the flag clear no matter how far it read.
+        push    ebx
+        call    __stdio_flag_ptr
+        add     esp, 4
+        test    eax, eax
+        jz      .cd_after
+        or      byte [eax], 1
+.cd_after:
         ; If we've read nothing yet, return NULL (EOF on fresh).
         mov     eax, [ebp - 8]
         test    eax, eax
@@ -574,6 +601,9 @@ _getchar:
         push    ebp
         mov     ebp, esp
         sub     esp, 4
+        push    ebx                  ; EBX is callee-saved; this used to
+                                     ; be clobbered outright (same bug
+                                     ; _lseek had).
         ; read(0, &local, 1)
         lea     edx, [ebp - 4]
         mov     ebx, 0
@@ -586,8 +616,19 @@ _getchar:
         movzx   eax, byte [ebp - 4]
         jmp     .done
 .eof:
+        ; Mark stdin at EOF. getchar() reads raw fd 0 while feof(stdin)
+        ; passes the 0xF0 sentinel; __stdio_flag_ptr folds both onto the
+        ; same byte, so `while (!feof(stdin)) getchar();` terminates.
+        push    dword 0
+        call    __stdio_flag_ptr
+        add     esp, 4
+        test    eax, eax
+        jz      .gc_eof_ret
+        or      byte [eax], 1
+.gc_eof_ret:
         mov     eax, -1
 .done:
+        pop     ebx
         mov     esp, ebp
         pop     ebp
         ret
@@ -4196,16 +4237,59 @@ _strcasecmp:
 _stdio_flags:   resb 256                    ; per-handle: bit0 EOF, bit1 error
         section .text
 
+; __stdio_flag_ptr(fd) -> address of that stream's flag byte, or NULL if
+; the handle is outside the table.
+;
+; Normalizes the dos_emu stdin/stdout/stderr sentinels (0xF0/0xF1/0xF2,
+; see _stdin/_stdout/_stderr) onto 0/1/2, because the two halves of the
+; library disagree about how they name the standard streams: getchar()
+; reads raw fd 0, while feof(stdin) is called with 0xF0. Without this
+; they would index different bytes and getchar()-to-EOF would never be
+; visible to feof(stdin).
+;
+; Takes its argument on the STACK, deliberately. The peephole deletes
+; `mov eax, [ebp+8]` immediately before a `call` — sound for cdecl,
+; where EAX is caller-saved and killed by the return value — and
+; main.py re-runs it over the *combined* user+libc asm, so a
+; register-argument helper in here would be silently miscompiled.
+__stdio_flag_ptr:
+        push    ebp
+        mov     ebp, esp
+        mov     eax, [ebp + 8]
+        cmp     eax, 0xF0
+        jb      .sfp_range
+        cmp     eax, 0xF2
+        ja      .sfp_range
+        sub     eax, 0xF0                   ; sentinel -> real handle 0/1/2
+.sfp_range:
+        cmp     eax, 255
+        ja      .sfp_none
+        add     eax, _stdio_flags
+        mov     esp, ebp
+        pop     ebp
+        ret
+.sfp_none:
+        xor     eax, eax
+        mov     esp, ebp
+        pop     ebp
+        ret
+
 ; fseek(FILE *stream, long offset, int whence) -> 0 on success, -1 on error.
-; Clears EOF for the stream (C11 7.21.9.2p5) but preserves the error flag.
+; Clears EOF for the stream (C11 7.21.9.2p5). It does NOT set the error
+; indicator on failure: C11 7.21.9.2p4 only specifies the return value,
+; and seeking a non-seekable stream is a normal, expected failure —
+; setting the flag would leave ferror(stdout) permanently true for any
+; program that probes stdout with fseek.
 _fseek:
         push    ebp
         mov     ebp, esp
         push    ebx
-        mov     eax, [ebp + 8]              ; stream -> fd
-        cmp     eax, 255
-        ja      .fsk_call                   ; out of table range: skip flags
-        and     byte [_stdio_flags + eax], 0xFE   ; clear EOF, keep error
+        push    dword [ebp + 8]
+        call    __stdio_flag_ptr
+        add     esp, 4
+        test    eax, eax
+        jz      .fsk_call
+        and     byte [eax], 0xFE            ; clear EOF, keep error
 .fsk_call:
         push    dword [ebp + 16]            ; whence
         push    dword [ebp + 12]            ; offset
@@ -4217,11 +4301,6 @@ _fseek:
         xor     eax, eax                    ; success -> 0
         jmp     .fsk_done
 .fsk_err:
-        mov     eax, [ebp + 8]
-        cmp     eax, 255
-        ja      .fsk_err_ret
-        or      byte [_stdio_flags + eax], 2     ; set error
-.fsk_err_ret:
         mov     eax, -1
 .fsk_done:
         pop     ebx
@@ -4255,10 +4334,12 @@ _rewind:
         push    dword [ebp + 8]
         call    _fseek
         add     esp, 12
-        mov     eax, [ebp + 8]
-        cmp     eax, 255
-        ja      .rw_done
-        mov     byte [_stdio_flags + eax], 0     ; clear EOF and error
+        push    dword [ebp + 8]
+        call    __stdio_flag_ptr
+        add     esp, 4
+        test    eax, eax
+        jz      .rw_done
+        mov     byte [eax], 0               ; clear EOF and error
 .rw_done:
         mov     esp, ebp
         pop     ebp
@@ -4268,24 +4349,30 @@ _rewind:
 _clearerr:
         push    ebp
         mov     ebp, esp
-        mov     eax, [ebp + 8]
-        cmp     eax, 255
-        ja      .ce_done
-        mov     byte [_stdio_flags + eax], 0
+        push    dword [ebp + 8]
+        call    __stdio_flag_ptr
+        add     esp, 4
+        test    eax, eax
+        jz      .ce_done
+        mov     byte [eax], 0
 .ce_done:
         mov     esp, ebp
         pop     ebp
         ret
 
 ; feof(FILE *stream) -> nonzero once a read has hit end-of-file.
-; Set by the read paths (_fgetc / _fread), not by lseek position.
+; Set by the read paths (_fgetc / _fread / _fgets / _getchar), not by
+; the lseek position — a stream sitting at the last byte is not at EOF
+; until a read actually comes up short.
 _feof:
         push    ebp
         mov     ebp, esp
-        mov     eax, [ebp + 8]
-        cmp     eax, 255
-        ja      .fe_none
-        movzx   eax, byte [_stdio_flags + eax]
+        push    dword [ebp + 8]
+        call    __stdio_flag_ptr
+        add     esp, 4
+        test    eax, eax
+        jz      .fe_none
+        movzx   eax, byte [eax]
         and     eax, 1
         mov     esp, ebp
         pop     ebp
@@ -4296,14 +4383,16 @@ _feof:
         pop     ebp
         ret
 
-; ferror(FILE *stream) -> nonzero if a read/seek reported a DOS error.
+; ferror(FILE *stream) -> nonzero if a read reported a DOS error.
 _ferror:
         push    ebp
         mov     ebp, esp
-        mov     eax, [ebp + 8]
-        cmp     eax, 255
-        ja      .ferr_none
-        movzx   eax, byte [_stdio_flags + eax]
+        push    dword [ebp + 8]
+        call    __stdio_flag_ptr
+        add     esp, 4
+        test    eax, eax
+        jz      .ferr_none
+        movzx   eax, byte [eax]
         and     eax, 2
         mov     esp, ebp
         pop     ebp
