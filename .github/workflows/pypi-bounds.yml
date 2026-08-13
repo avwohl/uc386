@@ -1,0 +1,120 @@
+name: pypi-bounds
+
+# Resolve dependencies from PyPI exactly as a user's `pip install`
+# does, instead of pre-installing the siblings from @main.
+#
+# The `Tests` workflow installs uc_core / upeep386 / upyle from
+# git@main on purpose: it doubles as the early-warning integration
+# test against sibling TIP. But because it hands pip the exact
+# versions up front, pip never gets to *choose* one -- so the version
+# bounds declared in pyproject.toml are never exercised there, and a
+# wrong bound cannot fail that job.
+#
+# That is precisely how 0.1.3 shipped broken. It declared an unbounded
+# `uc_core>=0.3.6`; pip gave users uc_core 0.4.0, which had renamed
+# TranslationUnit.declarations -> .items; every compile died with
+# AttributeError. CI was green the whole time, because CI was never
+# resolving from PyPI.
+#
+# The weekly schedule matters as much as the push trigger: this class
+# of breakage arrives when a *sibling* publishes a release, and there
+# is no uc386 commit to trigger anything.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'pyproject.toml'
+      - '.github/workflows/pypi-bounds.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'pyproject.toml'
+      - '.github/workflows/pypi-bounds.yml'
+  schedule:
+    # Mondays 06:17 UTC. Off-the-hour to avoid GitHub's peak-of-hour
+    # scheduling backlog.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  pypi-bounds:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Floor and ceiling of the supported range. 3.12 is covered by
+        # the main Tests matrix; resolution differences show up at the
+        # ends, not the middle.
+        python-version: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install nasm
+        run: sudo apt-get update -y && sudo apt-get install -y nasm
+
+      - name: Install with dependencies resolved from PyPI
+        # NO `git+https://...@main` installs here -- that is the entire
+        # point of this job. uc_core / uplox / upeep386 must come from
+        # PyPI via the bounds in pyproject.toml. `upyle` is not a
+        # declared dependency (only addons/harness/exe.py imports it),
+        # so install it the way docs/INSTALL.md tells users to.
+        # Non-editable install, so `import uc386` comes from the built
+        # wheel and packaging mistakes (missing package-data, bad
+        # entry point) surface here too.
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest unicorn upyle .
+
+      - name: Show what pip actually resolved
+        run: pip list | grep -Ei 'uc386|uc_core|uplox|upeep386|upyle'
+
+      - name: Unit tests against the resolved versions
+        run: pytest tests/ -q
+
+      - name: End-to-end compile against the resolved versions
+        # 0.1.3's failure did not surface at import -- it surfaced when
+        # codegen walked TranslationUnit.items against a uc_core that
+        # still called it .declarations. So actually compile, assemble
+        # and run a program rather than just importing the package.
+        run: |
+          uc386 examples/hello.c -o /tmp/hello.asm
+          nasm -f bin /tmp/hello.asm -o /tmp/hello.bin
+          python - <<'PY'
+          from pathlib import Path
+          from uc386.dos_emu import run
+          out = run(Path("/tmp/hello.bin")).stdout
+          assert out == "Hello, DOS!\n", f"unexpected output: {out!r}"
+          print(f"PASS: compiled + ran against PyPI-resolved deps -> {out!r}")
+          PY
+
+      - name: Flag sibling releases our bounds exclude
+        # Informational, never fails the job. When a sibling publishes
+        # a version our declared bound refuses, that is the moment to
+        # review the bound -- rather than discovering it when someone
+        # files a bug. The `<0.5` cap on uc_core exists precisely
+        # because 0.4.0 was a breaking rename.
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import json, urllib.request
+          from importlib.metadata import version
+          for pkg in ("uc_core", "uplox", "upeep386", "upyle"):
+              try:
+                  installed = version(pkg)
+                  with urllib.request.urlopen(
+                      f"https://pypi.org/pypi/{pkg}/json", timeout=15
+                  ) as fh:
+                      latest = json.load(fh)["info"]["version"]
+              except Exception as exc:
+                  print(f"{pkg}: check skipped ({exc})")
+                  continue
+              flag = "  <-- newer release exists; review the bound" \
+                  if installed != latest else ""
+              print(f"{pkg}: resolved {installed}, latest on PyPI {latest}{flag}")
+          PY

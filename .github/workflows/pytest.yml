@@ -51,6 +51,14 @@ jobs:
       # purpose: this job is also the integration test that uc386 still
       # works against the TIP of uc_core/upeep386/upyle, so a breaking
       # change over there shows up here instead of in a user's install.
+      #
+      # The flip side is that pip is handed exact versions and never
+      # resolves the bounds in pyproject.toml, so a wrong bound cannot
+      # fail THIS job — that is how 0.1.3 shipped an unbounded
+      # `uc_core>=0.3.6` with CI green. The complementary check lives in
+      # `.github/workflows/pypi-bounds.yml`, which installs with no git
+      # pins at all. Keep both: this one catches sibling TIP breaking
+      # us, that one catches our declared bounds being wrong.
       # They must land before `pip install -e .`, which would otherwise
       # resolve `upeep386>=0.2.0` from PyPI.
       # `upyle` is the OMF→MZ+LE linker (repo is still named pyle). It
