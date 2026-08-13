@@ -451,8 +451,21 @@ def run(
                 return -1
         else:
             return -1
-        fd = next_vfd[0]
-        next_vfd[0] += 1
+        # Allocate the LOWEST free handle >= 3, the way real DOS does.
+        # This used to be a monotonic counter that never reused a closed
+        # handle, so a program looping open/close handed out fd 303 after
+        # 300 iterations. Real DOS would have run out of handles long
+        # before that, and libc's per-stream flag table is indexed by
+        # handle — so a runaway fd silently lost its EOF/error state
+        # (measured: feof() stuck at 0 on the 301st stream).
+        fd = 3
+        while fd in vfd_table:
+            fd += 1
+        if fd > 255:
+            # Refuse rather than hand back a handle nothing can track.
+            # Real DOS caps a process far lower (20 by default).
+            return -1
+        next_vfd[0] = fd + 1
         pos = len(vfiles[name]) if mode == "a" else 0
         vfd_table[fd] = {"name": name, "pos": pos, "mode": mode}
         return fd
@@ -1485,6 +1498,12 @@ def run(
             if fd == 0xF0: fd = 0
             elif fd == 0xF1: fd = 1
             elif fd == 0xF2: fd = 2
+            # `err` is a DOS error code when the request is invalid, as
+            # opposed to a short/zero read (which is ordinary EOF). These
+            # used to collapse together into actual=0, so a bad handle
+            # was indistinguishable from end-of-file and ferror() could
+            # never fire under the emulator.
+            err = None
             if fd == 0:
                 start = stdin_pos[0]
                 end = min(start + count, len(stdin_bytes))
@@ -1496,9 +1515,16 @@ def run(
             elif fd >= 3:
                 actual = _vfile_read(fd, edx, count)
                 if actual < 0:
+                    err = 6          # DOS 6: invalid handle
                     actual = 0
             else:
+                err = 5              # DOS 5: access denied (1/2 write-only)
                 actual = 0
+            if err is not None:
+                eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
+                uc.reg_write(UC_X86_REG_EAX, (eax & ~0xFFFF) | err)
+                return
             # Clear CF: on real DOS a successful read clears carry, and
             # AX=0 (not CF) is how end-of-file is signalled. Without this
             # a stale CF makes libc's `jc` treat a good read as an I/O

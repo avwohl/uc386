@@ -62,6 +62,20 @@ Two subtleties worth knowing if you touch this code:
   seeking a non-seekable stream is an ordinary failure — setting the
   flag would leave `ferror(stdout)` true forever for any program that
   probes stdout with `fseek`.
+- Every INT 21h read/write caller checks the carry flag. It is not
+  decorative: on error DOS returns an error *code* in AX, so a caller
+  that ignores CF reads it as a byte count — `read()` on a bad handle
+  reported 6 bytes read, and `fgets()` returned a non-NULL pointer to
+  a garbage buffer instead of NULL.
+
+`dos_emu` was complicit in the old behaviour: it collapsed "invalid
+handle" into a zero-byte read, which is indistinguishable from
+end-of-file, so `ferror` could not fire under the emulator no matter
+what the libc did. It now sets CF with a DOS error code (6 invalid
+handle, 5 access denied) and clears CF on success for AH=0x3F/0x40, as
+real DOS does. It also allocates the lowest free handle instead of an
+ever-increasing counter — a 300-iteration open/close loop used to reach
+fd 303, past the flag table, silently losing EOF state.
 
 **Genuinely filled since this document was first written** (real
 INT 21h implementations, not stubs): `getenv`, `strtol` /

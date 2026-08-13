@@ -106,12 +106,21 @@ _fputs:
 _write:
         push    ebp
         mov     ebp, esp
+        push    ebx                         ; callee-saved
         mov     ebx, [ebp + 8]
         mov     edx, [ebp + 12]
         mov     ecx, [ebp + 16]
         mov     ah, 0x40
         int     21h
+        jc      .wr_err                     ; CF=1: AX is an error code
         movzx   eax, ax
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+.wr_err:
+        mov     eax, -1                     ; POSIX: -1 on error
+        pop     ebx
         mov     esp, ebp
         pop     ebp
         ret
@@ -445,6 +454,11 @@ _fgets:
         mov     ecx, 1
         mov     ah, 0x3F
         int     21h
+        jc      .fg_err              ; CF=1: error, not a byte count.
+                                     ; Without this the DOS error code
+                                     ; was treated as "1 byte read" and
+                                     ; fgets returned a garbage buffer
+                                     ; instead of NULL.
         movzx   eax, ax
         test    eax, eax
         jz      .checkdone
@@ -474,6 +488,18 @@ _fgets:
         mov     eax, [ebp - 8]
         test    eax, eax
         jnz     .end
+        xor     eax, eax
+        jmp     .ret
+.fg_err:
+        ; Read error: flag it and return NULL regardless of how much of
+        ; the line we had, per C11 7.21.7.2p3.
+        push    ebx
+        call    __stdio_flag_ptr
+        add     esp, 4
+        test    eax, eax
+        jz      .fg_err_ret
+        or      byte [eax], 2
+.fg_err_ret:
         xor     eax, eax
         jmp     .ret
 .end:
@@ -586,12 +612,24 @@ _fscanf:
 _read:
         push    ebp
         mov     ebp, esp
+        push    ebx                         ; callee-saved
         mov     ebx, [ebp + 8]
         mov     edx, [ebp + 12]
         mov     ecx, [ebp + 16]
         mov     ah, 0x3F
         int     21h
+        jc      .rd_err                     ; CF=1: AX is an error code,
+                                            ; not a byte count. Returning
+                                            ; it verbatim made read() on a
+                                            ; bad handle report 6 bytes read.
         movzx   eax, ax
+        pop     ebx
+        mov     esp, ebp
+        pop     ebp
+        ret
+.rd_err:
+        mov     eax, -1                     ; POSIX: -1 on error
+        pop     ebx
         mov     esp, ebp
         pop     ebp
         ret
@@ -610,11 +648,22 @@ _getchar:
         mov     ecx, 1
         mov     ah, 0x3F
         int     21h
+        jc      .gc_err              ; CF=1: error, not a byte count
         movzx   eax, ax
         test    eax, eax
         jz      .eof
         movzx   eax, byte [ebp - 4]
         jmp     .done
+.gc_err:
+        ; A read error on stdin is not EOF — record it as an error so
+        ; ferror(stdin) reports it, and still return EOF to the caller.
+        push    dword 0
+        call    __stdio_flag_ptr
+        add     esp, 4
+        test    eax, eax
+        jz      .gc_eof_ret
+        or      byte [eax], 2
+        jmp     .gc_eof_ret
 .eof:
         ; Mark stdin at EOF. getchar() reads raw fd 0 while feof(stdin)
         ; passes the 0xF0 sentinel; __stdio_flag_ptr folds both onto the

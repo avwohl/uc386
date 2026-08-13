@@ -231,6 +231,81 @@ def test_fseek_failure_does_not_poison_ferror(run_prog):
     assert res.stdout == "0\n"
 
 
+def test_ferror_distinguishes_io_error_from_eof(run_prog):
+    """A read error must set ferror, not feof.
+
+    dos_emu used to collapse "invalid handle" into actual=0, which is
+    indistinguishable from end-of-file, so ferror() could never fire
+    under the emulator at all. stdout is write-only, so reading it is a
+    DOS error rather than EOF.
+    """
+    src = dedent(r"""
+        #include <stdio.h>
+        int main(void) {
+            int c = fgetc(stdout);
+            printf("%d %d %d\n", c, ferror(stdout) ? 1 : 0,
+                   feof(stdout) ? 1 : 0);
+            clearerr(stdout);
+            printf("%d\n", ferror(stdout) ? 1 : 0);
+            return 0;
+        }
+    """)
+    res = run_prog(src)
+    assert res.error is None
+    assert res.stdout == "-1 1 0\n0\n"
+
+
+def test_read_and_fgets_report_errors_rather_than_data(run_prog):
+    """Callers that ignored CF turned a DOS error code into data.
+
+    POSIX read() on a bad handle returned 6 (the DOS "invalid handle"
+    code) as if six bytes had been read, and fgets() on a write-only
+    stream returned a non-NULL pointer to a garbage buffer.
+    """
+    src = dedent(r"""
+        #include <stdio.h>
+        int read(int, void *, int);
+        int main(void) {
+            char buf[32];
+            printf("%d\n", read(99, buf, 8));
+            char *r = fgets(buf, sizeof buf, stdout);
+            printf("%s %d\n", r ? "nonnull" : "NULL",
+                   ferror(stdout) ? 1 : 0);
+            return 0;
+        }
+    """)
+    res = run_prog(src)
+    assert res.error is None
+    assert res.stdout == "-1\nNULL 1\n"
+
+
+def test_handles_are_reused_so_flags_keep_working(run_prog):
+    """dos_emu handed out a fresh fd per open and never reused a closed
+    one, so a loop of open/close reached fd 303 -- past the 256-entry
+    flag table, silently losing EOF state. Real DOS returns the lowest
+    free handle (and would have run out long before 300).
+    """
+    src = dedent(r"""
+        #include <stdio.h>
+        int main(void) {
+            FILE *f;
+            for (int i = 0; i < 300; i++) {
+                f = fopen("d.txt", "r");
+                fclose(f);
+            }
+            f = fopen("d.txt", "r");
+            while (fgetc(f) != EOF) { }
+            printf("%d %d\n", (int)(long)f, feof(f) ? 1 : 0);
+            fclose(f);
+            return 0;
+        }
+    """)
+    res = run_prog(src, vfiles_init={b"d.txt": b"xy"})
+    assert res.error is None
+    # Lowest free handle is 3, and EOF is still tracked there.
+    assert res.stdout == "3 1\n"
+
+
 def test_eof_is_per_stream_not_global(run_prog):
     """`_stdio_flags` is indexed by handle, so hitting EOF on one open
     file must not make a second, independent stream report EOF."""
