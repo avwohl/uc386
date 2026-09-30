@@ -12,7 +12,7 @@ emulator (compile → assemble → run → diff): **215 / 220**
 [c-testsuite](https://github.com/c-testsuite/c-testsuite) and, with
 `--kr`, **1397 / 1514**
 [gcc-c-torture](https://github.com/llvm/llvm-test-suite) executable
-tests pass. [docs/status.md](docs/status.md) lists the remaining
+tests pass. [docs/status.md](https://github.com/avwohl/uc386/blob/main/docs/status.md) lists the remaining
 failures.
 
 The frontend (parsing, preprocessing, AST-level optimization) lives
@@ -29,9 +29,9 @@ driver, the x86-32 NASM emitter, and the DOS runtime bindings.
   awk, and 17 GNU utilities.
 - Compact code generation: `true` is 18 bytes as a flat `.bin`. A DOS
   `.exe` carries a ~32.8 KB DOS/32A extender floor
-  ([docs/size.md](docs/size.md)).
+  ([docs/size.md](https://github.com/avwohl/uc386/blob/main/docs/size.md)).
 - Target: unmodified Watcom-era DOS games such as Descent and Duke
-  Nukem 3D ([docs/design.md](docs/design.md)).
+  Nukem 3D ([docs/design.md](https://github.com/avwohl/uc386/blob/main/docs/design.md)).
 
 ## Install
 
@@ -62,7 +62,7 @@ it compiles with no `-I` at all.
 That install compiles C to `.asm`. Building a bootable DOS `.exe`
 additionally needs `pip install upyle` and the `addons/harness/`
 tree, which ships only in the source checkout — see
-[`docs/path-a-mz-le.md`](docs/path-a-mz-le.md).
+[`docs/path-a-mz-le.md`](https://github.com/avwohl/uc386/blob/main/docs/path-a-mz-le.md).
 
 Source checkout for development:
 
@@ -76,25 +76,25 @@ pytest tests/          # 498 passed, 1 skipped
 
 To co-develop the frontend or the optimizer, clone them as siblings
 and install those editable too — see
-[`CLAUDE.md`](CLAUDE.md) for that layout.
+[`CLAUDE.md`](https://github.com/avwohl/uc386/blob/main/CLAUDE.md) for that layout.
 
 macOS (Homebrew) and Fedora/RHEL (dnf) instructions, plus the
 optional toolchains for addon builds (bison/flex) and the
 DJGPP / OpenWatcom comparison columns, are documented in
-[`docs/INSTALL.md`](docs/INSTALL.md).
+[`docs/INSTALL.md`](https://github.com/avwohl/uc386/blob/main/docs/INSTALL.md).
 
 ## Documentation
 
-- [docs/status.md](docs/status.md) - suite results, `--kr`, highlights, libc status
-- [docs/size.md](docs/size.md) - executable sizes against Open Watcom and DJGPP
-- [docs/design.md](docs/design.md) - goal, non-goals, and what this repo contributes
-- [docs/INSTALL.md](docs/INSTALL.md) - per-platform install and optional toolchains
-- [docs/path-a-mz-le.md](docs/path-a-mz-le.md) - the MZ+LE `.exe` build path
-- [docs/dosiz-integration.md](docs/dosiz-integration.md) - dosiz as a test runner
-- [addons/STATUS.md](addons/STATUS.md) - per-addon report
-- [STANDARD_C_BACKLOG.md](STANDARD_C_BACKLOG.md) - standard-C backlog
-- [CHANGELOG.md](CHANGELOG.md) - release changes
-- [docs/changes.md](docs/changes.md) - historical development log
+- [docs/status.md](https://github.com/avwohl/uc386/blob/main/docs/status.md) - suite results, `--kr`, highlights, libc status
+- [docs/size.md](https://github.com/avwohl/uc386/blob/main/docs/size.md) - executable sizes against Open Watcom and DJGPP
+- [docs/design.md](https://github.com/avwohl/uc386/blob/main/docs/design.md) - goal, non-goals, and what this repo contributes
+- [docs/INSTALL.md](https://github.com/avwohl/uc386/blob/main/docs/INSTALL.md) - per-platform install and optional toolchains
+- [docs/path-a-mz-le.md](https://github.com/avwohl/uc386/blob/main/docs/path-a-mz-le.md) - the MZ+LE `.exe` build path
+- [docs/dosiz-integration.md](https://github.com/avwohl/uc386/blob/main/docs/dosiz-integration.md) - dosiz as a test runner
+- [addons/STATUS.md](https://github.com/avwohl/uc386/blob/main/addons/STATUS.md) - per-addon report
+- [STANDARD_C_BACKLOG.md](https://github.com/avwohl/uc386/blob/main/STANDARD_C_BACKLOG.md) - standard-C backlog
+- [CHANGELOG.md](https://github.com/avwohl/uc386/blob/main/CHANGELOG.md) - release changes
+- [docs/changes.md](https://github.com/avwohl/uc386/blob/main/docs/changes.md) - historical development log
 
 ## Related Projects
 
