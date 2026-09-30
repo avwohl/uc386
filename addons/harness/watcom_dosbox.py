@@ -6,7 +6,7 @@ won't run under Rosetta — Rosetta bridges x86_64→arm64 user space,
 not the Linux ABI). But the *DOS-hosted* `wcc386.exe` / `wlink.exe`
 run fine under DOSBox-X, which IS available on macOS/Linux. That is
 the only honest way to put a real Open Watcom size column next to
-uc386 on a Mac, so the README's "smaller than Watcom" claim can be
+uc386 on a Mac, so the "smaller than Watcom" claim in docs/size.md can be
 checked instead of asserted.
 
 The toolchain tree is the `binw/` + `h/` + `lib386/` subset unzipped

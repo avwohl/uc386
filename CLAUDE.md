@@ -6,8 +6,12 @@ expected at `../uc_core`). This repo owns the driver, the x86-32 codegen,
 and the DOS runtime bindings; several language-neutral pieces have been
 split out into sibling packages (see **Sibling packages** below).
 
-See `README.md` for the public status, the measured size table, and
-the install paths. Released on PyPI — `pip install uc386` (0.2.0).
+See `README.md` for the public status and the install paths,
+`docs/status.md` for the status detail, and `docs/size.md` for the
+measured size table. Released on PyPI — `pip install uc386` (0.2.0).
+
+## README stays short
+README.md is at most 150 lines. New detail goes in docs/<topic>.md with a one-line link from the README; never add sections to the README.
 
 ## Layout
 
