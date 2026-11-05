@@ -3,6 +3,32 @@
 Notable changes to uc386. Releases before 0.2.5 are described on the
 [GitHub releases page](https://github.com/avwohl/uc386/releases).
 
+## 0.2.6 — 2026-11-05
+
+No change to uc386's own source since 0.2.5 (two README edits only). This
+release raises the `uc_core` floor, so that a fresh `pip install uc386`
+resolves uc_core 0.4.2 and its fixes rather than 0.4.1.
+
+### Changed
+
+- `uc_core` floor raised to `>=0.4.2` (the `<0.5` cap is unchanged). 0.4.2 is
+  the 38 commits since 0.4.1, mostly preprocessor and parser fixes:
+  `__VA_OPT__` and `#__VA_ARGS__`, a self-named macro and an alias call
+  through an argument, the GNU comma paste, `__COUNTER__`, `_Pragma` and
+  pragma lines in `-E` text, a macro parameter replaced only in identifier
+  tokens; a label before `asm(...)`, a case or default label before a
+  declaration or a statement word; a block use of a tag that declares the
+  tag, a parameter that hides a file-scope enumerator; `volatile` kept for
+  typedef, struct, union and enum types. The uc_core CHANGELOG has each one.
+
+Measured on 2026-11-05: in a fresh Python 3.12 venv, `pip install .` took
+uc_core 0.4.2, upeep386 0.2.1 and uplox 3.3.1 from PyPI, and the suite with
+`unicorn` installed gave 498 passed, 1 skipped (the MicroPython test, which
+needs a built `micropython.bin`) - the same as against uc_core 0.4.1.
+
+Nothing here changes uc386's own command line, output format, or generated
+code beyond what uc_core changes.
+
 ## 0.2.5 — 2026-08-20
 
 No change to uc386's own source since 0.2.4. This release exists to raise the
