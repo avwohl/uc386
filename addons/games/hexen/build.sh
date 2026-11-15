@@ -17,7 +17,7 @@ if [ -n "${PYTHON:-}" ]; then
 elif [ -x "$REPO/.venv/bin/python" ]; then
     PYTHON="$REPO/.venv/bin/python"
 else
-    PYTHON="$(command -v python3.12 || command -v python3 || command -v python)"
+    PYTHON="$(command -v python3 || command -v python)"
 fi
 # The headers moved to src/uc386/lib/include when lib/ was packaged
 # for PyPI; $REPO/lib/include has not existed since. Every addon build

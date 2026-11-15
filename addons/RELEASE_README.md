@@ -73,7 +73,7 @@ compile it through uc386.
 
 ```sh
 git clone https://github.com/avwohl/uc386
-cd uc386 && python3.12 -m venv .venv
+cd uc386 && python3 -m venv .venv
 .venv/bin/pip install pytest unicorn upyle -e .
 
 # Then for any in-tree addon: drop its sources + manifest into
