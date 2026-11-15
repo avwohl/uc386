@@ -3,6 +3,16 @@
 Notable changes to uc386. Releases before 0.2.5 are described on the
 [GitHub releases page](https://github.com/avwohl/uc386/releases).
 
+## Unreleased
+
+### Changed
+
+- `pyproject.toml` no longer has the `<0.5` upper limit on `uc_core`. It has
+  floors only. The `pypi-bounds` workflow resolves from PyPI each week, and
+  finds a `uc_core` release that breaks uc386.
+- CI uses Python `3.x` (the newest release) in place of 3.12 and 3.13, and
+  the latest DJGPP release in place of v3.4.
+
 ## 0.2.6 — 2026-11-05
 
 No change to uc386's own source since 0.2.5 (two README edits only). This

@@ -24,7 +24,7 @@ jobs:
         # before a single test runs. uc386's own code is 3.10-clean;
         # the constraint is the transitive dep. addons/harness/ also
         # imports tomllib, which is stdlib only from 3.11.
-        python-version: ['3.11', '3.12', '3.13']
+        python-version: ['3.11', '3.x']
     steps:
     - uses: actions/checkout@v6
     - name: Set up Python ${{ matrix.python-version }}

@@ -16,12 +16,12 @@ license = "GPL-3.0-or-later"
 # lowers its floor, this can follow it back down.
 requires-python = ">=3.11"
 dependencies = [
-    # Upper bound is load-bearing, not defensive: uc_core 0.4.0 renamed
-    # TranslationUnit.declarations -> .items, and codegen.py:621 uses
-    # .items. The published uc386 0.1.3 declares an unbounded
-    # uc_core>=0.3.6, so pip gives it uc_core 0.4.0 and every compile
-    # dies with AttributeError. Keep the bound in step with the API.
-    "uc_core>=0.4.2,<0.5",
+    # A floor only, no upper limit (no pins to a specific version).
+    # uc_core 0.4.0 renamed TranslationUnit.declarations -> .items, and
+    # codegen.py uses .items, so a uc_core below 0.4 cannot work. When a
+    # later uc_core breaks uc386, fix uc386 and raise the floor; the
+    # pypi-bounds workflow resolves from PyPI each week and finds the break.
+    "uc_core>=0.4.2",
     "uplox>=3.3.0",
     "upeep386>=0.2.1",
 ]

@@ -77,7 +77,7 @@ copy `peephole.py`/`asm_dce.py`/`libc_split.py` back in.)
   `pip install uc386` fails at resolution with "no matching
   distributions ... uplox", so 3.10 was never installable regardless of
   whether the code would have run. On macOS install via
-  `brew install python@3.12` (Apple's system 3.9 is too old).
+  `brew install python` (Apple's system 3.9 is too old).
   Note `addons/harness/` additionally needs 3.11 outright — it imports
   `tomllib`, which is stdlib only from 3.11.
 - Working venv at `.venv/`.
@@ -166,12 +166,13 @@ Two workflows, triggered in sequence by one tag push:
    is CDN-cached and lags. The durable fix is to have release.yml
    create the release with a PAT instead of `GITHUB_TOKEN`.
 
-Keep the `uc_core` upper bound in `pyproject.toml` in step with the
-API actually used — see the comment there. CI installs the siblings
-from `@main` rather than PyPI, so a bad bound passes CI and only
-breaks for `pip install uc386` users.
+`pyproject.toml` has a floor on `uc_core` and no upper bound (no pins
+to a specific version) — see the comment there. CI installs the siblings
+from `@main` rather than PyPI, so a floor that is too low passes CI and
+only breaks for `pip install uc386` users; `pypi-bounds.yml` is the check
+that resolves from PyPI.
 
-The `pytest.yml` matrix (3.11–3.13) matches `requires-python` now.
+The `pytest.yml` matrix (3.11 and 3.x) matches `requires-python` now.
 It previously claimed `>=3.10` while testing only 3.11+; the claim was
 the wrong half — 3.10 is uninstallable because of uplox's own floor
 (see **Toolchain** above), so the floor moved up rather than the matrix

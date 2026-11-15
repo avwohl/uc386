@@ -28,9 +28,9 @@ you `.c` → `.asm`. Add `pip install unicorn` to run the output under
 	pytest tests/
 
 	# macOS (Homebrew)
-	brew install python@3.12 nasm git
+	brew install python nasm git
 	git clone https://github.com/avwohl/uc386 && cd uc386
-	python3.12 -m venv .venv && . .venv/bin/activate
+	python3 -m venv .venv && . .venv/bin/activate
 	pip install pytest unicorn upyle -e .
 	pytest tests/
 
@@ -46,7 +46,7 @@ A clean run prints `490 passed, 1 skipped`.
 ## Required tools
 
 	tool	purpose	apt	brew	dnf
-	python ≥ 3.11	driver + uc_core frontend	python3 python3-venv	python@3.12	python3 python3-virtualenv
+	python ≥ 3.11	driver + uc_core frontend	python3 python3-venv	python	python3 python3-virtualenv
 	nasm	assembler for emitted .asm	nasm	nasm	nasm
 	git	source checkout	git	git	git
 

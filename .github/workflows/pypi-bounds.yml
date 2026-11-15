@@ -43,10 +43,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Floor and ceiling of the supported range. 3.12 is covered by
-        # the main Tests matrix; resolution differences show up at the
-        # ends, not the middle.
-        python-version: ['3.11', '3.13']
+        # The floor of the supported range and the newest Python. No
+        # pin to a specific version: "3.x" moves by itself.
+        python-version: ['3.11', '3.x']
     steps:
       - uses: actions/checkout@v6
 
@@ -97,8 +96,8 @@ jobs:
         # Informational, never fails the job. When a sibling publishes
         # a version our declared bound refuses, that is the moment to
         # review the bound -- rather than discovering it when someone
-        # files a bug. The `<0.5` cap on uc_core exists precisely
-        # because 0.4.0 was a breaking rename.
+        # files a bug. pyproject.toml has floors only, so pip normally
+        # resolves the newest release and this step prints no flag.
         continue-on-error: true
         run: |
           python - <<'PY'

@@ -24,10 +24,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Set up Python 3.12
+      - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: '3.12'
+          python-version: '3.x'
 
       - name: Install build tools
         run: |
@@ -41,10 +41,14 @@ jobs:
           pip install -e .
 
       - name: Install DJGPP cross-compiler
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          # The latest release of andrewwutw/build-djgpp, no version pin.
+          # The asset name has the GCC version in it, so match a pattern.
           mkdir -p ~/.local/opt
-          curl -sL -o /tmp/djgpp.tar.bz2 \
-            https://github.com/andrewwutw/build-djgpp/releases/download/v3.4/djgpp-linux64-gcc1220.tar.bz2
+          gh release download --repo andrewwutw/build-djgpp \
+            --pattern 'djgpp-linux64-gcc*.tar.bz2' --output /tmp/djgpp.tar.bz2
           tar xjf /tmp/djgpp.tar.bz2 -C ~/.local/opt
           ~/.local/opt/djgpp/bin/i586-pc-msdosdjgpp-gcc --version
 
