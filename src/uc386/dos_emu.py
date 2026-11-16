@@ -380,6 +380,21 @@ def run(
         )
     if isinstance(binary, Path):
         binary = binary.read_bytes()
+    # The PSP + environment block go to free conventional memory: PSP_BASE
+    # unless the image reaches it, then right after the image (paragraph
+    # aligned). The segment must fit in 16 bits, so it has to end below
+    # 1 MiB; an image that leaves no room is refused rather than having its
+    # end overwritten.
+    psp_base = PSP_BASE
+    _img_end = CODE_BASE + len(binary)
+    if _img_end > PSP_BASE:
+        psp_base = (_img_end + 15) & ~15
+        if psp_base + PSP_SIZE > 0x100000:
+            return Result(error=(
+                f"binary of {len(binary)} bytes leaves no room for the PSP "
+                f"below 1 MiB"))
+    psp_seg = psp_base >> 4
+    env_seg = (psp_base + ENV_OFFSET) >> 4
 
     mu = Uc(UC_ARCH_X86, UC_MODE_32)
     mu.mem_map(CODE_BASE, CODE_SIZE)
@@ -448,8 +463,8 @@ def run(
     psp[0x00] = 0xCD  # INT 20h opcode (legacy CP/M-style exit)
     psp[0x01] = 0x20
     # PSP[0x2C..0x2D]: env segment (little-endian word).
-    psp[0x2C] = ENV_SEG & 0xFF
-    psp[0x2D] = (ENV_SEG >> 8) & 0xFF
+    psp[0x2C] = env_seg & 0xFF
+    psp[0x2D] = (env_seg >> 8) & 0xFF
 
     # Build the env block at ENV_BASE (offset ENV_OFFSET into the PSP
     # page). `env` defaults to empty so the block is just the
@@ -472,7 +487,7 @@ def run(
     if ENV_OFFSET + len(env_buf) > PSP_SIZE:
         return Result(error=f"env block too large: {len(env_buf)} bytes")
     psp[ENV_OFFSET:ENV_OFFSET + len(env_buf)] = env_buf
-    mu.mem_write(PSP_BASE, bytes(psp))
+    mu.mem_write(psp_base, bytes(psp))
 
     # Initialize stack near the top of the stack region. Push a fake return
     # address (0xFFFFFFFF) so `ret` from the entry function ends up at an
@@ -2101,7 +2116,7 @@ def run(
         if ah == 0x62:
             # Get current PSP segment. Returns BX = PSP_seg.
             ebx = uc.reg_read(UC_X86_REG_EBX)
-            new_ebx = (ebx & ~0xFFFF) | (PSP_SEG & 0xFFFF)
+            new_ebx = (ebx & ~0xFFFF) | (psp_seg & 0xFFFF)
             uc.reg_write(UC_X86_REG_EBX, new_ebx)
             return
         if ah == 0x4B and al == 0x00:
