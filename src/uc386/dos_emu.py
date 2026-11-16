@@ -113,7 +113,54 @@ def _read_cstr(uc: Uc, addr: int, max_len: int = 4096, term: bytes = b"\x00") ->
     return out
 
 
+def _fold_dot_components(p: bytes) -> bytes:
+    """Drop the `.` components of the absolute vfs path `p` ("C:\\...") and
+    let each `..` remove the component before it, never above the root —
+    the canonical name real DOS resolves every path to (AH=60h TRUENAME).
+    Separators are kept as written."""
+    if not (len(p) >= 3 and p[1:2] == b":" and p[2:3] in (b"\\", b"/")):
+        return p
+    rest = p[3:]
+    if b"." not in rest:
+        return p
+    parts: list = []                 # (separator before, component)
+    sep = b""
+    cur = bytearray()
+    for ch in rest:
+        if ch in (0x5C, 0x2F):
+            parts.append((sep, bytes(cur)))
+            sep = bytes([ch])
+            cur = bytearray()
+        else:
+            cur.append(ch)
+    parts.append((sep, bytes(cur)))
+    out: list = []
+    changed = False
+    for sp, comp in parts:
+        if comp == b".":
+            changed = True
+            continue
+        if comp == b"..":
+            changed = True
+            if out:
+                out.pop()
+            continue
+        out.append((sp, comp))
+    if not changed:
+        return p
+    body = b""
+    for i, (sp, comp) in enumerate(out):
+        body += comp if i == 0 else (sp or b"\\") + comp
+    return p[:3] + body
+
+
 def _canon_vfs_path(p: bytes, cwd: bytes) -> bytes:
+    """The canonical vfs key of `p` (see `_canon_vfs_path_unfolded`) with
+    its `.` and `..` components folded (`_fold_dot_components`)."""
+    return _fold_dot_components(_canon_vfs_path_unfolded(p, cwd))
+
+
+def _canon_vfs_path_unfolded(p: bytes, cwd: bytes) -> bytes:
     """Canonicalize a DOS path to the absolute form the flat vfs is
     keyed by: drive letter forced to C:, relative paths joined with
     `cwd`. Separators are kept verbatim (git mixes a "\\" drive root
@@ -290,8 +337,12 @@ def run(
     vdirs_init: set[bytes] | None = None,
     net=None,
     fs_mode: str = "lenient",
+    cwd: "bytes | str | None" = None,
 ) -> Result:
     """Emulate a flat-binary i386 program; return its stdout + exit code.
+
+    `cwd` is the start directory (default the root "C:\\"); it and its
+    parents exist in the virtual file system.
 
     `vfiles_init` seeds the virtual file system with named files
     visible to fopen("name", "r"). Pass `{b"data.txt": b"hello\n"}`
@@ -486,6 +537,20 @@ def run(
     # path resolution here — tests interact with the vfs by full
     # filename only.
     vcwd = [b"C:\\"]
+    if cwd:
+        # The start directory and its parents exist (E1).
+        _c = cwd.encode() if isinstance(cwd, str) else bytes(cwd)
+        _c = _canon_vfs_path(_c, b"C:\\")
+        while len(_c) > 3 and _c[-1:] in (b"\\", b"/"):
+            _c = _c[:-1]
+        vcwd[0] = _c
+        _d = _c
+        while len(_d) > 3:
+            vdirs.add(_d)
+            _i = max(_d.rfind(b"\\"), _d.rfind(b"/"))
+            if _i < 3:
+                break
+            _d = _d[:_i]
     # DTA address (set by INT 21h AH=0x1A); used by find-first/
     # find-next to write filename matches into the caller's buffer.
     vdta_addr = [0]
@@ -606,6 +671,42 @@ def run(
         buf[e["pos"]:end] = data
         e["pos"] = end
         return count
+
+    def _handle_entry(fd: int):
+        """The handle-table entry of `fd` (a file or a device entry), the
+        default device entry of an unredirected 0 / 1 / 2, else None (E2)."""
+        e = vfd_table.get(fd)
+        if e is not None:
+            return e
+        return {0: {"dev": "in"}, 1: {"dev": "out"},
+                2: {"dev": "err"}}.get(fd)
+
+    def _handle_write_data(fd: int, data: bytes) -> int:
+        """Write `data` to handle `fd` (E2): a device entry goes to the
+        console stream, a file entry into the file. Bytes written, or -1."""
+        e = _handle_entry(fd)
+        if e is None:
+            return -1
+        dev = e.get("dev")
+        if dev == "out":
+            _write_stdout(data)
+            return len(data)
+        if dev == "err":
+            _write_stderr(data)
+            return len(data)
+        if dev is not None or e.get("mode") not in ("w", "a", "r+"):
+            return -1
+        buf = vfiles.setdefault(e["name"], bytearray())
+        if e.get("mode") == "a":
+            e["pos"] = len(buf)
+        while len(buf) < e["pos"]:
+            buf.append(0)
+        end = e["pos"] + len(data)
+        if len(buf) < end:
+            buf.extend(b"\x00" * (end - len(buf)))
+        buf[e["pos"]:end] = data
+        e["pos"] = end
+        return len(data)
 
     def _vfile_delete(name: bytes) -> int:
         if name in vfiles:
@@ -1532,17 +1633,19 @@ def run(
             return
         if ah == 0x02:
             # putchar in DL on real DOS, but we accept AL too for codegen
-            # convenience. Look at DL primarily.
+            # convenience. Look at DL primarily. DOS writes it to the
+            # standard output HANDLE, so a redirection of handle 1 (AH=46h)
+            # captures it (E2).
             edx = uc.reg_read(UC_X86_REG_EDX)
             ch = bytes([edx & 0xFF])
-            _write_stdout(ch)
+            _handle_write_data(1, ch)
             return
         if ah == 0x06:
             # Direct console I/O: DL=char (or 0xFF for input). Output only.
             edx = uc.reg_read(UC_X86_REG_EDX)
             dl = edx & 0xFF
             if dl != 0xFF:
-                _write_stdout(bytes([dl]))
+                _handle_write_data(1, bytes([dl]))
             return
         if ah == 0x2A:
             # AH=0x2A — get system date.
@@ -1577,7 +1680,7 @@ def run(
         if ah == 0x09:
             edx = uc.reg_read(UC_X86_REG_EDX)
             s = _read_cstr(uc, edx, term=b"$")
-            _write_stdout(s)
+            _handle_write_data(1, s)
             return
         if ah == 0x40:
             # write(fd, buf, count): BX=fd, CX=count, DS:EDX=buf
@@ -1591,16 +1694,11 @@ def run(
             if fd == 0xF0: fd = 0
             elif fd == 0xF1: fd = 1
             elif fd == 0xF2: fd = 2
-            if fd == 1:
-                data = bytes(uc.mem_read(edx, count))
-                _write_stdout(data)
-                actual = count
-            elif fd == 2:
-                data = bytes(uc.mem_read(edx, count))
-                _write_stderr(data)
-                actual = count
-            elif fd >= 3:
-                actual = _vfile_write(fd, edx, count)
+            # The handle's entry decides: a device or a file, also for a
+            # standard handle redirected with AH=46h (E2).
+            if fd in vfd_table or fd in (1, 2):
+                data = bytes(uc.mem_read(edx, count)) if count else b""
+                actual = _handle_write_data(fd, data)
                 if actual < 0:
                     actual = 0
             else:
@@ -1632,7 +1730,24 @@ def run(
             # was indistinguishable from end-of-file and ferror() could
             # never fire under the emulator.
             err = None
-            if fd == 0:
+            _re2 = vfd_table.get(fd)
+            if _re2 is not None and _re2.get("dev") is not None:
+                # A device entry (E2): a duplicate of stdin reads stdin; a
+                # duplicate of stdout / stderr is write-only.
+                if _re2["dev"] == "in":
+                    fd = 0
+                else:
+                    fd = 1
+            elif _re2 is not None and fd < 3:
+                # A standard handle redirected to a FILE (E2).
+                actual = _vfile_read(fd, edx, count)
+                if actual < 0:
+                    err = 6
+                    actual = 0
+                fd = -1
+            if fd == -1:
+                pass
+            elif fd == 0:
                 start = stdin_pos[0]
                 end = min(start + count, len(stdin_bytes))
                 chunk = stdin_bytes[start:end]
@@ -1734,14 +1849,14 @@ def run(
             edx = uc.reg_read(UC_X86_REG_EDX)
             name, _ok = _dos_path(edx)
             eflags = uc.reg_read(UC_X86_REG_EFLAGS)
-            if _ok and (name in vdirs or name == b"." or name == b".."):
-                # Trivial cwd update — store the requested path
-                # verbatim with a "C:\" prefix if it isn't drive-
-                # qualified yet.
-                if not (len(name) >= 2 and name[1:2] == b":"):
-                    vcwd[0] = b"C:\\" + name
-                else:
-                    vcwd[0] = name
+            # `name` is canonical (relative to the cwd, `.`/`..` folded,
+            # E1). The root always exists; another directory must.
+            _nm = name
+            while len(_nm) > 3 and _nm[-1:] in (b"\\", b"/"):
+                _nm = _nm[:-1]
+            if _ok and (_nm in (b"C:\\", b"C:/") or _nm in vdirs
+                        or name in vdirs):
+                vcwd[0] = _nm
                 uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
             else:
                 uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
@@ -1751,6 +1866,8 @@ def run(
             edx = uc.reg_read(UC_X86_REG_EDX)
             name, _ok = _dos_path(edx)
             fd = _vfile_open(name, "w") if _ok else -1
+            if fd >= 0:
+                vfd_table[fd]["mode"] = "r+"
             new_eax = (eax & ~0xFFFFFFFF) | (fd & 0xFFFFFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
             return
@@ -1777,14 +1894,28 @@ def run(
             # close(fd): BX=fd. Returns 0 on success.
             ebx = uc.reg_read(UC_X86_REG_EBX)
             fd = ebx & 0xFFFFFFFF
-            # Standard streams: closing them is a no-op (success).
+            # A handle with a table entry (a file, a duplicate, a redirected
+            # standard handle) drops it (E2); an unredirected standard stream
+            # stays, as before.
+            if fd in vfd_table:
+                del vfd_table[fd]
+                uc.reg_write(UC_X86_REG_EAX, eax & ~0xFFFFFFFF)
+                eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
+                return
             if fd in (0xF0, 0xF1, 0xF2, 0, 1, 2):
                 new_eax = (eax & ~0xFFFFFFFF) | 0
                 uc.reg_write(UC_X86_REG_EAX, new_eax)
                 return
             rc = _vfile_close(fd)
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            if rc < 0:
+                uc.reg_write(UC_X86_REG_EAX, (eax & ~0xFFFF) | 6)
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
+                return
             new_eax = (eax & ~0xFFFFFFFF) | (rc & 0xFFFFFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
+            uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
             return
         if ah == 0x41:
             # unlink(name): DS:EDX=name. Returns 0 on success, -1 on error.
@@ -1793,6 +1924,33 @@ def run(
             rc = _vfile_delete(name) if _ok else -1
             new_eax = (eax & ~0xFFFFFFFF) | (rc & 0xFFFFFFFF)
             uc.reg_write(UC_X86_REG_EAX, new_eax)
+            return
+        if ah == 0x45 or ah == 0x46:
+            # 45h DUPLICATE HANDLE (BX) -> AX; 46h FORCE DUPLICATE: CX
+            # becomes a duplicate of BX (closing CX first). A duplicated
+            # file handle shares the SAME entry (and so the position) (E2).
+            ebx = uc.reg_read(UC_X86_REG_EBX)
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            old = ebx & 0xFFFF
+            e = _handle_entry(old)
+            if e is None:
+                uc.reg_write(UC_X86_REG_EAX, (eax & ~0xFFFF) | 6)
+                uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
+                return
+            if ah == 0x45:
+                new = 3
+                while new in vfd_table:
+                    new += 1
+                if new > 255:
+                    uc.reg_write(UC_X86_REG_EAX, (eax & ~0xFFFF) | 4)
+                    uc.reg_write(UC_X86_REG_EFLAGS, eflags | 1)
+                    return
+            else:
+                new = uc.reg_read(UC_X86_REG_ECX) & 0xFFFF
+                vfd_table.pop(new, None)
+            vfd_table[new] = e
+            uc.reg_write(UC_X86_REG_EAX, (eax & ~0xFFFF) | new)
+            uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)
             return
         if ah == 0x44 and al == 0x00:
             # IOCTL AX=4400h — Get Device Information. BX = handle.
@@ -1806,6 +1964,12 @@ def run(
             edx = uc.reg_read(UC_X86_REG_EDX)
             eflags = uc.reg_read(UC_X86_REG_EFLAGS)
             fd = ebx & 0xFFFF
+            _ie2 = vfd_table.get(fd)
+            if _ie2 is not None and _ie2.get("dev") is not None:
+                # A duplicate of a standard device (E2).
+                fd = {"in": 0, "out": 1, "err": 2}[_ie2["dev"]]
+            elif _ie2 is not None:
+                fd = -1                  # a FILE, also a redirected 0..2
             if fd in (0, 1, 2):
                 # std handles model a console / piped byte stream:
                 # char device (bit7), raw (bit5), not-EOF (bit6),
@@ -1815,7 +1979,7 @@ def run(
                              (edx & 0xFFFF0000) | dev)
                 uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)  # CF=0
                 return
-            if fd in vfd_table:
+            if fd == -1 or fd in vfd_table:
                 # a real disk file: bit7 clear (block/file), drive 0.
                 uc.reg_write(UC_X86_REG_EDX, edx & 0xFFFF0000)
                 uc.reg_write(UC_X86_REG_EFLAGS, eflags & ~1)  # CF=0
@@ -2750,6 +2914,7 @@ def assemble_and_run(
     env: dict[str, str] | None = None,
     program_path: str | None = None,
     vfiles_init: dict[bytes, bytes] | None = None,
+    cwd: "bytes | str | None" = None,
 ) -> Result:
     """Convenience: optionally bundle libc, nasm-assemble (-f bin), and run.
 
@@ -2776,6 +2941,7 @@ def assemble_and_run(
         env=env,
         program_path=program_path,
         vfiles_init=vfiles_init,
+        cwd=cwd,
     )
     if not keep_intermediate:
         try:
